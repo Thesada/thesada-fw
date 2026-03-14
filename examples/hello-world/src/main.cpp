@@ -1,12 +1,14 @@
+// thesada-fw — hello-world example
+// Minimal PlatformIO project to verify toolchain
+// SPDX-License-Identifier: GPL-3.0-only
+
 #include <Arduino.h>
 
 void setup() {
   Serial.begin(115200);
-  delay(2000);
-  Serial.println("Thesada hello-world");
 }
 
 void loop() {
-  Serial.println("Thesada hello-world");
+  Serial.println("thesada-fw hello-world");
   delay(1000);
 }
