@@ -1,0 +1,140 @@
+-- display.lua.example - OLED display with remote sensor data
+-- Copy to rules.lua and customize. Requires ENABLE_DISPLAY in config.h
+-- and display section in config.json.
+-- SPDX-License-Identifier: GPL-3.0-only
+
+Log.info("Display script loaded - waiting for hardware init")
+
+-- Integer division (math.floor not available on all ESP32 Lua builds)
+local function floor(n) return n - n % 1 end
+
+-- ── Cached sensor data ──────────────────────────────────────────────────────
+
+local temps = {}
+local currents = {}
+local batt = { present=false, percent=-1, voltage=0, charging=false }
+local page = 0
+
+-- ── Subscribe to remote node's MQTT topics ──────────────────────────────────
+
+local remote = Config.get("display.remote_prefix") or ""
+
+if #remote > 0 then
+  MQTT.subscribe(remote .. "/sensor/temperature", function(topic, payload)
+    local data = JSON.decode(payload)
+    if not data or not data.sensors then return end
+    temps = {}
+    for i, s in ipairs(data.sensors) do
+      temps[i] = { name = s.name or "?", value = s.temp or -127 }
+    end
+  end)
+
+  MQTT.subscribe(remote .. "/sensor/current", function(topic, payload)
+    local data = JSON.decode(payload)
+    if not data or not data.channels then return end
+    currents = {}
+    for i, ch in ipairs(data.channels) do
+      currents[i] = {
+        name = ch.name or "?",
+        amps = ch.current_a or 0,
+        watts = ch.power_w or 0
+      }
+    end
+  end)
+
+  MQTT.subscribe(remote .. "/sensor/battery/percent", function(topic, payload)
+    batt.present = true
+    batt.percent = tonumber(payload) or -1
+  end)
+  MQTT.subscribe(remote .. "/sensor/battery/voltage", function(topic, payload)
+    batt.voltage = tonumber(payload) or 0
+  end)
+  MQTT.subscribe(remote .. "/sensor/battery/charging", function(topic, payload)
+    batt.charging = (payload == "Charging")
+  end)
+
+  Log.info("Display subscribed to " .. remote)
+end
+
+-- ── Draw pages ──────────────────────────────────────────────────────────────
+
+local function drawStatus()
+  Display.font("medium")
+  Display.text(0, 10, "thesada-fw " .. Node.version())
+  Display.text(0, 24, "WiFi: OK  MQTT: OK")
+
+  local secs = floor(Node.uptime() / 1000)
+  local d = floor(secs / 86400); secs = secs % 86400
+  local h = floor(secs / 3600);  secs = secs % 3600
+  local m = floor(secs / 60)
+  Display.text(0, 38, string.format("Up: %dd %02d:%02d", d, h, m))
+  Display.text(0, 52, Config.get("device.name") or "node")
+end
+
+local function drawTemps()
+  Display.font("medium")
+  Display.text(0, 10, "-- Temperature --")
+  if #temps == 0 then
+    Display.text(0, 30, "Waiting for data...")
+    return
+  end
+  local unit = Config.get("temperature.unit") or ""
+  local y = 22
+  for _, t in ipairs(temps) do
+    if y > 62 then break end
+    Display.text(0, y, string.format("%-10s %6.1f%s", string.sub(t.name,1,10), t.value, unit))
+    y = y + 12
+  end
+end
+
+local function drawCurrent()
+  Display.font("medium")
+  Display.text(0, 10, "-- Current --")
+  if #currents == 0 then
+    Display.text(0, 30, "No channels")
+    return
+  end
+  local y = 22
+  for _, c in ipairs(currents) do
+    if y > 50 then break end
+    Display.text(0, y, string.format("%-10s %.2fA", string.sub(c.name,1,10), c.amps))
+    y = y + 12
+    Display.text(0, y, string.format("           %.0fW", c.watts))
+    y = y + 12
+  end
+end
+
+local function drawBattery()
+  Display.font("medium")
+  Display.text(0, 10, "-- Battery --")
+  if not batt.present then
+    Display.text(0, 30, "Not detected")
+    return
+  end
+  Display.text(0, 26, string.format("Voltage: %.2f V", batt.voltage))
+  Display.text(0, 40, string.format("Charge:  %d%%", batt.percent))
+  Display.text(0, 54, "Status:  " .. (batt.charging and "Charging" or "Discharging"))
+end
+
+local pages = { drawStatus, drawTemps, drawCurrent, drawBattery }
+local interval = (Config.get("display.page_interval_s") or 3) * 1000
+
+-- ── Page rotation ───────────────────────────────────────────────────────────
+
+local function rotatePage()
+  page = (page % #pages) + 1
+  Display.clear()
+  pages[page]()
+  Display.show()
+  Node.setTimeout(interval, rotatePage)
+end
+
+-- Start after display hardware is ready
+Node.setTimeout(3000, function()
+  if not Display.ready() then
+    Log.warn("Display not available")
+    return
+  end
+  Log.info("Display active - starting page rotation")
+  rotatePage()
+end)

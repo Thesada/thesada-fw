@@ -1,0 +1,155 @@
+-- rules.lua.example - event-driven alert rules
+-- Copy to rules.lua and customize thresholds/sensor names for your deployment.
+-- Hot-reloadable: edit on device, then run cli/lua.reload via MQTT or shell.
+-- SPDX-License-Identifier: GPL-3.0-only
+
+Log.info("rules.lua loaded")
+
+local prefix = Config.get("mqtt.topic_prefix")
+local unit   = Config.get("temperature.unit") or "C"
+
+-- ── Alert infrastructure ────────────────────────────────────────────────────
+
+local sustain = {}
+local cooldown = {}
+local COOLDOWN_MS     = 900000   -- 15 minutes between repeated alerts
+local PUMP_SUSTAIN    = 5        -- 5 consecutive readings (5 min at 60s interval)
+local TEMP_SUSTAIN    = 5        -- 5 readings OR 5 minutes, whichever is less
+local TEMP_SUSTAIN_MS = 300000   -- 5 minutes max wait
+
+-- Check if enough time has passed since last alert for this key.
+-- Does NOT set cooldown - caller must call set_cooldown() after successful send.
+local function can_alert(key)
+  local now = Node.uptime()
+  if cooldown[key] and (now - cooldown[key]) < COOLDOWN_MS then
+    return false
+  end
+  return true
+end
+
+-- Mark an alert key as sent (starts the cooldown timer).
+local function set_cooldown(key)
+  cooldown[key] = Node.uptime()
+end
+
+-- Send alert to all channels: log, Telegram, MQTT.
+-- Only sets cooldown if Telegram send succeeds. If it fails 3 times in a
+-- row (heap too low, network), reboot to clear fragmentation. The boot
+-- alert confirms the node is back, and the alert re-fires after sustain.
+local send_failures = 0
+
+local function notify(msg, key)
+  Log.warn(msg)
+  local ok = Telegram.broadcast(msg)
+  MQTT.publish(prefix .. "/alert", msg)
+  if ok then
+    set_cooldown(key)
+    send_failures = 0
+  else
+    send_failures = send_failures + 1
+    Log.error("Telegram failed (" .. send_failures .. "/3)")
+    if send_failures >= 3 then
+      Log.error("3 consecutive Telegram failures - rebooting")
+      Node.restart()
+    end
+  end
+end
+
+-- Temperature sustain: fires after N readings OR T ms, whichever comes first.
+local temp_sustain_start = {}
+
+local function temp_sustained(key)
+  local now = Node.uptime()
+  sustain[key] = (sustain[key] or 0) + 1
+  if not temp_sustain_start[key] then
+    temp_sustain_start[key] = now
+  end
+  local elapsed = now - temp_sustain_start[key]
+  if sustain[key] >= TEMP_SUSTAIN or elapsed >= TEMP_SUSTAIN_MS then
+    sustain[key] = 0
+    temp_sustain_start[key] = nil
+    return can_alert(key)
+  end
+  return false
+end
+
+local function temp_clear(key)
+  sustain[key] = 0
+  temp_sustain_start[key] = nil
+end
+
+-- ── Temperature alerts ──────────────────────────────────────────────────────
+-- Thresholds are always in Celsius (temp_c). Display value (temp) uses
+-- the configured unit (C or F).
+
+EventBus.subscribe("temperature", function(data)
+  if not data.sensors then return end
+  for _, s in ipairs(data.sensors) do
+
+    -- Overheat: specific sensor >= threshold (sustained)
+    local oh_key = "overheat:" .. s.name
+    if s.name == "House Supply" and s.temp_c >= 75 then
+      if temp_sustained(oh_key) then
+        notify(s.name .. ": " .. s.temp .. unit .. " - Overheat!", oh_key)
+      end
+    else
+      temp_clear(oh_key)
+    end
+
+    -- Low temp: specific sensor <= threshold (sustained)
+    local lt_key = "low_temp:" .. s.name
+    if s.name == "House Supply" and s.temp_c <= 55 then
+      if temp_sustained(lt_key) then
+        notify(s.name .. ": " .. s.temp .. unit .. " - Low temp, fire dying", lt_key)
+      end
+    else
+      temp_clear(lt_key)
+    end
+
+    -- Freeze: any sensor <= 2C (sustained)
+    local fr_key = "freeze:" .. s.name
+    if s.temp_c <= 2.0 then
+      if temp_sustained(fr_key) then
+        notify(s.name .. ": " .. s.temp .. unit .. " - Freeze risk!", fr_key)
+      end
+    else
+      temp_clear(fr_key)
+    end
+  end
+end)
+
+-- ── Pump current alerts ─────────────────────────────────────────────────────
+-- Uses simple count-based sustain (N consecutive low readings).
+-- Also sends a recovery notification when pump starts running again.
+
+EventBus.subscribe("current", function(data)
+  if not data.channels then return end
+  for _, ch in ipairs(data.channels) do
+    local key = "pump:" .. ch.name
+    if ch.current_a <= 0.5 then
+      sustain[key] = (sustain[key] or 0) + 1
+      if sustain[key] >= PUMP_SUSTAIN and can_alert(key) then
+        notify(ch.name .. " not running (" .. ch.current_a .. "A) for " .. (PUMP_SUSTAIN * 60) .. "s", key)
+        sustain[key] = 0
+      end
+    else
+      if sustain[key] and sustain[key] >= PUMP_SUSTAIN then
+        notify(ch.name .. " running again (" .. ch.current_a .. "A)", key)
+      end
+      sustain[key] = 0
+    end
+  end
+end)
+
+-- ── Battery alerts ──────────────────────────────────────────────────────────
+
+EventBus.subscribe("battery", function(data)
+  if not data.present then return end
+  local pct = data.percent or -1
+  if pct >= 0 and pct <= 20 and not data.charging then
+    local key = "battery_low"
+    if can_alert(key) then
+      notify("Battery low: " .. pct .. "% (" .. data.voltage_v .. "V)", key)
+    end
+  end
+end)

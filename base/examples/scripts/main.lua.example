@@ -1,0 +1,8 @@
+-- thesada-fw - main.lua
+-- Runs once at boot. Use for one-time setup, startup notifications, etc.
+-- SPDX-License-Identifier: GPL-3.0-only
+
+Log.info("main.lua loaded - firmware " .. Node.version())
+
+-- Example: publish a boot notification to MQTT
+MQTT.publish(Config.get("mqtt.topic_prefix") .. "/status/lua", "main.lua loaded")
