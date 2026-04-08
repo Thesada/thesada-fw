@@ -4,7 +4,7 @@ Modular ESP32 firmware for property monitoring nodes. Built from scratch in C++1
 
 **Currently deployed:** monitoring an outdoor wood boiler (temperature, pump current, Telegram alerts) and indoor climate (SHT31). Running 24/7 in the field.
 
-Full documentation: [thesada.io/firmware/fw-index](https://thesada.io/firmware/fw-index)
+Full documentation: [thesada.io/firmware/fw-index](https://thesada.io/firmware/)
 
 ---
 
