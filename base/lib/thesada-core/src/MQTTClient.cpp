@@ -1,0 +1,693 @@
+// thesada-fw - MQTTClient.cpp
+// SPDX-License-Identifier: GPL-3.0-only
+#include "MQTTClient.h"
+#include "Config.h"
+#include "EventBus.h"
+#include "WiFiManager.h"
+#include "Log.h"
+#include "Shell.h"
+#include <LittleFS.h>
+#include <lwip/sockets.h>
+#include <lwip/netdb.h>
+
+static const char* TAG = "MQTT";
+
+#ifdef MQTT_TLS
+WiFiClientSecure MQTTClient::_wifiClient;
+static String    _caCertStr;  // holds cert loaded from LittleFS (if present)
+#else
+WiFiClient       MQTTClient::_wifiClient;
+#endif
+PubSubClient MQTTClient::_client(_wifiClient);
+
+MQTTMessage      MQTTClient::_queue[MQTT_QUEUE_SIZE];
+uint8_t          MQTTClient::_queueHead     = 0;
+uint8_t          MQTTClient::_queueTail     = 0;
+uint8_t          MQTTClient::_queueCount    = 0;
+uint32_t         MQTTClient::_lastAttempt   = 0;
+uint32_t         MQTTClient::_retryInterval = RETRY_MIN_MS;
+uint8_t          MQTTClient::_retryCount    = 0;
+uint32_t         MQTTClient::_lastPublishMs   = 0;
+uint32_t         MQTTClient::_minIntervalMs   = 0;
+time_t           MQTTClient::_lastPublishTime = 0;
+uint16_t         MQTTClient::_bufferIn       = 4096;
+uint16_t         MQTTClient::_bufferOut      = 4096;
+
+MQTTSubscription MQTTClient::_subs[MQTT_MAX_SUBS];
+uint8_t          MQTTClient::_subCount = 0;
+DeferredCLI      MQTTClient::_deferred = { "", nullptr, 0, false };
+uint32_t         MQTTClient::_lastSuccessMs    = 0;
+uint32_t         MQTTClient::_connectedSinceMs = 0;
+bool             MQTTClient::_insecureFallback = false;
+
+// ---------------------------------------------------------------------------
+
+// Initialize MQTT client, load TLS cert, and set up subscriptions
+void MQTTClient::begin() {
+  JsonObject  cfg  = Config::get();
+  const char* host = cfg["mqtt"]["broker"]          | "";
+  uint16_t    port = cfg["mqtt"]["port"]            | 8883;
+  uint32_t    ivs  = cfg["mqtt"]["send_interval_s"] | 0;
+  _minIntervalMs   = ivs * 1000UL;
+
+  if (strlen(host) == 0) {
+    Log::error(TAG, "No broker in config");
+    return;
+  }
+
+  _bufferIn  = cfg["mqtt"]["buffer_in"]  | 4096;
+  _bufferOut = cfg["mqtt"]["buffer_out"] | 4096;
+  if (_bufferIn  < 512)  _bufferIn  = 512;
+  if (_bufferIn  > 8192) _bufferIn  = 8192;
+  if (_bufferOut < 512)  _bufferOut = 512;
+  if (_bufferOut > 8192) _bufferOut = 8192;
+
+  _client.setServer(host, port);
+  _client.setKeepAlive(60);
+  _client.setBufferSize(_bufferIn);
+  _client.setCallback(onMessage);
+
+#ifdef MQTT_TLS
+  // CA cert must be present as /ca.crt on LittleFS.
+  // If missing, TLS connection proceeds without cert verification (insecure).
+  if (LittleFS.exists("/ca.crt")) {
+    File cf = LittleFS.open("/ca.crt", "r");
+    if (cf) { _caCertStr = cf.readString(); cf.close(); Log::info(TAG, "CA cert loaded from /ca.crt"); }
+  }
+  if (_caCertStr.isEmpty()) {
+    Log::warn(TAG, "No /ca.crt - TLS without cert verification");
+    _wifiClient.setInsecure();
+  } else {
+    _wifiClient.setCACert(_caCertStr.c_str());
+  }
+#endif
+
+  // Initialize subscription storage.
+  for (int i = 0; i < MQTT_MAX_SUBS; i++) {
+    _subs[i].active = false;
+  }
+
+  // Publish alert events to MQTT alert topic.
+  EventBus::subscribe("alert", [](JsonObject data) {
+    JsonObject  cfg    = Config::get();
+    const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+    char topic[64];
+    snprintf(topic, sizeof(topic), "%s/alert", prefix);
+    char payload[256];
+    serializeJson(data, payload, sizeof(payload));
+    MQTTClient::publish(topic, payload);
+  });
+
+  // MQTT CLI: subscribe to <prefix>/cli/#, extract command from topic, payload = args.
+  // Response published to <prefix>/cli/response as JSON.
+  {
+    JsonObject  cfg    = Config::get();
+    const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+    char cliTopic[64];
+    snprintf(cliTopic, sizeof(cliTopic), "%s/cli/#", prefix);
+
+    // Store prefix length so the callback can extract the command name.
+    static char _cliPrefix[64];
+    snprintf(_cliPrefix, sizeof(_cliPrefix), "%s/cli/", prefix);
+    static size_t _cliPrefixLen = strlen(_cliPrefix);
+
+    MQTTClient::subscribe(cliTopic, [](const char* topic, const char* payload) {
+      // Defer CLI command to loop() - executing inside the PubSubClient
+      // callback blocks keepalive and causes disconnects on slow operations
+      // (LittleFS writes, config reload, etc).
+      if (_deferred.pending) {
+        Log::warn("MQTT", "CLI busy - command dropped");
+        return;
+      }
+      strncpy(_deferred.topic, topic, sizeof(_deferred.topic) - 1);
+      _deferred.topic[sizeof(_deferred.topic) - 1] = '\0';
+
+      // Copy payload to heap (preserves newlines for file.write)
+      size_t plen = payload ? strlen(payload) : 0;
+      if (_deferred.payload) { free(_deferred.payload); _deferred.payload = nullptr; }
+      if (plen > 0) {
+        _deferred.payload = (char*)malloc(plen + 1);
+        if (_deferred.payload) {
+          memcpy(_deferred.payload, payload, plen);
+          _deferred.payload[plen] = '\0';
+          _deferred.length = plen;
+        }
+      } else {
+        _deferred.payload = nullptr;
+        _deferred.length = 0;
+      }
+      _deferred.pending = true;
+    });
+  }
+
+  // cmd/config/set and cmd/config/push removed in v1.2.3.
+  // Use cli/config.set, cli/file.write + cli/config.reload instead.
+
+  connect();
+}
+
+// ---------------------------------------------------------------------------
+
+// Attempt to connect to the MQTT broker with LWT
+void MQTTClient::connect() {
+  if (!WiFiManager::connected()) return;
+
+  JsonObject  cfg      = Config::get();
+  const char* clientId = cfg["device"]["name"]   | "thesada-node";
+  const char* user     = cfg["mqtt"]["user"]      | "";
+  const char* password = cfg["mqtt"]["password"]  | "";
+  const char* prefix   = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+
+  // Availability topic - LWT publishes "offline" when connection drops
+  char availTopic[64];
+  snprintf(availTopic, sizeof(availTopic), "%s/status", prefix);
+
+  char msg[64];
+  snprintf(msg, sizeof(msg), "Connecting as %s...", clientId);
+  Log::info(TAG, msg);
+
+#ifdef MQTT_TLS
+  // If NTP hasn't synced yet, cert validation will fail (clock at epoch = every
+  // cert looks expired). Temporarily use insecure mode and reconnect with proper
+  // validation once NTP syncs in the background.
+  time_t now = time(nullptr);
+  if (now < 1700000000 && !_caCertStr.isEmpty()) {
+    if (!_insecureFallback) {
+      Log::warn(TAG, "NTP not synced - connecting without cert validation");
+      _wifiClient.setInsecure();
+      _insecureFallback = true;
+    }
+  } else if (_insecureFallback && now > 1700000000 && ESP.getFreeHeap() > 40000) {
+    // NTP synced since last attempt - restore cert validation
+    Log::info(TAG, "NTP synced - restoring cert validation");
+    _wifiClient.setCACert(_caCertStr.c_str());
+    _insecureFallback = false;
+  } else if (_insecureFallback && now > 1700000000) {
+    // NTP synced but not enough heap for TLS - stay insecure
+    static bool _heapWarnLogged = false;
+    if (!_heapWarnLogged) {
+      Log::warn(TAG, "Heap too low for TLS cert validation - staying insecure");
+      _heapWarnLogged = true;
+    }
+  }
+#endif
+
+  bool ok = (strlen(user) > 0)
+    ? _client.connect(clientId, user, password, availTopic, 0, true, "offline")
+    : _client.connect(clientId, availTopic, 0, true, "offline");
+
+  if (ok) {
+    _retryInterval = RETRY_MIN_MS;
+    _retryCount    = 0;
+    _lastSuccessMs    = millis();
+    _connectedSinceMs = millis();
+    Log::info(TAG, "Connected");
+
+    // Enable TCP keepalive to detect dead connections faster than MQTT keepalive
+    int fd = _wifiClient.fd();
+    if (fd >= 0) {
+      int keepAlive    = 1;
+      int keepIdle     = 30;   // seconds before first probe
+      int keepInterval = 10;   // seconds between probes
+      int keepCount    = 3;    // failed probes before declaring dead
+      setsockopt(fd, SOL_SOCKET,  SO_KEEPALIVE, &keepAlive,    sizeof(keepAlive));
+      setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepIdle,     sizeof(keepIdle));
+      setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL,&keepInterval, sizeof(keepInterval));
+      setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,  &keepCount,    sizeof(keepCount));
+      Log::info(TAG, "TCP keepalive enabled (30s/10s/3)");
+    }
+
+    // Publish online status (retained) - LWT handles offline
+    _client.publish(availTopic, "online", true);
+    resubscribeAll();
+    publishDiscovery();
+    flushQueue();
+  } else {
+    char err[64];
+    snprintf(err, sizeof(err), "Failed (rc=%d) - retry in %lums",
+             _client.state(), _retryInterval);
+    Log::warn(TAG, err);
+    _retryCount++;
+    _retryInterval = min(_retryInterval * 2, (uint32_t)RETRY_MAX_MS);
+  }
+}
+
+// ---------------------------------------------------------------------------
+
+// Process MQTT messages and handle reconnection with backoff
+void MQTTClient::loop() {
+  // Process deferred CLI command outside the PubSubClient callback context.
+  if (_deferred.pending) {
+    processDeferredCLI();
+  }
+
+  if (_client.connected()) {
+    // NTP upgrade: if we connected insecure and NTP has since synced,
+    // disconnect and reconnect with proper cert validation.
+    // Skip if free heap is below 40KB (TLS handshake needs ~30KB).
+    if (_insecureFallback && time(nullptr) > 1700000000 && ESP.getFreeHeap() > 40000) {
+      Log::info(TAG, "NTP synced - upgrading to cert-validated connection");
+      _connectedSinceMs = 0;  // suppress "lost after 0 seconds" log
+      _client.disconnect();
+      _wifiClient.stop();
+      _retryInterval = RETRY_MIN_MS;
+      return;
+    }
+
+    // Watchdog: force reconnect if no successful activity in WATCHDOG_MS
+    uint32_t now = millis();
+    if (_lastSuccessMs > 0 && (now - _lastSuccessMs > WATCHDOG_MS)) {
+      uint32_t uptime = (now - _connectedSinceMs) / 1000;
+      char wmsg[80];
+      snprintf(wmsg, sizeof(wmsg), "Watchdog: no activity for %lus - forcing reconnect (up %lus)", WATCHDOG_MS / 1000, uptime);
+      Log::warn(TAG, wmsg);
+      _client.disconnect();
+      _wifiClient.stop();
+      _lastSuccessMs = 0;
+      _retryInterval = RETRY_MIN_MS;
+      return;
+    }
+
+    _client.loop();
+    _lastSuccessMs = millis();  // MQTT loop succeeded (keepalive worked)
+
+    // Drain queued messages, respecting minimum send interval.
+    if (_queueCount > 0) {
+      if (_minIntervalMs == 0 || now - _lastPublishMs >= _minIntervalMs) {
+        MQTTMessage& msg = _queue[_queueHead];
+        if (msg.valid) {
+          if (_client.publish(msg.topic, msg.payload)) {
+            _lastPublishMs   = now;
+            _lastPublishTime = time(nullptr);
+            _lastSuccessMs   = now;
+            msg.valid = false;
+            _queueHead = (_queueHead + 1) % MQTT_QUEUE_SIZE;
+            _queueCount--;
+          }
+        }
+      }
+    }
+    return;
+  }
+
+  // Connection lost - log uptime
+  if (_connectedSinceMs > 0) {
+    uint32_t uptime = (millis() - _connectedSinceMs) / 1000;
+    char dmsg[64];
+    snprintf(dmsg, sizeof(dmsg), "Connection lost after %lu seconds", uptime);
+    Log::warn(TAG, dmsg);
+    _connectedSinceMs = 0;
+  }
+
+  if (!WiFiManager::connected()) return;
+
+  uint32_t now = millis();
+  if (now - _lastAttempt >= _retryInterval) {
+    _lastAttempt = now;
+    connect();
+  }
+}
+
+// ---------------------------------------------------------------------------
+
+// Publish a message, queuing it if disconnected or rate-limited
+void MQTTClient::publish(const char* topic, const char* payload) {
+  if (_client.connected()) {
+    if (_minIntervalMs > 0) {
+      uint32_t now = millis();
+      if (now - _lastPublishMs < _minIntervalMs) {
+        enqueue(topic, payload);
+        return;
+      }
+      _lastPublishMs   = now;
+      _lastPublishTime = time(nullptr);
+    }
+    _client.publish(topic, payload);
+    _lastPublishTime = time(nullptr);
+    return;
+  }
+  enqueue(topic, payload);
+}
+
+// Publish a retained message (for HA discovery configs)
+void MQTTClient::publishRetained(const char* topic, const char* payload) {
+  if (_client.connected()) {
+    _client.publish(topic, (const uint8_t*)payload, strlen(payload), true);
+  }
+}
+
+// ---------------------------------------------------------------------------
+
+// Register a topic subscription with a callback
+void MQTTClient::subscribe(const char* topic, MQTTCallback callback) {
+  if (_subCount >= MQTT_MAX_SUBS) {
+    Log::error(TAG, "Max subscriptions reached");
+    return;
+  }
+
+  MQTTSubscription& sub = _subs[_subCount];
+  strncpy(sub.topic, topic, sizeof(sub.topic) - 1);
+  sub.topic[sizeof(sub.topic) - 1] = '\0';
+  sub.callback = callback;
+  sub.active = true;
+  _subCount++;
+
+  char msg[128];
+  snprintf(msg, sizeof(msg), "Registered sub: %s (%d/%d)", topic, _subCount, MQTT_MAX_SUBS);
+  Log::info(TAG, msg);
+
+  // If already connected, subscribe immediately.
+  if (_client.connected()) {
+    _client.subscribe(topic);
+  }
+}
+
+// ---------------------------------------------------------------------------
+
+// Route incoming messages to matching subscription callbacks
+void MQTTClient::onMessage(char* topic, uint8_t* payload, unsigned int length) {
+  // Null-terminate the payload - heap-allocated to avoid stack overflow on WROOM-32.
+  size_t bufSize = length + 1;
+  char* payloadBuf = (char*)malloc(bufSize);
+  if (!payloadBuf) return;
+  memcpy(payloadBuf, payload, length);
+  payloadBuf[length] = '\0';
+
+  // Route to matching subscription callbacks (exact or wildcard # match).
+  for (uint8_t i = 0; i < _subCount; i++) {
+    if (!_subs[i].active) continue;
+    // Check for trailing /# wildcard
+    size_t slen = strlen(_subs[i].topic);
+    if (slen >= 2 && _subs[i].topic[slen - 1] == '#' && _subs[i].topic[slen - 2] == '/') {
+      if (strncmp(_subs[i].topic, topic, slen - 1) == 0) {
+        _subs[i].callback(topic, payloadBuf);
+      }
+    } else if (strcmp(_subs[i].topic, topic) == 0) {
+      _subs[i].callback(topic, payloadBuf);
+    }
+  }
+  free(payloadBuf);
+}
+
+// ---------------------------------------------------------------------------
+
+// Process a deferred CLI command (runs in loop(), not in PubSubClient callback)
+void MQTTClient::processDeferredCLI() {
+  _deferred.pending = false;
+
+  // Extract command from topic after <prefix>/cli/
+  JsonObject cfg = Config::get();
+  const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+  char cliPrefix[64];
+  snprintf(cliPrefix, sizeof(cliPrefix), "%s/cli/", prefix);
+  size_t prefixLen = strlen(cliPrefix);
+
+  const char* cmd = _deferred.topic + prefixLen;
+  if (strlen(cmd) == 0 || strcmp(cmd, "response") == 0) goto cleanup;
+
+  {
+    const char* payload = _deferred.payload;
+    size_t plen = _deferred.length;
+
+    // Special case: file.write - first line is path, rest is content.
+    if (strcmp(cmd, "file.write") == 0 && payload && plen > 0) {
+      const char* nl = strchr(payload, '\n');
+      JsonDocument resp;
+      resp["cmd"] = cmd;
+      if (!nl) {
+        resp["ok"] = false;
+        resp["output"][0] = "Usage: payload = <path>\\n<content>";
+      } else {
+        char path[64];
+        size_t pathLen = min((size_t)(nl - payload), sizeof(path) - 1);
+        memcpy(path, payload, pathLen);
+        path[pathLen] = '\0';
+        const char* content = nl + 1;
+        size_t contentLen = plen - pathLen - 1;
+
+        File f = LittleFS.open(path, "w");
+        if (f) {
+          size_t written = f.write((const uint8_t*)content, contentLen);
+          f.close();
+          resp["ok"] = true;
+          char msg[64];
+          snprintf(msg, sizeof(msg), "Wrote %d bytes to %s", (int)written, path);
+          resp["output"][0] = msg;
+          Log::info("MQTT", msg);
+        } else {
+          resp["ok"] = false;
+          resp["output"][0] = "Failed to open file";
+        }
+      }
+      char respTopic[64];
+      snprintf(respTopic, sizeof(respTopic), "%s/cli/response", prefix);
+      size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
+      char* rp = (char*)malloc(bufSz);
+      if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
+      goto cleanup;
+    }
+
+    // Build command line: "<cmd> <payload>"
+    char line[1024];
+    if (payload && plen > 0) {
+      snprintf(line, sizeof(line), "%s %s", cmd, payload);
+    } else {
+      snprintf(line, sizeof(line), "%s", cmd);
+    }
+
+    // Execute through Shell and collect output.
+    JsonDocument resp;
+    resp["cmd"] = cmd;
+    resp["ok"]  = true;
+    JsonArray output = resp["output"].to<JsonArray>();
+
+    Shell::execute(line, [&output](const char* outLine) {
+      output.add(outLine);
+    });
+
+    // Re-read prefix after execute (config.reload may have invalidated it)
+    JsonObject cfgAfter = Config::get();
+    const char* pfxAfter = cfgAfter["mqtt"]["topic_prefix"] | "thesada/node";
+    char respTopic[64];
+    snprintf(respTopic, sizeof(respTopic), "%s/cli/response", pfxAfter);
+    size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
+    char* respPayload = (char*)malloc(bufSz);
+    if (respPayload) {
+      serializeJson(resp, respPayload, bufSz);
+      MQTTClient::publish(respTopic, respPayload);
+      free(respPayload);
+    }
+  }
+
+cleanup:
+  if (_deferred.payload) { free(_deferred.payload); _deferred.payload = nullptr; }
+  _deferred.length = 0;
+}
+
+// ---------------------------------------------------------------------------
+
+// Re-subscribe all active topics after reconnect
+void MQTTClient::resubscribeAll() {
+  for (uint8_t i = 0; i < _subCount; i++) {
+    if (!_subs[i].active) continue;
+    _client.subscribe(_subs[i].topic);
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Subscribed: %s", _subs[i].topic);
+    Log::info(TAG, msg);
+  }
+}
+
+// ---------------------------------------------------------------------------
+
+// Publish Home Assistant MQTT discovery configs for all sensors
+void MQTTClient::publishDiscovery() {
+  JsonObject cfg = Config::get();
+  bool enabled = cfg["mqtt"]["ha_discovery"] | true;
+  if (!enabled) {
+    Log::info(TAG, "HA discovery disabled");
+    return;
+  }
+
+  const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+  const char* devName = cfg["device"]["friendly_name"] | cfg["device"]["name"] | "Thesada Node";
+  const char* devId = cfg["device"]["name"] | "thesada_node";
+
+  // Availability topic
+  char availTopic[64];
+  snprintf(availTopic, sizeof(availTopic), "%s/status", prefix);
+
+  // Helper: build slug from name (lowercase, underscores)
+  auto makeSlug = [](const char* name, char* slug, size_t sz) {
+    strncpy(slug, name, sz - 1);
+    slug[sz - 1] = '\0';
+    for (char* p = slug; *p; p++) { if (*p == ' ') *p = '_'; *p = tolower(*p); }
+  };
+
+  // Helper: publish a single discovery config (retained).
+  // Uses per-sensor state topics with simple {{value}} template.
+  auto disc = [&](const char* component, const char* uid, const char* name,
+                  const char* stateTopic,
+                  const char* unit, const char* devClass, const char* stateClass,
+                  const char* entityCategory = nullptr) {
+    JsonDocument doc;
+    doc["name"] = name;
+    doc["stat_t"] = stateTopic;
+    doc["uniq_id"] = uid;
+    doc["avty_t"] = availTopic;
+    if (unit && strlen(unit) > 0)        doc["unit_of_meas"] = unit;
+    if (devClass && strlen(devClass) > 0) doc["dev_cla"] = devClass;
+    if (stateClass && strlen(stateClass) > 0) doc["stat_cla"] = stateClass;
+    if (entityCategory && strlen(entityCategory) > 0) doc["ent_cat"] = entityCategory;
+
+    JsonObject dev = doc["dev"].to<JsonObject>();
+    dev["ids"] = devId;
+    dev["name"] = devName;
+    dev["mf"] = "Thesada";
+    dev["mdl"] = "Base Node";
+    dev["sw"] = FIRMWARE_VERSION;
+
+    char topic[128];
+    snprintf(topic, sizeof(topic), "homeassistant/%s/%s/%s/config", component, devId, uid);
+
+    char payload[640];
+    serializeJson(doc, payload, sizeof(payload));
+    _client.publish(topic, (const uint8_t*)payload, strlen(payload), true);
+  };
+
+  char slug[32], uid[48], stBuf[96];
+
+  // -- Temperature sensors --
+  JsonArray sensors = cfg["temperature"]["sensors"].as<JsonArray>();
+  if (sensors) {
+    const char* tunit = cfg["temperature"]["unit"] | "C";
+    const char* haUnit = (tunit[0] == 'F' || tunit[0] == 'f') ? "\xC2\xB0""F" : "\xC2\xB0""C";
+    for (JsonObject s : sensors) {
+      const char* sname = s["name"] | "unknown";
+      makeSlug(sname, slug, sizeof(slug));
+      snprintf(uid, sizeof(uid), "%s_%s_temp", devId, slug);
+      snprintf(stBuf, sizeof(stBuf), "%s/sensor/temperature/%s", prefix, slug);
+      disc("sensor", uid, sname, stBuf, haUnit, "temperature", "measurement");
+    }
+  }
+
+  // -- ADS1115 channels --
+  JsonArray channels = cfg["ads1115"]["channels"].as<JsonArray>();
+  if (channels) {
+    for (JsonObject ch : channels) {
+      const char* cname = ch["name"] | "unknown";
+      makeSlug(cname, slug, sizeof(slug));
+
+      // Current (A)
+      snprintf(uid, sizeof(uid), "%s_%s_current", devId, slug);
+      snprintf(stBuf, sizeof(stBuf), "%s/sensor/current/%s", prefix, slug);
+      disc("sensor", uid, cname, stBuf, "A", "current", "measurement");
+
+      // Power (W)
+      char pname[64];
+      snprintf(pname, sizeof(pname), "%s Power", cname);
+      snprintf(uid, sizeof(uid), "%s_%s_power", devId, slug);
+      snprintf(stBuf, sizeof(stBuf), "%s/sensor/power/%s", prefix, slug);
+      disc("sensor", uid, pname, stBuf, "W", "power", "measurement");
+    }
+  }
+
+  // -- Battery --
+  bool battEnabled = cfg["battery"]["enabled"] | true;
+  if (battEnabled) {
+    snprintf(uid, sizeof(uid), "%s_battery_percent", devId);
+    snprintf(stBuf, sizeof(stBuf), "%s/sensor/battery/percent", prefix);
+    disc("sensor", uid, "Battery", stBuf, "%", "battery", "measurement");
+
+    snprintf(uid, sizeof(uid), "%s_battery_voltage", devId);
+    snprintf(stBuf, sizeof(stBuf), "%s/sensor/battery/voltage", prefix);
+    disc("sensor", uid, "Battery Voltage", stBuf, "V", "voltage", "measurement");
+
+    snprintf(uid, sizeof(uid), "%s_battery_charging", devId);
+    snprintf(stBuf, sizeof(stBuf), "%s/sensor/battery/charging", prefix);
+    disc("sensor", uid, "Battery Charge State", stBuf, "", "", "");
+  }
+
+  // -- WiFi diagnostics (disabled by default in HA) --
+  snprintf(uid, sizeof(uid), "%s_wifi_rssi", devId);
+  snprintf(stBuf, sizeof(stBuf), "%s/sensor/wifi/rssi", prefix);
+  disc("sensor", uid, "WiFi RSSI", stBuf, "dBm", "signal_strength", "measurement", "diagnostic");
+
+  snprintf(uid, sizeof(uid), "%s_wifi_ssid", devId);
+  snprintf(stBuf, sizeof(stBuf), "%s/sensor/wifi/ssid", prefix);
+  disc("sensor", uid, "WiFi SSID", stBuf, "", "", "", "diagnostic");
+
+  snprintf(uid, sizeof(uid), "%s_wifi_ip", devId);
+  snprintf(stBuf, sizeof(stBuf), "%s/sensor/wifi/ip", prefix);
+  disc("sensor", uid, "WiFi IP", stBuf, "", "", "", "diagnostic");
+
+  // Publish WiFi stats now
+  {
+    char t[96], v[32];
+    snprintf(t, sizeof(t), "%s/sensor/wifi/rssi", prefix);
+    snprintf(v, sizeof(v), "%d", (int)WiFi.RSSI());
+    _client.publish(t, v);
+
+    snprintf(t, sizeof(t), "%s/sensor/wifi/ssid", prefix);
+    _client.publish(t, WiFi.SSID().c_str());
+
+    snprintf(t, sizeof(t), "%s/sensor/wifi/ip", prefix);
+    _client.publish(t, WiFi.localIP().toString().c_str());
+  }
+
+  Log::info(TAG, "HA discovery published");
+}
+
+// ---------------------------------------------------------------------------
+
+// Add a message to the offline queue, dropping oldest if full
+void MQTTClient::enqueue(const char* topic, const char* payload) {
+  if (_queueCount == MQTT_QUEUE_SIZE) {
+    Log::warn(TAG, "Queue full - dropping oldest message");
+    _queueHead = (_queueHead + 1) % MQTT_QUEUE_SIZE;
+    _queueCount--;
+  }
+
+  MQTTMessage& msg = _queue[_queueTail];
+  strncpy(msg.topic,   topic,   sizeof(msg.topic)   - 1);
+  strncpy(msg.payload, payload, sizeof(msg.payload) - 1);
+  msg.topic[sizeof(msg.topic)     - 1] = '\0';
+  msg.payload[sizeof(msg.payload) - 1] = '\0';
+  msg.valid = true;
+
+  _queueTail = (_queueTail + 1) % MQTT_QUEUE_SIZE;
+  _queueCount++;
+
+  char log[64];
+  snprintf(log, sizeof(log), "Queued (%d/%d): %s", _queueCount, MQTT_QUEUE_SIZE, topic);
+  Log::info(TAG, log);
+}
+
+// ---------------------------------------------------------------------------
+
+// Send all queued messages after reconnecting
+void MQTTClient::flushQueue() {
+  while (_queueCount > 0) {
+    MQTTMessage& msg = _queue[_queueHead];
+    if (msg.valid) {
+      _client.publish(msg.topic, msg.payload);
+      msg.valid = false;
+      char log[64];
+      snprintf(log, sizeof(log), "Flushed queued: %s", msg.topic);
+      Log::info(TAG, log);
+    }
+    _queueHead = (_queueHead + 1) % MQTT_QUEUE_SIZE;
+    _queueCount--;
+  }
+}
+
+// ---------------------------------------------------------------------------
+
+// Return whether the MQTT client is currently connected
+bool MQTTClient::connected() {
+  return _client.connected();
+}
+
+// Return the wall-clock time of the last successful publish
+time_t MQTTClient::lastPublishTime() {
+  return _lastPublishTime;
+}

@@ -1,0 +1,791 @@
+// thesada-fw - Shell.cpp
+// Interactive CLI shell. All commands output through a callback so the
+// same implementation works for serial and WebSocket transports.
+// SPDX-License-Identifier: GPL-3.0-only
+
+#include "Shell.h"
+#include "Config.h"
+#include "Log.h"
+#include "WiFiManager.h"
+#include "MQTTClient.h"
+#include "ModuleRegistry.h"
+#include <thesada_config.h>
+
+#include <LittleFS.h>
+#include <WiFi.h>
+#include <ArduinoJson.h>
+#include <sys/time.h>
+
+ShellEntry Shell::_commands[MAX_COMMANDS];
+int Shell::_commandCount = 0;
+char Shell::_parseBuf[256];
+
+// ---------------------------------------------------------------------------
+// Parser
+// ---------------------------------------------------------------------------
+
+// Tokenize a command line into argv-style arguments
+int Shell::parse(const char* line, char** argv, int maxArgs) {
+  strncpy(_parseBuf, line, sizeof(_parseBuf) - 1);
+  _parseBuf[sizeof(_parseBuf) - 1] = '\0';
+
+  int argc = 0;
+  char* token = strtok(_parseBuf, " \t");
+  while (token && argc < maxArgs) {
+    argv[argc++] = token;
+    token = strtok(nullptr, " \t");
+  }
+  return argc;
+}
+
+// ---------------------------------------------------------------------------
+// Command registry
+// ---------------------------------------------------------------------------
+
+// Register a named command with help text and handler
+void Shell::registerCommand(const char* name, const char* help, ShellCommand handler) {
+  if (_commandCount >= MAX_COMMANDS) return;
+  _commands[_commandCount] = {name, help, handler};
+  _commandCount++;
+}
+
+// Parse and dispatch a command line to the matching handler
+void Shell::execute(const char* line, ShellOutput out) {
+  if (!line || strlen(line) == 0) return;
+
+  char* argv[16];
+  int argc = parse(line, argv, 16);
+  if (argc == 0) return;
+
+  for (int i = 0; i < _commandCount; i++) {
+    if (strcasecmp(argv[0], _commands[i].name) == 0) {
+      _commands[i].handler(argc, argv, out);
+      return;
+    }
+  }
+
+  char msg[128];
+  snprintf(msg, sizeof(msg), "Unknown command: %s  (type 'help')", argv[0]);
+  out(msg);
+}
+
+// Print all registered commands with their help text
+void Shell::listCommands(ShellOutput out) {
+  for (int i = 0; i < _commandCount; i++) {
+    char line[128];
+    snprintf(line, sizeof(line), "  %-16s %s", _commands[i].name, _commands[i].help);
+    out(line);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem commands
+// ---------------------------------------------------------------------------
+
+// All filesystem commands use LittleFS by default.
+// SD card paths (/sd/*) are handled by SDModule which registers
+// its own fs.sd.ls, fs.sd.cat etc commands in begin().
+static FS* resolveFS(const char* /*path*/) {
+  return &LittleFS;
+}
+
+// Strip path prefix (no-op now, kept for compatibility)
+static const char* stripPrefix(const char* path) {
+  return path;
+}
+
+// List files in a directory
+static void cmd_ls(int argc, char** argv, ShellOutput out) {
+  const char* path = (argc > 1) ? argv[1] : "/";
+  FS* fs = resolveFS(path);
+  const char* fsPath = stripPrefix(path);
+
+  File dir = fs->open(fsPath);
+  if (!dir || !dir.isDirectory()) {
+    out("Not a directory or not found");
+    return;
+  }
+
+  char line[128];
+  File entry = dir.openNextFile();
+  while (entry) {
+    if (entry.isDirectory()) {
+      snprintf(line, sizeof(line), "  [DIR]  %s/", entry.name());
+    } else {
+      snprintf(line, sizeof(line), "  %6d  %s", (int)entry.size(), entry.name());
+    }
+    out(line);
+    entry = dir.openNextFile();
+  }
+}
+
+// Print file contents line by line
+static void cmd_cat(int argc, char** argv, ShellOutput out) {
+  if (argc < 2) { out("Usage: cat <path>"); return; }
+  FS* fs = resolveFS(argv[1]);
+  const char* fsPath = stripPrefix(argv[1]);
+
+  File f = fs->open(fsPath, "r");
+  if (!f) { out("File not found"); return; }
+
+  // Read line by line to avoid huge memory allocation.
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    out(line.c_str());
+  }
+  f.close();
+}
+
+// Remove a file from the filesystem
+static void cmd_rm(int argc, char** argv, ShellOutput out) {
+  if (argc < 2) { out("Usage: rm <path>"); return; }
+  FS* fs = resolveFS(argv[1]);
+  const char* fsPath = stripPrefix(argv[1]);
+
+  if (fs->remove(fsPath)) {
+    char msg[64];
+    snprintf(msg, sizeof(msg), "Removed %s", fsPath);
+    out(msg);
+  } else {
+    out("Failed to remove (file not found or directory)");
+  }
+}
+
+// Write content to a file
+static void cmd_write(int argc, char** argv, ShellOutput out) {
+  // write <path> <content...>
+  if (argc < 3) { out("Usage: write <path> <content...>"); return; }
+  FS* fs = resolveFS(argv[1]);
+  const char* fsPath = stripPrefix(argv[1]);
+
+  // Reconstruct content from remaining args.
+  String content;
+  for (int i = 2; i < argc; i++) {
+    if (i > 2) content += " ";
+    content += argv[i];
+  }
+
+  File f = fs->open(fsPath, "w");
+  if (!f) { out("Failed to open for writing"); return; }
+  f.print(content);
+  f.close();
+
+  char msg[64];
+  snprintf(msg, sizeof(msg), "Wrote %d bytes to %s", content.length(), fsPath);
+  out(msg);
+}
+
+// Rename or move a file
+static void cmd_mv(int argc, char** argv, ShellOutput out) {
+  if (argc < 3) { out("Usage: mv <src> <dst>"); return; }
+  FS* fs = resolveFS(argv[1]);
+  const char* src = stripPrefix(argv[1]);
+  const char* dst = stripPrefix(argv[2]);
+
+  if (fs->rename(src, dst)) {
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Renamed %s -> %s", src, dst);
+    out(msg);
+  } else {
+    out("Failed to rename");
+  }
+}
+
+// Show disk usage for LittleFS and SD card
+static void cmd_df(int argc, char** argv, ShellOutput out) {
+  char line[128];
+
+  size_t total = LittleFS.totalBytes();
+  size_t used  = LittleFS.usedBytes();
+  snprintf(line, sizeof(line), "LittleFS: %d / %d bytes used (%d%% free)",
+           (int)used, (int)total, (int)((total - used) * 100 / total));
+  out(line);
+
+  // SD card info is reported by SDModule::status() via module.status command
+}
+
+// ---------------------------------------------------------------------------
+// Config commands
+// ---------------------------------------------------------------------------
+
+// Read a config value by dot-notation key
+static void cmd_config_get(int argc, char** argv, ShellOutput out) {
+  if (argc < 2) { out("Usage: config.get <key>  (dot notation, e.g. mqtt.broker)"); return; }
+
+  JsonObject cfg = Config::get();
+  JsonVariant current = cfg;
+
+  char key[128];
+  strncpy(key, argv[1], sizeof(key) - 1);
+  key[sizeof(key) - 1] = '\0';
+
+  char* token = strtok(key, ".");
+  while (token) {
+    if (current.is<JsonObject>()) {
+      current = current[token];
+    } else {
+      out("Key not found");
+      return;
+    }
+    token = strtok(nullptr, ".");
+  }
+
+  if (current.isNull()) {
+    out("null");
+  } else {
+    String val;
+    serializeJsonPretty(current, val);
+    out(val.c_str());
+  }
+}
+
+// Set a config value by dot-notation key and save to flash
+static void cmd_config_set(int argc, char** argv, ShellOutput out) {
+  // config.set <key> <value>
+  // This modifies the in-memory config. Use config.save to persist.
+  if (argc < 3) { out("Usage: config.set <key> <value>  (then config.save to persist)"); return; }
+
+  // For now, only support simple top-level.section.key paths.
+  // Reconstruct value from remaining args.
+  String value;
+  for (int i = 2; i < argc; i++) {
+    if (i > 2) value += " ";
+    value += argv[i];
+  }
+
+  // Read current config file, parse, modify, and update in-memory.
+  if (!LittleFS.exists("/config.json")) { out("config.json not found"); return; }
+  File f = LittleFS.open("/config.json", "r");
+  if (!f) { out("Failed to read config.json"); return; }
+  String json = f.readString();
+  f.close();
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, json);
+  if (err) { out("JSON parse error in config.json"); return; }
+
+  // Walk the dot path and set the value.
+  char key[128];
+  strncpy(key, argv[1], sizeof(key) - 1);
+  key[sizeof(key) - 1] = '\0';
+
+  // Split into parent path + final key.
+  char* lastDot = strrchr(key, '.');
+  if (lastDot) {
+    *lastDot = '\0';
+    const char* finalKey = lastDot + 1;
+
+    JsonVariant parent = doc.as<JsonVariant>();
+    char* token = strtok(key, ".");
+    while (token) {
+      if (parent.is<JsonObject>()) {
+        parent = parent[token];
+      } else {
+        out("Parent key not found");
+        return;
+      }
+      token = strtok(nullptr, ".");
+    }
+
+    if (!parent.is<JsonObject>()) { out("Parent is not an object"); return; }
+
+    // Try to detect type: number, boolean, or string.
+    if (value == "true") parent[finalKey] = true;
+    else if (value == "false") parent[finalKey] = false;
+    else {
+      char* end;
+      long lv = strtol(value.c_str(), &end, 10);
+      if (*end == '\0' && value.length() > 0) {
+        parent[finalKey] = lv;
+      } else {
+        float fv = strtof(value.c_str(), &end);
+        if (*end == '\0' && value.length() > 0) {
+          parent[finalKey] = fv;
+        } else {
+          parent[finalKey] = value;
+        }
+      }
+    }
+  } else {
+    // Top-level key.
+    out("Cannot set top-level keys directly (use section.key format)");
+    return;
+  }
+
+  // Write back to LittleFS.
+  File wf = LittleFS.open("/config.json", "w");
+  if (!wf) { out("Failed to write config.json"); return; }
+  serializeJsonPretty(doc, wf);
+  wf.close();
+
+  // Config saved to flash. Reload with config.reload to apply.
+  // (Not auto-reloading here because Config::load() reinitializes MQTT,
+  //  which would drop the connection before the response is sent over MQTT CLI.)
+
+  char msg[128];
+  snprintf(msg, sizeof(msg), "Set %s = %s (saved - run config.reload to apply)", argv[1], value.c_str());
+  out(msg);
+}
+
+// Save the in-memory config to flash
+static void cmd_config_save(int argc, char** argv, ShellOutput out) {
+  // Config is already saved by config.set. This is for manual save after
+  // programmatic changes to Config::get() that bypass config.set.
+  JsonObject cfg = Config::get();
+  File f = LittleFS.open("/config.json", "w");
+  if (!f) { out("Failed to write config.json"); return; }
+  size_t bytes = serializeJsonPretty(cfg, f);
+  f.close();
+  char msg[64];
+  snprintf(msg, sizeof(msg), "Config saved to /config.json (%d bytes)", (int)bytes);
+  out(msg);
+}
+
+// Reload config from flash into memory
+static void cmd_config_reload(int argc, char** argv, ShellOutput out) {
+  Config::load();
+  JsonObject cfg = Config::get();
+  const char* name = cfg["device"]["name"] | "?";
+  char msg[96];
+  snprintf(msg, sizeof(msg), "Config reloaded from /config.json (device: %s)", name);
+  out(msg);
+}
+
+// Print the full config as pretty-printed JSON
+static void cmd_config_dump(int argc, char** argv, ShellOutput out) {
+  JsonObject cfg = Config::get();
+  String json;
+  serializeJsonPretty(cfg, json);
+  out(json.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Network commands
+// ---------------------------------------------------------------------------
+
+// Show WiFi connection details and network info
+static void cmd_ifconfig(int argc, char** argv, ShellOutput out) {
+  char line[128];
+
+  snprintf(line, sizeof(line), "WiFi: %s", WiFiManager::connected() ? "connected" : "disconnected");
+  out(line);
+
+  if (WiFiManager::connected()) {
+    snprintf(line, sizeof(line), "  SSID: %s", WiFi.SSID().c_str());
+    out(line);
+    snprintf(line, sizeof(line), "  IP:   %s", WiFi.localIP().toString().c_str());
+    out(line);
+    snprintf(line, sizeof(line), "  GW:   %s", WiFi.gatewayIP().toString().c_str());
+    out(line);
+    snprintf(line, sizeof(line), "  DNS:  %s", WiFi.dnsIP().toString().c_str());
+    out(line);
+    snprintf(line, sizeof(line), "  RSSI: %d dBm", WiFi.RSSI());
+    out(line);
+    snprintf(line, sizeof(line), "  MAC:  %s", WiFi.macAddress().c_str());
+    out(line);
+  }
+}
+
+// Test connectivity by resolving a hostname via DNS
+static void cmd_ping(int argc, char** argv, ShellOutput out) {
+  if (argc < 2) { out("Usage: ping <host>"); return; }
+
+  // ESP32 Arduino doesn't have a real ping. Use DNS resolve as a connectivity test.
+  IPAddress ip;
+  if (WiFi.hostByName(argv[1], ip)) {
+    char msg[64];
+    snprintf(msg, sizeof(msg), "%s resolved to %s", argv[1], ip.toString().c_str());
+    out(msg);
+  } else {
+    char msg[64];
+    snprintf(msg, sizeof(msg), "Failed to resolve %s", argv[1]);
+    out(msg);
+  }
+}
+
+// Show NTP status or manually set system time
+static void cmd_ntp(int argc, char** argv, ShellOutput out) {
+  char line[128];
+
+  // ntp set <epoch> or ntp set <ISO8601>
+  if (argc >= 3 && strcmp(argv[1], "set") == 0) {
+    time_t epoch = 0;
+    // Try epoch first (all digits).
+    bool isEpoch = true;
+    for (const char* p = argv[2]; *p; p++) {
+      if (*p < '0' || *p > '9') { isEpoch = false; break; }
+    }
+    if (isEpoch) {
+      epoch = (time_t)atol(argv[2]);
+    } else {
+      // Try ISO 8601: 2026-03-24T12:00:00Z
+      struct tm parsed = {};
+      if (strptime(argv[2], "%Y-%m-%dT%H:%M:%SZ", &parsed)) {
+        epoch = mktime(&parsed);
+      }
+    }
+    if (epoch > 1700000000UL) {
+      struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+      settimeofday(&tv, nullptr);
+      struct tm* t = gmtime(&epoch);
+      char ts[32];
+      strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", t);
+      snprintf(line, sizeof(line), "Time set to %s (epoch %ld)", ts, (long)epoch);
+      out(line);
+    } else {
+      out("Invalid time. Usage: ntp set <epoch> or ntp set 2026-03-24T12:00:00Z");
+    }
+    return;
+  }
+
+  time_t now = time(nullptr);
+  struct tm* t = gmtime(&now);
+
+  if (now < 1700000000) {
+    out("NTP: not synced (time is before 2023)");
+  } else {
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", t);
+    snprintf(line, sizeof(line), "NTP: synced  UTC: %s  epoch: %ld", ts, (long)now);
+    out(line);
+  }
+
+  JsonObject cfg = Config::get();
+  const char* server = cfg["ntp"]["server"] | "pool.ntp.org";
+  int offset = cfg["ntp"]["tz_offset_s"] | 0;
+  snprintf(line, sizeof(line), "  server: %s  offset: %ds", server, offset);
+  out(line);
+  out(now > 1700000000UL ? "  log timestamps: active" : "  log timestamps: pending sync");
+}
+
+// Show MQTT connection status and broker info
+static void cmd_mqtt(int argc, char** argv, ShellOutput out) {
+  char line[128];
+  snprintf(line, sizeof(line), "MQTT: %s", MQTTClient::connected() ? "connected" : "disconnected");
+  out(line);
+
+  JsonObject cfg = Config::get();
+  const char* broker = cfg["mqtt"]["broker"] | "";
+  int port = cfg["mqtt"]["port"] | 8883;
+  const char* prefix = cfg["mqtt"]["topic_prefix"] | "";
+  snprintf(line, sizeof(line), "  broker: %s:%d  prefix: %s", broker, port, prefix);
+  out(line);
+}
+
+// ---------------------------------------------------------------------------
+// Module commands
+// ---------------------------------------------------------------------------
+
+// List all modules and their compile-time enabled state
+static void cmd_module_list(int argc, char** argv, ShellOutput out) {
+  out("Compiled modules:");
+
+  #ifdef ENABLE_TEMPERATURE
+  out("  [x] temperature");
+  #else
+  out("  [ ] temperature");
+  #endif
+
+  #ifdef ENABLE_ADS1115
+  out("  [x] ads1115");
+  #else
+  out("  [ ] ads1115");
+  #endif
+
+  #ifdef ENABLE_PWM
+  out("  [x] pwm");
+  #else
+  out("  [ ] pwm");
+  #endif
+
+  #ifdef ENABLE_SD
+  out("  [x] sd");
+  #else
+  out("  [ ] sd");
+  #endif
+
+  #ifdef ENABLE_CELLULAR
+  out("  [x] cellular");
+  #else
+  out("  [ ] cellular");
+  #endif
+
+  #ifdef ENABLE_TELEGRAM
+  out("  [x] telegram");
+  #else
+  out("  [ ] telegram");
+  #endif
+
+  #ifdef ENABLE_LORA
+  out("  [x] lora");
+  #else
+  out("  [ ] lora");
+  #endif
+
+  #ifdef ENABLE_DISPLAY
+  out("  [x] display");
+  #else
+  out("  [ ] display");
+  #endif
+
+  #ifdef ENABLE_TFT
+  out("  [x] tftdisplay");
+  #else
+  out("  [ ] tftdisplay");
+  #endif
+}
+
+// Show runtime status of each registered module
+static void cmd_module_status(int argc, char** argv, ShellOutput out) {
+  for (uint8_t i = 0; i < ModuleRegistry::count(); i++) {
+    Module* m = ModuleRegistry::get(i);
+    if (!m) continue;
+    // Module name + status on one line
+    char buf[160] = {};
+    size_t off = snprintf(buf, sizeof(buf), "  %-14s ", m->name());
+    m->status([&buf, &off](const char* s) {
+      snprintf(buf + off, sizeof(buf) - off, "%s", s);
+    });
+    out(buf);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// System commands
+// ---------------------------------------------------------------------------
+
+// Reboot the device
+static void cmd_restart(int argc, char** argv, ShellOutput out) {
+  out("Restarting...");
+  delay(100);
+  ESP.restart();
+}
+
+// Show free heap, minimum watermark, and largest allocatable block
+static void cmd_heap(int argc, char** argv, ShellOutput out) {
+  char line[96];
+  snprintf(line, sizeof(line), "Free: %lu B  Min: %lu B  Max alloc: %lu B",
+           (unsigned long)ESP.getFreeHeap(),
+           (unsigned long)ESP.getMinFreeHeap(),
+           (unsigned long)ESP.getMaxAllocHeap());
+  out(line);
+}
+
+// Show device uptime in days, hours, minutes, seconds
+static void cmd_uptime(int argc, char** argv, ShellOutput out) {
+  unsigned long s = millis() / 1000;
+  char line[48];
+  snprintf(line, sizeof(line), "%lud %02lu:%02lu:%02lu",
+           s/86400, (s%86400)/3600, (s%3600)/60, s%60);
+  out(line);
+}
+
+// Show firmware version and build timestamp
+static void cmd_version(int argc, char** argv, ShellOutput out) {
+  char line[96];
+  snprintf(line, sizeof(line), "thesada-fw v%s (%s %s)", FIRMWARE_VERSION, __DATE__, __TIME__);
+  out(line);
+}
+
+// Show all available shell commands
+static void cmd_help(int argc, char** argv, ShellOutput out) {
+  out("thesada-fw shell");
+  out("");
+  Shell::listCommands(out);
+}
+
+// List all configured sensors and their current readings
+static void cmd_sensors(int argc, char** argv, ShellOutput out) {
+  char line[128];
+  int count = 0;
+
+  // Temperature
+  #ifdef ENABLE_TEMPERATURE
+  {
+    JsonObject cfg = Config::get();
+    JsonArray sensors = cfg["temperature"]["sensors"].as<JsonArray>();
+    if (!sensors.isNull()) {
+      for (JsonObject s : sensors) {
+        const char* name = s["name"] | "?";
+        const char* addr = s["address"] | "";
+        snprintf(line, sizeof(line), "  temp  %-12s %s", name, addr);
+        out(line);
+        count++;
+      }
+    }
+  }
+  #endif
+
+  // ADS1115
+  #ifdef ENABLE_ADS1115
+  {
+    JsonObject cfg = Config::get();
+    JsonArray channels = cfg["ads1115"]["channels"].as<JsonArray>();
+    if (!channels.isNull()) {
+      for (JsonObject ch : channels) {
+        const char* name = ch["name"] | "?";
+        const char* mux  = ch["mux"]  | "?";
+        float gain = ch["gain"] | 0.0f;
+        snprintf(line, sizeof(line), "  adc   %-12s mux=%s gain=%.3f", name, mux, gain);
+        out(line);
+        count++;
+      }
+    }
+  }
+  #endif
+
+  snprintf(line, sizeof(line), "%d sensor(s) configured", count);
+  out(line);
+}
+
+// ---------------------------------------------------------------------------
+// Self-test command
+// ---------------------------------------------------------------------------
+
+// Run diagnostic checks on all core subsystems
+static void cmd_selftest(int argc, char** argv, ShellOutput out) {
+  out("=== thesada-fw self-test ===");
+  out("");
+  char line[128];
+  int pass = 0, fail = 0;
+
+  // 1. Config
+  JsonObject cfg = Config::get();
+  const char* devName = cfg["device"]["name"] | "";
+  if (strlen(devName) > 0) {
+    snprintf(line, sizeof(line), "[PASS] Config loaded, device: %s", devName);
+    out(line); pass++;
+  } else {
+    out("[FAIL] Config: device name empty or missing"); fail++;
+  }
+
+  // 2. WiFi
+  if (WiFiManager::connected()) {
+    snprintf(line, sizeof(line), "[PASS] WiFi connected, IP: %s, RSSI: %d dBm",
+             WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    out(line); pass++;
+  } else {
+    out("[FAIL] WiFi not connected"); fail++;
+  }
+
+  // 3. NTP
+  time_t now = time(nullptr);
+  if (now > 1700000000) {
+    out("[PASS] NTP synced"); pass++;
+  } else {
+    out("[FAIL] NTP not synced (time before 2023)"); fail++;
+  }
+
+  // 4. MQTT
+  if (MQTTClient::connected()) {
+    out("[PASS] MQTT connected"); pass++;
+  } else {
+    out("[FAIL] MQTT not connected"); fail++;
+  }
+
+  // 5. LittleFS
+  if (LittleFS.exists("/config.json")) {
+    size_t total = LittleFS.totalBytes();
+    size_t used = LittleFS.usedBytes();
+    snprintf(line, sizeof(line), "[PASS] LittleFS mounted, %d/%d bytes used", (int)used, (int)total);
+    out(line); pass++;
+  } else {
+    out("[FAIL] LittleFS: /config.json not found"); fail++;
+  }
+
+  // 6. SD card - reported via Module::selftest() in SDModule
+
+  // 7. CA cert
+  if (LittleFS.exists("/ca.crt")) {
+    File cf = LittleFS.open("/ca.crt", "r");
+    if (cf && cf.size() > 100) {
+      snprintf(line, sizeof(line), "[PASS] /ca.crt present (%d bytes)", (int)cf.size());
+      out(line); pass++;
+      cf.close();
+    } else {
+      out("[WARN] /ca.crt exists but seems too small");
+      if (cf) cf.close();
+    }
+  } else {
+    out("[WARN] /ca.crt not found (MQTT TLS using insecure mode)");
+  }
+
+  // 8. Module self-tests
+  for (uint8_t i = 0; i < ModuleRegistry::count(); i++) {
+    Module* m = ModuleRegistry::get(i);
+    if (!m) continue;
+    m->selftest([&out, &pass, &fail](const char* line) {
+      out(line);
+      if (strncmp(line, "[PASS]", 6) == 0) pass++;
+      else if (strncmp(line, "[FAIL]", 6) == 0) fail++;
+    });
+  }
+
+  // 9. Scripts
+  if (LittleFS.exists("/scripts/main.lua")) {
+    out("[PASS] /scripts/main.lua present"); pass++;
+  } else {
+    out("[WARN] /scripts/main.lua not found");
+  }
+
+  if (LittleFS.exists("/scripts/rules.lua")) {
+    out("[PASS] /scripts/rules.lua present"); pass++;
+  } else {
+    out("[INFO] /scripts/rules.lua not found (optional)");
+  }
+
+  // Summary
+  out("");
+  snprintf(line, sizeof(line), "=== %d passed, %d failed ===", pass, fail);
+  out(line);
+}
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+// Register all built-in shell commands
+void Shell::registerBuiltins() {
+  // System
+  registerCommand("help",          "Show all commands",             cmd_help);
+  registerCommand("version",       "Firmware version and build",    cmd_version);
+  registerCommand("restart",       "Reboot device",                 cmd_restart);
+  registerCommand("heap",          "Free heap memory",              cmd_heap);
+  registerCommand("uptime",        "Device uptime",                 cmd_uptime);
+  registerCommand("sensors",       "Sensor readings info",          cmd_sensors);
+  registerCommand("selftest",      "Run self-test checks",          cmd_selftest);
+
+  // Filesystem
+  registerCommand("fs.ls",         "List directory (fs.ls [path])", cmd_ls);
+  registerCommand("fs.cat",        "Print file contents",           cmd_cat);
+  registerCommand("fs.rm",         "Remove a file",                 cmd_rm);
+  registerCommand("fs.write",      "Write content to file",         cmd_write);
+  registerCommand("fs.mv",         "Rename/move a file",            cmd_mv);
+  registerCommand("fs.df",         "Disk usage (LittleFS + SD)",    cmd_df);
+
+  // Config
+  registerCommand("config.get",    "Read config key (dot notation)",   cmd_config_get);
+  registerCommand("config.set",    "Set config key (saves + reloads)", cmd_config_set);
+  registerCommand("config.save",   "Save current config to flash",     cmd_config_save);
+  registerCommand("config.reload", "Reload config from flash",         cmd_config_reload);
+  registerCommand("config.dump",   "Print full config JSON",           cmd_config_dump);
+
+  // Network
+  registerCommand("net.ip",        "Network interface info",        cmd_ifconfig);
+  registerCommand("net.ping",      "DNS resolve test",              cmd_ping);
+  registerCommand("net.ntp",       "NTP status / net.ntp set <epoch|ISO8601>", cmd_ntp);
+  registerCommand("net.mqtt",      "MQTT connection status",        cmd_mqtt);
+
+  // Module
+  registerCommand("module.list",   "List compiled modules",         cmd_module_list);
+  registerCommand("module.status", "Module status overview",        cmd_module_status);
+}
+
+// Initialize the shell and register built-in commands
+void Shell::begin() {
+  registerBuiltins();
+
+  char msg[48];
+  snprintf(msg, sizeof(msg), "Shell ready - %d commands", _commandCount);
+  Log::info("Shell", msg);
+}
