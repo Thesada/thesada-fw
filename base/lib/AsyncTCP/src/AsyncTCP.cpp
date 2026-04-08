@@ -1666,7 +1666,7 @@ bool AsyncServer::getNoDelay() {
   return _noDelay;
 }
 
-uint8_t AsyncServer::status() {
+uint8_t AsyncServer::status() const {
   if (!_pcb) {
     return 0;
   }
