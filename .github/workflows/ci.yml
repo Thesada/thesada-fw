@@ -30,14 +30,36 @@ jobs:
       - name: Install PlatformIO
         run: pip install --upgrade platformio
 
-      - name: Build full firmware
+      - name: Build all board targets
         working-directory: base
         run: |
-          pio run -e esp32-owb
-          cp build/firmware.bin build/firmware_full.bin
-          cp build/firmware.json build/firmware_full.json
+          mkdir -p build/boards
 
-      - name: Build minimal firmware
+          # OWB (LILYGO S3 - primary, all modules)
+          pio run -e esp32-owb
+          cp .pio/build/esp32-owb/firmware.bin build/boards/firmware-owb.bin
+          cp build/firmware.json build/boards/firmware-owb.json
+
+          # CYD (ESP32-2432S028R - TFT touch + LiteServer)
+          pio run -e esp32-cyd
+          cp .pio/build/esp32-cyd/firmware.bin build/boards/firmware-cyd.bin
+
+          # WROOM (ESP32-WROOM-32 - OLED + WebServer)
+          pio run -e esp32-wroom
+          cp .pio/build/esp32-wroom/firmware.bin build/boards/firmware-wroom.bin
+
+          # ETH (WT32-ETH01 - Ethernet + WiFi fallback)
+          pio run -e esp32-eth
+          cp .pio/build/esp32-eth/firmware.bin build/boards/firmware-eth.bin
+
+          # S3 bare (debug, SHT31)
+          pio run -e esp32-s3-debug
+          cp .pio/build/esp32-s3-debug/firmware.bin build/boards/firmware-s3bare.bin
+
+          # Keep OWB as the default firmware.bin for backwards compat
+          cp build/boards/firmware-owb.bin build/firmware.bin
+
+      - name: Build minimal firmware (OWB core only)
         working-directory: base
         run: |
           cp src/thesada_config.h src/thesada_config.h.bak
@@ -53,8 +75,6 @@ jobs:
           pio run -e esp32-owb
           cp .pio/build/esp32-owb/firmware.bin build/firmware_minimal.bin
           mv src/thesada_config.h.bak src/thesada_config.h
-          mv build/firmware_full.bin build/firmware.bin
-          mv build/firmware_full.json build/firmware.json
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -64,6 +84,7 @@ jobs:
             base/build/firmware.bin
             base/build/firmware_minimal.bin
             base/build/firmware.json
+            base/build/boards/
 
   release:
     needs: build
@@ -111,7 +132,6 @@ jobs:
           else
             LOG=$(git log --pretty=format:"- %s" --no-merges -20 | grep -v "^- release:" || true)
           fi
-          # Write to file to preserve newlines
           echo "$LOG" > /tmp/changelog.txt
           echo "prev_tag=$PREV_TAG" >> $GITHUB_OUTPUT
 
@@ -135,5 +155,10 @@ jobs:
             artifacts/firmware.bin \
             artifacts/firmware_minimal.bin \
             artifacts/firmware.json \
+            artifacts/boards/firmware-owb.bin \
+            artifacts/boards/firmware-cyd.bin \
+            artifacts/boards/firmware-wroom.bin \
+            artifacts/boards/firmware-eth.bin \
+            artifacts/boards/firmware-s3bare.bin \
             --title "thesada-fw $TAG" \
             --notes-file /tmp/notes.md
