@@ -11,6 +11,7 @@
 #include <SPI.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include <esp_vfs_fat.h>
 #include <ModuleRegistry.h>
 
 static const char* TAG = "SD";
@@ -83,7 +84,13 @@ void SDModule::begin() {
     // Pass the existing SPI instance so we don't re-init the bus
     // (TFT may have already claimed it).
     uint8_t cs = cfg["sd"]["pin_cs"] | 5;
-    SD.end();  // clean up stale VFS mount
+    SD.end();
+    esp_vfs_fat_unregister_path("/sd");  // force clear stale VFS from warm reboot
+    // Deselect SD CS before init to ensure clean SPI bus state
+    pinMode(cs, OUTPUT);
+    digitalWrite(cs, HIGH);
+    SPI.end();
+    SPI.begin();
     if (!SD.begin(cs, SPI, 4000000)) {
       Log::error(TAG, "SPI mount failed - check wiring or card");
       return;
