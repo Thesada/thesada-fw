@@ -16,9 +16,9 @@ echo "=== Building thesada-fw $TAG ==="
 # ── 2. Build full firmware ────────────────────────────────────────────────────
 cd "$BASE"
 echo "--- Full build (all modules) ---"
-pio run -e esp32-s3-dev
+pio run -e esp32-owb
 
-BIN="$BASE/.pio/build/esp32-s3-dev/firmware.bin"
+BIN="$BASE/.pio/build/esp32-owb/firmware.bin"
 MANIFEST="$BASE/build/firmware.json"
 [ -f "$BIN" ]      || { echo "ERROR: firmware.bin not found"; exit 1; }
 [ -f "$MANIFEST" ] || { echo "ERROR: firmware.json not found"; exit 1; }
@@ -42,15 +42,15 @@ sed -i 's/^#define ENABLE_TELEGRAM/\/\/ #define ENABLE_TELEGRAM/' "$CONFIG_H"
 sed -i 's/^#define ENABLE_WEBSERVER/\/\/ #define ENABLE_WEBSERVER/' "$CONFIG_H"
 sed -i 's/^#define ENABLE_SCRIPTENGINE/\/\/ #define ENABLE_SCRIPTENGINE/' "$CONFIG_H"
 
-pio run -e esp32-s3-dev
+pio run -e esp32-owb
 BIN_MINIMAL="$BASE/build/firmware_minimal.bin"
-cp "$BASE/.pio/build/esp32-s3-dev/firmware.bin" "$BIN_MINIMAL"
+cp "$BASE/.pio/build/esp32-owb/firmware.bin" "$BIN_MINIMAL"
 echo "  minimal  : $BIN_MINIMAL ($(du -h "$BIN_MINIMAL" | cut -f1))"
 
 # Restore full config and rebuild so .pio output matches the full release binary
 mv "$CONFIG_H.bak" "$CONFIG_H"
 echo "--- Restoring full build ---"
-pio run -e esp32-s3-dev
+pio run -e esp32-owb
 
 # ── 3. Commit and tag ─────────────────────────────────────────────────────────
 cd "$REPO_ROOT"

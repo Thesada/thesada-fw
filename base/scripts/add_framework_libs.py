@@ -8,7 +8,7 @@ framework_dir = env.PioPlatform().get_package_dir("framework-arduinoespressif32"
 framework_libs = os.path.join(framework_dir, "libraries")
 
 needed = ["SPI", "Wire", "FS", "SD", "SD_MMC", "LittleFS",
-          "WiFi", "WiFiClientSecure", "HTTPClient", "Update"]
+          "WiFi", "WiFiClientSecure", "HTTPClient", "Update", "Ethernet"]
 
 for lib in needed:
     lib_src = os.path.join(framework_libs, lib, "src")

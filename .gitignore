@@ -1,4 +1,4 @@
 .DS_Store
 base/data/ca.crt
 *.patch
-tests/__pycache__/
+tests/__pycache__/.env

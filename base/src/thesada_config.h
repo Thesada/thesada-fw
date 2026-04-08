@@ -19,6 +19,7 @@
 
 // ── Connectivity modules ─────────────────────────────────────────────────────
 #define ENABLE_CELLULAR      // SIM7080G LTE-M/NB-IoT fallback
+// #define ENABLE_ETH        // LAN8720A Ethernet (WT32-ETH01 and similar)
 // #define ENABLE_LORA       // LoRa/Meshtastic (future hardware)
 
 // ── Notification / alerting ──────────────────────────────────────────────────
@@ -46,7 +47,7 @@
 // ── Board pinout ─────────────────────────────────────────────────────────────
 // Board is set via platformio.ini build_flags (-DBOARD_WROOM32 etc).
 // Default is LILYGO if no board flag is set.
-#if !defined(BOARD_WROOM32) && !defined(BOARD_S3_BARE)
+#if !defined(BOARD_WROOM32) && !defined(BOARD_S3_BARE) && !defined(BOARD_ETH)
   #define BOARD_LILYGO_T_SIM7080_S3
 #endif
 
@@ -73,6 +74,20 @@
   #undef ENABLE_SD
   #undef ENABLE_TEMPERATURE
   #undef ENABLE_ADS1115
+  #undef BOARD_LILYGO_T_SIM7080_S3
+#endif
+
+// WT32-ETH01 (or similar ESP32 + LAN8720A) - Ethernet primary, WiFi fallback.
+// Sensors via remaining GPIOs (IO4=1-Wire, IO14/IO15=I2C).
+#ifdef BOARD_ETH
+  #undef ENABLE_CELLULAR
+  #undef ENABLE_PMU
+  #undef ENABLE_BATTERY
+  #undef ENABLE_DISPLAY
+  #undef ENABLE_TFT
+  #ifndef ENABLE_ETH
+    #define ENABLE_ETH
+  #endif
   #undef BOARD_LILYGO_T_SIM7080_S3
 #endif
 

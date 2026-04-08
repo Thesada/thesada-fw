@@ -1,0 +1,139 @@
+name: PlatformIO CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/.cache
+            base/.pio/libdeps
+          key: ${{ runner.os }}-pio-${{ hashFiles('base/platformio.ini') }}
+          restore-keys: ${{ runner.os }}-pio-
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build full firmware
+        working-directory: base
+        run: |
+          pio run -e esp32-owb
+          cp build/firmware.bin build/firmware_full.bin
+          cp build/firmware.json build/firmware_full.json
+
+      - name: Build minimal firmware
+        working-directory: base
+        run: |
+          cp src/thesada_config.h src/thesada_config.h.bak
+          sed -i 's/^#define ENABLE_TEMPERATURE/\/\/ #define ENABLE_TEMPERATURE/' src/thesada_config.h
+          sed -i 's/^#define ENABLE_ADS1115/\/\/ #define ENABLE_ADS1115/' src/thesada_config.h
+          sed -i 's/^#define ENABLE_BATTERY/\/\/ #define ENABLE_BATTERY/' src/thesada_config.h
+          sed -i 's/^#define ENABLE_PMU/\/\/ #define ENABLE_PMU/' src/thesada_config.h
+          sed -i 's/^#define ENABLE_SD/\/\/ #define ENABLE_SD/' src/thesada_config.h
+          sed -i 's/^#define ENABLE_CELLULAR/\/\/ #define ENABLE_CELLULAR/' src/thesada_config.h
+          sed -i 's/^#define ENABLE_TELEGRAM/\/\/ #define ENABLE_TELEGRAM/' src/thesada_config.h
+          sed -i 's/^#define ENABLE_WEBSERVER/\/\/ #define ENABLE_WEBSERVER/' src/thesada_config.h
+          sed -i 's/^#define ENABLE_SCRIPTENGINE/\/\/ #define ENABLE_SCRIPTENGINE/' src/thesada_config.h
+          pio run -e esp32-owb
+          cp .pio/build/esp32-owb/firmware.bin build/firmware_minimal.bin
+          mv src/thesada_config.h.bak src/thesada_config.h
+          mv build/firmware_full.bin build/firmware.bin
+          mv build/firmware_full.json build/firmware.json
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: |
+            base/build/firmware.bin
+            base/build/firmware_minimal.bin
+            base/build/firmware.json
+
+  release:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from config.h
+        id: version
+        run: |
+          VERSION=$(grep -oP '(?<=")\d+\.\d+\.\d+(?=")' base/src/thesada_config.h)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check if release already exists
+        id: check_tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Release v${{ steps.version.outputs.version }} already exists - skipping"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "New version v${{ steps.version.outputs.version }} - will create release"
+          fi
+
+      - name: Download build artifacts
+        if: steps.check_tag.outputs.exists == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware
+          path: artifacts
+
+      - name: Generate changelog
+        if: steps.check_tag.outputs.exists == 'false'
+        id: changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            LOG=$(git log "$PREV_TAG..HEAD" --pretty=format:"- %s" --no-merges | grep -v "^- release:" || true)
+          else
+            LOG=$(git log --pretty=format:"- %s" --no-merges -20 | grep -v "^- release:" || true)
+          fi
+          # Write to file to preserve newlines
+          echo "$LOG" > /tmp/changelog.txt
+          echo "prev_tag=$PREV_TAG" >> $GITHUB_OUTPUT
+
+      - name: Create release
+        if: steps.check_tag.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          PREV="${{ steps.changelog.outputs.prev_tag }}"
+          CHANGELOG=$(cat /tmp/changelog.txt)
+          cat > /tmp/notes.md << EOF
+          ## Changes
+
+          ${CHANGELOG}
+
+          **Full diff:** https://github.com/${{ github.repository }}/compare/${PREV:-main}...${TAG}
+          EOF
+
+          gh release create "$TAG" \
+            artifacts/firmware.bin \
+            artifacts/firmware_minimal.bin \
+            artifacts/firmware.json \
+            --title "thesada-fw $TAG" \
+            --notes-file /tmp/notes.md
