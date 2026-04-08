@@ -219,4 +219,4 @@ Queries PlatformIO registry and GitHub for newer versions. Exit 0 = up to date, 
 | Adafruit ADS1X15 | 2.6.2 | |
 | ESPAsyncWebServer | git | |
 | ESP-Arduino-Lua | git | GPL-3.0 |
-| AsyncTCP | vendored | v3.3.2 + null-PCB crash fixes in `lib/AsyncTCP/` |
+| AsyncTCP | vendored | v3.4.10 (ESP32Async) in `lib/AsyncTCP/` |
