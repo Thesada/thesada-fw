@@ -1,8 +1,8 @@
 # thesada-fw
 
-Production firmware for ESP32-S3 property monitoring nodes. Built from scratch in C++17 on the Arduino framework using PlatformIO. Runs on the LILYGO T-SIM7080-S3 with WiFi primary and LTE-M/NB-IoT cellular fallback - the node stays connected and publishing even when WiFi goes down.
+Modular ESP32 firmware for property monitoring nodes. Built from scratch in C++17 on the Arduino framework using PlatformIO. Runs on multiple board targets - from LILYGO S3 with cellular fallback, to WROOM-32 with OLED, to CYD touch displays, to Ethernet nodes. WiFi, Ethernet, or LTE-M - the node stays connected and publishing.
 
-**Currently deployed:** monitoring an outdoor wood boiler - supply/return temperatures, circulator pump current, and real-time alerts via Telegram. Running continuously in the field.
+**Currently deployed:** monitoring an outdoor wood boiler (temperature, pump current, Telegram alerts) and indoor climate (SHT31). Running 24/7 in the field.
 
 Full documentation: [thesada.cloud/firmware/fw-index](https://thesada.cloud/firmware/fw-index)
 
@@ -80,13 +80,16 @@ Full documentation: [thesada.cloud/firmware/fw-index](https://thesada.cloud/firm
 ```
 ┌─ Optional modules (ENABLE_*) ───────────────────────┐
 │  ┌─────────────┐ ┌───────────┐ ┌──────────────────┐ │
-│  │ Temperature │ │  ADS1115  │ │    Telegram      │ │
+│  │ Temperature │ │   SHT31   │ │     ADS1115      │ │
 │  └─────────────┘ └───────────┘ └──────────────────┘ │
 │  ┌─────────────┐ ┌──────────┐ ┌──────────────────┐  │
 │  │   Battery   │ │    SD    │ │   PowerManager   │  │
 │  └─────────────┘ └──────────┘ └──────────────────┘  │
 │  ┌─────────────┐ ┌──────────┐ ┌───────────────────┐ │
-│  │ HttpServer  │ │ Cellular │ │   ScriptEngine    │ │
+│  │ HttpServer  │ │LiteServer│ │   ScriptEngine    │ │
+│  └─────────────┘ └──────────┘ └───────────────────┘ │
+│  ┌─────────────┐ ┌──────────┐ ┌───────────────────┐ │
+│  │  Cellular   │ │ Ethernet │ │    Telegram       │ │
 │  └─────────────┘ └──────────┘ └───────────────────┘ │
 │  ┌─────────────┐ ┌────────────┐                     │
 │  │   Display   │ │ TftDisplay │                     │
@@ -100,9 +103,9 @@ Full documentation: [thesada.cloud/firmware/fw-index](https://thesada.cloud/firm
 │  │    Shell    │ │ EventBus │ │   SleepManager    │ │
 │  │  30+ cmds   │ │          │ │                   │ │
 │  └─────────────┘ └──────────┘ └───────────────────┘ │
-│  ┌──────────────┐                                    │
-│  │ModuleRegistry│                                    │
-│  └──────────────┘                                    │
+│  ┌──────────────┐                                   │
+│  │ModuleRegistry│                                   │
+│  └──────────────┘                                   │
 └─────────────────────────────────────────────────────┘
 * Push OTA (/ota upload) requires ENABLE_HTTPSERVER
 ```
@@ -113,7 +116,7 @@ Config is split: `thesada_config.h` for compile-time module enables, `config.jso
 
 **Core (always compiled):** Config, EventBus, Log, Shell, ModuleRegistry, WiFiManager, MQTTClient, OTAUpdate, SleepManager, HeartbeatLED
 
-**Optional modules (ENABLE_* guards):** Temperature, SHT31, ADS1115, Battery, PMU, SD, Cellular, Telegram, HttpServer, LiteServer, ScriptEngine, Display (OLED), TftDisplay (CYD), PWM, PowerManager
+**Optional modules (ENABLE_* guards):** Temperature, SHT31, ADS1115, Battery, PMU, SD, Cellular, Ethernet, Telegram, HttpServer, LiteServer, ScriptEngine, Display (OLED), TftDisplay (CYD), PWM, PowerManager
 
 Minimal build (core only) saves ~313 KB flash. Full build with all modules: 1.4 MB. Release includes both `firmware.bin` (full) and `firmware_minimal.bin` (core only).
 
@@ -123,12 +126,13 @@ Minimal build (core only) saves ~313 KB flash. Full build with all modules: 1.4 
 
 | Board | PIO environment | Notes |
 |---|---|---|
-| LILYGO T-SIM7080-S3 | `esp32-s3-dev` | Primary target - all modules |
-| ESP32-S3 bare devkit | `esp32-s3-debug` | USB CDC serial, no LILYGO hardware (BOARD_S3_BARE) |
+| LILYGO T-SIM7080-S3 | `esp32-owb` | Primary target - all modules |
+| ESP32-S3 bare devkit | `esp32-s3-debug` | USB CDC serial, SHT31 enabled (BOARD_S3_BARE) |
 | ESP32-WROOM-32 | `esp32-wroom` | No cellular/PMU/SD - OLED display, WiFi, MQTT |
-| CYD (ESP32-2432S028R) | `esp32-cyd` | 2.8" TFT touch, RGB LED, LDR, SD (SPI) |
+| CYD (ESP32-2432S028R) | `esp32-cyd` | 2.8" TFT touch, LiteServer, SD (SPI) |
+| WT32-ETH01 | `esp32-eth` | LAN8720A Ethernet, WiFi fallback, well pump node |
 
-Board-specific module overrides are in `thesada_config.h` (e.g. `BOARD_WROOM32` disables LILYGO-specific hardware).
+Board-specific module overrides are in `thesada_config.h` (e.g. `BOARD_ETH` enables Ethernet and disables cellular/PMU).
 
 ---
 
@@ -144,8 +148,8 @@ cp examples/config.json.example data/config.json
 # optionally copy example scripts:
 #   cp examples/scripts/rules.lua.example data/scripts/rules.lua
 #   cp examples/scripts/display.lua.example data/scripts/display.lua  (OLED display)
-pio run -e esp32-s3-dev --target upload      # or esp32-wroom for WROOM-32
-pio run -e esp32-s3-dev --target uploadfs
+pio run -e esp32-owb --target upload      # or esp32-wroom for WROOM-32
+pio run -e esp32-owb --target uploadfs
 ```
 
 **Releasing:** `./release.sh` builds full + minimal binaries, tags, pushes, and creates a GitHub release with auto-generated changelog.
