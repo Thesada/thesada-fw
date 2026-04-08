@@ -18,11 +18,11 @@
   License along with this library; if not, write to the Free Software
   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
-// thesada-fw local copy of AsyncTCP v3.3.2 (mathieucarbou/AsyncTCP).
+// thesada-fw local copy of AsyncTCP v3.3.2 (ESP32Async/AsyncTCP).
 // Vendored here to apply null-pointer guards in _accept/_s_accept/_s_accepted
 // that prevent LoadProhibited crashes (EXCVADDR 0x00000030) when lwIP calls
 // these callbacks with a null PCB or a null server pointer.
-// Upstream issue: https://github.com/mathieucarbou/AsyncTCP/issues (null PCB crash)
+// Upstream repo moved: mathieucarbou/AsyncTCP -> ESP32Async/AsyncTCP (archived Jan 2025)
 // Patches applied:
 //   _accept (null PCB guard), _s_accept (null arg), _s_accepted (null arg)
 //   All 8 event-enqueue functions (_tcp_*): null check after malloc() to prevent
