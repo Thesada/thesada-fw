@@ -57,9 +57,7 @@ PIO_PLATFORM_NAME  = "espressif32"
 PIO_PLATFORM_PIN   = "6.13.0"
 
 # Vendored libs - never checked automatically
-VENDORED = [
-    ("AsyncTCP", "patched in lib/ - update manually if upstream fixes are needed"),
-]
+VENDORED = []
 
 
 # ── HTTP helper ───────────────────────────────────────────────────────────────

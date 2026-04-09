@@ -216,5 +216,5 @@ void SDModule::selftest(ShellOutput out) {
 }
 
 #ifdef ENABLE_SD
-MODULE_REGISTER(SDModule, PRIORITY_SERVICE)
+MODULE_REGISTER(SDModule, PRIORITY_NETWORK)  // before TFT(SERVICE) to init SPI bus first
 #endif

@@ -316,6 +316,6 @@ void TftDisplayModule::status(ShellOutput out) {
   out(line);
 }
 
-MODULE_REGISTER(TftDisplayModule, PRIORITY_OUTPUT)  // before ScriptEngine(40) so Lua bindings are registered first
+MODULE_REGISTER(TftDisplayModule, PRIORITY_SERVICE)  // before ScriptEngine(40) so Lua bindings are registered first
 
 #endif // ENABLE_TFT

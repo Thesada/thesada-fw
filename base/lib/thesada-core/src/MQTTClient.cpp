@@ -68,6 +68,9 @@ void MQTTClient::begin() {
   _client.setCallback(onMessage);
 
 #ifdef MQTT_TLS
+  // Keep socket timeout well under the 30s hardware watchdog
+  _wifiClient.setTimeout(10);
+
   // CA cert must be present as /ca.crt on LittleFS.
   // If missing, TLS connection proceeds without cert verification (insecure).
   if (LittleFS.exists("/ca.crt")) {
