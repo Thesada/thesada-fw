@@ -2,3 +2,4 @@
 base/data/ca.crt
 *.patch
 tests/__pycache__
+base/scripts/deploy-ota.sh

@@ -68,8 +68,12 @@ void MQTTClient::begin() {
   _client.setCallback(onMessage);
 
 #ifdef MQTT_TLS
-  // Keep socket timeout well under the 30s hardware watchdog
+  // Keep socket timeout well under the 30s hardware watchdog.
+  // arduino-esp32 v2.x: setTimeout takes seconds (current platform).
+  // arduino-esp32 v3.x: setTimeout takes milliseconds (future-proof).
+  // Setting both ensures correct behavior across versions.
   _wifiClient.setTimeout(10);
+  _wifiClient.setHandshakeTimeout(10);  // ssl handshake, always seconds
 
   // CA cert must be present as /ca.crt on LittleFS.
   // If missing, TLS connection proceeds without cert verification (insecure).
@@ -232,6 +236,17 @@ void MQTTClient::connect() {
     Log::warn(TAG, err);
     _retryCount++;
     _retryInterval = min(_retryInterval * 2, (uint32_t)RETRY_MAX_MS);
+
+    // Heap fragmentation safety net: if MQTT can't reconnect after many
+    // attempts, the most likely cause is mbedtls failing to allocate ~30KB
+    // for a fresh TLS context. A clean restart defragments the heap.
+    // Telegram and other HTTPS still work in this state, so the device
+    // can self-recover via the next OTA poll - but a reboot is faster.
+    if (_retryCount >= 30) {
+      Log::error(TAG, "MQTT reconnect failed 30 times - rebooting to defrag heap");
+      delay(1000);
+      ESP.restart();
+    }
   }
 }
 
