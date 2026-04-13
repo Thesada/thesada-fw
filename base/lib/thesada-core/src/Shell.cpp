@@ -561,14 +561,30 @@ static void cmd_restart(int argc, char** argv, ShellOutput out) {
   ESP.restart();
 }
 
-// Show free heap, minimum watermark, and largest allocatable block
+// Show free heap, minimum watermark, and largest allocatable block.
+// Also shows PSRAM stats if PSRAM is present and enabled.
 static void cmd_heap(int argc, char** argv, ShellOutput out) {
-  char line[96];
+  char line[128];
   snprintf(line, sizeof(line), "Free: %lu B  Min: %lu B  Max alloc: %lu B",
            (unsigned long)ESP.getFreeHeap(),
            (unsigned long)ESP.getMinFreeHeap(),
            (unsigned long)ESP.getMaxAllocHeap());
   out(line);
+#if defined(BOARD_HAS_PSRAM)
+  if (psramFound()) {
+    snprintf(line, sizeof(line),
+             "PSRAM: free %lu B  size %lu B  min %lu B  max alloc %lu B",
+             (unsigned long)ESP.getFreePsram(),
+             (unsigned long)ESP.getPsramSize(),
+             (unsigned long)ESP.getMinFreePsram(),
+             (unsigned long)ESP.getMaxAllocPsram());
+    out(line);
+  } else {
+    out("PSRAM: not detected (psramFound() == false)");
+  }
+#else
+  out("PSRAM: not enabled in build");
+#endif
 }
 
 // Show device uptime in days, hours, minutes, seconds
