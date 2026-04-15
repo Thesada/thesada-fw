@@ -9,7 +9,14 @@
 #include "WiFiManager.h"
 #include "MQTTClient.h"
 #include "ModuleRegistry.h"
+#include "OTAUpdate.h"
 #include <thesada_config.h>
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
+#include <esp_chip_info.h>
+#include <esp_flash.h>
+#include <esp_system.h>
+#include <esp_app_format.h>
 
 #include <LittleFS.h>
 #include <WiFi.h>
@@ -459,8 +466,11 @@ static void cmd_ntp(int argc, char** argv, ShellOutput out) {
 }
 
 // Show MQTT connection status and broker info
+// Print MQTT connection state, broker, prefix, and the full subscription table
+// (slot index, topic, active flag). Used to diagnose subscription dispatch
+// issues - e.g. a cmd_topic that silently stopped firing after reconnect.
 static void cmd_mqtt(int argc, char** argv, ShellOutput out) {
-  char line[128];
+  char line[160];
   snprintf(line, sizeof(line), "MQTT: %s", MQTTClient::connected() ? "connected" : "disconnected");
   out(line);
 
@@ -469,6 +479,269 @@ static void cmd_mqtt(int argc, char** argv, ShellOutput out) {
   int port = cfg["mqtt"]["port"] | 8883;
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "";
   snprintf(line, sizeof(line), "  broker: %s:%d  prefix: %s", broker, port, prefix);
+  out(line);
+
+  snprintf(line, sizeof(line), "  subs: %u/%u", (unsigned)MQTTClient::_subCount, (unsigned)MQTT_MAX_SUBS);
+  out(line);
+  for (uint8_t i = 0; i < MQTTClient::_subCount; i++) {
+    snprintf(line, sizeof(line), "  [%u] %s %s",
+             (unsigned)i,
+             MQTTClient::_subs[i].topic,
+             MQTTClient::_subs[i].active ? "active" : "inactive");
+    out(line);
+  }
+
+  // RX ring - last N topics received at onMessage. If a topic was published
+  // and broker delivered it, it shows here regardless of whether any
+  // subscription callback matched.
+  snprintf(line, sizeof(line), "  rx ring: %u/%u", (unsigned)MQTTClient::_rxRingCount, (unsigned)MQTTClient::RX_RING_SIZE);
+  out(line);
+  uint8_t count = MQTTClient::_rxRingCount;
+  uint8_t head  = MQTTClient::_rxRingHead;
+  uint32_t now  = millis();
+  // Walk from oldest to newest
+  for (uint8_t i = 0; i < count; i++) {
+    uint8_t idx = (head + MQTTClient::RX_RING_SIZE - count + i) % MQTTClient::RX_RING_SIZE;
+    uint32_t ageMs = now - MQTTClient::_rxRingTs[idx];
+    snprintf(line, sizeof(line), "    %us ago: %s", (unsigned)(ageMs / 1000), MQTTClient::_rxRing[idx]);
+    out(line);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// OTA + chip diagnostic commands
+// ---------------------------------------------------------------------------
+
+// Trigger an OTA check immediately. Optional args:
+//   ota.check              - fetch config manifest_url, install if newer
+//   ota.check <url>        - fetch <url> manifest, install if newer
+//   ota.check --force      - fetch config manifest_url, install regardless
+//   ota.check --force <url>- fetch <url>, install regardless of version
+// Force mode bypasses the isNewer() check so dev iteration doesn't need
+// a FIRMWARE_VERSION bump every cycle.
+static void cmd_ota_check(int argc, char** argv, ShellOutput out) {
+  bool force = false;
+  const char* url = nullptr;
+  for (int i = 1; i < argc; i++) {
+    if (argv[i] && strcmp(argv[i], "--force") == 0) {
+      force = true;
+    } else if (argv[i] && strlen(argv[i]) > 0 && !url) {
+      url = argv[i];
+    }
+  }
+
+  char line[192];
+  snprintf(line, sizeof(line), "ota.check queued (force=%s, url=%s)",
+           force ? "yes" : "no",
+           url ? url : "config");
+  out(line);
+  out("check will run on next OTAUpdate::loop() tick - device may reboot shortly");
+  // Non-blocking trigger. If we called OTAUpdate::check() directly here the
+  // ESP.restart() at the end of a successful flash would fire before Shell
+  // returned, so the cli/response would never publish.
+  OTAUpdate::triggerCheck(url, force);
+}
+
+// Print running + boot + next-update partition info and OTA state. Uses the
+// ESP-IDF esp_ota API directly so it works regardless of whether the Arduino
+// Update wrapper has been touched this boot. Useful for diagnosing rollback
+// state and confirming a freshly-flashed partition is marked valid.
+static void cmd_ota_status(int argc, char** argv, ShellOutput out) {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  const esp_partition_t* boot    = esp_ota_get_boot_partition();
+  const esp_partition_t* next    = esp_ota_get_next_update_partition(NULL);
+
+  char line[160];
+  if (running) {
+    snprintf(line, sizeof(line), "running: %s  addr=0x%lx  size=%lu",
+             running->label, (unsigned long)running->address, (unsigned long)running->size);
+    out(line);
+  } else {
+    out("running: <unknown>");
+  }
+  if (boot) {
+    snprintf(line, sizeof(line), "boot:    %s  addr=0x%lx",
+             boot->label, (unsigned long)boot->address);
+    out(line);
+  }
+  if (next) {
+    snprintf(line, sizeof(line), "next:    %s  addr=0x%lx  size=%lu",
+             next->label, (unsigned long)next->address, (unsigned long)next->size);
+    out(line);
+  }
+
+  if (running) {
+    esp_ota_img_states_t state;
+    if (esp_ota_get_state_partition(running, &state) == ESP_OK) {
+      const char* stateStr = "unknown";
+      switch (state) {
+        case ESP_OTA_IMG_NEW:            stateStr = "new"; break;
+        case ESP_OTA_IMG_PENDING_VERIFY: stateStr = "pending_verify"; break;
+        case ESP_OTA_IMG_VALID:          stateStr = "valid"; break;
+        case ESP_OTA_IMG_INVALID:        stateStr = "invalid"; break;
+        case ESP_OTA_IMG_ABORTED:        stateStr = "aborted"; break;
+        case ESP_OTA_IMG_UNDEFINED:      stateStr = "undefined"; break;
+      }
+      snprintf(line, sizeof(line), "running state: %s", stateStr);
+      out(line);
+    }
+  }
+
+  snprintf(line, sizeof(line), "fw version: %s  built: %s %s",
+           FIRMWARE_VERSION, __DATE__, __TIME__);
+  out(line);
+}
+
+// Boot count (from RTC-memory survival across deep sleep via SleepManager)
+// plus the last reset reason as a human-readable string. Cheap, no flash
+// reads, safe to call in any state.
+static void cmd_boot_info(int argc, char** argv, ShellOutput out) {
+  esp_reset_reason_t reason = esp_reset_reason();
+  const char* reasonStr = "unknown";
+  switch (reason) {
+    case ESP_RST_POWERON:  reasonStr = "power_on"; break;
+    case ESP_RST_EXT:      reasonStr = "external_pin"; break;
+    case ESP_RST_SW:       reasonStr = "sw_reset (ESP.restart())"; break;
+    case ESP_RST_PANIC:    reasonStr = "panic / exception"; break;
+    case ESP_RST_INT_WDT:  reasonStr = "interrupt_watchdog"; break;
+    case ESP_RST_TASK_WDT: reasonStr = "task_watchdog"; break;
+    case ESP_RST_WDT:      reasonStr = "other_watchdog"; break;
+    case ESP_RST_DEEPSLEEP:reasonStr = "deep_sleep_wake"; break;
+    case ESP_RST_BROWNOUT: reasonStr = "brownout"; break;
+    case ESP_RST_SDIO:     reasonStr = "sdio_reset"; break;
+    default: break;
+  }
+  char line[160];
+  snprintf(line, sizeof(line), "reset reason: %s (%d)", reasonStr, (int)reason);
+  out(line);
+
+  snprintf(line, sizeof(line), "uptime: %lu ms", (unsigned long)millis());
+  out(line);
+
+  snprintf(line, sizeof(line), "fw version: %s  built: %s %s",
+           FIRMWARE_VERSION, __DATE__, __TIME__);
+  out(line);
+}
+
+// List all partitions (app + data) with label, type, subtype, offset, size.
+// Uses esp_partition_next iterator - no hardcoded layout assumptions.
+static void cmd_partitions(int argc, char** argv, ShellOutput out) {
+  char line[160];
+  out("partition table:");
+  esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, NULL);
+  while (it) {
+    const esp_partition_t* p = esp_partition_get(it);
+    if (p) {
+      snprintf(line, sizeof(line),
+               "  %-10s type=%u sub=%u  addr=0x%08lx  size=%lu",
+               p->label,
+               (unsigned)p->type,
+               (unsigned)p->subtype,
+               (unsigned long)p->address,
+               (unsigned long)p->size);
+      out(line);
+    }
+    it = esp_partition_next(it);
+  }
+  esp_partition_iterator_release(it);
+}
+
+// Dump selected CONFIG_* values from sdkconfig.h that affect OTA + partition
+// + rollback behavior. Used to confirm the device's runtime config matches
+// what the firmware was built against. No hidden state - all macros are
+// evaluated at compile time.
+static void cmd_sdkconfig(int argc, char** argv, ShellOutput out) {
+  char line[160];
+
+#ifdef CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+  out("CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE: 1 (pending_verify auto-rollback on)");
+#else
+  out("CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE: 0 (no auto-rollback)");
+#endif
+#ifdef CONFIG_APP_ROLLBACK_ENABLE
+  out("CONFIG_APP_ROLLBACK_ENABLE: 1");
+#else
+  out("CONFIG_APP_ROLLBACK_ENABLE: 0");
+#endif
+
+#ifdef CONFIG_SPIRAM
+  out("CONFIG_SPIRAM: 1 (PSRAM compiled in)");
+#else
+  out("CONFIG_SPIRAM: 0 (no PSRAM)");
+#endif
+#ifdef CONFIG_SPIRAM_MODE_OCT
+  out("CONFIG_SPIRAM_MODE_OCT: 1 (octal PSRAM)");
+#elif defined(CONFIG_SPIRAM_MODE_QUAD)
+  out("CONFIG_SPIRAM_MODE_QUAD: 1 (quad PSRAM)");
+#endif
+#ifdef CONFIG_ESPTOOLPY_FLASHMODE_QIO
+  out("CONFIG_ESPTOOLPY_FLASHMODE_QIO: 1");
+#elif defined(CONFIG_ESPTOOLPY_FLASHMODE_DIO)
+  out("CONFIG_ESPTOOLPY_FLASHMODE_DIO: 1");
+#endif
+
+#ifdef CONFIG_ESPTOOLPY_FLASHSIZE
+  snprintf(line, sizeof(line), "CONFIG_ESPTOOLPY_FLASHSIZE: %s", CONFIG_ESPTOOLPY_FLASHSIZE);
+  out(line);
+#endif
+
+#ifdef CONFIG_FREERTOS_HZ
+  snprintf(line, sizeof(line), "CONFIG_FREERTOS_HZ: %d", CONFIG_FREERTOS_HZ);
+  out(line);
+#endif
+#ifdef CONFIG_ESP_TASK_WDT_TIMEOUT_S
+  snprintf(line, sizeof(line), "CONFIG_ESP_TASK_WDT_TIMEOUT_S: %d", CONFIG_ESP_TASK_WDT_TIMEOUT_S);
+  out(line);
+#endif
+#ifdef CONFIG_ESP_INT_WDT_TIMEOUT_MS
+  snprintf(line, sizeof(line), "CONFIG_ESP_INT_WDT_TIMEOUT_MS: %d", CONFIG_ESP_INT_WDT_TIMEOUT_MS);
+  out(line);
+#endif
+
+  out("runtime esp_task_wdt_init: 30s (from main.cpp)");
+
+#ifdef CONFIG_PARTITION_TABLE_FILENAME
+  snprintf(line, sizeof(line), "CONFIG_PARTITION_TABLE_FILENAME: %s", CONFIG_PARTITION_TABLE_FILENAME);
+  out(line);
+#endif
+}
+
+// Chip revision, cores, flash size, PSRAM size. No hidden state - pure
+// hardware facts, read from esp_chip_info + esp_flash + heap_caps.
+static void cmd_chip_info(int argc, char** argv, ShellOutput out) {
+  esp_chip_info_t info;
+  esp_chip_info(&info);
+  char line[160];
+
+  const char* model = "?";
+  switch (info.model) {
+    case CHIP_ESP32:   model = "ESP32"; break;
+    case CHIP_ESP32S2: model = "ESP32-S2"; break;
+    case CHIP_ESP32S3: model = "ESP32-S3"; break;
+    case CHIP_ESP32C3: model = "ESP32-C3"; break;
+    default: break;
+  }
+  snprintf(line, sizeof(line), "chip: %s  rev=%u  cores=%u",
+           model, (unsigned)info.revision, (unsigned)info.cores);
+  out(line);
+
+  uint32_t flashSize = 0;
+  esp_flash_get_size(NULL, &flashSize);
+  snprintf(line, sizeof(line), "flash: %lu bytes (%.2f MB)",
+           (unsigned long)flashSize, flashSize / (1024.0 * 1024.0));
+  out(line);
+
+#if defined(BOARD_HAS_PSRAM)
+  size_t psramSize = ESP.getPsramSize();
+  size_t psramFree = ESP.getFreePsram();
+  snprintf(line, sizeof(line), "psram: %u bytes free / %u bytes total",
+           (unsigned)psramFree, (unsigned)psramSize);
+  out(line);
+#else
+  out("psram: not compiled in (no BOARD_HAS_PSRAM)");
+#endif
+
+  snprintf(line, sizeof(line), "cpu freq: %lu MHz", (unsigned long)getCpuFrequencyMhz());
   out(line);
 }
 
@@ -790,7 +1063,13 @@ void Shell::registerBuiltins() {
   registerCommand("net.ip",        "Network interface info",        cmd_ifconfig);
   registerCommand("net.ping",      "DNS resolve test",              cmd_ping);
   registerCommand("net.ntp",       "NTP status / net.ntp set <epoch|ISO8601>", cmd_ntp);
-  registerCommand("net.mqtt",      "MQTT connection status",        cmd_mqtt);
+  registerCommand("net.mqtt",      "MQTT connection + subscription dump", cmd_mqtt);
+  registerCommand("ota.check",     "Trigger OTA check (ota.check [--force] [url])", cmd_ota_check);
+  registerCommand("ota.status",    "Partition + rollback state",    cmd_ota_status);
+  registerCommand("boot.info",     "Last reset reason + uptime",    cmd_boot_info);
+  registerCommand("partitions",    "Full partition table dump",     cmd_partitions);
+  registerCommand("chip.info",     "Chip revision, flash, PSRAM",   cmd_chip_info);
+  registerCommand("sdkconfig",     "Selected CONFIG_* relevant to OTA/boot", cmd_sdkconfig);
 
   // Module
   registerCommand("module.list",   "List compiled modules",         cmd_module_list);
