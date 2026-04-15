@@ -32,6 +32,7 @@
 #include <Update.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
+#include <esp_task_wdt.h>
 #include <mbedtls/sha256.h>
 
 static const char* TAG = "OTA";
@@ -40,6 +41,7 @@ uint32_t OTAUpdate::_lastCheck       = 0;
 uint32_t OTAUpdate::_checkIntervalMs = 21600000;  // 6 hours
 bool     OTAUpdate::_enabled         = true;
 bool     OTAUpdate::_checkRequested  = false;
+bool     OTAUpdate::_forceRequested  = false;
 String   OTAUpdate::_pendingManifestUrl;
 
 // Load CA cert from LittleFS, matching MQTTClient pattern.
@@ -62,7 +64,10 @@ static void loadCaCert() {
   }
 }
 
-// Apply CA cert or insecure mode to a WiFiClientSecure instance
+// Apply CA cert or insecure mode to a WiFiClientSecure instance.
+// Short socket + handshake timeouts so a flaky upstream cannot block
+// readBytes() long enough to trip the task watchdog. WiFiClientSecure
+// defaults to ~60s read timeout, far past the ~5s TWDT window.
 static void configureSecureClient(WiFiClientSecure& client) {
   loadCaCert();
   if (_otaCaCert.isEmpty()) {
@@ -70,6 +75,8 @@ static void configureSecureClient(WiFiClientSecure& client) {
   } else {
     client.setCACert(_otaCaCert.c_str());
   }
+  client.setTimeout(10);            // arduino-esp32 v2.x: seconds (current platform)
+  client.setHandshakeTimeout(10);   // ssl handshake, always seconds
 }
 
 // ---------------------------------------------------------------------------
@@ -96,8 +103,9 @@ void OTAUpdate::begin() {
   }
 
   // Subscribe to MQTT OTA trigger (optional dedicated topic).
-  // OTA can also be triggered via CLI: cli/ota.check
-  // If ota.cmd_topic is set in config, subscribe to it for backwards compat.
+  // There is NO `cli/ota.check` shell command - the only on-demand trigger
+  // is publishing to the topic defined by ota.cmd_topic in config.
+  // If ota.cmd_topic is set, subscribe to it.
   const char* customTopic = cfg["ota"]["cmd_topic"] | "";
   if (strlen(customTopic) == 0) goto skip_ota_sub;
   {
@@ -123,14 +131,29 @@ void OTAUpdate::begin() {
 
 // ---------------------------------------------------------------------------
 
+// Non-blocking OTA trigger used by the Shell `ota.check` command and the
+// MQTT cmd_topic callback. Setting state here lets the caller return
+// immediately so CLI responses can publish before the device reboots.
+void OTAUpdate::triggerCheck(const char* manifestOverride, bool force) {
+  if (manifestOverride && strlen(manifestOverride) > 0) {
+    _pendingManifestUrl = manifestOverride;
+  } else {
+    _pendingManifestUrl = "";
+  }
+  _forceRequested = force;
+  _checkRequested = true;
+}
+
 // Periodically check for updates or handle MQTT-triggered checks
 void OTAUpdate::loop() {
   // Handle deferred MQTT-triggered check (runs outside MQTT callback context).
   if (_checkRequested) {
     _checkRequested = false;
+    bool force = _forceRequested;
+    _forceRequested = false;
     const char* override = _pendingManifestUrl.length() > 0
                              ? _pendingManifestUrl.c_str() : nullptr;
-    check(override);
+    check(override, force);
     _pendingManifestUrl = "";
     return;
   }
@@ -161,8 +184,12 @@ void OTAUpdate::loop() {
 
 // ---------------------------------------------------------------------------
 
-// Fetch manifest, compare versions, and apply update if newer
-void OTAUpdate::check(const char* manifestOverride) {
+// Fetch manifest, compare versions, and apply update if newer.
+// `force=true` bypasses the isNewer() check so the device re-flashes whatever
+// the manifest points at even if the remote version equals the local one.
+// Intended for dev iteration (avoids bumping FIRMWARE_VERSION every cycle)
+// and for recovering from a stuck state without a version bump.
+void OTAUpdate::check(const char* manifestOverride, bool force) {
   if (!WiFiManager::connected()) {
     Log::warn(TAG, "No WiFi - skipping OTA check");
     return;
@@ -178,7 +205,7 @@ void OTAUpdate::check(const char* manifestOverride) {
     return;
   }
 
-  Log::info(TAG, "Checking for update...");
+  Log::info(TAG, force ? "Checking for update (FORCED)..." : "Checking for update...");
 
   String remoteVersion, binUrl, sha256;
   if (!fetchManifest(url, remoteVersion, binUrl, sha256)) {
@@ -191,9 +218,12 @@ void OTAUpdate::check(const char* manifestOverride) {
            remoteVersion.c_str(), FIRMWARE_VERSION);
   Log::info(TAG, msg);
 
-  if (!isNewer(remoteVersion.c_str(), FIRMWARE_VERSION)) {
+  if (!force && !isNewer(remoteVersion.c_str(), FIRMWARE_VERSION)) {
     Log::info(TAG, "Already up to date");
     return;
+  }
+  if (force && !isNewer(remoteVersion.c_str(), FIRMWARE_VERSION)) {
+    Log::warn(TAG, "Force flag set - re-flashing same or older version");
   }
 
   snprintf(msg, sizeof(msg), "Updating to %s from %.80s",
@@ -226,6 +256,11 @@ void OTAUpdate::check(const char* manifestOverride) {
 // ---------------------------------------------------------------------------
 
 // Download and parse the OTA manifest JSON from a URL
+// Fetch the manifest JSON. Belt-and-braces watchdog feeding + tight timeouts
+// so a stall here (TLS handshake, hung socket read on a flaky upstream)
+// cannot block this task long enough to trip TWDT. configureSecureClient
+// already sets 10 s socket + handshake timeouts on the local WiFiClientSecure;
+// this wraps the whole fetch in the same defensive envelope as applyUpdate().
 bool OTAUpdate::fetchManifest(const char* url,
                                String& version, String& binUrl, String& sha256) {
   HTTPClient http;
@@ -242,9 +277,17 @@ bool OTAUpdate::fetchManifest(const char* url,
   }
 
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.setTimeout(15000);
+  http.setConnectTimeout(10000);  // ms - cap connect phase
+  http.setTimeout(10000);         // ms - cap per-read wait
+
+  yield();
+  esp_task_wdt_reset();
 
   int code = http.GET();
+
+  yield();
+  esp_task_wdt_reset();
+
   if (code != 200) {
     char msg[64];
     snprintf(msg, sizeof(msg), "Manifest HTTP %d", code);
@@ -255,6 +298,9 @@ bool OTAUpdate::fetchManifest(const char* url,
 
   String body = http.getString();
   http.end();
+
+  yield();
+  esp_task_wdt_reset();
 
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, body);
@@ -359,6 +405,13 @@ bool OTAUpdate::applyUpdate(const String& binUrl, const String& expectedSha256) 
 
     remaining -= bytesRead;
     written += bytesRead;
+
+    // Feed both watchdogs every chunk. A slow readBytes() on a weak link
+    // plus the per-chunk Update.write() flash time can stack past the ~5s
+    // task watchdog window and panic-reboot mid-flash, leaving the new
+    // partition never marked bootable.
+    yield();
+    esp_task_wdt_reset();
 
     if ((written % 65536) < 1024) {
       snprintf(msg, sizeof(msg), "Progress: %d / %d bytes (%d%%)",
