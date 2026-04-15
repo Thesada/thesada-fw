@@ -52,10 +52,18 @@ Full documentation: [thesada.io/firmware/fw-index](https://thesada.io/firmware/)
 **Shell CLI**
 - 30+ commands across serial, WebSocket, HTTP, and MQTT - same handler, zero duplication
 - Commands: filesystem, config, network diagnostics, Lua exec, OTA trigger, selftest, battery, sensors, module status
+- Debug CLI: `ota.status`, `boot.info`, `partitions`, `chip.info`, `sdkconfig`, `net.mqtt` (subscription table + RX ring of recent topics) for remote-debug sessions without serial access
 
 **OTA**
 - Push: upload `.bin` via web dashboard or curl
 - Pull: JSON manifest with SHA256 verification, periodic check + MQTT trigger
+- Watchdog-safe download loop: `yield()` + `esp_task_wdt_reset()` after every chunk + short socket/handshake timeouts keep fetchManifest and applyUpdate from stalling past the task watchdog on flaky wireless links
+- `ota.check [--force] [url]` shell command: accessible over MQTT CLI (`<prefix>/cli/ota.check`), serial, WebSocket, HTTP. `--force` bypasses version check for dev iteration and stuck-device recovery. Deferred execution so the CLI response publishes before the reboot
+- PSRAM routing: when `BOARD_HAS_PSRAM` is set, large allocations (CA cert, heap-hungry buffers) go to external PSRAM to keep the internal heap free for TLS context allocation
+
+**Telemetry**
+- Heap + PSRAM telemetry: free / min free / max alloc block / psram free published to MQTT every 5 min with HA auto-discovery for each metric
+- Every Telegram alert tagged with `[heap=N]` for post-mortem correlation
 
 **Security**
 - Bearer token auth: `POST /api/login` returns a 1-hour token (max 4 concurrent, auto-evict oldest)
