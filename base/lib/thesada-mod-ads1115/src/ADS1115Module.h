@@ -22,7 +22,7 @@ enum class ADS1115Mux : uint8_t {
 
 // One configured input channel.
 struct ADS1115Channel {
-  char        name[32];    // human name (e.g. "house_pump")
+  char        name[32];    // human label, e.g. "pump_a" or "ct1"
   ADS1115Mux  mux;         // resolved mux mode
   float       gain;        // PGA full-scale in V (e.g. 1.024)
   adsGain_t   gainEnum;    // resolved Adafruit gain constant
