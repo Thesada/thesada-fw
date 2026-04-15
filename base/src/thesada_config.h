@@ -91,6 +91,28 @@
   #undef BOARD_LILYGO_T_SIM7080_S3
 #endif
 
+// OWB rescue build - minimal firmware for remote unbricking via OTA on a
+// weak link. Keeps PMU (mandatory for VBUS accept) + core (WiFi/MQTT/OTA).
+// Strips every optional module to shrink the binary so it has a fighting
+// chance to complete download before a readBytes() stall trips the TWDT.
+// Inherits LILYGO_T_SIM7080_S3 pinout (no board flag set, default applies).
+#ifdef BOARD_OWB_RESCUE
+  #undef ENABLE_TEMPERATURE
+  #undef ENABLE_SHT31
+  #undef ENABLE_ADS1115
+  #undef ENABLE_BATTERY
+  #undef ENABLE_SD
+  #undef ENABLE_CELLULAR
+  #undef ENABLE_TELEGRAM
+  #undef ENABLE_WEBSERVER
+  #undef ENABLE_LITESERVER
+  #undef ENABLE_SCRIPTENGINE
+  #undef ENABLE_PWM
+  #undef ENABLE_DISPLAY
+  #undef ENABLE_TFT
+  // ENABLE_PMU stays - AXP2101 must be initialized or board rejects VBUS
+#endif
+
 // CYD is a display-only node with TFT touch, RGB LED, LDR.
 // LiteServer replaces full WebServer (not enough heap for AsyncTCP on WROOM-32).
 #ifdef BOARD_CYD
