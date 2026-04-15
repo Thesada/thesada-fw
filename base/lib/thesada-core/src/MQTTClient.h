@@ -59,6 +59,7 @@ private:
   static void resubscribeAll();
   static void publishDiscovery();
   static void publishHeapStats();
+  static void publishDeviceInfo();
 
 public:
   // Sampled at the most recent publishHeapStats() call, or live if never.

@@ -9,6 +9,7 @@
 #include <LittleFS.h>
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
+#include <esp_chip_info.h>
 
 static const char* TAG = "MQTT";
 
@@ -266,6 +267,7 @@ void MQTTClient::connect() {
     _client.publish(availTopic, "online", true);
     resubscribeAll();
     publishDiscovery();
+    publishDeviceInfo();
     flushQueue();
   } else {
     char err[64];
@@ -770,6 +772,84 @@ void MQTTClient::publishHeapStats() {
 
   _lastHeapPublishMs = millis();
 }
+
+// ---------------------------------------------------------------------------
+
+// Publish a retained JSON blob to <prefix>/info describing the firmware and
+// hardware: version, chip model/rev, board flag, MAC, PSRAM presence, build
+// timestamp. Called once per successful reconnect from connect(). Retained
+// so a fresh MQTT subscriber gets the device metadata immediately without
+// waiting for the next boot.
+void MQTTClient::publishDeviceInfo() {
+  if (!_client.connected()) return;
+
+  JsonObject cfg = Config::get();
+  const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+
+  const char* board =
+#if defined(BOARD_OWB_RESCUE)
+    "owb-rescue";
+#elif defined(BOARD_S3_BARE)
+    "s3-bare";
+#elif defined(BOARD_CYD)
+    "cyd";
+#elif defined(BOARD_WROOM)
+    "wroom";
+#elif defined(BOARD_ETH)
+    "eth";
+#else
+    "unknown";
+#endif
+
+  esp_chip_info_t chip;
+  esp_chip_info(&chip);
+  const char* chipModel = "unknown";
+  switch (chip.model) {
+    case CHIP_ESP32:   chipModel = "esp32";    break;
+    case CHIP_ESP32S2: chipModel = "esp32-s2"; break;
+    case CHIP_ESP32S3: chipModel = "esp32-s3"; break;
+    case CHIP_ESP32C3: chipModel = "esp32-c3"; break;
+    default: break;
+  }
+
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02x:%02x:%02x:%02x:%02x:%02x",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+  bool psram = false;
+#if defined(BOARD_HAS_PSRAM)
+  psram = psramFound();
+#endif
+
+  char payload[384];
+  snprintf(payload, sizeof(payload),
+    "{\"firmware_version\":\"%s\","
+    "\"hardware_type\":\"%s\","
+    "\"board\":\"%s\","
+    "\"chip_model\":\"%s\","
+    "\"chip_revision\":%d,"
+    "\"chip_cores\":%d,"
+    "\"mac\":\"%s\","
+    "\"psram\":%s,"
+    "\"build_time\":\"%s %s\"}",
+    FIRMWARE_VERSION,
+    chipModel,
+    board,
+    chipModel,
+    chip.revision,
+    chip.cores,
+    macStr,
+    psram ? "true" : "false",
+    __DATE__, __TIME__);
+
+  char topic[96];
+  snprintf(topic, sizeof(topic), "%s/info", prefix);
+  _client.publish(topic, payload, true);
+}
+
+// ---------------------------------------------------------------------------
 
 // Returns the most recently sampled free heap (from the 5 min publish), or
 // a live read if the sampler has not run yet. Used by alert tagging.
