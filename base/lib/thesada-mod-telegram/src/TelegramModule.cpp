@@ -14,6 +14,7 @@
 #include <Config.h>
 #include <EventBus.h>
 #include <WiFiManager.h>
+#include <MQTTClient.h>
 #include <Log.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
@@ -129,13 +130,21 @@ bool TelegramModule::sendTo(const char* chatId, const char* message) {
 
 // ---------------------------------------------------------------------------
 
-// Broadcast a message to all configured chat IDs, EventBus, and optional webhook
+// Broadcast a message to all configured chat IDs, EventBus, and optional webhook.
+// Appends `[heap=N]` to the outbound message so every alert carries a heap
+// breadcrumb. MQTT+TLS+Telegram+TLS concurrency is the most likely failure
+// mode for this device class, and the heap value at the moment of alert is
+// the single most useful datapoint for diagnosing it.
 bool TelegramModule::send(const char* message) {
   if (!_ready) { Log::warn(TAG, "not ready"); return false; }
 
+  char tagged[256];
+  snprintf(tagged, sizeof(tagged), "%s [heap=%lu]",
+           message, (unsigned long)MQTTClient::currentFreeHeap());
+
   // Publish alert event - MQTTClient and CellularModule subscribe to this.
   JsonDocument doc;
-  doc["value"] = message;
+  doc["value"] = tagged;
   EventBus::publish("alert", doc.as<JsonObject>());
 
   // Send to all configured chat_ids (supports both array and object format).

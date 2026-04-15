@@ -58,6 +58,13 @@ private:
   static void onMessage(char* topic, uint8_t* payload, unsigned int length);
   static void resubscribeAll();
   static void publishDiscovery();
+  static void publishHeapStats();
+
+public:
+  // Sampled at the most recent publishHeapStats() call, or live if never.
+  // Used by alert paths (Telegram tagging) so every outbound alert carries
+  // an observability breadcrumb.
+  static uint32_t currentFreeHeap();
 
 #ifdef MQTT_TLS
   static WiFiClientSecure _wifiClient;
@@ -90,7 +97,20 @@ private:
   static uint32_t      _connectedSinceMs;   // millis() when current connection was established
   static bool          _insecureFallback;   // true if connected without cert validation (NTP not synced)
 
+  static uint32_t      _lastHeapPublishMs;  // millis() of last heap stats publish
+  static uint32_t      _lastHeapFree;       // last sampled ESP.getFreeHeap() for alert tagging
+
+  // Debug RX ring - last 8 received topics + timestamps, oldest-overwrite.
+  // Used by `net.mqtt rx` to see what actually arrives at onMessage - helps
+  // diagnose broker-side delivery vs client-side dispatch bugs.
+  static constexpr uint8_t RX_RING_SIZE = 8;
+  static char     _rxRing[RX_RING_SIZE][96];
+  static uint32_t _rxRingTs[RX_RING_SIZE];
+  static uint8_t  _rxRingHead;
+  static uint8_t  _rxRingCount;
+
   static constexpr uint32_t RETRY_MIN_MS   = 2000;
   static constexpr uint32_t RETRY_MAX_MS   = 60000;
   static constexpr uint32_t WATCHDOG_MS    = 600000;  // 10 min - force reconnect if no activity
+  static constexpr uint32_t HEAP_PUBLISH_MS = 300000; // 5 min - periodic heap telemetry
 };

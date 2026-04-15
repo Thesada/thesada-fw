@@ -14,7 +14,13 @@ static const char* TAG = "MQTT";
 
 #ifdef MQTT_TLS
 WiFiClientSecure MQTTClient::_wifiClient;
-static String    _caCertStr;  // holds cert loaded from LittleFS (if present)
+// CA cert buffer - routed to PSRAM when BOARD_HAS_PSRAM is defined, falling
+// back to internal heap otherwise. Raw char* + length instead of Arduino
+// String so we can use heap_caps_malloc(MALLOC_CAP_SPIRAM) directly and
+// avoid paying ~2 KB of internal SRAM for a cert that only matters during
+// TLS handshake.
+static char*     _caCert    = nullptr;
+static size_t    _caCertLen = 0;
 #else
 WiFiClient       MQTTClient::_wifiClient;
 #endif
@@ -39,6 +45,13 @@ DeferredCLI      MQTTClient::_deferred = { "", nullptr, 0, false };
 uint32_t         MQTTClient::_lastSuccessMs    = 0;
 uint32_t         MQTTClient::_connectedSinceMs = 0;
 bool             MQTTClient::_insecureFallback = false;
+uint32_t         MQTTClient::_lastHeapPublishMs = 0;
+uint32_t         MQTTClient::_lastHeapFree      = 0;
+
+char             MQTTClient::_rxRing[MQTTClient::RX_RING_SIZE][96] = {};
+uint32_t         MQTTClient::_rxRingTs[MQTTClient::RX_RING_SIZE]    = {};
+uint8_t          MQTTClient::_rxRingHead  = 0;
+uint8_t          MQTTClient::_rxRingCount = 0;
 
 // ---------------------------------------------------------------------------
 
@@ -76,16 +89,41 @@ void MQTTClient::begin() {
   _wifiClient.setHandshakeTimeout(10);  // ssl handshake, always seconds
 
   // CA cert must be present as /ca.crt on LittleFS.
-  // If missing, TLS connection proceeds without cert verification (insecure).
+  // Allocate the cert buffer in PSRAM when available (keeps ~2 KB off the
+  // internal heap, where it matters more under MQTT+Telegram fragmentation).
+  // Falls back to internal heap via plain malloc on non-PSRAM targets.
   if (LittleFS.exists("/ca.crt")) {
     File cf = LittleFS.open("/ca.crt", "r");
-    if (cf) { _caCertStr = cf.readString(); cf.close(); Log::info(TAG, "CA cert loaded from /ca.crt"); }
+    if (cf) {
+      size_t sz = cf.size();
+      if (sz > 0) {
+#if defined(BOARD_HAS_PSRAM)
+        _caCert = (char*)heap_caps_malloc(sz + 1, MALLOC_CAP_SPIRAM);
+        const char* heapTag = "PSRAM";
+#else
+        _caCert = (char*)malloc(sz + 1);
+        const char* heapTag = "heap";
+#endif
+        if (_caCert) {
+          size_t readBytes = cf.readBytes(_caCert, sz);
+          _caCert[readBytes] = '\0';
+          _caCertLen = readBytes;
+          char msg[96];
+          snprintf(msg, sizeof(msg), "CA cert loaded from /ca.crt (%u B in %s)",
+                   (unsigned)readBytes, heapTag);
+          Log::info(TAG, msg);
+        } else {
+          Log::error(TAG, "CA cert alloc failed");
+        }
+      }
+      cf.close();
+    }
   }
-  if (_caCertStr.isEmpty()) {
+  if (!_caCert || _caCertLen == 0) {
     Log::warn(TAG, "No /ca.crt - TLS without cert verification");
     _wifiClient.setInsecure();
   } else {
-    _wifiClient.setCACert(_caCertStr.c_str());
+    _wifiClient.setCACert(_caCert);
   }
 #endif
 
@@ -178,7 +216,7 @@ void MQTTClient::connect() {
   // cert looks expired). Temporarily use insecure mode and reconnect with proper
   // validation once NTP syncs in the background.
   time_t now = time(nullptr);
-  if (now < 1700000000 && !_caCertStr.isEmpty()) {
+  if (now < 1700000000 && _caCert && _caCertLen > 0) {
     if (!_insecureFallback) {
       Log::warn(TAG, "NTP not synced - connecting without cert validation");
       _wifiClient.setInsecure();
@@ -187,7 +225,7 @@ void MQTTClient::connect() {
   } else if (_insecureFallback && now > 1700000000 && ESP.getFreeHeap() > 40000) {
     // NTP synced since last attempt - restore cert validation
     Log::info(TAG, "NTP synced - restoring cert validation");
-    _wifiClient.setCACert(_caCertStr.c_str());
+    _wifiClient.setCACert(_caCert);
     _insecureFallback = false;
   } else if (_insecureFallback && now > 1700000000) {
     // NTP synced but not enough heap for TLS - stay insecure
@@ -288,6 +326,13 @@ void MQTTClient::loop() {
 
     _client.loop();
     _lastSuccessMs = millis();  // MQTT loop succeeded (keepalive worked)
+
+    // Periodic heap telemetry. Runs on the MQTT loop
+    // cadence but only when the 5 min interval has elapsed, so we get no
+    // more than 288 publishes/day per metric.
+    if (_lastHeapPublishMs == 0 || (now - _lastHeapPublishMs) >= HEAP_PUBLISH_MS) {
+      publishHeapStats();
+    }
 
     // Drain queued messages, respecting minimum send interval.
     if (_queueCount > 0) {
@@ -390,6 +435,15 @@ void MQTTClient::onMessage(char* topic, uint8_t* payload, unsigned int length) {
   if (!payloadBuf) return;
   memcpy(payloadBuf, payload, length);
   payloadBuf[length] = '\0';
+
+  // Debug RX ring: capture every received topic so `net.mqtt rx` can show it.
+  // Helps narrow broker-side delivery vs client-side dispatch when a
+  // subscription is active but its callback never fires.
+  strncpy(_rxRing[_rxRingHead], topic, sizeof(_rxRing[0]) - 1);
+  _rxRing[_rxRingHead][sizeof(_rxRing[0]) - 1] = '\0';
+  _rxRingTs[_rxRingHead] = millis();
+  _rxRingHead = (_rxRingHead + 1) % RX_RING_SIZE;
+  if (_rxRingCount < RX_RING_SIZE) _rxRingCount++;
 
   // Route to matching subscription callbacks (exact or wildcard # match).
   for (uint8_t i = 0; i < _subCount; i++) {
@@ -652,7 +706,76 @@ void MQTTClient::publishDiscovery() {
     _client.publish(t, WiFi.localIP().toString().c_str());
   }
 
+  // -- Heap + PSRAM diagnostics --
+  snprintf(uid, sizeof(uid), "%s_heap_free", devId);
+  snprintf(stBuf, sizeof(stBuf), "%s/sensor/heap/free", prefix);
+  disc("sensor", uid, "Free Heap", stBuf, "B", "", "measurement", "diagnostic");
+
+  snprintf(uid, sizeof(uid), "%s_heap_min_free", devId);
+  snprintf(stBuf, sizeof(stBuf), "%s/sensor/heap/min_free", prefix);
+  disc("sensor", uid, "Min Free Heap", stBuf, "B", "", "measurement", "diagnostic");
+
+  snprintf(uid, sizeof(uid), "%s_heap_max_alloc_block", devId);
+  snprintf(stBuf, sizeof(stBuf), "%s/sensor/heap/max_alloc_block", prefix);
+  disc("sensor", uid, "Max Alloc Block", stBuf, "B", "", "measurement", "diagnostic");
+
+  snprintf(uid, sizeof(uid), "%s_heap_psram_free", devId);
+  snprintf(stBuf, sizeof(stBuf), "%s/sensor/heap/psram_free", prefix);
+  disc("sensor", uid, "Free PSRAM", stBuf, "B", "", "measurement", "diagnostic");
+
+  // Publish first heap sample immediately so HA has values on discovery.
+  publishHeapStats();
+
   Log::info(TAG, "HA discovery published");
+}
+
+// ---------------------------------------------------------------------------
+
+// Publish free heap, min free heap, max alloc block, and free PSRAM to
+// <prefix>/sensor/heap/*. Called on a 5 min timer from loop() and once from
+// publishDiscovery() for immediate HA visibility. Last sampled free heap is
+// cached in _lastHeapFree for alert tagging via currentFreeHeap().
+void MQTTClient::publishHeapStats() {
+  if (!_client.connected()) return;
+
+  JsonObject cfg = Config::get();
+  const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+
+  uint32_t freeHeap   = ESP.getFreeHeap();
+  uint32_t minFree    = ESP.getMinFreeHeap();
+  uint32_t maxAlloc   = ESP.getMaxAllocHeap();
+  uint32_t freePsram  = 0;
+#if defined(BOARD_HAS_PSRAM)
+  if (psramFound()) freePsram = ESP.getFreePsram();
+#endif
+  _lastHeapFree = freeHeap;
+
+  char topic[96], value[16];
+
+  snprintf(topic, sizeof(topic), "%s/sensor/heap/free", prefix);
+  snprintf(value, sizeof(value), "%lu", (unsigned long)freeHeap);
+  _client.publish(topic, value);
+
+  snprintf(topic, sizeof(topic), "%s/sensor/heap/min_free", prefix);
+  snprintf(value, sizeof(value), "%lu", (unsigned long)minFree);
+  _client.publish(topic, value);
+
+  snprintf(topic, sizeof(topic), "%s/sensor/heap/max_alloc_block", prefix);
+  snprintf(value, sizeof(value), "%lu", (unsigned long)maxAlloc);
+  _client.publish(topic, value);
+
+  snprintf(topic, sizeof(topic), "%s/sensor/heap/psram_free", prefix);
+  snprintf(value, sizeof(value), "%lu", (unsigned long)freePsram);
+  _client.publish(topic, value);
+
+  _lastHeapPublishMs = millis();
+}
+
+// Returns the most recently sampled free heap (from the 5 min publish), or
+// a live read if the sampler has not run yet. Used by alert tagging.
+uint32_t MQTTClient::currentFreeHeap() {
+  if (_lastHeapFree > 0) return _lastHeapFree;
+  return ESP.getFreeHeap();
 }
 
 // ---------------------------------------------------------------------------
