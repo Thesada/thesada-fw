@@ -6,6 +6,7 @@
 #include "WiFiManager.h"
 #include "Log.h"
 #include "Shell.h"
+#include "OTAUpdate.h"
 #include <LittleFS.h>
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
@@ -48,6 +49,7 @@ uint32_t         MQTTClient::_connectedSinceMs = 0;
 bool             MQTTClient::_insecureFallback = false;
 uint32_t         MQTTClient::_lastHeapPublishMs = 0;
 uint32_t         MQTTClient::_lastHeapFree      = 0;
+bool             MQTTClient::_reinitPending     = false;
 
 char             MQTTClient::_rxRing[MQTTClient::RX_RING_SIZE][96] = {};
 uint32_t         MQTTClient::_rxRingTs[MQTTClient::RX_RING_SIZE]    = {};
@@ -297,6 +299,18 @@ void MQTTClient::loop() {
   // Process deferred CLI command outside the PubSubClient callback context.
   if (_deferred.pending) {
     processDeferredCLI();
+  }
+
+  // Deferred reconnect after reinitSubscriptions() - runs on a clean stack
+  // so TLS handshake has enough room (~10KB for mbedtls).
+  if (_reinitPending) {
+    _reinitPending = false;
+    JsonObject  cfgR = Config::get();
+    const char* host = cfgR["mqtt"]["broker"] | "";
+    uint16_t    port = cfgR["mqtt"]["port"]   | 8883;
+    _client.setServer(host, port);
+    _retryInterval = RETRY_MIN_MS;
+    connect();
   }
 
   if (_client.connected()) {
@@ -559,6 +573,55 @@ cleanup:
 }
 
 // ---------------------------------------------------------------------------
+
+// Clear subscriptions and re-register core MQTT topics (cli/#, cmd/ota)
+// with the current config prefix. Called after config.reload when network
+// keys changed. Does NOT re-register EventBus handlers or reload TLS certs.
+void MQTTClient::reinitSubscriptions() {
+  for (int i = 0; i < MQTT_MAX_SUBS; i++) _subs[i].active = false;
+  _subCount = 0;
+
+  JsonObject  cfg    = Config::get();
+  const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+  char cliTopic[64];
+  snprintf(cliTopic, sizeof(cliTopic), "%s/cli/#", prefix);
+
+  static char _cliPrefix[64];
+  snprintf(_cliPrefix, sizeof(_cliPrefix), "%s/cli/", prefix);
+  static size_t _cliPrefixLen = strlen(_cliPrefix);
+
+  MQTTClient::subscribe(cliTopic, [](const char* topic, const char* payload) {
+    if (_deferred.pending) {
+      Log::warn("MQTT", "CLI busy - command dropped");
+      return;
+    }
+    strncpy(_deferred.topic, topic, sizeof(_deferred.topic) - 1);
+    _deferred.topic[sizeof(_deferred.topic) - 1] = '\0';
+
+    size_t plen = payload ? strlen(payload) : 0;
+    if (_deferred.payload) { free(_deferred.payload); _deferred.payload = nullptr; }
+    if (plen > 0) {
+      _deferred.payload = (char*)malloc(plen + 1);
+      if (_deferred.payload) {
+        memcpy(_deferred.payload, payload, plen);
+        _deferred.payload[plen] = '\0';
+        _deferred.length = plen;
+      }
+    } else {
+      _deferred.payload = nullptr;
+      _deferred.length = 0;
+    }
+    _deferred.pending = true;
+  });
+
+  OTAUpdate::begin();
+
+  if (_client.connected()) {
+    _client.disconnect();
+    Log::info(TAG, "Disconnected for subscription reinit");
+  }
+  _reinitPending = true;
+}
 
 // Re-subscribe all active topics after reconnect
 void MQTTClient::resubscribeAll() {

@@ -41,6 +41,7 @@ struct DeferredCLI {
 class MQTTClient {
 public:
   static void begin();
+  static void reinitSubscriptions();
   static void loop();
   static void publish(const char* topic, const char* payload);
   static void publishRetained(const char* topic, const char* payload);
@@ -109,6 +110,8 @@ public:
   static uint32_t _rxRingTs[RX_RING_SIZE];
   static uint8_t  _rxRingHead;
   static uint8_t  _rxRingCount;
+
+  static bool          _reinitPending;
 
   static constexpr uint32_t RETRY_MIN_MS   = 2000;
   static constexpr uint32_t RETRY_MAX_MS   = 60000;

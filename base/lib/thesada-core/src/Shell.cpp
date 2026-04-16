@@ -348,11 +348,36 @@ static void cmd_config_save(int argc, char** argv, ShellOutput out) {
   out(msg);
 }
 
-// Reload config from flash into memory
+// Reload config from flash. If network-affecting keys changed, reinit MQTT
+// subscriptions and reconnect (reload-or-restart, like systemd).
 static void cmd_config_reload(int argc, char** argv, ShellOutput out) {
+  JsonObject oldCfg = Config::get();
+  char oldPrefix[64], oldBroker[64], oldUser[64], oldPass[64], oldOtaTopic[96];
+  uint16_t oldPort;
+  strncpy(oldPrefix,   oldCfg["mqtt"]["topic_prefix"] | "thesada/node", sizeof(oldPrefix));
+  strncpy(oldBroker,   oldCfg["mqtt"]["broker"]       | "",             sizeof(oldBroker));
+  strncpy(oldUser,     oldCfg["mqtt"]["user"]          | "",             sizeof(oldUser));
+  strncpy(oldPass,     oldCfg["mqtt"]["password"]      | "",             sizeof(oldPass));
+  strncpy(oldOtaTopic, oldCfg["ota"]["cmd_topic"]      | "",             sizeof(oldOtaTopic));
+  oldPort = oldCfg["mqtt"]["port"] | 8883;
+
   Config::load();
   JsonObject cfg = Config::get();
   const char* name = cfg["device"]["name"] | "?";
+
+  bool networkChanged =
+    strcmp(oldPrefix,   cfg["mqtt"]["topic_prefix"] | "thesada/node") != 0 ||
+    strcmp(oldBroker,   cfg["mqtt"]["broker"]       | "")             != 0 ||
+    strcmp(oldUser,     cfg["mqtt"]["user"]          | "")             != 0 ||
+    strcmp(oldPass,     cfg["mqtt"]["password"]      | "")             != 0 ||
+    strcmp(oldOtaTopic, cfg["ota"]["cmd_topic"]      | "")             != 0 ||
+    oldPort != (cfg["mqtt"]["port"] | 8883);
+
+  if (networkChanged) {
+    out("Network config changed - reinitializing MQTT subscriptions");
+    MQTTClient::reinitSubscriptions();
+  }
+
   char msg[96];
   snprintf(msg, sizeof(msg), "Config reloaded from /config.json (device: %s)", name);
   out(msg);
