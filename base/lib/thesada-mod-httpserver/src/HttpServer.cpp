@@ -654,10 +654,13 @@ void HttpServer::setupRoutes() {
   _ws.onEvent([](AsyncWebSocket* srv, AsyncWebSocketClient* client,
                  AwsEventType type, void* arg, uint8_t* data, size_t len) {
     if (type == WS_EVT_CONNECT) {
-      // Require prior GET /api/ws/token (auth-gated). Checks by client IP - no
-      // query-param parsing needed (unreliable on WS upgrade in ESPAsyncWebServer 3.x).
-      AsyncWebServerRequest* req = (AsyncWebServerRequest*)arg;
-      String ip = req->client()->remoteIP().toString();
+      // Use the AsyncWebSocketClient lambda param for remoteIP(), not
+      // req->client(). On WS_EVT_CONNECT the underlying lwIP pcb has
+      // already been transferred from the HTTP request's AsyncClient to
+      // the new AsyncWebSocketClient via _switchClient, so
+      // req->client()->_pcb is NULL and the old API null-derefs in
+      // AsyncClient::getRemoteAddress().
+      String ip = client->remoteIP().toString();
       if (!_consumeWsAuth(ip)) {
         Log::warn(TAG, "WS: rejected - not pre-authorized");
         client->close();
@@ -680,6 +683,15 @@ void HttpServer::setupRoutes() {
         }
       }
     } else if (type == WS_EVT_DATA) {
+      // Only accept final, unfragmented text frames. On WS_EVT_DATA the
+      // arg pointer is an AwsFrameInfo* describing the current frame.
+      // Without this check we'd pass binary opcodes, fragment headers
+      // or partial text chunks straight to Shell::execute as garbage.
+      AwsFrameInfo* info = (AwsFrameInfo*)arg;
+      if (!info || !info->final || info->index != 0 || info->len != len ||
+          info->opcode != WS_TEXT) {
+        return;
+      }
       String cmd = String((char*)data, len);
       cmd.trim();
       if (cmd.length() > 0) {
