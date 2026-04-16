@@ -225,6 +225,9 @@ document.getElementById('authPass').addEventListener('keydown', e => {
   if (e.key === 'Enter') authSubmit();
 });
 
+const _escEl = document.createElement('span');
+function esc(s) { _escEl.textContent = s; return _escEl.innerHTML; }
+
 function show(id, btn) {
   document.getElementById('adminNav').style.display = 'none';
   document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
@@ -278,16 +281,53 @@ function refreshState() {
         if (typeof val === 'object' && val !== null) {
           if (Array.isArray(val.sensors)) {
             val.sensors.forEach(s => {
-              html += `<tr><td>${s.name || s.address}</td>
-                           <td class="val">${s.temp_c ?? '-'} °C</td>
-                           <td>${now}</td></tr>`;
+              const sensorName = esc(s.name || s.address || key);
+              const metrics = [];
+              const addMetric = (metricKey, label, unit) => {
+                const v = s[metricKey];
+                if (v === undefined || v === null) return;
+                metrics.push({ label: label, value: unit ? `${v} ${unit}` : String(v) });
+              };
+
+              if (s.temp !== undefined && s.temp !== null) {
+                const unit = (s.temp_c !== undefined && s.temp !== s.temp_c) ? '\u00B0F' : '\u00B0C';
+                addMetric('temp', 'temperature', unit);
+              } else {
+                addMetric('temp_c', 'temperature', '\u00B0C');
+              }
+              addMetric('humidity', 'humidity', '%');
+              addMetric('current_a', 'current', 'A');
+              addMetric('voltage_v', 'voltage', 'V');
+              addMetric('power_w', 'power', 'W');
+              addMetric('percent', 'percent', '%');
+
+              const known = new Set(['name', 'address', 'temp', 'temp_c', 'humidity', 'current_a', 'voltage_v', 'power_w', 'percent']);
+              Object.entries(s).forEach(([metricKey, raw]) => {
+                if (known.has(metricKey)) return;
+                if (raw === undefined || raw === null) return;
+                if (typeof raw === 'object') return;
+                metrics.push({ label: esc(metricKey.replace(/_/g, ' ')), value: esc(String(raw)) });
+              });
+
+              if (!metrics.length) {
+                html += `<tr><td>${sensorName}</td>
+                             <td class="val">-</td>
+                             <td>${now}</td></tr>`;
+                return;
+              }
+
+              metrics.forEach(m => {
+                html += `<tr><td>${sensorName} - ${m.label}</td>
+                             <td class="val">${m.value}</td>
+                             <td>${now}</td></tr>`;
+              });
             });
           } else if (Array.isArray(val.channels)) {
             val.channels.forEach(c => {
               const a = c.current_a !== undefined ? c.current_a + ' A' : '-';
               const w = c.power_w !== undefined ? c.power_w + ' W' : '-';
               const v = c.voltage_v !== undefined ? c.voltage_v + ' V' : '-';
-              html += `<tr><td>${c.name}</td>
+              html += `<tr><td>${esc(c.name)}</td>
                            <td class="val">${a} &nbsp; ${w} &nbsp; <span style="color:#888">${v}</span></td>
                            <td>${now}</td></tr>`;
             });
