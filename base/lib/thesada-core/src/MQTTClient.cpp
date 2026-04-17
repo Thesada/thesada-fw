@@ -8,6 +8,7 @@
 #include "Shell.h"
 #include "OTAUpdate.h"
 #include <LittleFS.h>
+#include <mbedtls/sha256.h>
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
 #include <esp_chip_info.h>
@@ -497,8 +498,12 @@ void MQTTClient::processDeferredCLI() {
     const char* payload = _deferred.payload;
     size_t plen = _deferred.length;
 
-    // Special case: file.write - first line is path, rest is content.
-    if (strcmp(cmd, "file.write") == 0 && payload && plen > 0) {
+    // Special case: fs.write / fs.append / file.write (legacy alias)
+    // First line of payload is the path, rest is content.
+    // fs.write truncates (mode "w"), fs.append appends (mode "a").
+    if ((strcmp(cmd, "fs.write") == 0 || strcmp(cmd, "file.write") == 0 ||
+         strcmp(cmd, "fs.append") == 0) && payload && plen > 0) {
+      const char* mode = (strcmp(cmd, "fs.append") == 0) ? "a" : "w";
       const char* nl = strchr(payload, '\n');
       JsonDocument resp;
       resp["cmd"] = cmd;
@@ -513,13 +518,14 @@ void MQTTClient::processDeferredCLI() {
         const char* content = nl + 1;
         size_t contentLen = plen - pathLen - 1;
 
-        File f = LittleFS.open(path, "w");
+        File f = LittleFS.open(path, mode);
         if (f) {
           size_t written = f.write((const uint8_t*)content, contentLen);
           f.close();
           resp["ok"] = true;
           char msg[64];
-          snprintf(msg, sizeof(msg), "Wrote %d bytes to %s", (int)written, path);
+          snprintf(msg, sizeof(msg), "%s %d bytes to %s",
+                   mode[0] == 'a' ? "Appended" : "Wrote", (int)written, path);
           resp["output"][0] = msg;
           Log::info("MQTT", msg);
         } else {
@@ -533,6 +539,75 @@ void MQTTClient::processDeferredCLI() {
       char* rp = (char*)malloc(bufSz);
       if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
       goto cleanup;
+    }
+
+    // Special case: fs.cat with offset/length for chunked reads.
+    // Payload: "<path> <offset> <length>" - reads a byte range and returns
+    // JSON with offset, length, total, done, and data (JSON-escaped text).
+    // Without offset/length, falls through to Shell::execute (line-by-line).
+    if (strcmp(cmd, "fs.cat") == 0 && payload && plen > 0) {
+      // Parse: path offset length (space-separated)
+      char pbuf[256];
+      strncpy(pbuf, payload, min(plen, sizeof(pbuf) - 1));
+      pbuf[min(plen, sizeof(pbuf) - 1)] = '\0';
+
+      char* path = strtok(pbuf, " ");
+      char* offStr = strtok(nullptr, " ");
+      char* lenStr = strtok(nullptr, " ");
+
+      // Only handle chunked mode (with offset + length)
+      if (path && offStr && lenStr) {
+        size_t offset = (size_t)atol(offStr);
+        size_t chunkLen = (size_t)atol(lenStr);
+        if (chunkLen == 0) chunkLen = 2048;
+        if (chunkLen > 2048) chunkLen = 2048;
+
+        JsonDocument resp;
+        resp["cmd"] = cmd;
+
+        File f = LittleFS.open(path, "r");
+        if (!f) {
+          resp["ok"] = false;
+          resp["output"][0] = "File not found";
+        } else {
+          size_t total = f.size();
+          resp["ok"] = true;
+          resp["total"] = (int)total;
+          resp["offset"] = (int)offset;
+
+          if (offset >= total) {
+            resp["length"] = 0;
+            resp["done"] = true;
+            resp["data"] = "";
+          } else {
+            f.seek(offset);
+            size_t avail = total - offset;
+            size_t toRead = min(chunkLen, avail);
+            char* buf = (char*)malloc(toRead + 1);
+            if (buf) {
+              size_t got = f.read((uint8_t*)buf, toRead);
+              buf[got] = '\0';
+              resp["length"] = (int)got;
+              resp["done"] = (offset + got >= total);
+              // ArduinoJson escapes the string for JSON automatically
+              resp["data"] = buf;
+              free(buf);
+            } else {
+              resp["ok"] = false;
+              resp["output"][0] = "malloc failed";
+            }
+          }
+          f.close();
+        }
+
+        char respTopic[64];
+        snprintf(respTopic, sizeof(respTopic), "%s/cli/response", prefix);
+        size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
+        char* rp = (char*)malloc(bufSz);
+        if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
+        goto cleanup;
+      }
+      // No offset/length - fall through to Shell::execute for line-by-line
     }
 
     // Build command line: "<cmd> <payload>"
@@ -843,6 +918,44 @@ void MQTTClient::publishHeapStats() {
 // timestamp. Called once per successful reconnect from connect(). Retained
 // so a fresh MQTT subscriber gets the device metadata immediately without
 // waiting for the next boot.
+// Compute SHA256 hex digest of a string. Output buffer must be >= 65 bytes.
+// in: data, length, output buffer. out: none (writes hex string to out).
+static void sha256Hex(const char* data, size_t len, char* out) {
+  uint8_t hash[32];
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+  mbedtls_sha256_update(&ctx, (const unsigned char*)data, len);
+  mbedtls_sha256_finish(&ctx, hash);
+  mbedtls_sha256_free(&ctx);
+  for (int i = 0; i < 32; i++) sprintf(out + i * 2, "%02x", hash[i]);
+  out[64] = '\0';
+}
+
+// Compute SHA256 hex digest of a LittleFS file. Returns empty hash if missing.
+// in: file path, output buffer (>= 65 bytes). out: none.
+static void sha256File(const char* path, char* out) {
+  File f = LittleFS.open(path, "r");
+  if (!f) {
+    sha256Hex("", 0, out);
+    return;
+  }
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+  uint8_t buf[256];
+  while (f.available()) {
+    size_t n = f.read(buf, sizeof(buf));
+    mbedtls_sha256_update(&ctx, buf, n);
+  }
+  f.close();
+  uint8_t hash[32];
+  mbedtls_sha256_finish(&ctx, hash);
+  mbedtls_sha256_free(&ctx);
+  for (int i = 0; i < 32; i++) sprintf(out + i * 2, "%02x", hash[i]);
+  out[64] = '\0';
+}
+
 void MQTTClient::publishDeviceInfo() {
   if (!_client.connected()) return;
 
@@ -886,7 +999,17 @@ void MQTTClient::publishDeviceInfo() {
   psram = psramFound();
 #endif
 
-  char payload[384];
+  // Compute config + script hashes for drift detection
+  char configHash[65], mainHash[65], rulesHash[65];
+  {
+    String cfgJson;
+    serializeJson(Config::get(), cfgJson);
+    sha256Hex(cfgJson.c_str(), cfgJson.length(), configHash);
+  }
+  sha256File("/scripts/main.lua", mainHash);
+  sha256File("/scripts/rules.lua", rulesHash);
+
+  char payload[640];
   snprintf(payload, sizeof(payload),
     "{\"firmware_version\":\"%s\","
     "\"hardware_type\":\"%s\","
@@ -896,7 +1019,10 @@ void MQTTClient::publishDeviceInfo() {
     "\"chip_cores\":%d,"
     "\"mac\":\"%s\","
     "\"psram\":%s,"
-    "\"build_time\":\"%s %s\"}",
+    "\"build_time\":\"%s %s\","
+    "\"config_hash\":\"%s\","
+    "\"scripts_main_hash\":\"%s\","
+    "\"scripts_rules_hash\":\"%s\"}",
     FIRMWARE_VERSION,
     chipModel,
     board,
@@ -905,7 +1031,10 @@ void MQTTClient::publishDeviceInfo() {
     chip.cores,
     macStr,
     psram ? "true" : "false",
-    __DATE__, __TIME__);
+    __DATE__, __TIME__,
+    configHash,
+    mainHash,
+    rulesHash);
 
   char topic[96];
   snprintf(topic, sizeof(topic), "%s/info", prefix);

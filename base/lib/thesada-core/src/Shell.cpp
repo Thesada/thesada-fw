@@ -325,12 +325,12 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
   serializeJsonPretty(doc, wf);
   wf.close();
 
-  // Config saved to flash. Reload with config.reload to apply.
-  // (Not auto-reloading here because Config::load() reinitializes MQTT,
-  //  which would drop the connection before the response is sent over MQTT CLI.)
+  // Refresh in-memory config from flash so config.dump shows the new value.
+  // This does NOT trigger MQTT reconnect - that requires config.reload.
+  Config::load();
 
   char msg[128];
-  snprintf(msg, sizeof(msg), "Set %s = %s (saved - run config.reload to apply)", argv[1], value.c_str());
+  snprintf(msg, sizeof(msg), "Set %s = %s (saved - run config.reload to apply network changes)", argv[1], value.c_str());
   out(msg);
 }
 
@@ -1074,6 +1074,7 @@ void Shell::registerBuiltins() {
   registerCommand("fs.cat",        "Print file contents",           cmd_cat);
   registerCommand("fs.rm",         "Remove a file",                 cmd_rm);
   registerCommand("fs.write",      "Write content to file",         cmd_write);
+  registerCommand("fs.append",     "Append content to file",        cmd_write);
   registerCommand("fs.mv",         "Rename/move a file",            cmd_mv);
   registerCommand("fs.df",         "Disk usage (LittleFS + SD)",    cmd_df);
 
