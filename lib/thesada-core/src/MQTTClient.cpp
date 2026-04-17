@@ -226,13 +226,13 @@ void MQTTClient::connect() {
       _wifiClient.setInsecure();
       _insecureFallback = true;
     }
-  } else if (_insecureFallback && now > 1700000000 && ESP.getFreeHeap() > 40000) {
+  } else if (_insecureFallback && now > 1700000000 && ESP.getMaxAllocHeap() > 40000) {
     // NTP synced since last attempt - restore cert validation
     Log::info(TAG, "NTP synced - restoring cert validation");
     _wifiClient.setCACert(_caCert);
     _insecureFallback = false;
   } else if (_insecureFallback && now > 1700000000) {
-    // NTP synced but not enough heap for TLS - stay insecure
+    // NTP synced but not enough contiguous heap for TLS - stay insecure
     static bool _heapWarnLogged = false;
     if (!_heapWarnLogged) {
       Log::warn(TAG, "Heap too low for TLS cert validation - staying insecure");
@@ -317,8 +317,8 @@ void MQTTClient::loop() {
   if (_client.connected()) {
     // NTP upgrade: if we connected insecure and NTP has since synced,
     // disconnect and reconnect with proper cert validation.
-    // Skip if free heap is below 40KB (TLS handshake needs ~30KB).
-    if (_insecureFallback && time(nullptr) > 1700000000 && ESP.getFreeHeap() > 40000) {
+    // Skip if largest contiguous block is below 40KB (TLS handshake needs ~30KB).
+    if (_insecureFallback && time(nullptr) > 1700000000 && ESP.getMaxAllocHeap() > 40000) {
       Log::info(TAG, "NTP synced - upgrading to cert-validated connection");
       _connectedSinceMs = 0;  // suppress "lost after 0 seconds" log
       _client.disconnect();
