@@ -252,12 +252,15 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
   // This modifies the in-memory config. Use config.save to persist.
   if (argc < 3) { out("Usage: config.set <key> <value>  (then config.save to persist)"); return; }
 
-  // For now, only support simple top-level.section.key paths.
-  // Reconstruct value from remaining args.
+  // Reconstruct value from remaining args, strip surrounding quotes.
   String value;
   for (int i = 2; i < argc; i++) {
     if (i > 2) value += " ";
     value += argv[i];
+  }
+  // Strip surrounding double quotes (MQTT CLI payloads often arrive quoted)
+  if (value.length() >= 2 && value.charAt(0) == '"' && value.charAt(value.length() - 1) == '"') {
+    value = value.substring(1, value.length() - 1);
   }
 
   // Read current config file, parse, modify, and update in-memory.
@@ -296,6 +299,14 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
 
     if (!parent.is<JsonObject>()) { out("Parent is not an object"); return; }
 
+    // Delete key if value is "--delete"
+    if (value == "--delete") {
+      parent[finalKey].clear();
+      parent.as<JsonObject>().remove(finalKey);
+      // Write back + reload below
+      goto save;
+    }
+
     // Try to detect type: number, boolean, or string.
     if (value == "true") parent[finalKey] = true;
     else if (value == "false") parent[finalKey] = false;
@@ -319,6 +330,7 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
     return;
   }
 
+  save:
   // Write back to LittleFS.
   File wf = LittleFS.open("/config.json", "w");
   if (!wf) { out("Failed to write config.json"); return; }
@@ -330,7 +342,11 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
   Config::load();
 
   char msg[128];
-  snprintf(msg, sizeof(msg), "Set %s = %s (saved - run config.reload to apply network changes)", argv[1], value.c_str());
+  if (value == "--delete") {
+    snprintf(msg, sizeof(msg), "Deleted %s (saved)", argv[1]);
+  } else {
+    snprintf(msg, sizeof(msg), "Set %s = %s (saved - run config.reload to apply network changes)", argv[1], value.c_str());
+  }
   out(msg);
 }
 

@@ -280,13 +280,18 @@ void MQTTClient::connect() {
     _retryCount++;
     _retryInterval = min(_retryInterval * 2, (uint32_t)RETRY_MAX_MS);
 
-    // Heap fragmentation safety net: if MQTT can't reconnect after many
-    // attempts, the most likely cause is mbedtls failing to allocate ~30KB
-    // for a fresh TLS context. A clean restart defragments the heap.
-    // Telegram and other HTTPS still work in this state, so the device
-    // can self-recover via the next OTA poll - but a reboot is faster.
+    // Fast restart on TLS OOM: if max contiguous block is below the ~30KB
+    // mbedtls needs, retrying is pointless - only a fresh boot defragments.
+    // Give 3 attempts for transient failures, then reboot.
+    if (_retryCount >= 3 && ESP.getMaxAllocHeap() < 40000) {
+      Log::error(TAG, "TLS alloc failed 3x with low heap - rebooting to defrag");
+      delay(1000);
+      ESP.restart();
+    }
+
+    // General safety net for other failure modes (broker down, auth wrong, etc.)
     if (_retryCount >= 30) {
-      Log::error(TAG, "MQTT reconnect failed 30 times - rebooting to defrag heap");
+      Log::error(TAG, "MQTT reconnect failed 30 times - rebooting");
       delay(1000);
       ESP.restart();
     }
@@ -447,9 +452,12 @@ void MQTTClient::subscribe(const char* topic, MQTTCallback callback) {
   snprintf(msg, sizeof(msg), "Registered sub: %s (%d/%d)", topic, _subCount, MQTT_MAX_SUBS);
   Log::info(TAG, msg);
 
-  // If already connected, subscribe immediately.
+  // If already connected, subscribe immediately and feed keepalive.
+  // Bulk subscription during Lua init can take >10s total - without
+  // tick() the broker or HAProxy drops the idle TCP connection.
   if (_client.connected()) {
     _client.subscribe(topic);
+    _client.loop();
   }
 }
 
