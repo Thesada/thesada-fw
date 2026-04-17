@@ -49,8 +49,8 @@ static String _cmdBodyBuf;
 
 // Rate limiter: 5 failures per source IP → 30 s lockout.
 struct _RLEntry { char ip[20]; uint8_t fails; uint32_t until; };
-static _RLEntry _rlTable[8] = {};
-static uint8_t  _rlCount    = 0;
+static _RLEntry _rlTable[16] = {};
+static uint8_t  _rlCount     = 0;
 
 // Check if an IP is allowed or currently rate-limited
 static bool _rlAllow(const String& ip) {
@@ -67,7 +67,7 @@ static void _rlFail(const String& ip) {
     if (++_rlTable[i].fails >= 5) _rlTable[i].until = millis() + 30000UL;
     return;
   }
-  if (_rlCount < 8) {
+  if (_rlCount < 16) {
     strncpy(_rlTable[_rlCount].ip, ip.c_str(), sizeof(_rlTable[0].ip) - 1);
     _rlTable[_rlCount].ip[sizeof(_rlTable[0].ip) - 1] = '\0';
     _rlTable[_rlCount].fails = 1;
@@ -82,6 +82,13 @@ static void _rlReset(const String& ip) {
     _rlTable[i].fails = 0; _rlTable[i].until = 0;
     return;
   }
+}
+
+// Reject path traversal attempts. Returns true if path is safe.
+// Blocks ".." segments that could escape the intended directory.
+// in: path string. out: true if safe, false if traversal detected.
+static bool _pathSafe(const String& path) {
+  return path.indexOf("..") < 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -568,6 +575,7 @@ void HttpServer::setupRoutes() {
     if (!_checkAuth(req, webUser, webPass)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
     if (!req->hasParam("path")) { req->send(400, "text/plain", "missing path"); return; }
     String path = req->getParam("path")->value();
+    if (!_pathSafe(path)) { req->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid path\"}"); return; }
     String src = req->hasParam("source") ? req->getParam("source")->value() : "sd";
     bool useLFS     = (src == "littlefs");
     bool useScripts = (src == "scripts");
@@ -589,6 +597,7 @@ void HttpServer::setupRoutes() {
     if (!_checkAuth(req, webUser, webPass)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
     if (!req->hasParam("path")) { req->send(400, "application/json", "{\"error\":\"missing path\"}"); return; }
     String path = req->getParam("path")->value();
+    if (!_pathSafe(path)) { req->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid path\"}"); return; }
     String src = req->hasParam("source") ? req->getParam("source")->value() : "sd";
     bool useLFS     = (src == "littlefs");
     bool useScripts = (src == "scripts");
@@ -621,6 +630,11 @@ void HttpServer::setupRoutes() {
       return;
     }
     String path    = req->getParam("path")->value();
+    if (!_pathSafe(path)) {
+      _fileBodyBuf = "";
+      req->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid path\"}");
+      return;
+    }
     String src     = req->hasParam("source") ? req->getParam("source")->value() : "sd";
     bool   useLFS     = (src == "littlefs");
     bool   useScripts = (src == "scripts");

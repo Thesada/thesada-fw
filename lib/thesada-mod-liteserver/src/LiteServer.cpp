@@ -27,7 +27,11 @@ static bool checkAuth() {
   JsonObject cfg = Config::get();
   const char* user = cfg["web"]["user"]     | "";
   const char* pass = cfg["web"]["password"] | "";
-  if (strlen(user) == 0 && strlen(pass) == 0) return true;
+  if (strlen(user) == 0 && strlen(pass) == 0) {
+    static bool _warnedOnce = false;
+    if (!_warnedOnce) { Log::warn(TAG, "No web credentials configured - admin endpoints unprotected"); _warnedOnce = true; }
+    return true;
+  }
   if (!_server.authenticate(user, pass)) {
     _server.requestAuthentication();
     return false;

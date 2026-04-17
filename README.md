@@ -50,7 +50,7 @@ Full documentation: [thesada.io/firmware](https://thesada.io/firmware/)
 - REST API: `POST /api/cmd` runs any shell command with JSON response
 
 **Shell CLI**
-- 30+ commands across serial, WebSocket, HTTP, and MQTT - same handler, zero duplication
+- 35+ commands across serial, WebSocket, HTTP, and MQTT - same handler, zero duplication
 - Commands: filesystem, config, network diagnostics, Lua exec, OTA trigger, selftest, battery, sensors, module status
 - Debug CLI: `ota.status`, `boot.info`, `partitions`, `chip.info`, `sdkconfig`, `net.mqtt` (subscription table + RX ring of recent topics) for remote-debug sessions without serial access
 
@@ -95,7 +95,7 @@ Full documentation: [thesada.io/firmware](https://thesada.io/firmware/)
 +---------------------------------------------------------+
 |  Core (always compiled)                                 |
 |  WiFiManager + NTP  MQTTClient  OTAUpdate               |
-|  Shell (30+ cmds)   EventBus    SleepManager             |
+|  Shell (35+ cmds)   EventBus    SleepManager             |
 |  ModuleRegistry     Config      Log  HeartbeatLED        |
 +---------------------------------------------------------+
 ```
@@ -116,13 +116,15 @@ Minimal build (core only) saves ~313 KB flash. Full build with all modules: 1.4 
 
 | Board | PIO environment | Notes |
 |---|---|---|
-| LILYGO T-SIM7080-S3 | `esp32-owb` | Primary target - all modules |
+| LILYGO T-SIM7080-S3 | `esp32-owb` | Primary target - all modules, PSRAM |
 | ESP32-S3 bare devkit | `esp32-s3-debug` | USB CDC serial, SHT31 enabled (BOARD_S3_BARE) |
 | ESP32-WROOM-32 | `esp32-wroom` | No cellular/PMU/SD - OLED display, WiFi, MQTT |
 | CYD (ESP32-2432S028R) | `esp32-cyd` | 2.8" TFT touch, LiteServer, SD (SPI) |
 | WT32-ETH01 | `esp32-eth` | LAN8720A Ethernet, WiFi fallback, well pump node |
+| LILYGO T-SIM7080-S3 | `esp32-owb-rescue` | Stripped rescue build (~1070 KB) for remote recovery |
+| ESP32-S3 bare devkit | `esp32-s3-debug-rescue` | Rescue twin for lab validation |
 
-Board-specific module overrides are in `thesada_config.h` (e.g. `BOARD_ETH` enables Ethernet and disables cellular/PMU).
+Board-specific module overrides are in `thesada_config.h` (e.g. `BOARD_ETH` enables Ethernet and disables cellular/PMU). Rescue builds strip all optional modules except PMU via `BOARD_OWB_RESCUE` - used for OTA recovery on weak links where the full binary fails mid-download.
 
 ---
 
