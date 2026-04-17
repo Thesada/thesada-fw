@@ -2,6 +2,7 @@
 // Priority-sorted module registry. Modules self-register via MODULE_REGISTER.
 // SPDX-License-Identifier: GPL-3.0-only
 #include "ModuleRegistry.h"
+#include "MQTTClient.h"
 #include "Log.h"
 
 
@@ -33,6 +34,10 @@ void ModuleRegistry::beginAll() {
     snprintf(msg, sizeof(msg), "Init [%d]: %s", _entries[i].priority, _entries[i].mod->name());
     Log::info("Registry", msg);
     _entries[i].mod->begin();
+    // Feed MQTT keepalive between module inits. Module begin() can take
+    // seconds (TFT init, Lua script load, SD mount) and the total init
+    // time can exceed the MQTT keepalive window, dropping the connection.
+    MQTTClient::tick();
   }
 }
 

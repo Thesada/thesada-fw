@@ -295,6 +295,17 @@ void MQTTClient::connect() {
 
 // ---------------------------------------------------------------------------
 
+// Lightweight keepalive - just run PubSubClient::loop() to send/receive
+// PINGREQ/PINGRESP. Safe to call during beginAll() between module inits
+// so the MQTT connection survives long init sequences.
+void MQTTClient::tick() {
+  if (_client.connected()) {
+    _client.loop();
+  }
+}
+
+// ---------------------------------------------------------------------------
+
 // Process MQTT messages and handle reconnection with backoff
 void MQTTClient::loop() {
   // Process deferred CLI command outside the PubSubClient callback context.
@@ -559,8 +570,10 @@ void MQTTClient::processDeferredCLI() {
       if (path && offStr && lenStr) {
         size_t offset = (size_t)atol(offStr);
         size_t chunkLen = (size_t)atol(lenStr);
-        if (chunkLen == 0) chunkLen = 2048;
-        if (chunkLen > 2048) chunkLen = 2048;
+        // Cap chunk to half of output buffer (response JSON has overhead)
+        size_t maxChunk = _bufferOut > 512 ? _bufferOut / 2 : 512;
+        if (chunkLen == 0) chunkLen = maxChunk;
+        if (chunkLen > maxChunk) chunkLen = maxChunk;
 
         JsonDocument resp;
         resp["cmd"] = cmd;

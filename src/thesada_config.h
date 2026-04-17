@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
-#define FIRMWARE_VERSION "1.3.5"  // bump on each release
+#define FIRMWARE_VERSION "1.3.6"  // bump on each release
 
 // ── Sensor modules ──────────────────────────────────────────────────────────
 #define ENABLE_TEMPERATURE   // DS18B20 one-wire temperature sensors

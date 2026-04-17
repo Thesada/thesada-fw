@@ -43,6 +43,7 @@ public:
   static void begin();
   static void reinitSubscriptions();
   static void loop();
+  static void tick();  // lightweight keepalive - call during long init phases
   static void publish(const char* topic, const char* payload);
   static void publishRetained(const char* topic, const char* payload);
   static bool   connected();
