@@ -4,7 +4,7 @@ Modular ESP32 firmware for property monitoring nodes. Built from scratch in C++1
 
 **Currently deployed:** monitoring an outdoor wood boiler (temperature, pump current, Telegram alerts) and indoor climate (SHT31). Running 24/7 in the field.
 
-Full documentation: [thesada.io/firmware/fw-index](https://thesada.io/firmware/)
+Full documentation: [thesada.io/firmware](https://thesada.io/firmware/)
 
 ---
 
@@ -36,9 +36,9 @@ Full documentation: [thesada.io/firmware/fw-index](https://thesada.io/firmware/)
 - SD card CSV logging with per-boot files and configurable log rotation (SD handling fully in SDModule)
 - MQTT publish queue with ring buffer and minimum send interval
 - MQTT CLI: full shell access over MQTT (`cli/#` - topic is command, payload is args, response on `cli/response`)
-- MQTT remote config: set single key (`cli/config.set`) or push full config (`cli/file.write` + `cli/config.reload`)
+- MQTT remote config: set single key (`cli/config.set`) or push full config (`cli/fs.write` + `cli/config.reload`)
+- MQTT file ops: `fs.write` (truncate), `fs.append`, `fs.cat` with chunked reads (offset/length for large files)
 - Home Assistant MQTT auto-discovery (per-sensor topics, availability via LWT, WiFi diagnostics)
-- MQTT file upload (`cli/file.write` - push scripts and config files remotely)
 - Lua 5.3 scripting engine - hot-reloadable event rules without recompiling
 - Lua bindings: MQTT.subscribe, JSON.decode, Display.*, EventBus, Config, Node, Telegram
 
@@ -63,6 +63,7 @@ Full documentation: [thesada.io/firmware/fw-index](https://thesada.io/firmware/)
 
 **Telemetry**
 - Heap + PSRAM telemetry: free / min free / max alloc block / psram free published to MQTT every 5 min with HA auto-discovery for each metric
+- Config + script SHA256 hashes in device info for drift detection
 - Every Telegram alert tagged with `[heap=N]` for post-mortem correlation
 
 **Security**
@@ -86,36 +87,17 @@ Full documentation: [thesada.io/firmware/fw-index](https://thesada.io/firmware/)
 ## Architecture
 
 ```
-┌─ Optional modules (ENABLE_*) ───────────────────────┐
-│  ┌─────────────┐ ┌───────────┐ ┌──────────────────┐ │
-│  │ Temperature │ │   SHT31   │ │     ADS1115      │ │
-│  └─────────────┘ └───────────┘ └──────────────────┘ │
-│  ┌─────────────┐ ┌──────────┐ ┌──────────────────┐  │
-│  │   Battery   │ │    SD    │ │   PowerManager   │  │
-│  └─────────────┘ └──────────┘ └──────────────────┘  │
-│  ┌─────────────┐ ┌──────────┐ ┌───────────────────┐ │
-│  │ HttpServer  │ │LiteServer│ │   ScriptEngine    │ │
-│  └─────────────┘ └──────────┘ └───────────────────┘ │
-│  ┌─────────────┐ ┌──────────┐ ┌───────────────────┐ │
-│  │  Cellular   │ │ Ethernet │ │    Telegram       │ │
-│  └─────────────┘ └──────────┘ └───────────────────┘ │
-│  ┌─────────────┐ ┌────────────┐                     │
-│  │   Display   │ │ TftDisplay │                     │
-│  └─────────────┘ └────────────┘                     │
-├─ Core (always compiled) ────────────────────────────┤
-│  ┌─────────────┐ ┌──────────┐ ┌───────────────────┐ │
-│  │ WiFiManager │ │   MQTT   │ │    OTAUpdate      │ │
-│  │  + NTP      │ │  Client  │ │    (pull only*)   │ │
-│  └─────────────┘ └──────────┘ └───────────────────┘ │
-│  ┌─────────────┐ ┌──────────┐ ┌───────────────────┐ │
-│  │    Shell    │ │ EventBus │ │   SleepManager    │ │
-│  │  30+ cmds   │ │          │ │                   │ │
-│  └─────────────┘ └──────────┘ └───────────────────┘ │
-│  ┌──────────────┐                                   │
-│  │ModuleRegistry│                                   │
-│  └──────────────┘                                   │
-└─────────────────────────────────────────────────────┘
-* Push OTA (/ota upload) requires ENABLE_HTTPSERVER
++-- Optional modules (ENABLE_*) -------------------------+
+|  Temperature  SHT31  ADS1115  Battery  SD  PowerManager |
+|  HttpServer  LiteServer  ScriptEngine  Cellular         |
+|  Ethernet  Telegram  Display (OLED)  TftDisplay (CYD)   |
+|  PWM                                                    |
++---------------------------------------------------------+
+|  Core (always compiled)                                 |
+|  WiFiManager + NTP  MQTTClient  OTAUpdate               |
+|  Shell (30+ cmds)   EventBus    SleepManager             |
+|  ModuleRegistry     Config      Log  HeartbeatLED        |
++---------------------------------------------------------+
 ```
 
 Modules self-register via `MODULE_REGISTER(Class, Priority)` at the bottom of each .cpp file - main.cpp has zero module includes and just calls `ModuleRegistry::beginAll()` / `loopAll()`. Priorities control init order: POWER(10), NETWORK(20), SERVICE(30), SCRIPT(40), SENSOR(50), OUTPUT(60). Modules communicate via EventBus - never direct calls. Lua bindings are also self-registering: modules call `ScriptEngine::addBindings()` in their `begin()`, so ScriptEngine has no module includes either.
@@ -146,21 +128,16 @@ Board-specific module overrides are in `thesada_config.h` (e.g. `BOARD_ETH` enab
 
 ## Quick start
 
-See [`base/`](base/) for build instructions, config reference, and shell command list.
-
 ```bash
-cd base
 python3 scripts/check_deps.py        # verify PlatformIO + libraries
 cp examples/config.json.example data/config.json
 # edit data/config.json (WiFi, MQTT, sensor pins)
 # optionally copy example scripts:
 #   cp examples/scripts/rules.lua.example data/scripts/rules.lua
 #   cp examples/scripts/display.lua.example data/scripts/display.lua  (OLED display)
-pio run -e esp32-owb --target upload      # or esp32-wroom for WROOM-32
+pio run -e esp32-owb --target upload      # or esp32-wroom, esp32-cyd, etc.
 pio run -e esp32-owb --target uploadfs
 ```
-
-**Releasing:** `./release.sh` builds full + minimal binaries, tags, pushes, and creates a GitHub release with auto-generated changelog.
 
 ---
 
@@ -168,31 +145,31 @@ pio run -e esp32-owb --target uploadfs
 
 ```
 thesada-fw/
-  base/
-    src/
-      main.cpp                  # entry point - no module includes
-      thesada_config.h          # compile-time ENABLE_* flags, pin maps
-    lib/
-      thesada-core/src/         # Config, EventBus, Log, Shell, ModuleRegistry, ...
-      thesada-mod-temperature/  # each module is a PlatformIO library
-      thesada-mod-ads1115/
-      thesada-mod-battery/
-      thesada-mod-cellular/
-      thesada-mod-display/
-      thesada-mod-httpserver/
-      thesada-mod-powermanager/
-      thesada-mod-pwm/
-      thesada-mod-scriptengine/
-      thesada-mod-sd/
-      thesada-mod-telegram/
-      thesada-mod-tftdisplay/
-    scripts/
-      add_framework_libs.py     # PlatformIO framework lib discovery
-      ota_upload.py             # push OTA to a device over HTTP
-    examples/                   # config.json.example and Lua script examples
-  examples/                     # minimal reference projects
-  tests/                        # hardware-in-the-loop test suite (test_firmware.py)
-  release.sh                    # one-command build, tag, push, GitHub release
+  src/
+    main.cpp                  # entry point - no module includes
+    thesada_config.h          # compile-time ENABLE_* flags, pin maps
+  lib/
+    thesada-core/src/         # Config, EventBus, Log, Shell, ModuleRegistry, ...
+    thesada-mod-temperature/  # each module is a PlatformIO library
+    thesada-mod-ads1115/
+    thesada-mod-battery/
+    thesada-mod-cellular/
+    thesada-mod-display/
+    thesada-mod-httpserver/
+    thesada-mod-powermanager/
+    thesada-mod-pwm/
+    thesada-mod-scriptengine/
+    thesada-mod-sd/
+    thesada-mod-telegram/
+    thesada-mod-tftdisplay/
+  scripts/
+    add_framework_libs.py     # PlatformIO framework lib discovery
+    ota_upload.py             # push OTA to a device over HTTP
+    deploy-ota.sh             # deploy to self-hosted OTA server (gitignored)
+  examples/                   # config.json.example and Lua script examples
+  tests/                      # hardware-in-the-loop test suite (test_firmware.py)
+  data/                       # LittleFS filesystem (config.json, scripts/, ca.crt)
+  platformio.ini              # board environments + library deps
 ```
 
 Each `thesada-mod-*` directory is a standalone PlatformIO library with its own `library.json` (`libCompatMode: off`). All includes use angle brackets (`#include <Log.h>`) - no relative paths. Modules that wrap a static class (PowerManager, HttpServer, ScriptEngine) have thin `*Module` wrappers that handle the MODULE_REGISTER glue.

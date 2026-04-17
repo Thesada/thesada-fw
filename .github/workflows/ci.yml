@@ -19,8 +19,8 @@ jobs:
           path: |
             ~/.cache/pip
             ~/.platformio/.cache
-            base/.pio/libdeps
-          key: ${{ runner.os }}-pio-${{ hashFiles('base/platformio.ini') }}
+            .pio/libdeps
+          key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini') }}
           restore-keys: ${{ runner.os }}-pio-
 
       - uses: actions/setup-python@v5
@@ -31,7 +31,6 @@ jobs:
         run: pip install --upgrade platformio
 
       - name: Build all board targets
-        working-directory: base
         run: |
           mkdir -p build/boards
 
@@ -60,7 +59,6 @@ jobs:
           cp build/boards/firmware-owb.bin build/firmware.bin
 
       - name: Build minimal firmware (OWB core only)
-        working-directory: base
         run: |
           cp src/thesada_config.h src/thesada_config.h.bak
           sed -i 's/^#define ENABLE_TEMPERATURE/\/\/ #define ENABLE_TEMPERATURE/' src/thesada_config.h
@@ -81,10 +79,10 @@ jobs:
         with:
           name: firmware
           path: |
-            base/build/firmware.bin
-            base/build/firmware_minimal.bin
-            base/build/firmware.json
-            base/build/boards/
+            build/firmware.bin
+            build/firmware_minimal.bin
+            build/firmware.json
+            build/boards/
 
   release:
     needs: build
@@ -98,7 +96,7 @@ jobs:
       - name: Extract version from config.h
         id: version
         run: |
-          VERSION=$(grep -oP '(?<=")\d+\.\d+\.\d+(?=")' base/src/thesada_config.h)
+          VERSION=$(grep -oP '(?<=")\d+\.\d+\.\d+(?=")' src/thesada_config.h)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "tag=v$VERSION" >> $GITHUB_OUTPUT
 
