@@ -3,7 +3,7 @@
 #include "Log.h"
 
 void (*Log::_remoteHandler)(const char* line) = nullptr;
-char    Log::_ring[RING_SIZE][220] = {};
+char    Log::_ring[RING_SIZE][LOG_LINE_LEN] = {};
 uint8_t Log::_ringHead = 0;
 uint8_t Log::_ringUsed = 0;
 
@@ -26,7 +26,7 @@ uint8_t Log::ringCount() {
 
 // Format, store, and output a log line to serial and remote handler
 void Log::write(LogLevel level, const char* tag, const char* msg) {
-  char line[220];
+  char line[LOG_LINE_LEN];
   time_t now = time(nullptr);
   if (now > 1700000000UL) {
     char ts[22];

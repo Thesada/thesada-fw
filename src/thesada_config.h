@@ -4,7 +4,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
-#define FIRMWARE_VERSION "1.3.7"  // bump on each release
+#define FIRMWARE_VERSION "1.3.9"  // bump on each release
+
+// ── Memory tuning defaults ──────────────────────────────────────────────────
+// Board overrides below redefine these for heap-constrained boards (CYD/WROOM).
+#define LOG_RING_SIZE       50    // log replay lines for WS terminal
+#define LOG_LINE_LEN        220   // max chars per log line
+#define MQTT_QUEUE_SIZE     8     // offline publish queue depth
+#define MQTT_RX_RING_SIZE   8     // debug RX topic ring
 
 // ── Sensor modules ──────────────────────────────────────────────────────────
 #define ENABLE_TEMPERATURE   // DS18B20 one-wire temperature sensors
@@ -83,6 +90,7 @@
   #undef ENABLE_CELLULAR
   #undef ENABLE_PMU
   #undef ENABLE_BATTERY
+  #undef ENABLE_SD
   #undef ENABLE_DISPLAY
   #undef ENABLE_TFT
   #ifndef ENABLE_ETH
@@ -131,6 +139,16 @@
   #ifndef ENABLE_TFT
     #define ENABLE_TFT
   #endif
+  // Memory tuning - WROOM-32 has no PSRAM, 32KB max contiguous heap.
+  // Shrink static buffers to free ~10KB for TLS reconnects and OTA.
+  #undef  LOG_RING_SIZE
+  #define LOG_RING_SIZE       20
+  #undef  LOG_LINE_LEN
+  #define LOG_LINE_LEN        160
+  #undef  MQTT_QUEUE_SIZE
+  #define MQTT_QUEUE_SIZE     4
+  #undef  MQTT_RX_RING_SIZE
+  #define MQTT_RX_RING_SIZE   4
 #endif
 
 // ── MQTT transport ───────────────────────────────────────────────────────────

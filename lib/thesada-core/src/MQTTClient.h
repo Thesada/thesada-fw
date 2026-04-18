@@ -13,12 +13,15 @@
 #include <time.h>
 #include <thesada_config.h>
 
-static constexpr uint8_t MQTT_QUEUE_SIZE = 8;
+#ifndef MQTT_QUEUE_SIZE
+  #define MQTT_QUEUE_SIZE 8
+#endif
+
 static constexpr uint8_t MQTT_MAX_SUBS  = 16;  // max MQTT subscriptions (CLI + Lua + modules)
 
 struct MQTTMessage {
   char topic[64];
-  char payload[256];
+  char payload[128];
   bool valid;
 };
 
@@ -52,6 +55,29 @@ public:
   // Subscribe to a topic with a callback. Subscriptions are stored and
   // re-applied on every reconnect. Can be called before connect().
   static void subscribe(const char* topic, MQTTCallback callback);
+
+  // Per-device mTLS client certificate stored in NVS. If both cert and key
+  // are present, MQTT connects with mTLS auth (broker extracts CN as
+  // username via use_identity_as_username). If absent, falls back to
+  // username/password from config.json.
+  //
+  // Cert/key are PEM-encoded. Max size per NVS blob: ~4000 B.
+  // ECDSA P-256 certs ~800 B, keys ~250 B - well within limit.
+  //
+  // storeClientCert writes to NVS. Pass nullptr or empty to store only
+  // one half. Returns true on success.
+  static bool storeClientCert(const char* certPEM, const char* keyPEM);
+  // loadClientCert fills cert and key (both must be non-null buffers of
+  // size maxLen >= 4096). Returns true if both are present in NVS.
+  static bool loadClientCert(char* cert, char* key, size_t maxLen);
+  // Clears both cert and key from NVS. Returns true on success.
+  static bool clearClientCert();
+  // True if both cert and key are present in NVS.
+  static bool hasClientCert();
+  // Parse stored cert PEM and fill info (caller-allocated, size >= 128).
+  // Fields: CN, serial hex, not_before, not_after, issuer CN.
+  // Returns true if cert parsed. Never touches private key.
+  static bool getCertInfo(char* cn, char* serial, char* notBefore, char* notAfter, size_t maxLen);
 
 private:
   static void connect();
@@ -106,7 +132,10 @@ public:
   // Debug RX ring - last 8 received topics + timestamps, oldest-overwrite.
   // Used by `net.mqtt rx` to see what actually arrives at onMessage - helps
   // diagnose broker-side delivery vs client-side dispatch bugs.
-  static constexpr uint8_t RX_RING_SIZE = 8;
+#ifndef MQTT_RX_RING_SIZE
+  #define MQTT_RX_RING_SIZE 8
+#endif
+  static constexpr uint8_t RX_RING_SIZE = MQTT_RX_RING_SIZE;
   static char     _rxRing[RX_RING_SIZE][96];
   static uint32_t _rxRingTs[RX_RING_SIZE];
   static uint8_t  _rxRingHead;
