@@ -273,7 +273,7 @@ void HttpServer::setupRoutes() {
 
   // ── Dashboard HTML - public (sensor data is read-only) ────────────────────
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
-    AsyncWebServerResponse* resp = req->beginResponse_P(200, "text/html", (const uint8_t*)DASHBOARD_HTML, strlen_P(DASHBOARD_HTML));
+    AsyncWebServerResponse* resp = req->beginResponse(200, "text/html", (const uint8_t*)DASHBOARD_HTML, strlen_P(DASHBOARD_HTML));
     req->send(resp);
   });
 

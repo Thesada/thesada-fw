@@ -16,6 +16,8 @@
 #include <LittleFS.h>
 #include <Update.h>
 #include <ArduinoJson.h>
+#include <esp_task_wdt.h>
+#include <MQTTClient.h>
 #include "liteserver.html.h"
 
 static const char* TAG = "LiteServer";
@@ -165,12 +167,22 @@ static void handleOtaUpload() {
   HTTPUpload& upload = _server.upload();
   if (upload.status == UPLOAD_FILE_START) {
     Log::info(TAG, "OTA upload started");
+    // Free MQTT TLS buffers so Update.begin() can malloc on low-heap boards
+    if (MQTTClient::connected() && ESP.getMaxAllocHeap() < 40000) {
+      Log::info(TAG, "Low heap - disconnecting MQTT for OTA");
+      MQTTClient::_client.disconnect();
+      MQTTClient::_wifiClient.stop();
+      MQTTClient::_connectedSinceMs = 0;
+      delay(100);
+    }
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
       char msg[64];
       snprintf(msg, sizeof(msg), "Update.begin failed: %s", Update.errorString());
       Log::error(TAG, msg);
     }
   } else if (upload.status == UPLOAD_FILE_WRITE) {
+    esp_task_wdt_reset();
+    yield();
     if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
       char msg[64];
       snprintf(msg, sizeof(msg), "Update.write failed: %s", Update.errorString());
