@@ -60,8 +60,13 @@ void setup() {
   }
 
   if (networkConnected()) {
-    MQTTClient::begin();
+    // OTA check BEFORE MQTT - heap is still contiguous here (~80KB max alloc).
+    // After MQTT + modules load, heap fragments and a second TLS session
+    // for the OTA manifest fetch can't allocate on WROOM-32 boards.
+    // If an update is found, the device flashes and reboots - never reaches MQTT.
     OTAUpdate::begin();
+    OTAUpdate::checkNow();  // immediate check while heap is clean
+    MQTTClient::begin();
   }
 
   Shell::begin();

@@ -131,6 +131,18 @@ void OTAUpdate::begin() {
 
 // ---------------------------------------------------------------------------
 
+// Immediate boot-time OTA check. Runs before MQTT/modules to use clean heap.
+// If an update is found, the device flashes and reboots (never returns).
+void OTAUpdate::checkNow() {
+  if (!_enabled) return;
+  if (!WiFiManager::connected()) return;
+  Log::info(TAG, "Boot-time OTA check (clean heap)");
+  check();
+  // If we get here, no update was found. Disable the 30s delayed check
+  // since we just checked.
+  _lastCheck = millis();
+}
+
 // Non-blocking OTA trigger used by the Shell `ota.check` command and the
 // MQTT cmd_topic callback. Setting state here lets the caller return
 // immediately so CLI responses can publish before the device reboots.
@@ -206,6 +218,25 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
   }
 
   Log::info(TAG, force ? "Checking for update (FORCED)..." : "Checking for update...");
+
+  // On heap-constrained boards (CYD/WROOM), MQTT's TLS session fragments
+  // heap so a second TLS connection for the manifest fetch will OOM.
+  // Skip periodic checks when heap is too low - boot-time checkNow()
+  // handles OTA with clean heap before MQTT connects.
+  // Exception: --force means user explicitly wants to flash. Disconnect
+  // MQTT to free TLS buffers, letting the manifest fetch succeed on a
+  // clean heap. MQTT reconnect happens post-reboot if update applies, or
+  // in loop() if we bail out.
+  if (MQTTClient::connected() && ESP.getMaxAllocHeap() < 40000) {
+    if (!force) {
+      Log::info(TAG, "Skipping OTA check - heap too low for second TLS session");
+      return;
+    }
+    Log::warn(TAG, "Heap low - disconnecting MQTT to free TLS buffers for forced OTA");
+    MQTTClient::_client.disconnect();
+    MQTTClient::_wifiClient.stop();
+    delay(200);  // let TCP teardown + free mbedtls context
+  }
 
   String remoteVersion, binUrl, sha256;
   if (!fetchManifest(url, remoteVersion, binUrl, sha256)) {

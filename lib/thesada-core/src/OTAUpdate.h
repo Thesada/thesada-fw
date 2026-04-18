@@ -35,6 +35,11 @@ public:
   // response publish before the device reboots).
   static void triggerCheck(const char* manifestOverride = nullptr, bool force = false);
 
+  // Immediate boot-time check. Called from setup() before MQTT/modules load,
+  // while heap is still contiguous. If update found, flashes and reboots.
+  // If no update or OTA disabled, returns immediately.
+  static void checkNow();
+
 private:
   static bool fetchManifest(const char* url, String& version, String& binUrl, String& sha256);
   static bool applyUpdate(const String& binUrl, const String& expectedSha256);
