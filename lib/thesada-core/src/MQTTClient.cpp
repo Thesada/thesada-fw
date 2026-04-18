@@ -8,15 +8,61 @@
 #include "Shell.h"
 #include "OTAUpdate.h"
 #include <LittleFS.h>
+#include <Preferences.h>
 #include <mbedtls/sha256.h>
+#include <mbedtls/x509_crt.h>
+#include <mbedtls/pk.h>
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
 #include <esp_chip_info.h>
+#ifdef ENABLE_ETH
+  #include <ETH.h>
+#endif
+
+// NVS namespace + keys for per-device mTLS client certificate.
+// Kept separate from Config so cert survives factory reset of config.json
+// and is never exposed via /api/config or config.dump.
+static const char* CERT_NS        = "thesada-tls";
+static const char* CERT_KEY_CERT  = "client_cert";
+static const char* CERT_KEY_KEY   = "client_key";
+static constexpr size_t CERT_MAX_LEN = 4000;  // ESP32 NVS blob size limit
 
 static const char* TAG = "MQTT";
 
 #ifdef MQTT_TLS
 WiFiClientSecure MQTTClient::_wifiClient;
+// Client cert + key buffers for mTLS. Loaded from NVS on connect(), held
+// live while the WiFiClientSecure session is open (the TLS stack holds
+// the pointer, must outlive the handshake). Freed/NULL when no cert set.
+static char*     _clientCert    = nullptr;
+static char*     _clientKey     = nullptr;
+static bool      _mtlsActive    = false;
+static bool      _mtlsWasActive = false;  // last connect() used mTLS - need to clear WiFiClientSecure on fallback
+
+// Validate a PEM cert + key pair via mbedtls. Prevents feeding a bad
+// buffer into WiFiClientSecure::setCertificate which would stick in the
+// TLS stack and break every future reconnect until restart.
+// in: cert (PEM string), key (PEM string).
+// out: true if both parse as valid X.509 cert + compatible private key.
+static bool validateClientCertKey(const char* cert, const char* key) {
+  if (!cert || !key || !*cert || !*key) return false;
+
+  mbedtls_x509_crt crt;
+  mbedtls_x509_crt_init(&crt);
+  int rc = mbedtls_x509_crt_parse(&crt, (const unsigned char*)cert, strlen(cert) + 1);
+  mbedtls_x509_crt_free(&crt);
+  if (rc != 0) return false;
+
+  mbedtls_pk_context pk;
+  mbedtls_pk_init(&pk);
+  // arduino-esp32 (espressif32@6.x) uses the 5-arg form without RNG.
+  rc = mbedtls_pk_parse_key(&pk,
+                            (const unsigned char*)key, strlen(key) + 1,
+                            nullptr, 0);
+  mbedtls_pk_free(&pk);
+  return rc == 0;
+}
+
 // CA cert buffer - routed to PSRAM when BOARD_HAS_PSRAM is defined, falling
 // back to internal heap otherwise. Raw char* + length instead of Arduino
 // String so we can use heap_caps_malloc(MALLOC_CAP_SPIRAM) directly and
@@ -61,6 +107,14 @@ uint8_t          MQTTClient::_rxRingCount = 0;
 
 // Initialize MQTT client, load TLS cert, and set up subscriptions
 void MQTTClient::begin() {
+  // Bootstrap the TLS NVS namespace so readonly begin() calls from
+  // hasClientCert() / loadClientCert() / getCertInfo() don't spam
+  // "nvs_open failed: NOT_FOUND" to serial on first-boot devices.
+  {
+    Preferences prefs;
+    if (prefs.begin(CERT_NS, false)) prefs.end();
+  }
+
   JsonObject  cfg  = Config::get();
   const char* host = cfg["mqtt"]["broker"]          | "";
   uint16_t    port = cfg["mqtt"]["port"]            | 8883;
@@ -239,11 +293,54 @@ void MQTTClient::connect() {
       _heapWarnLogged = true;
     }
   }
+
+  // Client certificate (per-device mTLS). Loaded from NVS once and kept
+  // in module-level buffers because WiFiClientSecure holds the raw char*
+  // pointer for the life of the TLS session. Re-load if cert was cleared
+  // externally (cert.clear via CLI) - hasClientCert() drives enable.
+  //
+  // Validation: parse PEM via mbedtls BEFORE setCertificate. Arduino-esp32
+  // WiFiClientSecure has no clear-cert API; once a bad pointer is set, every
+  // reconnect fails until restart. Catch bad PEM here and skip mTLS.
+  _mtlsActive = false;
+  if (!_insecureFallback && hasClientCert()) {
+    if (!_clientCert) _clientCert = (char*)malloc(CERT_MAX_LEN);
+    if (!_clientKey)  _clientKey  = (char*)malloc(CERT_MAX_LEN);
+    if (_clientCert && _clientKey &&
+        loadClientCert(_clientCert, _clientKey, CERT_MAX_LEN)) {
+      if (validateClientCertKey(_clientCert, _clientKey)) {
+        _wifiClient.setCertificate(_clientCert);
+        _wifiClient.setPrivateKey(_clientKey);
+        _mtlsActive = true;
+        Log::info(TAG, "mTLS: client cert loaded from NVS");
+      } else {
+        Log::warn(TAG, "mTLS: stored cert/key failed mbedtls validation - password fallback");
+      }
+    } else {
+      Log::warn(TAG, "mTLS: NVS load failed, falling back to password auth");
+    }
+  }
+  // If previous attempt used mTLS but this one won't, clear stale pointer
+  // inside WiFiClientSecure by passing nullptr. Without this, the old
+  // setCertificate pointer lingers and sabotages every future connect().
+  if (_mtlsWasActive && !_mtlsActive) {
+    _wifiClient.setCertificate(nullptr);
+    _wifiClient.setPrivateKey(nullptr);
+    Log::info(TAG, "mTLS cleared - prior cert pointer reset in WiFiClientSecure");
+  }
+  _mtlsWasActive = _mtlsActive;
 #endif
 
-  bool ok = (strlen(user) > 0)
-    ? _client.connect(clientId, user, password, availTopic, 0, true, "offline")
-    : _client.connect(clientId, availTopic, 0, true, "offline");
+  // With mTLS active, broker uses CN as username (use_identity_as_username).
+  // Skip sending user/pass - cleaner auth path, avoids mixed-mode confusion.
+  bool ok;
+  if (_mtlsActive) {
+    ok = _client.connect(clientId, nullptr, nullptr, availTopic, 0, true, "offline");
+  } else {
+    ok = (strlen(user) > 0)
+      ? _client.connect(clientId, user, password, availTopic, 0, true, "offline")
+      : _client.connect(clientId, availTopic, 0, true, "offline");
+  }
 
   if (ok) {
     _retryInterval = RETRY_MIN_MS;
@@ -631,6 +728,71 @@ void MQTTClient::processDeferredCLI() {
       // No offset/length - fall through to Shell::execute for line-by-line
     }
 
+    // Special case: cert.set - per-device mTLS client cert/key push.
+    // Payload: "<type>\n<PEM content>" where type is "client_cert" or
+    // "client_key". Writes to NVS (survives factory reset of config.json).
+    // cert.apply (non-binary command) disconnects MQTT and reconnects with
+    // mTLS once both halves are present.
+    if (strcmp(cmd, "cert.set") == 0 && payload && plen > 0) {
+      JsonDocument resp;
+      resp["cmd"] = cmd;
+
+      const char* nl = strchr(payload, '\n');
+      if (!nl) {
+        resp["ok"] = false;
+        resp["output"][0] = "Usage: payload = <type>\\n<PEM>  (type: client_cert|client_key)";
+      } else {
+        char type[32];
+        size_t typeLen = min((size_t)(nl - payload), sizeof(type) - 1);
+        memcpy(type, payload, typeLen);
+        type[typeLen] = '\0';
+        const char* pem = nl + 1;
+        size_t pemLen = plen - typeLen - 1;
+
+        if (pemLen >= CERT_MAX_LEN) {
+          resp["ok"] = false;
+          resp["output"][0] = "PEM too large (>4000 B)";
+        } else if (strcmp(type, "client_cert") == 0) {
+          // Null-terminate a copy; NVS putString needs a C string.
+          char* buf = (char*)malloc(pemLen + 1);
+          if (!buf) {
+            resp["ok"] = false;
+            resp["output"][0] = "malloc failed";
+          } else {
+            memcpy(buf, pem, pemLen);
+            buf[pemLen] = '\0';
+            bool ok = storeClientCert(buf, nullptr);
+            free(buf);
+            resp["ok"] = ok;
+            resp["output"][0] = ok ? "Client cert stored in NVS" : "NVS write failed";
+          }
+        } else if (strcmp(type, "client_key") == 0) {
+          char* buf = (char*)malloc(pemLen + 1);
+          if (!buf) {
+            resp["ok"] = false;
+            resp["output"][0] = "malloc failed";
+          } else {
+            memcpy(buf, pem, pemLen);
+            buf[pemLen] = '\0';
+            bool ok = storeClientCert(nullptr, buf);
+            free(buf);
+            resp["ok"] = ok;
+            resp["output"][0] = ok ? "Client key stored in NVS" : "NVS write failed";
+          }
+        } else {
+          resp["ok"] = false;
+          resp["output"][0] = "Unknown type - expected client_cert or client_key";
+        }
+      }
+
+      char respTopic[64];
+      snprintf(respTopic, sizeof(respTopic), "%s/cli/response", prefix);
+      size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
+      char* rp = (char*)malloc(bufSz);
+      if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
+      goto cleanup;
+    }
+
     // Build command line: "<cmd> <payload>"
     char line[1024];
     if (payload && plen > 0) {
@@ -785,6 +947,10 @@ void MQTTClient::publishDiscovery() {
     char payload[640];
     serializeJson(doc, payload, sizeof(payload));
     _client.publish(topic, (const uint8_t*)payload, strlen(payload), true);
+    // Drain TCP buffer between retained publishes. Without this, small
+    // MQTT buffers (CYD 1024B) overflow and spam EAGAIN socket errors.
+    _client.loop();
+    yield();
   };
 
   char slug[32], uid[48], stBuf[96];
@@ -866,6 +1032,35 @@ void MQTTClient::publishDiscovery() {
     snprintf(t, sizeof(t), "%s/sensor/wifi/ip", prefix);
     _client.publish(t, WiFi.localIP().toString().c_str());
   }
+
+#ifdef ENABLE_ETH
+  // -- Ethernet diagnostics (disabled by default in HA) --
+  snprintf(uid, sizeof(uid), "%s_eth_ip", devId);
+  snprintf(stBuf, sizeof(stBuf), "%s/sensor/eth/ip", prefix);
+  disc("sensor", uid, "Ethernet IP", stBuf, "", "", "", "diagnostic");
+
+  snprintf(uid, sizeof(uid), "%s_eth_speed", devId);
+  snprintf(stBuf, sizeof(stBuf), "%s/sensor/eth/speed", prefix);
+  disc("sensor", uid, "Ethernet Speed", stBuf, "Mbps", "", "measurement", "diagnostic");
+
+  snprintf(uid, sizeof(uid), "%s_eth_mac", devId);
+  snprintf(stBuf, sizeof(stBuf), "%s/sensor/eth/mac", prefix);
+  disc("sensor", uid, "Ethernet MAC", stBuf, "", "", "", "diagnostic");
+
+  // Publish ETH stats now
+  if (ETH.linkUp()) {
+    char t[96], v[32];
+    snprintf(t, sizeof(t), "%s/sensor/eth/ip", prefix);
+    _client.publish(t, ETH.localIP().toString().c_str());
+
+    snprintf(t, sizeof(t), "%s/sensor/eth/speed", prefix);
+    snprintf(v, sizeof(v), "%d", ETH.linkSpeed());
+    _client.publish(t, v);
+
+    snprintf(t, sizeof(t), "%s/sensor/eth/mac", prefix);
+    _client.publish(t, ETH.macAddress().c_str());
+  }
+#endif
 
   // -- Heap + PSRAM diagnostics --
   snprintf(uid, sizeof(uid), "%s_heap_free", devId);
@@ -1124,4 +1319,143 @@ bool MQTTClient::connected() {
 // Return the wall-clock time of the last successful publish
 time_t MQTTClient::lastPublishTime() {
   return _lastPublishTime;
+}
+
+// ---------------------------------------------------------------------------
+// Per-device mTLS client certificate - NVS storage
+// ---------------------------------------------------------------------------
+
+// Store PEM-encoded client cert and/or key in NVS.
+// Pass nullptr or empty string to skip a half (lets cert + key arrive in
+// separate cli/cert.set messages). Returns false on size violation or
+// NVS write failure.
+// in:  certPEM, keyPEM (PEM strings or nullptr/empty to skip)
+// out: true on success
+bool MQTTClient::storeClientCert(const char* certPEM, const char* keyPEM) {
+  Preferences prefs;
+  if (!prefs.begin(CERT_NS, false)) {
+    Log::error(TAG, "NVS open failed (rw)");
+    return false;
+  }
+  bool ok = true;
+  if (certPEM && *certPEM) {
+    size_t len = strlen(certPEM);
+    if (len >= CERT_MAX_LEN) {
+      Log::error(TAG, "cert too large for NVS");
+      ok = false;
+    } else if (!prefs.putString(CERT_KEY_CERT, certPEM)) {
+      Log::error(TAG, "NVS putString(cert) failed");
+      ok = false;
+    }
+  }
+  if (ok && keyPEM && *keyPEM) {
+    size_t len = strlen(keyPEM);
+    if (len >= CERT_MAX_LEN) {
+      Log::error(TAG, "key too large for NVS");
+      ok = false;
+    } else if (!prefs.putString(CERT_KEY_KEY, keyPEM)) {
+      Log::error(TAG, "NVS putString(key) failed");
+      ok = false;
+    }
+  }
+  prefs.end();
+  return ok;
+}
+
+// Load client cert + key from NVS into caller-provided buffers.
+// Both buffers must be at least CERT_MAX_LEN bytes.
+// in:  cert, key buffers (>= maxLen bytes each), maxLen
+// out: true only if BOTH cert and key are present and fit in buffers
+bool MQTTClient::loadClientCert(char* cert, char* key, size_t maxLen) {
+  if (!cert || !key || maxLen < CERT_MAX_LEN) return false;
+  Preferences prefs;
+  if (!prefs.begin(CERT_NS, true)) return false;
+  size_t certLen = prefs.getString(CERT_KEY_CERT, cert, maxLen);
+  size_t keyLen  = prefs.getString(CERT_KEY_KEY,  key,  maxLen);
+  prefs.end();
+  return certLen > 0 && keyLen > 0;
+}
+
+// Erase client cert + key from NVS. Safe to call when absent.
+// out: true if both keys were cleared (or were already absent)
+bool MQTTClient::clearClientCert() {
+  Preferences prefs;
+  if (!prefs.begin(CERT_NS, false)) return false;
+  prefs.remove(CERT_KEY_CERT);
+  prefs.remove(CERT_KEY_KEY);
+  prefs.end();
+  return true;
+}
+
+// True if both cert and key are present in NVS (non-zero length).
+bool MQTTClient::hasClientCert() {
+  Preferences prefs;
+  if (!prefs.begin(CERT_NS, true)) return false;
+  // Stored as strings via putString - isKey is enough. getBytesLength
+  // is for NVS_TYPE_BLOB and logs an error when queried on a string key.
+  bool ok = prefs.isKey(CERT_KEY_CERT) && prefs.isKey(CERT_KEY_KEY);
+  prefs.end();
+  return ok;
+}
+
+// Parse stored cert PEM and fill caller-allocated buffers with metadata.
+// Never touches the private key. Uses mbedtls directly (already linked
+// for TLS), no extra deps.
+// in:  cn, serial, notBefore, notAfter buffers (>= maxLen each), maxLen >= 128
+// out: true if cert loaded and parsed, false if missing or malformed
+bool MQTTClient::getCertInfo(char* cn, char* serial, char* notBefore, char* notAfter, size_t maxLen) {
+  if (!cn || !serial || !notBefore || !notAfter || maxLen < 64) return false;
+
+  char* cert = (char*)malloc(CERT_MAX_LEN);
+  if (!cert) return false;
+
+  Preferences prefs;
+  bool ok = false;
+  if (prefs.begin(CERT_NS, true)) {
+    size_t got = prefs.getString(CERT_KEY_CERT, cert, CERT_MAX_LEN);
+    prefs.end();
+    if (got > 0) ok = true;
+  }
+  if (!ok) { free(cert); return false; }
+
+  mbedtls_x509_crt crt;
+  mbedtls_x509_crt_init(&crt);
+  int rc = mbedtls_x509_crt_parse(&crt, (const unsigned char*)cert, strlen(cert) + 1);
+  free(cert);
+  if (rc != 0) {
+    mbedtls_x509_crt_free(&crt);
+    return false;
+  }
+
+  // Subject DN - mbedtls returns "CN=foo, O=bar, ..." - extract CN
+  char subj[256];
+  mbedtls_x509_dn_gets(subj, sizeof(subj), &crt.subject);
+  const char* cnp = strstr(subj, "CN=");
+  if (cnp) {
+    cnp += 3;
+    size_t i = 0;
+    while (*cnp && *cnp != ',' && i < maxLen - 1) cn[i++] = *cnp++;
+    cn[i] = '\0';
+  } else {
+    snprintf(cn, maxLen, "(no CN)");
+  }
+
+  // Serial - hex bytes joined
+  char* sp = serial;
+  char* se = serial + maxLen - 1;
+  for (size_t i = 0; i < crt.serial.len && sp + 2 < se; i++) {
+    sp += sprintf(sp, "%02x", crt.serial.p[i]);
+  }
+  *sp = '\0';
+
+  // Validity - YYYY-MM-DDTHH:MM:SSZ
+  snprintf(notBefore, maxLen, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+           crt.valid_from.year, crt.valid_from.mon, crt.valid_from.day,
+           crt.valid_from.hour, crt.valid_from.min, crt.valid_from.sec);
+  snprintf(notAfter, maxLen, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+           crt.valid_to.year, crt.valid_to.mon, crt.valid_to.day,
+           crt.valid_to.hour, crt.valid_to.min, crt.valid_to.sec);
+
+  mbedtls_x509_crt_free(&crt);
+  return true;
 }

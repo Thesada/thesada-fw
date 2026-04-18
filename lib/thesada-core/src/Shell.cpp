@@ -20,6 +20,7 @@
 
 #include <LittleFS.h>
 #include <WiFi.h>
+#include <Preferences.h>
 #include <ArduinoJson.h>
 #include <sys/time.h>
 
@@ -113,14 +114,27 @@ static void cmd_ls(int argc, char** argv, ShellOutput out) {
     return;
   }
 
-  char line[128];
+  // Build a base path that entries can be appended to with a single slash.
+  // "/" stays as "/". "/scripts" or "/scripts/" both become "/scripts".
+  // Paths go back out in absolute form so user can copy-paste into fs.cat.
+  char base[96];
+  strncpy(base, path, sizeof(base) - 1);
+  base[sizeof(base) - 1] = '\0';
+  size_t bl = strlen(base);
+  while (bl > 1 && base[bl - 1] == '/') { base[--bl] = '\0'; }
+
+  char line[160];
   File entry = dir.openNextFile();
   while (entry) {
     if (entry.isDirectory()) {
-      snprintf(line, sizeof(line), "  [DIR]  %s/", entry.name());
+      snprintf(line, sizeof(line), "  [DIR]  %s/%s/", base, entry.name());
     } else {
-      snprintf(line, sizeof(line), "  %6d  %s", (int)entry.size(), entry.name());
+      snprintf(line, sizeof(line), "  %6d  %s/%s",
+               (int)entry.size(), base, entry.name());
     }
+    // "//foo" collapses to "/foo" when base is "/".
+    char* dbl = strstr(line, "//");
+    while (dbl) { memmove(dbl, dbl + 1, strlen(dbl)); dbl = strstr(line, "//"); }
     out(line);
     entry = dir.openNextFile();
   }
@@ -581,6 +595,82 @@ static void cmd_ota_check(int argc, char** argv, ShellOutput out) {
   // ESP.restart() at the end of a successful flash would fire before Shell
   // returned, so the cli/response would never publish.
   OTAUpdate::triggerCheck(url, force);
+}
+
+// Print stored mTLS client cert metadata (CN, serial, validity). Never
+// exposes the private key - info-only. No args.
+// in: argc, argv, out. out: prints cert info lines, or "no cert stored"
+static void cmd_cert_info(int argc, char** argv, ShellOutput out) {
+  // Check raw NVS existence first so a stored-but-unparseable cert
+  // reports "corrupt" instead of "not stored".
+  Preferences prefs;
+  bool hasCertBlob = false, hasKeyBlob = false;
+  if (prefs.begin("thesada-tls", true)) {
+    // Stored as strings via putString - use isKey alone (getBytesLength
+    // is for blob type and logs an error for string keys).
+    hasCertBlob = prefs.isKey("client_cert");
+    hasKeyBlob  = prefs.isKey("client_key");
+    prefs.end();
+  }
+
+  if (!hasCertBlob && !hasKeyBlob) {
+    out("No client cert stored (using password auth)");
+    return;
+  }
+
+  char cn[128], serial[96], notBefore[32], notAfter[32];
+  bool parsed = hasCertBlob && MQTTClient::getCertInfo(cn, serial, notBefore, notAfter, sizeof(cn));
+
+  if (parsed) {
+    char line[192];
+    snprintf(line, sizeof(line), "CN:         %s", cn);         out(line);
+    snprintf(line, sizeof(line), "Serial:     %s", serial);     out(line);
+    snprintf(line, sizeof(line), "Not before: %s", notBefore);  out(line);
+    snprintf(line, sizeof(line), "Not after:  %s", notAfter);   out(line);
+  } else if (hasCertBlob) {
+    out("Cert stored but unparseable (corrupt or not valid PEM)");
+  }
+
+  if (hasCertBlob && hasKeyBlob) {
+    out("Status:     cert + key in NVS - cert.apply to reconnect with mTLS");
+  } else if (hasCertBlob) {
+    out("Status:     cert stored, KEY MISSING - push client_key via cli/cert.set");
+  } else {
+    out("Status:     key stored, CERT MISSING - push client_cert via cli/cert.set");
+  }
+}
+
+// Apply a newly-pushed client cert by disconnecting MQTT. The loop() path
+// then reconnects and (if both cert + key are now in NVS) sets up mTLS.
+// in: argc, argv, out. out: status line
+static void cmd_cert_apply(int argc, char** argv, ShellOutput out) {
+  if (!MQTTClient::hasClientCert()) {
+    out("No cert + key in NVS - push both via cli/cert.set before apply");
+    return;
+  }
+  out("Disconnecting MQTT - will reconnect with mTLS client cert");
+  // Disconnect triggers loop() to reconnect path, which now picks up
+  // the stored cert via hasClientCert() -> loadClientCert() -> setCertificate.
+  MQTTClient::_client.disconnect();
+  MQTTClient::_wifiClient.stop();
+}
+
+// Erase stored mTLS cert + key from NVS and force a reconnect. Device
+// falls back to password auth on next connect. Safe if no cert present.
+// in: argc, argv, out. out: status line
+static void cmd_cert_clear(int argc, char** argv, ShellOutput out) {
+  bool had = MQTTClient::hasClientCert();
+  if (!MQTTClient::clearClientCert()) {
+    out("NVS clear failed");
+    return;
+  }
+  if (had) {
+    out("Client cert + key cleared - reconnecting with password auth");
+    MQTTClient::_client.disconnect();
+    MQTTClient::_wifiClient.stop();
+  } else {
+    out("No cert to clear (already using password auth)");
+  }
 }
 
 // Print running + boot + next-update partition info and OTA state. Uses the
@@ -1108,6 +1198,11 @@ void Shell::registerBuiltins() {
   registerCommand("net.mqtt",      "MQTT connection + subscription dump", cmd_mqtt);
   registerCommand("ota.check",     "Trigger OTA check (ota.check [--force] [url])", cmd_ota_check);
   registerCommand("ota.status",    "Partition + rollback state",    cmd_ota_status);
+
+  // mTLS client cert management (NVS-backed)
+  registerCommand("cert.info",     "Show stored client cert metadata",  cmd_cert_info);
+  registerCommand("cert.apply",    "Reconnect MQTT with stored cert",   cmd_cert_apply);
+  registerCommand("cert.clear",    "Erase client cert from NVS",        cmd_cert_clear);
   registerCommand("boot.info",     "Last reset reason + uptime",    cmd_boot_info);
   registerCommand("partitions",    "Full partition table dump",     cmd_partitions);
   registerCommand("chip.info",     "Chip revision, flash, PSRAM",   cmd_chip_info);
