@@ -25,10 +25,15 @@ void PWMModule::begin() {
   _frequency  = cfg["pwm"]["frequency_hz"] | 25000;
   _resolution = cfg["pwm"]["resolution"]   | 8;
 
-  // Arduino ESP32 2.x LEDC API: setup channel then attach pin.
+  // arduino-esp32 3.x unified LEDC API to pin-based (ledcAttach), 2.x was channel-based.
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(_pin, _frequency, _resolution);
+  ledcWrite(_pin, 0);
+#else
   ledcSetup(_channel, _frequency, _resolution);
   ledcAttachPin(_pin, _channel);
   ledcWrite(_channel, 0);
+#endif
 
   char msg[64];
   snprintf(msg, sizeof(msg), "Ready - GPIO%d, %luHz, %d-bit", _pin, _frequency, _resolution);
@@ -48,7 +53,11 @@ void PWMModule::setLevel(float level) {
 
   uint32_t maxVal = (1 << _resolution) - 1;
   uint32_t duty   = (uint32_t)(level * maxVal);
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(_pin, duty);
+#else
   ledcWrite(_channel, duty);
+#endif
 
   char msg[64];
   snprintf(msg, sizeof(msg), "Level set to %.0f%% (duty %lu/%lu)", level * 100, duty, maxVal);

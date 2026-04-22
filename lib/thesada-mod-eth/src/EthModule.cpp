@@ -14,6 +14,7 @@
 #include <Shell.h>
 #include <ModuleRegistry.h>
 #include <ETH.h>
+#include <WiFi.h>
 #include <esp_sntp.h>
 #include <esp_task_wdt.h>
 
@@ -21,8 +22,13 @@ static const char* TAG = "ETH";
 
 bool EthModule::_connected = false;
 
-// Ethernet event handler
+// Ethernet event handler. Callback signature changed in arduino-esp32 3.x:
+// 2.x: void(WiFiEvent_t). 3.x: void(arduino_event_id_t, arduino_event_info_t).
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+static void onEthEvent(arduino_event_id_t event, arduino_event_info_t /*info*/) {
+#else
 static void onEthEvent(WiFiEvent_t event) {
+#endif
   switch (event) {
     case ARDUINO_EVENT_ETH_START:
       Log::info(TAG, "Started");
@@ -68,7 +74,12 @@ void EthModule::earlyInit() {
   WiFi.onEvent(onEthEvent);
 
   Log::info(TAG, "Initializing LAN8720A...");
+  // ETH.begin signature changed in arduino-esp32 3.x: type first, power last.
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  if (!ETH.begin(ETH_PHY_LAN8720, phyAddr, mdc, mdio, powerPin, ETH_CLOCK_GPIO0_IN)) {
+#else
   if (!ETH.begin(phyAddr, powerPin, mdc, mdio, ETH_PHY_LAN8720, ETH_CLOCK_GPIO0_IN)) {
+#endif
     Log::error(TAG, "ETH.begin() failed");
     return;
   }

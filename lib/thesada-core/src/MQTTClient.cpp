@@ -7,11 +7,13 @@
 #include "Log.h"
 #include "Shell.h"
 #include "OTAUpdate.h"
+#include <WiFi.h>
 #include <LittleFS.h>
 #include <Preferences.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/pk.h>
+#include <mbedtls/version.h>
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
 #include <esp_chip_info.h>
@@ -55,10 +57,17 @@ static bool validateClientCertKey(const char* cert, const char* key) {
 
   mbedtls_pk_context pk;
   mbedtls_pk_init(&pk);
-  // arduino-esp32 (espressif32@6.x) uses the 5-arg form without RNG.
+  // mbedtls 3.x (pioarduino / IDF 5.x) added RNG callback args; 2.x has 5-arg form.
+#if MBEDTLS_VERSION_MAJOR >= 3
+  rc = mbedtls_pk_parse_key(&pk,
+                            (const unsigned char*)key, strlen(key) + 1,
+                            nullptr, 0,
+                            nullptr, nullptr);
+#else
   rc = mbedtls_pk_parse_key(&pk,
                             (const unsigned char*)key, strlen(key) + 1,
                             nullptr, 0);
+#endif
   mbedtls_pk_free(&pk);
   return rc == 0;
 }

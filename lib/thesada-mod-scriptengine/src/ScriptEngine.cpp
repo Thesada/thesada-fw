@@ -484,10 +484,23 @@ bool ScriptEngine::executeFile(const char* path) {
     return false;
   }
 
-  String script = f.readString();
-  f.close();
+  // Chunked reader for lua_load so the parser never needs the full script
+  // contiguously in heap (OOM on WROOM-32 under arduino-esp32 3.x / IDF 5).
+  struct Ctx { File* f; char buf[256]; };
+  auto reader = [](lua_State*, void* ud, size_t* size) -> const char* {
+    Ctx* c = (Ctx*)ud;
+    if (!c->f->available()) { *size = 0; return nullptr; }
+    *size = c->f->readBytes(c->buf, sizeof(c->buf));
+    return *size ? c->buf : nullptr;
+  };
+  Ctx ctx{&f, {0}};
 
-  int result = luaL_dostring(gL, script.c_str());
+  // GC existing state before parser peak.
+  lua_gc(gL, LUA_GCCOLLECT, 0);
+
+  int result = lua_load(gL, reader, &ctx, path, nullptr);
+  f.close();
+  if (result == LUA_OK) result = lua_pcall(gL, 0, LUA_MULTRET, 0);
   if (result != LUA_OK) {
     const char* err = lua_tostring(gL, -1);
     char msg[196];
@@ -632,6 +645,16 @@ uint32_t ScriptEngine::generation() {
 void ScriptEngine::loop() {
   if (!gL) return;
   uint32_t now = millis();
+
+  // Periodic full GC. See LUA_GC_INTERVAL_MS in thesada_config.h for rationale.
+#if LUA_GC_INTERVAL_MS > 0
+  static uint32_t lastGc = 0;
+  if (now - lastGc >= LUA_GC_INTERVAL_MS) {
+    lastGc = now;
+    lua_gc(gL, LUA_GCCOLLECT, 0);
+  }
+#endif
+
   for (int i = 0; i < MAX_TIMERS; i++) {
     if (_timers[i].callbackRef != LUA_NOREF && now >= _timers[i].fireAt) {
       int ref = _timers[i].callbackRef;

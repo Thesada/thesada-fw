@@ -43,7 +43,17 @@ void setup() {
   while (!Serial && millis() - serialWait < 3000) delay(10);
 
   // Hardware watchdog: reboot if loop() doesn't feed within 30s.
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  // IDF 5 pre-initializes TWDT. Use reconfigure to extend timeout to 30s.
+  esp_task_wdt_config_t wdt_cfg = {
+    .timeout_ms = 60000,
+    .idle_core_mask = 0,
+    .trigger_panic = true,
+  };
+  esp_task_wdt_reconfigure(&wdt_cfg);
+#else
   esp_task_wdt_init(30, true);
+#endif
   esp_task_wdt_add(NULL);
 
   Serial.println("[INF][Boot] thesada-fw v" FIRMWARE_VERSION " (" __DATE__ " " __TIME__ ")");

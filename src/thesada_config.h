@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
-#define FIRMWARE_VERSION "1.3.9"  // bump on each release
+#define FIRMWARE_VERSION "1.3.10"  // bump on each release
 
 // ── Memory tuning defaults ──────────────────────────────────────────────────
 // Board overrides below redefine these for heap-constrained boards (CYD/WROOM).
@@ -12,6 +12,13 @@
 #define LOG_LINE_LEN        220   // max chars per log line
 #define MQTT_QUEUE_SIZE     8     // offline publish queue depth
 #define MQTT_RX_RING_SIZE   8     // debug RX topic ring
+
+// Lua GC cadence. On low-alloc MCU workloads Lua's incremental GC is
+// starved and dead short strings (MQTT payloads, JSON-decoded fields)
+// accumulate until the system heap fragments and mbedtls can no longer
+// find a contiguous TLS buffer. Periodic full collect prevents this.
+// Set to 0 to disable. Override per-board below.
+#define LUA_GC_INTERVAL_MS  30000
 
 // ── Sensor modules ──────────────────────────────────────────────────────────
 #define ENABLE_TEMPERATURE   // DS18B20 one-wire temperature sensors
@@ -131,10 +138,13 @@
   #undef ENABLE_ADS1115
   #undef ENABLE_DISPLAY
   #undef ENABLE_WEBSERVER
-  #ifndef ENABLE_LITESERVER
-    #define ENABLE_LITESERVER
-  #endif
-  // SD stays enabled - CYD has SPI SD slot (sd.mode: "spi", sd.pin_cs: 5)
+  // Strip LiteServer + Telegram + SD on CYD: heap budget for TLS.
+  // OTA via MQTT CLI (cli/ota.check --force) + boot-time check. USB fallback for brick.
+  // Telegram unused on CYD (alerts fire on OWB). SD has no sensors to log on CYD;
+  // when the album-art cache feature lands it will mount SD on demand.
+  #undef ENABLE_LITESERVER
+  #undef ENABLE_TELEGRAM
+  #undef ENABLE_SD
   #undef BOARD_LILYGO_T_SIM7080_S3
   #ifndef ENABLE_TFT
     #define ENABLE_TFT
