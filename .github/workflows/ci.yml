@@ -28,7 +28,10 @@ jobs:
           python-version: '3.11'
 
       - name: Install PlatformIO
-        run: pip install --upgrade platformio
+        # intelhex is an indirect runtime dep of the newer esptool.py that
+        # ships with espressif32; pinning it explicitly so CI builds do
+        # not fail with "ModuleNotFoundError: intelhex" on a fresh runner.
+        run: pip install --upgrade platformio intelhex
 
       - name: Build all board targets
         run: |

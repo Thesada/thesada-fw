@@ -647,7 +647,12 @@ void HttpServer::setupRoutes() {
                                                                  : "{\"ok\":false,\"error\":\"SD write failed\"}");
       return;
     }
-    if (_fileBodyBuf.length() == 0) {
+    // Empty body is legitimate when Content-Length: 0 (user cleared the
+    // editor and saves). onBody is never invoked for zero-length bodies,
+    // so _fileBodyBuf stays at whatever the previous write left it as.
+    // Only fail if the client promised content (contentLength > 0) and
+    // none of it arrived - that's the real async race case.
+    if (_fileBodyBuf.length() == 0 && req->contentLength() > 0) {
       f.close();
       _fileBodyBuf = "";
       req->send(200, "application/json", "{\"ok\":false,\"error\":\"Empty body - try again\"}");

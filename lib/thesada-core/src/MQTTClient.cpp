@@ -41,6 +41,15 @@ static char*     _clientKey     = nullptr;
 static bool      _mtlsActive    = false;
 static bool      _mtlsWasActive = false;  // last connect() used mTLS - need to clear WiFiClientSecure on fallback
 
+// Persistent broker hostname buffer. PubSubClient::setServer(const char*,
+// uint16_t) stores the pointer, not the contents, so we cannot hand it
+// a pointer into the ArduinoJson document - Config::load() (from
+// config.reload) resets the pool and invalidates the pointer, later
+// reconnects then feed garbage into WiFi.hostByName() and the DNS lookup
+// fails with the previous buffer bytes as the "hostname". Copy once into
+// this buffer on each read.
+static char      _brokerHost[96] = {0};
+
 // Validate a PEM cert + key pair via mbedtls. Prevents feeding a bad
 // buffer into WiFiClientSecure::setCertificate which would stick in the
 // TLS stack and break every future reconnect until restart.
@@ -142,7 +151,10 @@ void MQTTClient::begin() {
   if (_bufferOut < 512)  _bufferOut = 512;
   if (_bufferOut > 8192) _bufferOut = 8192;
 
-  _client.setServer(host, port);
+  // Copy broker into persistent buffer - see _brokerHost comment.
+  strncpy(_brokerHost, host, sizeof(_brokerHost) - 1);
+  _brokerHost[sizeof(_brokerHost) - 1] = '\0';
+  _client.setServer(_brokerHost, port);
   _client.setKeepAlive(60);
   _client.setBufferSize(_bufferIn);
   _client.setCallback(onMessage);
@@ -431,7 +443,12 @@ void MQTTClient::loop() {
     JsonObject  cfgR = Config::get();
     const char* host = cfgR["mqtt"]["broker"] | "";
     uint16_t    port = cfgR["mqtt"]["port"]   | 8883;
-    _client.setServer(host, port);
+    // Refresh the persistent buffer so the re-parsed pool cannot dangle
+    // the pointer PubSubClient holds across future reconnects. See
+    // _brokerHost comment at the top of the file.
+    strncpy(_brokerHost, host, sizeof(_brokerHost) - 1);
+    _brokerHost[sizeof(_brokerHost) - 1] = '\0';
+    _client.setServer(_brokerHost, port);
     _retryInterval = RETRY_MIN_MS;
     connect();
   }
