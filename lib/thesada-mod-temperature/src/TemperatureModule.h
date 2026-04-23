@@ -25,6 +25,10 @@ public:
   const char* name() override { return "TemperatureModule"; }
   void status(ShellOutput out) override;
 
+  // One-shot read for the SensorRegistry callback. Writes one line per
+  // discovered probe: `<name>: <temp> C|F`.
+  void sensorRead(ShellOutput out);
+
 private:
   void        discoverSensors();
   void        loadConfigSensors();

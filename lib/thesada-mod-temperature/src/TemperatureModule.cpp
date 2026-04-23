@@ -8,6 +8,7 @@
 #include <Log.h>
 #include <LittleFS.h>
 #include <ModuleRegistry.h>
+#include <SensorRegistry.h>
 
 static const char* TAG             = "Temp";
 static const char* DISCOVERED_PATH = "/discovered_sensors.json";
@@ -39,6 +40,11 @@ void TemperatureModule::begin() {
   char msg[64];
   snprintf(msg, sizeof(msg), "Ready - %d sensor(s) on GPIO%d", (int)_sensorList.size(), _pin);
   Log::info(TAG, msg);
+
+  SensorRegistry::add("temperature", "DS18B20 1-wire probes",
+    [](ShellOutput out, void* ctx) {
+      static_cast<TemperatureModule*>(ctx)->sensorRead(out);
+    }, this, true);
 }
 
 // Trigger a read-and-publish cycle at the configured interval
@@ -272,6 +278,27 @@ void TemperatureModule::readAndPublish() {
 void TemperatureModule::addressToStr(DeviceAddress addr, char* out) {
   for (int i = 0; i < 8; i++) snprintf(out + (i * 2), 3, "%02X", addr[i]);
   out[16] = '\0';
+}
+
+// SensorRegistry read callback. Triggers a conversion, then prints one line
+// per named probe with the latest reading.
+void TemperatureModule::sensorRead(ShellOutput out) {
+  if (!_sensors || _sensorList.empty()) { out("  no probes on bus"); return; }
+  _sensors->requestTemperatures();
+  delay(_conversionMs);
+  char line[96];
+  for (auto& s : _sensorList) {
+    float c = _sensors->getTempC(s.address);
+    if (c == DEVICE_DISCONNECTED_C) {
+      snprintf(line, sizeof(line), "  %-16s: disconnected", s.name);
+    } else {
+      float v = _useFahrenheit ? (c * 9.0f / 5.0f + 32.0f) : c;
+      snprintf(line, sizeof(line), "  %-16s: %.2f %s",
+               s.name, v, _useFahrenheit ? "F" : "C");
+      s.lastTemp = c;
+    }
+    out(line);
+  }
 }
 
 // Report temperature module status

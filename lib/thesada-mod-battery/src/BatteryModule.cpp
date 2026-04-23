@@ -7,6 +7,7 @@
 #include <MQTTClient.h>
 #include <Log.h>
 #include <Shell.h>
+#include <SensorRegistry.h>
 #include <PowerManager.h>
 #include <ArduinoJson.h>
 #include <ModuleRegistry.h>
@@ -35,17 +36,20 @@ void BatteryModule::begin() {
            (unsigned long)(_intervalMs / 1000), _lowPct);
   Log::info(TAG, msg);
 
-  // Register battery shell command
-  Shell::registerCommand("battery", "Battery voltage, percent, charging state",
-      [](int argc, char** argv, ShellOutput out) {
-        if (!PowerManager::isPmuOk()) { out("PMU not available"); return; }
-        if (!PowerManager::isBatteryPresent()) { out("Battery: not detected"); return; }
-        char line[64];
-        snprintf(line, sizeof(line), "Battery: %.2fV  %d%%  [%s]",
-                 PowerManager::getVoltage(), PowerManager::getPercent(),
-                 PowerManager::isCharging() ? "CHARGING" : "DISCHARGING");
-        out(line);
-      });
+  // Register under the unified `sensors` CLI (#126). Use `sensors battery`.
+  SensorRegistry::add("battery", "voltage, percent, charging state (PMU)",
+    [](ShellOutput out, void* /*ctx*/) {
+      if (!PowerManager::isPmuOk())         { out("  PMU not available"); return; }
+      if (!PowerManager::isBatteryPresent()) { out("  not detected"); return; }
+      char line[64];
+      snprintf(line, sizeof(line), "  voltage:  %.2f V",    PowerManager::getVoltage());
+      out(line);
+      snprintf(line, sizeof(line), "  percent:  %d %%",     PowerManager::getPercent());
+      out(line);
+      snprintf(line, sizeof(line), "  state:    %s",
+               PowerManager::isCharging() ? "charging" : "discharging");
+      out(line);
+    }, nullptr, true);
 
   // Publish initial state immediately on boot.
   readAndPublish();

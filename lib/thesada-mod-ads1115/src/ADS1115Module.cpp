@@ -16,6 +16,7 @@
 #include <Log.h>
 #include <Wire.h>
 #include <ModuleRegistry.h>
+#include <SensorRegistry.h>
 
 static const char* TAG = "ADS1115";
 
@@ -46,6 +47,11 @@ void ADS1115Module::begin() {
   snprintf(msg, sizeof(msg), "Ready - %d channel(s) at I2C 0x%02X (SDA=%d SCL=%d)",
            (int)_channels.size(), addr, sda, scl);
   Log::info(TAG, msg);
+
+  SensorRegistry::add("current", "ADS1115 CT channels (RMS current)",
+    [](ShellOutput out, void* ctx) {
+      static_cast<ADS1115Module*>(ctx)->sensorRead(out);
+    }, this, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -83,6 +89,24 @@ void ADS1115Module::loop() {
   if (now - _lastRead >= _intervalMs) {
     _lastRead = now;
     readAndPublish();
+  }
+}
+
+// ---------------------------------------------------------------------------
+
+// SensorRegistry read callback. One line per configured channel showing
+// RMS voltage, computed current, and estimated power. Does not publish.
+void ADS1115Module::sensorRead(ShellOutput out) {
+  if (_channels.empty()) { out("  no channels configured"); return; }
+  char line[128];
+  for (auto& ch : _channels) {
+    float rmsV    = readRmsVoltage(ch, 30);
+    float current = rmsV * 30.0f;
+    float power   = current * _lineVoltage;
+    snprintf(line, sizeof(line),
+             "  %-12s: %.4f V rms  %.2f A  %.1f W",
+             ch.name, rmsV, current, power);
+    out(line);
   }
 }
 

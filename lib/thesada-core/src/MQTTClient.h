@@ -143,6 +143,16 @@ public:
 
   static bool          _reinitPending;
 
+public:
+  // Deferred reboot latch set by cert.apply. Main loop calls ESP.restart()
+  // once the deadline passes so the shell handler can publish its response
+  // before the reboot wipes the session. Unconditional reboot is the only
+  // reliable recovery when WiFiClientSecure holds sticky mbedtls state
+  // across cert swap (classic-platform boards hit this).
+  static bool     _certApplyRebootPending;
+  static uint32_t _certApplyRebootAtMs;
+private:
+
   static constexpr uint32_t RETRY_MIN_MS   = 2000;
   static constexpr uint32_t RETRY_MAX_MS   = 60000;
   static constexpr uint32_t WATCHDOG_MS    = 600000;  // 10 min - force reconnect if no activity

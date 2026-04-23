@@ -19,26 +19,6 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 0.6.1~4
-  espressif/cjson:
-    component_hash: e788323270d90738662d66fffa910bfe1fba019bba087f01557e70c40485b469
-    dependencies:
-    - name: idf
-      require: private
-      version: '>=5.0'
-    source:
-      registry_url: https://components.espressif.com
-      type: service
-    version: 1.7.19~2
-  espressif/dl_fft:
-    component_hash: 7dadbd644c0d7ba4733cc3726ec4cff6edf27b043725e1115861dec1609a3d28
-    dependencies:
-    - name: idf
-      require: private
-      version: '>=5.0'
-    source:
-      registry_url: https://components.espressif.com
-      type: service
-    version: 0.3.1
   espressif/esp-dsp:
     component_hash: 12e44db246517a627bc0fe2b255b8335410c0215c98bfba2df5a8e3edea839ef
     dependencies:
@@ -66,28 +46,6 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 0.0.11
-  espressif/esp-sr:
-    component_hash: b9f96cf7cd7d5fc6c4b666c5b64d9a5ecdf11bf68e5434474d3487ea6bd50787
-    dependencies:
-    - name: espressif/cjson
-      registry_url: https://components.espressif.com
-      require: private
-      version: ^1.7.19
-    - name: espressif/dl_fft
-      registry_url: https://components.espressif.com
-      require: private
-      version: '>=0.2.0'
-    - name: espressif/esp-dsp
-      registry_url: https://components.espressif.com
-      require: private
-      version: 1.8.0
-    - name: idf
-      require: private
-      version: '>=5.0'
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    version: 2.4.1
   espressif/esp-zboss-lib:
     component_hash: 321883d142421f65009972408287441794250057668a11abbdfd8bec77c3309a
     dependencies:
@@ -282,6 +240,33 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 1.0.3
+  espressif/lan867x:
+    component_hash: 651c9d6e3d96acb08bd5066144b12a12e94df0a6241127a0538d8680689de2c4
+    dependencies:
+    - name: espressif/lan86xx_common
+      registry_url: https://components.espressif.com
+      require: private
+      version: '*'
+    - name: idf
+      require: private
+      version: '>=5.3'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32
+    - esp32p4
+    version: 2.0.0
+  espressif/lan86xx_common:
+    component_hash: 6dcb1be9f43ae940979bd628fa5bee278949b66c545e1fe2321e486102e81026
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.2'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.0.0
   espressif/libsodium:
     component_hash: b51f5836f044d8b7fbb1784257605c47ff7356f701377b005912fe6a2f12db37
     dependencies:
@@ -345,7 +330,6 @@ direct_dependencies:
 - espressif/cbor
 - espressif/esp-dsp
 - espressif/esp-modbus
-- espressif/esp-sr
 - espressif/esp-zboss-lib
 - espressif/esp-zigbee-lib
 - espressif/esp_diag_data_store
@@ -353,6 +337,7 @@ direct_dependencies:
 - espressif/esp_insights
 - espressif/esp_modem
 - espressif/esp_rainmaker
+- espressif/lan867x
 - espressif/libsodium
 - espressif/mdns
 - espressif/network_provisioning
@@ -361,5 +346,5 @@ direct_dependencies:
 - idf
 - joltwallet/littlefs
 manifest_hash: 3e908f06feb1567024342d2aa7f9257e07d7fd89e839fca4eec0522ea95a34de
-target: esp32s3
+target: esp32
 version: 2.0.0

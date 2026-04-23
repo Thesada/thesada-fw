@@ -115,6 +115,8 @@ bool             MQTTClient::_insecureFallback = false;
 uint32_t         MQTTClient::_lastHeapPublishMs = 0;
 uint32_t         MQTTClient::_lastHeapFree      = 0;
 bool             MQTTClient::_reinitPending     = false;
+bool             MQTTClient::_certApplyRebootPending = false;
+uint32_t         MQTTClient::_certApplyRebootAtMs    = 0;
 
 char             MQTTClient::_rxRing[MQTTClient::RX_RING_SIZE][96] = {};
 uint32_t         MQTTClient::_rxRingTs[MQTTClient::RX_RING_SIZE]    = {};
@@ -434,6 +436,18 @@ void MQTTClient::loop() {
   // Process deferred CLI command outside the PubSubClient callback context.
   if (_deferred.pending) {
     processDeferredCLI();
+  }
+
+  // Deferred reboot after cert.apply. The shell handler publishes its
+  // response, schedules the reboot for a few seconds later, then returns.
+  // This main-loop tick performs the actual restart - only reliable way to
+  // clear sticky WiFiClientSecure / mbedtls state across a cert swap on
+  // classic-platform boards. Remote devices have no USB
+  // fallback, so cert.apply must self-recover.
+  if (_certApplyRebootPending && (int32_t)(millis() - _certApplyRebootAtMs) >= 0) {
+    Log::warn(TAG, "cert.apply deferred reboot firing");
+    delay(100);
+    ESP.restart();
   }
 
   // Deferred reconnect after reinitSubscriptions() - runs on a clean stack
@@ -1105,6 +1119,10 @@ void MQTTClient::publishDiscovery() {
   snprintf(stBuf, sizeof(stBuf), "%s/sensor/heap/psram_free", prefix);
   disc("sensor", uid, "Free PSRAM", stBuf, "B", "", "measurement", "diagnostic");
 
+  snprintf(uid, sizeof(uid), "%s_uptime", devId);
+  snprintf(stBuf, sizeof(stBuf), "%s/sensor/uptime", prefix);
+  disc("sensor", uid, "Uptime", stBuf, "s", "duration", "total_increasing", "diagnostic");
+
   // Publish first heap sample immediately so HA has values on discovery.
   publishHeapStats();
 
@@ -1148,6 +1166,10 @@ void MQTTClient::publishHeapStats() {
 
   snprintf(topic, sizeof(topic), "%s/sensor/heap/psram_free", prefix);
   snprintf(value, sizeof(value), "%lu", (unsigned long)freePsram);
+  _client.publish(topic, value);
+
+  snprintf(topic, sizeof(topic), "%s/sensor/uptime", prefix);
+  snprintf(value, sizeof(value), "%lu", (unsigned long)(millis() / 1000));
   _client.publish(topic, value);
 
   _lastHeapPublishMs = millis();

@@ -13,6 +13,7 @@
 #include <Log.h>
 #include <Shell.h>
 #include <ModuleRegistry.h>
+#include <SensorRegistry.h>
 #include <Wire.h>
 #include <ArduinoJson.h>
 
@@ -45,6 +46,13 @@ static bool sht31Read(uint8_t addr, float& temp, float& humid) {
 // Initialize I2C and verify sensor is present
 void SHT31Module::begin() {
   JsonObject cfg = Config::get();
+  // Runtime gate (#116): nodes without the sensor soldered can set
+  // sht31.enabled=false to skip the probe and silence the "no device" log.
+  bool enabled = cfg["sht31"]["enabled"] | true;
+  if (!enabled) {
+    Log::info(TAG, "disabled via config (sht31.enabled=false)");
+    return;
+  }
   int sda  = cfg["sht31"]["sda"]        | 11;
   int scl  = cfg["sht31"]["scl"]        | 12;
   _addr    = cfg["sht31"]["address"]    | 0x44;
@@ -53,13 +61,14 @@ void SHT31Module::begin() {
 
   Wire.begin(sda, scl);
 
-  // Probe the sensor
+  // Probe the sensor. Missing device is expected on bare nodes that share
+  // the BOARD_S3_BARE env with sht31 devices - log at info, not error.
   Wire.beginTransmission(_addr);
   uint8_t err = Wire.endTransmission();
   if (err != 0) {
     char msg[64];
-    snprintf(msg, sizeof(msg), "No device at 0x%02X (SDA=%d SCL=%d) - err %d", _addr, sda, scl, err);
-    Log::error(TAG, msg);
+    snprintf(msg, sizeof(msg), "no device at 0x%02X (SDA=%d SCL=%d) - sensor absent", _addr, sda, scl);
+    Log::info(TAG, msg);
     return;
   }
 
@@ -111,19 +120,12 @@ void SHT31Module::begin() {
     Log::info(TAG, "HA discovery published");
   }
 
-  // Register shell command
-  Shell::registerCommand("sht31", "SHT31 temperature and humidity",
-      [this](int argc, char** argv, ShellOutput out) {
-        if (!_ok) { out("SHT31 not initialized"); return; }
-        float t, h;
-        if (sht31Read(_addr, t, h)) {
-          char line[64];
-          snprintf(line, sizeof(line), "%.1fC  %.1f%%", t, h);
-          out(line);
-        } else {
-          out("Read failed");
-        }
-      });
+  // Register under the unified `sensors` CLI (#126). The old standalone
+  // `sht31` command is gone - use `sensors sht31` instead.
+  SensorRegistry::add("sht31", "temperature + humidity (I2C)",
+    [](ShellOutput out, void* ctx) {
+      static_cast<SHT31Module*>(ctx)->sensorRead(out);
+    }, this, true);
 
   char msg[64];
   snprintf(msg, sizeof(msg), "Ready - SDA=%d SCL=%d addr=0x%02X interval=%lus", sda, scl, _addr, iv);
@@ -186,6 +188,21 @@ void SHT31Module::readAndPublish() {
   char msg[64];
   snprintf(msg, sizeof(msg), "%.1f%s  %.1f%%", displayTemp, unit, humid);
   Log::info(TAG, msg);
+}
+
+// SensorRegistry read callback. Outputs two lines on success, one on error.
+void SHT31Module::sensorRead(ShellOutput out) {
+  if (!_ok) { out("  not initialized"); return; }
+  float t, h;
+  if (sht31Read(_addr, t, h)) {
+    char line[64];
+    snprintf(line, sizeof(line), "  temperature: %.1f C", t);
+    out(line);
+    snprintf(line, sizeof(line), "  humidity:    %.1f %%", h);
+    out(line);
+  } else {
+    out("  read failed");
+  }
 }
 
 // Report module status

@@ -10,6 +10,7 @@
 #include "MQTTClient.h"
 #include "ModuleRegistry.h"
 #include "OTAUpdate.h"
+#include "SensorRegistry.h"
 #include <thesada_config.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
@@ -648,11 +649,14 @@ static void cmd_cert_apply(int argc, char** argv, ShellOutput out) {
     out("No cert + key in NVS - push both via cli/cert.set before apply");
     return;
   }
-  out("Disconnecting MQTT - will reconnect with mTLS client cert");
-  // Disconnect triggers loop() to reconnect path, which now picks up
-  // the stored cert via hasClientCert() -> loadClientCert() -> setCertificate.
-  MQTTClient::_client.disconnect();
-  MQTTClient::_wifiClient.stop();
+  // Disconnect alone is not enough on classic-platform boards: WiFiClientSecure
+  // holds sticky mbedtls state across the cert swap and the next handshake
+  // silently drops the freshly-loaded cert. Reboot is the only
+  // reliable recovery. Schedule it 3 s out so this handler can publish its
+  // cli/response first and the main loop gets one tick to flush the socket.
+  out("Cert + key present - rebooting in 3s to apply (mTLS on next boot)");
+  MQTTClient::_certApplyRebootAtMs    = millis() + 3000;
+  MQTTClient::_certApplyRebootPending = true;
 }
 
 // Erase stored mTLS cert + key from NVS and force a reconnect. Device
@@ -1000,10 +1004,21 @@ static void cmd_uptime(int argc, char** argv, ShellOutput out) {
   out(line);
 }
 
-// Show firmware version and build timestamp
+// Show firmware version, build timestamp, and configured device name.
+// Device name prints on a second line so the identify-dev-ports helper
+// (and any other scripts that only grep the `thesada-fw v...` line) keep
+// working unchanged.
 static void cmd_version(int argc, char** argv, ShellOutput out) {
   char line[96];
   snprintf(line, sizeof(line), "thesada-fw v%s (%s %s)", FIRMWARE_VERSION, __DATE__, __TIME__);
+  out(line);
+
+  JsonObject cfg = Config::get();
+  const char* devName   = cfg["device"]["name"]        | "";
+  const char* topicPref = cfg["mqtt"]["topic_prefix"]  | "";
+  snprintf(line, sizeof(line), "device: %s  topic: %s",
+           devName[0]   ? devName   : "?",
+           topicPref[0] ? topicPref : "?");
   out(line);
 }
 
@@ -1014,48 +1029,55 @@ static void cmd_help(int argc, char** argv, ShellOutput out) {
   Shell::listCommands(out);
 }
 
-// List all configured sensors and their current readings
+// Unified sensors command backed by SensorRegistry. Modules self-register
+// a read callback in their begin(); this handler dispatches by name or
+// iterates all registered entries.
+//
+//   sensors            list registered sensors (name, desc, (disabled))
+//   sensors <name>     run the one-shot read for that sensor
+//   sensors all        run every registered sensor in turn
+//
+// Uniform sensor-read interface for the unified `sensors` CLI.
 static void cmd_sensors(int argc, char** argv, ShellOutput out) {
-  char line[128];
-  int count = 0;
-
-  // Temperature
-  #ifdef ENABLE_TEMPERATURE
-  {
-    JsonObject cfg = Config::get();
-    JsonArray sensors = cfg["temperature"]["sensors"].as<JsonArray>();
-    if (!sensors.isNull()) {
-      for (JsonObject s : sensors) {
-        const char* name = s["name"] | "?";
-        const char* addr = s["address"] | "";
-        snprintf(line, sizeof(line), "  temp  %-12s %s", name, addr);
-        out(line);
-        count++;
-      }
-    }
+  if (argc <= 1) {
+    char line[96];
+    snprintf(line, sizeof(line), "%d sensor(s) registered:", SensorRegistry::count());
+    out(line);
+    SensorRegistry::forEach([](const SensorEntry& e, ShellOutput o) {
+      char l[128];
+      snprintf(l, sizeof(l), "  %-12s %s%s",
+               e.name,
+               e.desc ? e.desc : "",
+               e.enabled ? "" : "  (disabled)");
+      o(l);
+    }, out);
+    out("usage: sensors <name> | sensors all");
+    return;
   }
-  #endif
 
-  // ADS1115
-  #ifdef ENABLE_ADS1115
-  {
-    JsonObject cfg = Config::get();
-    JsonArray channels = cfg["ads1115"]["channels"].as<JsonArray>();
-    if (!channels.isNull()) {
-      for (JsonObject ch : channels) {
-        const char* name = ch["name"] | "?";
-        const char* mux  = ch["mux"]  | "?";
-        float gain = ch["gain"] | 0.0f;
-        snprintf(line, sizeof(line), "  adc   %-12s mux=%s gain=%.3f", name, mux, gain);
-        out(line);
-        count++;
-      }
-    }
+  if (strcmp(argv[1], "all") == 0) {
+    SensorRegistry::forEach([](const SensorEntry& e, ShellOutput o) {
+      char hdr[64];
+      snprintf(hdr, sizeof(hdr), "[%s]", e.name);
+      o(hdr);
+      if (!e.enabled) { o("  (disabled)"); return; }
+      e.read(o, e.ctx);
+    }, out);
+    return;
   }
-  #endif
 
-  snprintf(line, sizeof(line), "%d sensor(s) configured", count);
-  out(line);
+  const SensorEntry* e = SensorRegistry::find(argv[1]);
+  if (!e) {
+    char line[96];
+    snprintf(line, sizeof(line), "unknown sensor: %s", argv[1]);
+    out(line);
+    return;
+  }
+  if (!e->enabled) {
+    out("sensor disabled in config");
+    return;
+  }
+  e->read(out, e->ctx);
 }
 
 // ---------------------------------------------------------------------------

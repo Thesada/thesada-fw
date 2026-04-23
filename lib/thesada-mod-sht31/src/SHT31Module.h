@@ -16,6 +16,10 @@ public:
   void status(ShellOutput out) override;
   void selftest(ShellOutput out) override;
 
+  // One-shot read for the SensorRegistry callback. Writes two lines
+  // (temperature, humidity) or an error line. Returns nothing.
+  void sensorRead(ShellOutput out);
+
 private:
   void readAndPublish();
 

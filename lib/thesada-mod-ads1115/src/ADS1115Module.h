@@ -35,6 +35,10 @@ public:
   const char* name()  override { return "ADS1115"; }
   void        status(ShellOutput out) override;
 
+  // One-shot read for the SensorRegistry callback. Prints one line per
+  // configured channel with the RMS current reading.
+  void        sensorRead(ShellOutput out);
+
 private:
   void        loadChannels();
   void        readAndPublish();
