@@ -8,7 +8,6 @@
 #include "Cellular.h"
 #include <Config.h>
 #include <Log.h>
-#include <WiFiManager.h>
 #include <LittleFS.h>
 
 // ── TinyGSM ─────────────────────────────────────────────────────────────────
@@ -35,16 +34,18 @@ static const char* TAG = "Cellular";
 
 
 // ── Module state ─────────────────────────────────────────────────────────────
-bool     Cellular::_started      = false;
-bool     Cellular::_mqttOk       = false;
-bool     Cellular::_hasCACert    = false;
-uint32_t Cellular::_lastWiFiCheck = 0;
+bool     Cellular::_started        = false;
+bool     Cellular::_mqttConnected  = false;
+bool     Cellular::_publishGate    = false;
+bool     Cellular::_hasCACert      = false;
+int      Cellular::_signalQuality  = 99;
+uint32_t Cellular::_lastSignalSample = 0;
 
 // Serial port for TinyGSM
 static TinyGsm modem(Serial1);
 
-// ── WiFi re-check interval - 15 minutes ─────────────────────────────────────
-static constexpr uint32_t WIFI_RECHECK_MS = 15UL * 60UL * 1000UL;
+// Sample AT+CSQ at most every 30 s to keep AT bus clean.
+static constexpr uint32_t SIGNAL_SAMPLE_MS = 30UL * 1000UL;
 
 // ---------------------------------------------------------------------------
 
@@ -335,34 +336,24 @@ void Cellular::begin() {
     delay(10000);
   }
 
-  _started       = true;
-  _mqttOk        = true;
-  _lastWiFiCheck = millis();
+  _started          = true;
+  _mqttConnected    = true;
+  _publishGate      = true;
+  _lastSignalSample = 0;
+  sampleSignalQuality();
 }
 
 // ---------------------------------------------------------------------------
 
-// Periodic WiFi recheck and automatic network/MQTT recovery
+// Cellular-only recovery: re-register on network loss, reconnect MQTT on drop.
+// WiFi-vs-cellular policy is handled by CellularModule, not here.
 void Cellular::loop() {
   if (!_started) return;
-
-  // Periodic WiFi re-check (every 15 min).
-  if (millis() - _lastWiFiCheck >= WIFI_RECHECK_MS) {
-    _lastWiFiCheck = millis();
-    Log::info(TAG, "Periodic WiFi recheck...");
-    if (WiFiManager::recheckWiFi()) {
-      Log::info(TAG, "WiFi back - cellular yielding");
-      // WiFiManager is now connected; main.cpp will switch back.
-      // Stop publishing via cellular.
-      _mqttOk = false;
-      return;
-    }
-  }
 
   // Recovery: network dropped.
   if (!isRegistered() || !modem.isGprsConnected()) {
     Log::warn(TAG, "Network lost - re-registering");
-    _mqttOk = false;
+    _mqttConnected = false;
     while (!networkConnect()) {
       Log::warn(TAG, "Retry network in 10s");
       delay(10000);
@@ -371,27 +362,59 @@ void Cellular::loop() {
       Log::warn(TAG, "Retry MQTT in 10s");
       delay(10000);
     }
-    _mqttOk = true;
+    _mqttConnected = true;
     return;
   }
 
   // Recovery: MQTT dropped, network still up.
   if (!mqttIsConnected()) {
     Log::warn(TAG, "MQTT dropped - reconnecting");
-    _mqttOk = false;
+    _mqttConnected = false;
     if (mqttConnect()) {
-      _mqttOk = true;
+      _mqttConnected = true;
     } else {
       delay(5000);
     }
   }
+
+  sampleSignalQuality();
 }
 
 // ---------------------------------------------------------------------------
 
-// Return true if cellular is started and MQTT is connected
+// True when modem is up AND the publish gate is open. Subscribers gate on
+// this so a brief WiFi recovery does not require tearing the modem down.
 bool Cellular::connected() {
-  return _started && _mqttOk;
+  return _started && _mqttConnected && _publishGate;
+}
+
+// ---------------------------------------------------------------------------
+
+// Toggle the publish gate. Closing it stops cellular publishes immediately
+// while leaving the MQTT session warm for fast re-takeover. CellularModule
+// uses this on yield (WiFi recovered) and resume (WiFi dropped again).
+void Cellular::setPublishGate(bool open) {
+  _publishGate = open;
+}
+
+// ---------------------------------------------------------------------------
+
+// Last sampled signal quality from AT+CSQ. Range 0..31 (higher is better),
+// 99 means unknown / no sample yet.
+int Cellular::getSignalQuality() {
+  return _signalQuality;
+}
+
+// ---------------------------------------------------------------------------
+
+// Refresh _signalQuality from AT+CSQ at most every SIGNAL_SAMPLE_MS to avoid
+// monopolising the AT bus. Called from begin() and loop() while started.
+void Cellular::sampleSignalQuality() {
+  uint32_t now = millis();
+  if (_lastSignalSample != 0 && (now - _lastSignalSample) < SIGNAL_SAMPLE_MS) return;
+  _lastSignalSample = now;
+  int rssi = modem.getSignalQuality();  // TinyGSM: 0..31, 99 = unknown
+  _signalQuality = rssi;
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +430,7 @@ bool Cellular::publish(const char* topic, const char* payload) {
   modem.sendAT(cmd);
   if (modem.waitResponse(5000UL, ">") != 1) {
     Log::warn(TAG, "No SMPUB prompt");
-    _mqttOk = false;
+    _mqttConnected = false;
     return false;
   }
 
@@ -417,7 +440,7 @@ bool Cellular::publish(const char* topic, const char* payload) {
     return true;
   }
   Log::warn(TAG, "SMPUB failed");
-  _mqttOk = false;
+  _mqttConnected = false;
   return false;
 }
 
