@@ -226,6 +226,28 @@ static void cmd_df(int argc, char** argv, ShellOutput out) {
   // SD card info is reported by SDModule::status() via module.status command
 }
 
+// Reformat LittleFS - destroys every file. Requires `fs.format --yes` so
+// a stray `fs.format` press over MQTT cannot wipe a device. Use case:
+// recover from a corrupt / zombie-dirent state when targeted fs.rm
+// cannot reach the bad entry. Always reboots after format so the rest
+// of the firmware (Lua state, MQTT subs, OTA timers) starts fresh
+// against the empty filesystem instead of crashing on stale handles.
+// Caller is responsible for re-uploading config.json + ca.crt + scripts.
+//
+// In:  argv[1] must be "--yes"
+// Out: status line, then reboot
+static void cmd_format(int argc, char** argv, ShellOutput out) {
+  if (argc < 2 || strcmp(argv[1], "--yes") != 0) {
+    out("Usage: fs.format --yes  (DESTROYS every file on LittleFS)");
+    return;
+  }
+  LittleFS.end();
+  bool ok = LittleFS.format();
+  out(ok ? "LittleFS reformatted - rebooting" : "LittleFS format FAILED - rebooting anyway");
+  delay(200);
+  esp_restart();
+}
+
 // ---------------------------------------------------------------------------
 // Config commands
 // ---------------------------------------------------------------------------
@@ -1205,6 +1227,7 @@ void Shell::registerBuiltins() {
   registerCommand("fs.append",     "Append content to file",        cmd_write);
   registerCommand("fs.mv",         "Rename/move a file",            cmd_mv);
   registerCommand("fs.df",         "Disk usage (LittleFS + SD)",    cmd_df);
+  registerCommand("fs.format",     "Reformat LittleFS (fs.format --yes)", cmd_format);
 
   // Config
   registerCommand("config.get",    "Read config key (dot notation)",   cmd_config_get);
