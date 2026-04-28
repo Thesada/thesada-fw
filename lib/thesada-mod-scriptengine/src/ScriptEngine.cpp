@@ -389,6 +389,34 @@ static const luaL_Reg jsonLib[] = {
   {nullptr, nullptr}
 };
 
+// ---------------------------------------------------------------------------
+// OS bindings - targeted LittleFS file removal that the shell parser
+// cannot reach (e.g. zombie dirents with whitespace or embedded
+// newlines in filenames - Shell::parse strtok-splits on whitespace).
+// Lua arg is a single string so any byte sequence is addressable.
+// ---------------------------------------------------------------------------
+
+// os.remove(path) -> true | nil, errmsg
+//
+// In:  Lua string arg (raw filename bytes, may contain whitespace/newlines)
+// Out: 1 return value on success (true) or 2 on failure (nil, errmsg)
+static int lua_os_remove(lua_State* L) {
+  size_t len = 0;
+  const char* path = luaL_checklstring(L, 1, &len);
+  if (LittleFS.remove(path)) {
+    lua_pushboolean(L, 1);
+    return 1;
+  }
+  lua_pushnil(L);
+  lua_pushstring(L, "remove failed");
+  return 2;
+}
+
+static const luaL_Reg osLib[] = {
+  {"remove", lua_os_remove},
+  {nullptr, nullptr}
+};
+
 // Display, TFT, and Telegram Lua bindings have moved to their respective
 // module .cpp files. They register via ScriptEngine::addBindings() in begin().
 
@@ -449,6 +477,18 @@ void ScriptEngine::registerCoreBindings() {
 
   luaL_newlib(gL, jsonLib);
   lua_setglobal(gL, "JSON");
+
+  // Augment Lua's `os` table with os.remove. ESP-Arduino-Lua does not
+  // load the full os stdlib (no os.execute / os.exit / os.time on MCU),
+  // but a targeted os.remove is the minimum viable cleanup path for
+  // zombie LittleFS dirents that Shell::parse cannot address.
+  lua_getglobal(gL, "os");
+  if (!lua_istable(gL, -1)) {
+    lua_pop(gL, 1);
+    lua_newtable(gL);
+  }
+  luaL_setfuncs(gL, osLib, 0);
+  lua_setglobal(gL, "os");
 }
 
 // Register a module's Lua binding function (called in module begin())
