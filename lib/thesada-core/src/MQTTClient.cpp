@@ -1,6 +1,7 @@
 // thesada-fw - MQTTClient.cpp
 // SPDX-License-Identifier: GPL-3.0-only
 #include "MQTTClient.h"
+#include <thesada_config.h>
 #include "Config.h"
 #include "EventBus.h"
 #include "WiFiManager.h"
@@ -114,6 +115,7 @@ uint32_t         MQTTClient::_connectedSinceMs = 0;
 bool             MQTTClient::_insecureFallback = false;
 uint32_t         MQTTClient::_lastHeapPublishMs = 0;
 uint32_t         MQTTClient::_lastHeapFree      = 0;
+uint32_t         MQTTClient::_lowHeapSinceMs    = 0;
 bool             MQTTClient::_reinitPending     = false;
 bool             MQTTClient::_certApplyRebootPending = false;
 uint32_t         MQTTClient::_certApplyRebootAtMs    = 0;
@@ -433,6 +435,38 @@ void MQTTClient::tick() {
 
 // Process MQTT messages and handle reconnection with backoff
 void MQTTClient::loop() {
+  // Preventive reboot if free heap stays below HEAP_REBOOT_FLOOR_BYTES for
+  // longer than HEAP_REBOOT_HOLD_MS. Prevents the bad path where an
+  // mbedtls allocation inside the TLS stack fails mid-handshake and
+  // wedges the connection without a clean recovery. A reboot here lands
+  // the device on a fresh, defragmented heap. Disable by defining
+  // HEAP_REBOOT_FLOOR_BYTES = 0 in thesada_config.h.
+  if (HEAP_REBOOT_FLOOR_BYTES > 0) {
+    uint32_t freeHeap = ESP.getFreeHeap();
+    uint32_t now = millis();
+    if (freeHeap < HEAP_REBOOT_FLOOR_BYTES) {
+      if (_lowHeapSinceMs == 0) {
+        _lowHeapSinceMs = now;
+        char wmsg[96];
+        snprintf(wmsg, sizeof(wmsg),
+                 "free heap %lu B below floor %d B - watchdog armed",
+                 (unsigned long)freeHeap, (int)HEAP_REBOOT_FLOOR_BYTES);
+        Log::warn(TAG, wmsg);
+      } else if ((now - _lowHeapSinceMs) >= (uint32_t)HEAP_REBOOT_HOLD_MS) {
+        char emsg[96];
+        snprintf(emsg, sizeof(emsg),
+                 "free heap stuck below %d B for %d ms - rebooting",
+                 (int)HEAP_REBOOT_FLOOR_BYTES, (int)HEAP_REBOOT_HOLD_MS);
+        Log::error(TAG, emsg);
+        delay(100);
+        esp_restart();
+      }
+    } else if (_lowHeapSinceMs != 0) {
+      Log::info(TAG, "free heap recovered - watchdog disarmed");
+      _lowHeapSinceMs = 0;
+    }
+  }
+
   // Process deferred CLI command outside the PubSubClient callback context.
   if (_deferred.pending) {
     processDeferredCLI();

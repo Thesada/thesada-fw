@@ -167,6 +167,25 @@
 // Set to false only for local unencrypted testing brokers.
 #define MQTT_TLS  true
 
+// ── Phase 3 heap safeguards (Forgejo #40) ───────────────────────────────────
+// Preventive reboot when free heap stays below the floor for the hold
+// window. Lands the device on a fresh, defragmented heap before mbedtls
+// allocations start failing inside the TLS stack. Set FLOOR=0 to disable.
+#ifndef HEAP_REBOOT_FLOOR_BYTES
+  #define HEAP_REBOOT_FLOOR_BYTES   25000
+#endif
+#ifndef HEAP_REBOOT_HOLD_MS
+  #define HEAP_REBOOT_HOLD_MS       60000
+#endif
+
+// Heap-aware skip in TelegramModule::sendTo. MQTT carries OTA so it has
+// hard priority over Telegram. If free heap is below this floor we
+// silently drop the Telegram POST instead of contending for the same
+// TLS buffers as the MQTT client.
+#ifndef TELEGRAM_HEAP_FLOOR_BYTES
+  #define TELEGRAM_HEAP_FLOOR_BYTES 35000
+#endif
+
 // ── Build-time debug options ─────────────────────────────────────────────────
 // Enabling these increases binary size and serial output.
 // #define DEBUG_AT_COMMANDS  // dump raw AT traffic to Serial (TinyGSM)

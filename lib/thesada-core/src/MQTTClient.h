@@ -129,6 +129,12 @@ public:
   static uint32_t      _lastHeapPublishMs;  // millis() of last heap stats publish
   static uint32_t      _lastHeapFree;       // last sampled ESP.getFreeHeap() for alert tagging
 
+  // #40 Phase 3 preventive reboot: track when free heap first dropped below
+  // HEAP_REBOOT_FLOOR_BYTES. If it stays under for HEAP_REBOOT_HOLD_MS, the
+  // device reboots itself rather than crashing in a malloc inside the TLS
+  // stack. 0 means heap is currently above the floor.
+  static uint32_t      _lowHeapSinceMs;
+
   // Debug RX ring - last 8 received topics + timestamps, oldest-overwrite.
   // Used by `net.mqtt rx` to see what actually arrives at onMessage - helps
   // diagnose broker-side delivery vs client-side dispatch bugs.
