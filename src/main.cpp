@@ -115,6 +115,11 @@ void loop() {
     OTAUpdate::loop();
   }
 
+  // Drain the deferred Shell ring (#62). Commands enqueued from non-main
+  // task contexts (WS serial, future BLE/Telegram CLIs) execute here with
+  // full main-loop stack instead of inside an AsyncTCP / mbedtls callback.
+  Shell::loop();
+
   HeartbeatLED::loop();
   ModuleRegistry::loopAll();
   SleepManager::loop();

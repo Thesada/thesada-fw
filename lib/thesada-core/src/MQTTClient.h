@@ -11,6 +11,7 @@
 #include <WiFiClientSecure.h>
 #include <functional>
 #include <time.h>
+#include <vector>
 #include <thesada_config.h>
 
 #ifndef MQTT_QUEUE_SIZE
@@ -88,6 +89,19 @@ private:
   static void publishDiscovery();
   static void publishHeapStats();
   static void publishDeviceInfo();
+
+  // Tracks every retained topic this device publishes during a connect cycle.
+  // Cleared at the start of each connect(), filled by recordRetainedTopic()
+  // from each retained-publish site (LWT, /info, HA discovery, modules), then
+  // serialized to <prefix>/info/retained_topics by publishRetainedManifest()
+  // so the platform can clear them all on device delete (#187 / #184 PR 3).
+  // in: topic string. out: appended to _retainedTopics if not already present.
+  static std::vector<String> _retainedTopics;
+  static bool     _manifestPublished;     // initial manifest emitted at least once
+  static bool     _manifestDirty;         // a topic was added after last emit
+  static uint32_t _manifestDirtySinceMs;  // first dirty-set timestamp for debounce
+  static void recordRetainedTopic(const char* topic);
+  static void publishRetainedManifest();
 
 public:
   // Sampled at the most recent publishHeapStats() call, or live if never.

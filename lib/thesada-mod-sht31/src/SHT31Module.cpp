@@ -73,52 +73,10 @@ void SHT31Module::begin() {
   }
 
   _ok = true;
-
-  // Publish HA MQTT discovery for temperature and humidity
-  bool haDisc = cfg["mqtt"]["ha_discovery"] | true;
-  if (haDisc) {
-    const char* prefix  = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-    const char* devName = cfg["device"]["friendly_name"] | cfg["device"]["name"] | "Thesada Node";
-    const char* devId   = cfg["device"]["name"] | "thesada_node";
-    const char* unit    = cfg["temperature"]["unit"] | "C";
-    const char* haUnit  = (unit[0] == 'F' || unit[0] == 'f') ? "\xC2\xB0""F" : "\xC2\xB0""C";
-
-    char availTopic[64];
-    snprintf(availTopic, sizeof(availTopic), "%s/status", prefix);
-
-    // Helper: publish one discovery config (retained)
-    auto disc = [&](const char* uid, const char* name, const char* stateTopic,
-                    const char* dUnit, const char* devClass, const char* stateClass) {
-      JsonDocument doc;
-      doc["name"]        = name;
-      doc["stat_t"]      = stateTopic;
-      doc["uniq_id"]     = uid;
-      doc["avty_t"]      = availTopic;
-      if (dUnit && strlen(dUnit) > 0)      doc["unit_of_meas"] = dUnit;
-      if (devClass && strlen(devClass) > 0) doc["dev_cla"]     = devClass;
-      if (stateClass && strlen(stateClass) > 0) doc["stat_cla"] = stateClass;
-      JsonObject dev = doc["dev"].to<JsonObject>();
-      dev["ids"]  = devId;
-      dev["name"] = devName;
-      dev["mf"]   = "Thesada";
-      dev["sw"]   = FIRMWARE_VERSION;
-      char topic[128], payload[512];
-      snprintf(topic, sizeof(topic), "homeassistant/sensor/%s/%s/config", devId, uid);
-      serializeJson(doc, payload, sizeof(payload));
-      MQTTClient::publishRetained(topic, payload);
-    };
-
-    char uid[48], st[96];
-    snprintf(uid, sizeof(uid), "%s_sht31_temp", devId);
-    snprintf(st, sizeof(st), "%s/sensor/temperature/sht31", prefix);
-    disc(uid, "SHT31 Temperature", st, haUnit, "temperature", "measurement");
-
-    snprintf(uid, sizeof(uid), "%s_sht31_humidity", devId);
-    snprintf(st, sizeof(st), "%s/sensor/humidity/sht31", prefix);
-    disc(uid, "SHT31 Humidity", st, "%", "humidity", "measurement");
-
-    Log::info(TAG, "HA discovery published");
-  }
+  // HA discovery is deferred to publishHaDiscovery(), invoked from loop()
+  // once MQTT is connected. Calling MQTTClient::publishRetained() here would
+  // short-circuit (MQTT is not up during module begin) so the configs would
+  // never land on the broker (#199).
 
   // Register under the unified `sensors` CLI (#126). The old standalone
   // `sht31` command is gone - use `sensors sht31` instead.
@@ -135,14 +93,89 @@ void SHT31Module::begin() {
   readAndPublish();
 }
 
-// Periodic sensor read at configured interval
+// Periodic sensor read at configured interval. Also drives the deferred
+// HA discovery publish (#199): module begin() runs before MQTT connects so
+// the discovery configs cannot be published there. Once MQTT is up, the
+// next loop() tick lands them and remembers via _haPublished. Discovery
+// re-publishes on the next reconnect because MQTTClient::connect() resets
+// the retained-topics manifest and re-emits LWT + /info via its own path;
+// SHT31 must do the same so the broker keeps the configs after a session
+// drop. We watch MQTTClient::connected() transitions: when we observe a
+// fresh connect (was disconnected, now connected) we clear _haPublished.
 void SHT31Module::loop() {
   if (!_ok) return;
+
+  static bool wasConnected = false;
+  bool nowConnected = MQTTClient::connected();
+  if (nowConnected && !wasConnected) {
+    _haPublished = false;
+  }
+  wasConnected = nowConnected;
+
+  if (nowConnected && !_haPublished) {
+    publishHaDiscovery();
+  }
+
   uint32_t now = millis();
   if (now - _lastRead >= _intervalMs) {
     _lastRead = now;
     readAndPublish();
   }
+}
+
+// Build + publish HA MQTT discovery (retained) for SHT31 temperature and
+// humidity. Idempotent. Caller must guarantee MQTTClient::connected() is
+// true; we set _haPublished on success so loop() won't re-emit until the
+// next reconnect transition clears it.
+// in: none (reads Config). out: 2 retained MQTT messages on the broker.
+void SHT31Module::publishHaDiscovery() {
+  JsonObject cfg = Config::get();
+  bool haDisc = cfg["mqtt"]["ha_discovery"] | true;
+  if (!haDisc) {
+    _haPublished = true;  // disabled by config; do not retry
+    return;
+  }
+  const char* prefix  = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+  const char* devName = cfg["device"]["friendly_name"] | cfg["device"]["name"] | "Thesada Node";
+  const char* devId   = cfg["device"]["name"] | "thesada_node";
+  const char* unit    = cfg["temperature"]["unit"] | "C";
+  const char* haUnit  = (unit[0] == 'F' || unit[0] == 'f') ? "\xC2\xB0""F" : "\xC2\xB0""C";
+
+  char availTopic[64];
+  snprintf(availTopic, sizeof(availTopic), "%s/status", prefix);
+
+  auto disc = [&](const char* uid, const char* name, const char* stateTopic,
+                  const char* dUnit, const char* devClass, const char* stateClass) {
+    JsonDocument doc;
+    doc["name"]        = name;
+    doc["stat_t"]      = stateTopic;
+    doc["uniq_id"]     = uid;
+    doc["avty_t"]      = availTopic;
+    if (dUnit && strlen(dUnit) > 0)           doc["unit_of_meas"] = dUnit;
+    if (devClass && strlen(devClass) > 0)     doc["dev_cla"]      = devClass;
+    if (stateClass && strlen(stateClass) > 0) doc["stat_cla"]     = stateClass;
+    JsonObject dev = doc["dev"].to<JsonObject>();
+    dev["ids"]  = devId;
+    dev["name"] = devName;
+    dev["mf"]   = "Thesada";
+    dev["sw"]   = FIRMWARE_VERSION;
+    char topic[128], payload[512];
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/%s/%s/config", devId, uid);
+    serializeJson(doc, payload, sizeof(payload));
+    MQTTClient::publishRetained(topic, payload);
+  };
+
+  char uid[48], st[96];
+  snprintf(uid, sizeof(uid), "%s_sht31_temp", devId);
+  snprintf(st, sizeof(st), "%s/sensor/temperature/sht31", prefix);
+  disc(uid, "SHT31 Temperature", st, haUnit, "temperature", "measurement");
+
+  snprintf(uid, sizeof(uid), "%s_sht31_humidity", devId);
+  snprintf(st, sizeof(st), "%s/sensor/humidity/sht31", prefix);
+  disc(uid, "SHT31 Humidity", st, "%", "humidity", "measurement");
+
+  _haPublished = true;
+  Log::info(TAG, "HA discovery published");
 }
 
 // Read sensor and publish to MQTT + EventBus

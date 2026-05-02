@@ -34,9 +34,29 @@ public:
   // Call once at boot after all core classes are initialized.
   static void begin();
 
-  // Process a command line string. Called by serial handler and WebSocket handler.
-  // Output is sent via the provided callback.
+  // Process a command line string synchronously on the caller's task. Used
+  // by the serial reader (always main loop context) and the deferred-drain
+  // path. Callers running from non-main contexts (AsyncTCP, PubSubClient
+  // callback) MUST use enqueue() instead - executing here from those
+  // task stacks risks overflow on commands that touch fs / MQTT / TLS.
+  // in: command line, output callback. out: none.
   static void execute(const char* line, ShellOutput out);
+
+  // Stage a command for execution on the main loop task (Forgejo #62).
+  // Copies the command into a ring slot and returns true. Returns false
+  // if the ring is full - the caller is expected to surface "shell busy"
+  // to the user. The sink callback is invoked once per output line during
+  // the eventual execute() drain. Safe to call from any task context;
+  // copies happen under a brief critical section.
+  // in: command, output sink. out: true if accepted, false if ring full.
+  static bool enqueue(const char* line, ShellOutput sink);
+
+  // Drain one staged command (if any) on the caller's task. Wired into the
+  // main loop so every enqueued command runs with full main-loop stack and
+  // not from inside an async/network callback. Drains at most one slot per
+  // call so a long-running command does not starve other periodic work.
+  // in: none. out: none.
+  static void loop();
 
   // Register a command. Called internally by begin() and by modules.
   static void registerCommand(const char* name, const char* help, ShellCommand handler);
@@ -47,6 +67,12 @@ public:
   // Max commands
   static constexpr int MAX_COMMANDS = 40;
 
+  // Deferred-execution ring depth. 4 slots covers concurrent serial + WS +
+  // MQTT CLI bursts without runaway memory. Bump if "shell busy" starts
+  // surfacing in normal use.
+  static constexpr int DEFERRED_RING_SIZE = 4;
+  static constexpr int DEFERRED_LINE_LEN  = 256;
+
 private:
   static void registerBuiltins();
   static int parse(const char* line, char** argv, int maxArgs);
@@ -54,4 +80,20 @@ private:
   static ShellEntry _commands[MAX_COMMANDS];
   static int _commandCount;
   static char _parseBuf[256];  // mutable copy for tokenization
+
+  // Deferred-execution ring (#62). Each slot holds a buffered command line
+  // plus the per-call output sink. `active` flips true on enqueue and back
+  // to false at the end of the drain so the slot is reusable. `head` is
+  // the next slot loop() will drain; `tail` is where enqueue() writes.
+  // Wraps modulo DEFERRED_RING_SIZE. Guarded by a brief portMUX during
+  // enqueue/drain to keep the indices and active flags consistent against
+  // AsyncTCP / PubSubClient-thread enqueues.
+  struct DeferredSlot {
+    char        line[DEFERRED_LINE_LEN];
+    ShellOutput sink;
+    bool        active;
+  };
+  static DeferredSlot _ring[DEFERRED_RING_SIZE];
+  static uint8_t      _ringHead;
+  static uint8_t      _ringTail;
 };

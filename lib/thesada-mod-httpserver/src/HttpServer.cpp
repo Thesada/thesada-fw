@@ -714,9 +714,20 @@ void HttpServer::setupRoutes() {
       String cmd = String((char*)data, len);
       cmd.trim();
       if (cmd.length() > 0) {
-        Shell::execute(cmd.c_str(), [client](const char* line) {
-          client->text(line);
-        });
+        // Stage on the Shell deferred ring (#62) instead of running on
+        // the AsyncTCP task. The async task stack is sized for WS frame
+        // dispatch only - any command that reaches LittleFS / MQTT / TLS
+        // can blow it. Look up the client by id at drain time so a
+        // disconnect mid-execute degrades to a no-op (the AsyncWebSocket
+        // returns nullptr for the closed id) instead of UAF on a stale
+        // AsyncWebSocketClient* pointer captured here.
+        uint32_t cid = client->id();
+        if (!Shell::enqueue(cmd.c_str(), [cid](const char* line) {
+              AsyncWebSocketClient* c = _ws.client(cid);
+              if (c) c->text(line);
+            })) {
+          client->text("[shell busy - command dropped]");
+        }
       }
     }
   });

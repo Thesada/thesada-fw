@@ -125,6 +125,11 @@ uint32_t         MQTTClient::_rxRingTs[MQTTClient::RX_RING_SIZE]    = {};
 uint8_t          MQTTClient::_rxRingHead  = 0;
 uint8_t          MQTTClient::_rxRingCount = 0;
 
+std::vector<String> MQTTClient::_retainedTopics;
+bool     MQTTClient::_manifestPublished    = false;
+bool     MQTTClient::_manifestDirty        = false;
+uint32_t MQTTClient::_manifestDirtySinceMs = 0;
+
 // ---------------------------------------------------------------------------
 
 // Initialize MQTT client, load TLS cert, and set up subscriptions
@@ -295,6 +300,19 @@ void MQTTClient::connect() {
   Log::info(TAG, msg);
 
 #ifdef MQTT_TLS
+  // Force a fresh mbedtls context on every connect attempt (#121). When a
+  // prior connect failed mid-handshake, WiFiClientSecure retains the
+  // underlying mbedtls_ssl_context with whatever cert/key pointers were
+  // configured at that time. A subsequent setCACert / setCertificate /
+  // setPrivateKey on a still-allocated context is silently ignored - the
+  // next handshake reuses the stale config and the broker logs
+  // "peer did not return a certificate". stop() releases the context so
+  // PubSubClient's next _client.connect() call rebuilds it from scratch
+  // with whatever we configure below. Cost: ~one extra TLS handshake
+  // round trip on each reconnect, which we pay anyway because PubSubClient
+  // tears the connection down on any failure.
+  _wifiClient.stop();
+
   // If NTP hasn't synced yet, cert validation will fail (clock at epoch = every
   // cert looks expired). Temporarily use insecure mode and reconnect with proper
   // validation once NTP syncs in the background.
@@ -388,11 +406,21 @@ void MQTTClient::connect() {
       Log::info(TAG, "TCP keepalive enabled (30s/10s/3)");
     }
 
+    // Reset the retained-topics manifest before we start re-publishing this
+    // session's retained state. publishDiscovery / publishDeviceInfo / SHT31
+    // and friends will repopulate it; publishRetainedManifest() ships it.
+    _retainedTopics.clear();
+    _manifestPublished    = false;
+    _manifestDirty        = false;
+    _manifestDirtySinceMs = 0;
+
     // Publish online status (retained) - LWT handles offline
     _client.publish(availTopic, "online", true);
+    recordRetainedTopic(availTopic);
     resubscribeAll();
     publishDiscovery();
     publishDeviceInfo();
+    publishRetainedManifest();
     flushQueue();
   } else {
     char err[64];
@@ -470,6 +498,14 @@ void MQTTClient::loop() {
   // Process deferred CLI command outside the PubSubClient callback context.
   if (_deferred.pending) {
     processDeferredCLI();
+  }
+
+  // Late-arriving retained topics (e.g. SHT31 discovery published after the
+  // initial connect()-time manifest) re-emit after a 5 s debounce so we do
+  // not thrash the broker during burst-publishes from module begin().
+  if (_manifestDirty && _client.connected() &&
+      (millis() - _manifestDirtySinceMs) >= 5000) {
+    publishRetainedManifest();
   }
 
   // Deferred reboot after cert.apply. The shell handler publishes its
@@ -596,11 +632,65 @@ void MQTTClient::publish(const char* topic, const char* payload) {
   enqueue(topic, payload);
 }
 
-// Publish a retained message (for HA discovery configs)
+// Publish a retained message (for HA discovery configs).
+// Records the topic in the retained-topics manifest so the platform can
+// clear it on device delete (#187).
 void MQTTClient::publishRetained(const char* topic, const char* payload) {
   if (_client.connected()) {
     _client.publish(topic, (const uint8_t*)payload, strlen(payload), true);
+    recordRetainedTopic(topic);
   }
+}
+
+// Append a topic to the retained-topics manifest, deduping case-sensitively.
+// Caller is responsible for invoking this only when a retained publish was
+// actually issued. Manifest is reset at the start of each connect() so it
+// always reflects the current session's footprint.
+// in: topic. out: appended to _retainedTopics if not already present.
+void MQTTClient::recordRetainedTopic(const char* topic) {
+  if (!topic || !*topic) return;
+  for (const auto& t : _retainedTopics) {
+    if (t == topic) return;
+  }
+  _retainedTopics.emplace_back(topic);
+  if (_manifestPublished) {
+    _manifestDirty = true;
+    _manifestDirtySinceMs = millis();
+  }
+}
+
+// Publish a retained JSON array of every retained topic this device owns to
+// <prefix>/info/retained_topics. Called after publishDiscovery + module
+// discovery have run so the list is complete. Lets a controller enumerate
+// + clean up retained state when a device is unprovisioned.
+// in: none (reads _retainedTopics + topic_prefix from Config).
+// out: publishes one retained MQTT message; topic itself is added to the
+// manifest list pre-publish so the device can also clean its own info.
+void MQTTClient::publishRetainedManifest() {
+  if (!_client.connected()) return;
+
+  JsonObject cfg = Config::get();
+  const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+
+  char topic[96];
+  snprintf(topic, sizeof(topic), "%s/info/retained_topics", prefix);
+
+  // Include the manifest topic itself so a delete sweep also clears it.
+  recordRetainedTopic(topic);
+
+  JsonDocument doc;
+  JsonArray arr = doc.to<JsonArray>();
+  for (const auto& t : _retainedTopics) arr.add(t);
+
+  // Conservative budget: ~30-50 short topics * ~80 B = ~4 KB. Keep on heap.
+  String payload;
+  serializeJson(doc, payload);
+
+  _client.publish(topic, (const uint8_t*)payload.c_str(), payload.length(), true);
+  _manifestPublished    = true;
+  _manifestDirty        = false;
+  _manifestDirtySinceMs = 0;
+  Log::info(TAG, (String("retained-topics manifest: ") + _retainedTopics.size() + " entries").c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,6 +1111,7 @@ void MQTTClient::publishDiscovery() {
     char payload[640];
     serializeJson(doc, payload, sizeof(payload));
     _client.publish(topic, (const uint8_t*)payload, strlen(payload), true);
+    recordRetainedTopic(topic);
     // Drain TCP buffer between retained publishes. Without this, small
     // MQTT buffers (CYD 1024B) overflow and spam EAGAIN socket errors.
     _client.loop();
@@ -1337,6 +1428,7 @@ void MQTTClient::publishDeviceInfo() {
   char topic[96];
   snprintf(topic, sizeof(topic), "%s/info", prefix);
   _client.publish(topic, payload, true);
+  recordRetainedTopic(topic);
 }
 
 // ---------------------------------------------------------------------------

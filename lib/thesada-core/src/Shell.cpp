@@ -29,6 +29,16 @@ ShellEntry Shell::_commands[MAX_COMMANDS];
 int Shell::_commandCount = 0;
 char Shell::_parseBuf[256];
 
+Shell::DeferredSlot Shell::_ring[Shell::DEFERRED_RING_SIZE] = {};
+uint8_t             Shell::_ringHead = 0;
+uint8_t             Shell::_ringTail = 0;
+
+// portMUX guards _ring + indices against concurrent enqueue from non-main
+// task contexts (AsyncTCP onEvent, PubSubClient callback). The critical
+// sections are short - just memcpy + index bump - so spinning in the other
+// task is fine.
+static portMUX_TYPE _shellRingMux = portMUX_INITIALIZER_UNLOCKED;
+
 // ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
@@ -76,6 +86,55 @@ void Shell::execute(const char* line, ShellOutput out) {
   char msg[128];
   snprintf(msg, sizeof(msg), "Unknown command: %s  (type 'help')", argv[0]);
   out(msg);
+}
+
+// Stage a command for main-loop execution (#62 deferred dispatcher).
+// Capture by-value of the sink intentional - the caller's lambda may
+// reference task-local state that goes out of scope before loop()
+// fires; std::function's small-buffer optimization keeps trivial
+// captures inline.
+bool Shell::enqueue(const char* line, ShellOutput sink) {
+  if (!line || strlen(line) == 0) return false;
+  bool accepted = false;
+  taskENTER_CRITICAL(&_shellRingMux);
+  uint8_t next = (uint8_t)((_ringTail + 1) % DEFERRED_RING_SIZE);
+  if (next != _ringHead) {  // not full
+    DeferredSlot& slot = _ring[_ringTail];
+    strncpy(slot.line, line, sizeof(slot.line) - 1);
+    slot.line[sizeof(slot.line) - 1] = '\0';
+    slot.sink = sink;
+    slot.active = true;
+    _ringTail = next;
+    accepted = true;
+  }
+  taskEXIT_CRITICAL(&_shellRingMux);
+  return accepted;
+}
+
+// Drain at most one staged command per tick. Wired into the main loop so
+// every enqueued command runs with full main-loop stack and not from
+// inside an async/network callback. Capture line + sink under the mutex,
+// then run execute() outside the critical section so a long-running
+// command (fs reads, LittleFS writes, MQTT publishes) does not block
+// concurrent enqueuers.
+void Shell::loop() {
+  char line[DEFERRED_LINE_LEN];
+  ShellOutput sink;
+  bool have = false;
+
+  taskENTER_CRITICAL(&_shellRingMux);
+  if (_ringHead != _ringTail && _ring[_ringHead].active) {
+    DeferredSlot& slot = _ring[_ringHead];
+    memcpy(line, slot.line, sizeof(line));
+    sink = slot.sink;
+    slot.sink = nullptr;     // drop captured state asap
+    slot.active = false;
+    _ringHead = (uint8_t)((_ringHead + 1) % DEFERRED_RING_SIZE);
+    have = true;
+  }
+  taskEXIT_CRITICAL(&_shellRingMux);
+
+  if (have) execute(line, sink);
 }
 
 // Print all registered commands with their help text
