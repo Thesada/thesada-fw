@@ -219,7 +219,7 @@ bool Cellular::networkConnect() {
 // Configure and connect modem-native MQTT over TLS
 bool Cellular::mqttConnect() {
   JsonObject  cfg      = Config::get();
-  const char* broker   = cfg["mqtt"]["broker"]   | "mqtt.thesada.app";
+  const char* broker   = cfg["mqtt"]["broker"]   | "mqtt.example.com";
   int         port     = cfg["mqtt"]["port"]      | 8883;
   const char* user     = cfg["mqtt"]["user"]      | "";
   const char* password = cfg["mqtt"]["password"]  | "";
