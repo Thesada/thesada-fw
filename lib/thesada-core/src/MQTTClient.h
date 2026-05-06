@@ -34,14 +34,6 @@ struct MQTTSubscription {
   bool active;
 };
 
-// Deferred CLI command - stored in callback, executed in loop()
-struct DeferredCLI {
-  char topic[96];
-  char* payload;     // heap-allocated, freed after processing
-  uint16_t length;
-  bool pending;
-};
-
 class MQTTClient {
 public:
   static void begin();
@@ -133,8 +125,15 @@ public:
   static uint16_t      _bufferIn;
   static uint16_t      _bufferOut;
 
-  static DeferredCLI   _deferred;
-  static void          processDeferredCLI();
+  // CLI handler invoked on the main loop (Shell::enqueueDeferred drain).
+  // Receives the command name extracted from the cli/<cmd> topic and a heap
+  // copy of the raw payload. Special-cases binary protocols (fs.write,
+  // fs.cat chunked, cert.set) before falling through to Shell::execute.
+  // The caller (PubSubClient subscribe lambda) builds the std::function
+  // capture and enqueues - this is just the body that runs at drain time.
+  // in: cmd string, payload buffer (may be nullptr), payload length.
+  // out: publishes to <prefix>/cli/response.
+  static void          runCli(const char* cmd, const char* payload, size_t plen);
 
   static uint32_t      _lastSuccessMs;      // millis() of last successful publish or MQTT loop
   static uint32_t      _connectedSinceMs;   // millis() when current connection was established
