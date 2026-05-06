@@ -39,7 +39,7 @@ public:
 
 private:
   static void initPMU();
-  static void wakeModem();
+  static bool wakeModem();
   static bool writeCACert();
   static bool networkConnect();
   static bool mqttConnect();
