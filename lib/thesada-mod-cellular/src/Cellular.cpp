@@ -9,6 +9,7 @@
 #include <Config.h>
 #include <Log.h>
 #include <LittleFS.h>
+#include <esp_task_wdt.h>
 
 // ── TinyGSM ─────────────────────────────────────────────────────────────────
 // TINY_GSM_MODEM_SIM7080 and TINY_GSM_RX_BUFFER=1024 set via build_flags.
@@ -72,23 +73,34 @@ void Cellular::initPMU() {
 
 // ---------------------------------------------------------------------------
 
-// Start serial and pulse PWRKEY until the modem responds to AT
-void Cellular::wakeModem() {
+// Start serial and pulse PWRKEY until the modem responds to AT.
+// Bounded by WAKE_BUDGET_MS so a wedged or unpowered modem fails cleanly
+// instead of hanging the loop task long enough to trip the TWDT.
+// Returns true on AT-OK, false on timeout.
+bool Cellular::wakeModem() {
   Serial1.begin(115200, SERIAL_8N1, PIN_MODEM_RXD, PIN_MODEM_TXD);
   pinMode(PIN_MODEM_PWR, OUTPUT);
   pinMode(PIN_MODEM_DTR, OUTPUT);
 
+  static constexpr uint32_t WAKE_BUDGET_MS = 60UL * 1000UL;
+  uint32_t start = millis();
   int retry = 0;
   while (!modem.testAT(1000)) {
+    esp_task_wdt_reset();
+    if (millis() - start > WAKE_BUDGET_MS) {
+      Log::error(TAG, "Modem AT timeout");
+      return false;
+    }
     if (++retry > 6) {
       Log::info(TAG, "PWRKEY pulse");
-      digitalWrite(PIN_MODEM_PWR, LOW);  delay(100);
-      digitalWrite(PIN_MODEM_PWR, HIGH); delay(1000);
+      digitalWrite(PIN_MODEM_PWR, LOW);  delay(100); esp_task_wdt_reset();
+      digitalWrite(PIN_MODEM_PWR, HIGH); delay(1000); esp_task_wdt_reset();
       digitalWrite(PIN_MODEM_PWR, LOW);
       retry = 0;
     }
   }
   Log::info(TAG, "Modem alive");
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -174,15 +186,26 @@ bool Cellular::networkConnect() {
   modem.waitResponse(20000UL);
 
   // Critical: let LTE-M radio settle before polling registration.
+  // Chunk the delay so the task watchdog stays fed; whole sequence runs
+  // inside a single loop() tick that otherwise blocks > TWDT timeout.
   char msg[64];
   snprintf(msg, sizeof(msg), "RF settle %lu ms...", rfSettleMs);
   Log::info(TAG, msg);
-  delay(rfSettleMs);
+  {
+    uint32_t remaining = rfSettleMs;
+    while (remaining) {
+      uint32_t step = remaining > 500UL ? 500UL : remaining;
+      delay(step);
+      esp_task_wdt_reset();
+      remaining -= step;
+    }
+  }
 
   Log::info(TAG, "Waiting for registration...");
   SIM70xxRegStatus s;
   uint32_t start = millis();
   do {
+    esp_task_wdt_reset();
     s = modem.getRegistrationStatus();
     if (s == REG_OK_HOME)    { Log::info(TAG, "Registered - HOME");    break; }
     if (s == REG_OK_ROAMING) { Log::info(TAG, "Registered - ROAMING"); break; }
@@ -301,7 +324,10 @@ void Cellular::begin() {
   Log::info(TAG, "Starting cellular path...");
 
   initPMU();
-  wakeModem();
+  if (!wakeModem()) {
+    Log::error(TAG, "Modem did not wake - aborting cellular bring-up");
+    return;
+  }
 
   // Unlock SIM with PIN if configured.
   {
@@ -329,11 +355,11 @@ void Cellular::begin() {
   // Retry network + MQTT until both succeed.
   while (!networkConnect()) {
     Log::warn(TAG, "Network connect failed, retry in 10s");
-    delay(10000);
+    for (int i = 0; i < 20; ++i) { delay(500); esp_task_wdt_reset(); }
   }
   while (!mqttConnect()) {
     Log::warn(TAG, "MQTT connect failed, retry in 10s");
-    delay(10000);
+    for (int i = 0; i < 20; ++i) { delay(500); esp_task_wdt_reset(); }
   }
 
   _started          = true;
@@ -356,11 +382,11 @@ void Cellular::loop() {
     _mqttConnected = false;
     while (!networkConnect()) {
       Log::warn(TAG, "Retry network in 10s");
-      delay(10000);
+      for (int i = 0; i < 20; ++i) { delay(500); esp_task_wdt_reset(); }
     }
     while (!mqttConnect()) {
       Log::warn(TAG, "Retry MQTT in 10s");
-      delay(10000);
+      for (int i = 0; i < 20; ++i) { delay(500); esp_task_wdt_reset(); }
     }
     _mqttConnected = true;
     return;
@@ -373,7 +399,7 @@ void Cellular::loop() {
     if (mqttConnect()) {
       _mqttConnected = true;
     } else {
-      delay(5000);
+      for (int i = 0; i < 10; ++i) { delay(500); esp_task_wdt_reset(); }
     }
   }
 

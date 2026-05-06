@@ -15,6 +15,7 @@
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/pk.h>
 #include <mbedtls/version.h>
+#include <string>
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
 #include <esp_chip_info.h>
@@ -109,7 +110,6 @@ uint16_t         MQTTClient::_bufferOut      = 4096;
 
 MQTTSubscription MQTTClient::_subs[MQTT_MAX_SUBS];
 uint8_t          MQTTClient::_subCount = 0;
-DeferredCLI      MQTTClient::_deferred = { "", nullptr, 0, false };
 uint32_t         MQTTClient::_lastSuccessMs    = 0;
 uint32_t         MQTTClient::_connectedSinceMs = 0;
 bool             MQTTClient::_insecureFallback = false;
@@ -239,37 +239,39 @@ void MQTTClient::begin() {
     char cliTopic[64];
     snprintf(cliTopic, sizeof(cliTopic), "%s/cli/#", prefix);
 
-    // Store prefix length so the callback can extract the command name.
-    static char _cliPrefix[64];
-    snprintf(_cliPrefix, sizeof(_cliPrefix), "%s/cli/", prefix);
-    static size_t _cliPrefixLen = strlen(_cliPrefix);
-
     MQTTClient::subscribe(cliTopic, [](const char* topic, const char* payload) {
-      // Defer CLI command to loop() - executing inside the PubSubClient
-      // callback blocks keepalive and causes disconnects on slow operations
-      // (LittleFS writes, config reload, etc).
-      if (_deferred.pending) {
-        Log::warn("MQTT", "CLI busy - command dropped");
-        return;
-      }
-      strncpy(_deferred.topic, topic, sizeof(_deferred.topic) - 1);
-      _deferred.topic[sizeof(_deferred.topic) - 1] = '\0';
+      // Defer CLI command to the Shell ring - executing inside the
+      // PubSubClient callback blocks keepalive and causes disconnects on
+      // slow operations (LittleFS writes, config reload, etc). The
+      // generic shell-line path goes through Shell::enqueue (#62 phase A);
+      // binary-payload commands (fs.write, fs.cat chunked, cert.set) and
+      // the response-shape contract (one cli/response message per
+      // command, JSON array of output lines) need their own handler so
+      // they go through Shell::enqueueDeferred (#62 phase B). Same ring,
+      // same backpressure, single drain path.
+      JsonObject  cfg    = Config::get();
+      const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+      char cliPrefix[64];
+      snprintf(cliPrefix, sizeof(cliPrefix), "%s/cli/", prefix);
+      size_t prefixLen = strlen(cliPrefix);
+      if (strncmp(topic, cliPrefix, prefixLen) != 0) return;
+      const char* cmd = topic + prefixLen;
+      if (strlen(cmd) == 0 || strcmp(cmd, "response") == 0) return;
 
-      // Copy payload to heap (preserves newlines for file.write)
+      // Copy cmd + payload onto the heap so the lambda owns them past the
+      // lifetime of this callback. std::string capture handles destruction
+      // when the slot's DeferredFn is reset on drain.
+      std::string cmdCopy(cmd);
       size_t plen = payload ? strlen(payload) : 0;
-      if (_deferred.payload) { free(_deferred.payload); _deferred.payload = nullptr; }
-      if (plen > 0) {
-        _deferred.payload = (char*)malloc(plen + 1);
-        if (_deferred.payload) {
-          memcpy(_deferred.payload, payload, plen);
-          _deferred.payload[plen] = '\0';
-          _deferred.length = plen;
-        }
-      } else {
-        _deferred.payload = nullptr;
-        _deferred.length = 0;
-      }
-      _deferred.pending = true;
+      std::string payloadCopy(payload ? payload : "", plen);
+
+      bool ok = Shell::enqueueDeferred(
+        [cmdCopy = std::move(cmdCopy), payloadCopy = std::move(payloadCopy)]() {
+          MQTTClient::runCli(cmdCopy.c_str(),
+                             payloadCopy.empty() ? nullptr : payloadCopy.c_str(),
+                             payloadCopy.size());
+        });
+      if (!ok) Log::warn("MQTT", "CLI busy - command dropped");
     });
   }
 
@@ -495,10 +497,8 @@ void MQTTClient::loop() {
     }
   }
 
-  // Process deferred CLI command outside the PubSubClient callback context.
-  if (_deferred.pending) {
-    processDeferredCLI();
-  }
+  // CLI commands are now drained from the Shell ring (#62 phase B) -
+  // see Shell::loop() drained from the main app loop. No poll needed here.
 
   // Late-arriving retained topics (e.g. SHT31 discovery published after the
   // initial connect()-time manifest) re-emit after a 5 s debounce so we do
@@ -760,23 +760,20 @@ void MQTTClient::onMessage(char* topic, uint8_t* payload, unsigned int length) {
 
 // ---------------------------------------------------------------------------
 
-// Process a deferred CLI command (runs in loop(), not in PubSubClient callback)
-void MQTTClient::processDeferredCLI() {
-  _deferred.pending = false;
+// Run a CLI command on the main loop (Shell::enqueueDeferred drain).
+// The PubSubClient callback already extracted cmd from the topic and
+// copied payload onto the heap (owned by the std::function capture);
+// this just dispatches by command name + binary-protocol special case.
+void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
+  if (!cmd || strlen(cmd) == 0) return;
 
-  // Extract command from topic after <prefix>/cli/
+  // Caller already filtered out empty cmd + the response topic itself,
+  // but the special-case branches still expect the locals to exist for
+  // the response-publish path so resolve prefix here.
   JsonObject cfg = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-  char cliPrefix[64];
-  snprintf(cliPrefix, sizeof(cliPrefix), "%s/cli/", prefix);
-  size_t prefixLen = strlen(cliPrefix);
-
-  const char* cmd = _deferred.topic + prefixLen;
-  if (strlen(cmd) == 0 || strcmp(cmd, "response") == 0) goto cleanup;
 
   {
-    const char* payload = _deferred.payload;
-    size_t plen = _deferred.length;
 
     // Special case: fs.write / fs.append / file.write (legacy alias)
     // First line of payload is the path, rest is content.
@@ -990,8 +987,9 @@ void MQTTClient::processDeferredCLI() {
   }
 
 cleanup:
-  if (_deferred.payload) { free(_deferred.payload); _deferred.payload = nullptr; }
-  _deferred.length = 0;
+  // Payload is owned by the std::function capture in the Shell ring slot;
+  // it gets released when the slot is reset on drain. Nothing to free here.
+  return;
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,32 +1006,29 @@ void MQTTClient::reinitSubscriptions() {
   char cliTopic[64];
   snprintf(cliTopic, sizeof(cliTopic), "%s/cli/#", prefix);
 
-  static char _cliPrefix[64];
-  snprintf(_cliPrefix, sizeof(_cliPrefix), "%s/cli/", prefix);
-  static size_t _cliPrefixLen = strlen(_cliPrefix);
-
+  // Same Shell::enqueueDeferred path as begin()'s subscribe so config.reload
+  // does not split CLI dispatch between two mechanisms.
   MQTTClient::subscribe(cliTopic, [](const char* topic, const char* payload) {
-    if (_deferred.pending) {
-      Log::warn("MQTT", "CLI busy - command dropped");
-      return;
-    }
-    strncpy(_deferred.topic, topic, sizeof(_deferred.topic) - 1);
-    _deferred.topic[sizeof(_deferred.topic) - 1] = '\0';
+    JsonObject  cfgInner    = Config::get();
+    const char* prefixInner = cfgInner["mqtt"]["topic_prefix"] | "thesada/node";
+    char cliPrefixInner[64];
+    snprintf(cliPrefixInner, sizeof(cliPrefixInner), "%s/cli/", prefixInner);
+    size_t prefixLen = strlen(cliPrefixInner);
+    if (strncmp(topic, cliPrefixInner, prefixLen) != 0) return;
+    const char* cmd = topic + prefixLen;
+    if (strlen(cmd) == 0 || strcmp(cmd, "response") == 0) return;
 
+    std::string cmdCopy(cmd);
     size_t plen = payload ? strlen(payload) : 0;
-    if (_deferred.payload) { free(_deferred.payload); _deferred.payload = nullptr; }
-    if (plen > 0) {
-      _deferred.payload = (char*)malloc(plen + 1);
-      if (_deferred.payload) {
-        memcpy(_deferred.payload, payload, plen);
-        _deferred.payload[plen] = '\0';
-        _deferred.length = plen;
-      }
-    } else {
-      _deferred.payload = nullptr;
-      _deferred.length = 0;
-    }
-    _deferred.pending = true;
+    std::string payloadCopy(payload ? payload : "", plen);
+
+    bool ok = Shell::enqueueDeferred(
+      [cmdCopy = std::move(cmdCopy), payloadCopy = std::move(payloadCopy)]() {
+        MQTTClient::runCli(cmdCopy.c_str(),
+                           payloadCopy.empty() ? nullptr : payloadCopy.c_str(),
+                           payloadCopy.size());
+      });
+    if (!ok) Log::warn("MQTT", "CLI busy - command dropped");
   });
 
   OTAUpdate::begin();
