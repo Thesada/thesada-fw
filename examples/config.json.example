@@ -1,10 +1,10 @@
 {
   "device": {
-    "name": "thesada-node",
-    "friendly_name": "Thesada Node",
-    "heartbeat_s": -1,
-    "heartbeat_pin": -1,
-    "charging_led": true
+    "name":           "thesada-node",
+    "friendly_name":  "Thesada Node",
+    "heartbeat_s":    -1,
+    "heartbeat_pin":  -1,
+    "charging_led":   true
   },
 
   "web": {
@@ -19,52 +19,42 @@
     ],
     "timeout_per_ssid_s":    10,
     "wifi_check_interval_s": 900,
+    "retries":               2,
     "ap_password":           "",
     "ap_timeout_s":          300,
+    "static_ip":             "",
+    "gateway":               "192.168.1.1",
+    "subnet":                "255.255.255.0",
+    "dns":                   "8.8.8.8"
+  },
+
+  "eth": {
     "static_ip": "",
     "gateway":   "192.168.1.1",
     "subnet":    "255.255.255.0",
-    "dns":       "8.8.8.8"
+    "dns":       "8.8.8.8",
+    "phy_addr":  1,
+    "power_pin": 16,
+    "mdc":       23,
+    "mdio":      18
   },
 
   "ntp": {
-    "server":     "pool.ntp.org",
+    "server":      "pool.ntp.org",
+    "server2":     "time.cloudflare.com",
     "tz_offset_s": 3600
   },
 
   "mqtt": {
-    "broker":           "mqtt.example.com",
-    "port":             8883,
-    "user":             "mqtt-user",
-    "password":         "mqtt-password",
-    "topic_prefix":     "thesada/node",
-    "send_interval_s":  0,
-    "ha_discovery":     true,
-    "buffer_in":        4096,
-    "buffer_out":       4096
-  },
-
-  "temperature": {
-    "pin":                12,
-    "interval_s":         60,
-    "auto_discover":      true,
-    "conversion_wait_ms": 750,
-    "unit":              "C",
-    "sensors": [
-      { "address": "FFFFFFFFFFFFFFFF", "name": "sensor_1" }
-    ]
-  },
-
-  "ads1115": {
-    "line_voltage": 120,
-    "i2c_sda":    1,
-    "i2c_scl":    2,
-    "address":    72,
-    "interval_s": 60,
-    "channels": [
-      { "name": "house_pump", "mux": "A0_A1", "gain": 0.256 },
-      { "name": "barn_pump",  "mux": "A2_A3", "gain": 0.256 }
-    ]
+    "broker":          "mqtt.example.com",
+    "port":            8883,
+    "user":            "mqtt-user",
+    "password":        "mqtt-password",
+    "topic_prefix":    "thesada/node",
+    "send_interval_s": 0,
+    "ha_discovery":    true,
+    "buffer_in":       4096,
+    "buffer_out":      4096
   },
 
   "cellular": {
@@ -74,62 +64,12 @@
     "reg_timeout_ms": 180000
   },
 
-  "sd": {
-    "enabled":     true,
-    "pin_clk":     38,
-    "pin_cmd":     39,
-    "pin_data":    40,
-    "max_file_kb": 1024
-  },
-
-  "telegram": {
-    "bot_token": "",
-    "chat_ids": [],
-    "cooldown_s": 300,
-    "alerts": [
-      {
-        "enabled": true,
-        "name": "overheat",
-        "function": "gte",
-        "value": 90.0,
-        "message": "OVERHEAT",
-        "sensors": []
-      },
-      {
-        "enabled": true,
-        "name": "freeze",
-        "function": "lte",
-        "value": 2.0,
-        "message": "LOW TEMP",
-        "sensors": ["temp_1", "temp_2"]
-      }
-    ]
-  },
-
-  "webhook": {
-    "url":              "",
-    "message_template": "{{value}}"
-  },
-
-  "battery": {
-    "enabled":    true,
-    "interval_s": 60,
-    "low_pct":    20,
-    "charge_ma":  300,
-    "charge_v":   4.2
-  },
-
-  "display": {
-    "sda":              21,
-    "scl":              22,
-    "address":          60,
-    "page_interval_s":  3
-  },
-
-  "sleep": {
-    "enabled":    false,
-    "sleep_s":    300,
-    "wake_s":     30
+  "gnss": {
+    "enabled":             false,
+    "interval_s":          30,
+    "cold_fix_s":          60,
+    "warm_fix_s":          10,
+    "publish_without_fix": false
   },
 
   "ota": {
@@ -140,13 +80,101 @@
   },
 
   "lua": {
-    "reload_topic":     ""
+    "reload_topic": ""
+  },
+
+  "temperature": {
+    "pin":                12,
+    "interval_s":         60,
+    "auto_discover":      true,
+    "conversion_wait_ms": 750,
+    "unit":               "C",
+    "sensors": [
+      { "address": "FFFFFFFFFFFFFFFF", "name": "sensor_1" }
+    ]
+  },
+
+  "sht31": {
+    "enabled":    true,
+    "sda":        11,
+    "scl":        12,
+    "address":    68,
+    "interval_s": 30
+  },
+
+  "ads1115": {
+    "line_voltage": 120,
+    "i2c_sda":      1,
+    "i2c_scl":      2,
+    "address":      72,
+    "interval_s":   60,
+    "channels": [
+      { "name": "house_pump", "mux": "A0_A1", "gain": 0.256 },
+      { "name": "barn_pump",  "mux": "A2_A3", "gain": 0.256 }
+    ]
+  },
+
+  "battery": {
+    "enabled":    true,
+    "interval_s": 60,
+    "low_pct":    20,
+    "charge_ma":  300,
+    "charge_v":   4.2
+  },
+
+  "sd": {
+    "enabled":     true,
+    "mode":        "sdmmc",
+    "pin_clk":     38,
+    "pin_cmd":     39,
+    "pin_data":    40,
+    "pin_cs":      5,
+    "max_file_kb": 1024
+  },
+
+  "display": {
+    "sda":             21,
+    "scl":             22,
+    "address":         60,
+    "rotation":        1,
+    "page_interval_s": 3
   },
 
   "pwm": {
     "pin":          16,
-    "frequency_hz": 25000,
     "channel":      0,
+    "frequency_hz": 25000,
     "resolution":   8
+  },
+
+  "telegram": {
+    "bot_token":  "",
+    "chat_ids":   [],
+    "cooldown_s": 300,
+    "alerts": [
+      {
+        "enabled":          false,
+        "name":             "overheat",
+        "temp_high_c":      40.0,
+        "message_template": "{{sensor.name}}: {{sensor.value}}C -- OVERHEAT (>= {{threshold}}C)"
+      },
+      {
+        "enabled":          false,
+        "name":             "freeze",
+        "temp_low_c":       2.0,
+        "message_template": "{{sensor.name}}: {{sensor.value}}C -- FREEZE RISK (<= {{threshold}}C)"
+      }
+    ]
+  },
+
+  "webhook": {
+    "url":              "",
+    "message_template": "{{value}}"
+  },
+
+  "sleep": {
+    "enabled": false,
+    "sleep_s": 300,
+    "wake_s":  30
   }
 }
