@@ -256,7 +256,7 @@ void MQTTClient::begin() {
     JsonObject  cfg    = Config::get();
     const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
     char cliTopic[64];
-    snprintf(cliTopic, sizeof(cliTopic), "%s/cli/+", prefix);
+    snprintf(cliTopic, sizeof(cliTopic), "%s/cli/#", prefix);
 
     MQTTClient::subscribe(cliTopic, [](const char* topic, const char* payload) {
       // Defer CLI command to the Shell ring - executing inside the
