@@ -114,6 +114,13 @@ private:
   static void flushQueue();
   static void enqueue(const char* topic, const char* payload);
   static void onMessage(char* topic, uint8_t* payload, unsigned int length);
+  // Capture topic in the rxRing and fire every active subscription whose
+  // topic matches by exact string OR trailing /# (multi-level wildcard)
+  // OR trailing /+ (single-level wildcard). Shared by onMessage (WiFi)
+  // and dispatchInbound (cellular) so both transports use the same
+  // matching rules - any future change to wildcard semantics lands in
+  // one place. payload must be null-terminated.
+  static void matchAndDispatch(const char* topic, const char* payload);
   static void resubscribeAll();
   static void publishDiscovery();
   static void publishHeapStats();

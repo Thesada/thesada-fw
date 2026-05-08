@@ -757,11 +757,11 @@ void MQTTClient::subscribe(const char* topic, MQTTCallback callback) {
 
 // ---------------------------------------------------------------------------
 
-// Route incoming messages to matching subscription callbacks
-// Public dispatcher used by Cellular::pumpInbound to route +SMSUB: URCs
-// through the same subscription callbacks as the WiFi onMessage path.
-void MQTTClient::dispatchInbound(const char* topic, const char* payload, size_t length) {
-  // Mirror onMessage: rxRing capture + topic match (exact or trailing /#).
+// Capture topic in the rxRing and fire every active subscription whose
+// topic matches by exact string OR trailing /# OR trailing /+. Shared
+// between WiFi (onMessage) and cellular (dispatchInbound) so the two
+// transports never drift on wildcard semantics.
+void MQTTClient::matchAndDispatch(const char* topic, const char* payload) {
   strncpy(_rxRing[_rxRingHead], topic, sizeof(_rxRing[0]) - 1);
   _rxRing[_rxRingHead][sizeof(_rxRing[0]) - 1] = '\0';
   _rxRingTs[_rxRingHead] = millis();
@@ -791,6 +791,13 @@ void MQTTClient::dispatchInbound(const char* topic, const char* payload, size_t 
       _subs[i].callback(topic, payload);
     }
   }
+}
+
+// Route incoming messages to matching subscription callbacks.
+// Public dispatcher used by Cellular::pumpInbound to route +SMSUB: URCs
+// through the same subscription callbacks as the WiFi onMessage path.
+void MQTTClient::dispatchInbound(const char* topic, const char* payload, size_t length) {
+  matchAndDispatch(topic, payload);
   (void)length;  // payload is null-terminated by caller
 }
 
@@ -819,28 +826,7 @@ void MQTTClient::onMessage(char* topic, uint8_t* payload, unsigned int length) {
   memcpy(payloadBuf, payload, length);
   payloadBuf[length] = '\0';
 
-  // Debug RX ring: capture every received topic so `net.mqtt rx` can show it.
-  // Helps narrow broker-side delivery vs client-side dispatch when a
-  // subscription is active but its callback never fires.
-  strncpy(_rxRing[_rxRingHead], topic, sizeof(_rxRing[0]) - 1);
-  _rxRing[_rxRingHead][sizeof(_rxRing[0]) - 1] = '\0';
-  _rxRingTs[_rxRingHead] = millis();
-  _rxRingHead = (_rxRingHead + 1) % RX_RING_SIZE;
-  if (_rxRingCount < RX_RING_SIZE) _rxRingCount++;
-
-  // Route to matching subscription callbacks (exact or wildcard # match).
-  for (uint8_t i = 0; i < _subCount; i++) {
-    if (!_subs[i].active) continue;
-    // Check for trailing /# wildcard
-    size_t slen = strlen(_subs[i].topic);
-    if (slen >= 2 && _subs[i].topic[slen - 1] == '#' && _subs[i].topic[slen - 2] == '/') {
-      if (strncmp(_subs[i].topic, topic, slen - 1) == 0) {
-        _subs[i].callback(topic, payloadBuf);
-      }
-    } else if (strcmp(_subs[i].topic, topic) == 0) {
-      _subs[i].callback(topic, payloadBuf);
-    }
-  }
+  matchAndDispatch(topic, payloadBuf);
   free(payloadBuf);
 }
 
