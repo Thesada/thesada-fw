@@ -123,6 +123,28 @@ private:
   static bool mqttIsConnected();
   static void sampleSignalQuality();
 
+  // URC-safe AT helper. Sends "AT<cmd>\r\n" via Serial1, reads the
+  // response line by line. Any +SMSUB: line is routed to dispatchInbound
+  // (same path pumpInbound uses) so a URC arriving inside the call's
+  // response window is delivered, not eaten by the parser.
+  // Works around TinyGSM SIM7080 handleURCs missing +SMSUB: support;
+  // lets us drop steady-state TinyGSM AT calls without forking the
+  // upstream library.
+  //
+  // Caller must hold the AT-bus mutex (ATGuard).
+  //
+  // in:  cmd          AT command without leading "AT" or trailing CRLF
+  //                   (e.g. "+CSQ", "+SMSTATE?")
+  //      expect       success terminator the caller is waiting for
+  //                   (typically "OK")
+  //      timeoutMs    upper bound on response window
+  //      lineCallback per non-URC, non-terminator line; nullptr ok
+  // out: int           1 on expect match, 0 on timeout, -1 on ERROR
+  static int  cellAT(const char* cmd, const char* expect, uint32_t timeoutMs,
+                     std::function<void(const char*)> lineCallback);
+  static void routeSmsubLine(char* line);
+  static bool isGprsConnectedRaw();
+
   static bool     _started;
   static bool     _mqttConnected;
   static bool     _publishGate;

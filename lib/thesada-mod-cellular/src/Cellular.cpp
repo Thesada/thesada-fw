@@ -521,20 +521,177 @@ bool Cellular::mqttConnect() {
 
 // ---------------------------------------------------------------------------
 
-// Check if the modem is registered on the cellular network
-bool Cellular::isRegistered() {
-  SIM70xxRegStatus s = modem.getRegistrationStatus();
-  return (s == REG_OK_HOME || s == REG_OK_ROAMING);
+// Parse a single +SMSUB: URC line and dispatch to MQTTClient. Shared
+// by pumpInbound and cellAT so both code paths deliver URCs identically.
+//
+// in:  line   NUL-terminated +SMSUB: URC line (no trailing CRLF)
+// out: none   - dispatched via MQTTClient::dispatchInbound on success
+void Cellular::routeSmsubLine(char* line) {
+  // Format: +SMSUB: "<topic>","<payload>"
+  char* p = line + 8;
+  if (*p != '"') return;
+  p++;
+  char* topicStart = p;
+  char* topicEnd   = strchr(p, '"');
+  if (!topicEnd) return;
+  *topicEnd = '\0';
+  p = topicEnd + 1;
+  if (*p != ',' || *(p + 1) != '"') return;
+  p += 2;
+  char* payloadStart = p;
+  char* payloadEnd   = strrchr(p, '"');
+  if (!payloadEnd || payloadEnd == p - 1) return;
+  *payloadEnd = '\0';
+
+  char dmsg[160];
+  snprintf(dmsg, sizeof(dmsg), "RX %s (%u B)", topicStart,
+           (unsigned)(payloadEnd - payloadStart));
+  Log::info(TAG, dmsg);
+
+  MQTTClient::dispatchInbound(topicStart, payloadStart,
+                              (size_t)(payloadEnd - payloadStart));
 }
 
-// Query the modem MQTT connection state via AT command
-bool Cellular::mqttIsConnected() {
-  modem.sendAT("+SMSTATE?");
-  if (modem.waitResponse(3000UL, "+SMSTATE: ") == 1) {
-    String res = modem.stream.readStringUntil('\r');
-    return res.toInt() == 1;
+// URC-safe AT command. See header for contract.
+int Cellular::cellAT(const char* cmd, const char* expect, uint32_t timeoutMs,
+                     std::function<void(const char*)> lineCallback) {
+  // Drain any bytes already in the modem stream so we do not mix
+  // straggler URCs into our response window. Any +SMSUB: lines we
+  // find here are dispatched immediately.
+  {
+    char    line[512];
+    size_t  lineLen = 0;
+    while (Serial1.available()) {
+      char c = (char)Serial1.read();
+      if (c == '\r') continue;
+      if (c == '\n') {
+        line[lineLen] = '\0';
+        if (strncmp(line, "+SMSUB: ", 8) == 0) routeSmsubLine(line);
+        lineLen = 0;
+        continue;
+      }
+      if (lineLen < sizeof(line) - 1) line[lineLen++] = c;
+    }
   }
-  return false;
+
+  // Send command.
+  Serial1.print("AT");
+  Serial1.print(cmd);
+  Serial1.print("\r\n");
+
+  uint32_t end = millis() + timeoutMs;
+  uint32_t lastWdt = millis();
+  char     line[512];
+  size_t   lineLen = 0;
+
+  while (millis() < end) {
+    // Watchdog feed every 500 ms so callers can pass long timeouts
+    // without tripping the 5 s task watchdog.
+    if (millis() - lastWdt > 500) {
+      esp_task_wdt_reset();
+      lastWdt = millis();
+    }
+    while (Serial1.available()) {
+      char c = (char)Serial1.read();
+      if (c == '\r') continue;
+      if (c == '\n') {
+        line[lineLen] = '\0';
+        // Empty line: skip (the modem prefixes responses with a CRLF).
+        if (lineLen == 0) continue;
+
+        // URC -> dispatch and continue waiting for our response.
+        if (strncmp(line, "+SMSUB: ", 8) == 0) {
+          routeSmsubLine(line);
+          lineLen = 0;
+          continue;
+        }
+
+        // Terminator?
+        if (strcmp(line, expect) == 0) return 1;
+        if (strcmp(line, "ERROR") == 0) return -1;
+        // CME / CMS errors carry detail; treat as ERROR for return code
+        // but pass the line through so callers can log the cause.
+        bool isErr = (strncmp(line, "+CME ERROR", 10) == 0 ||
+                      strncmp(line, "+CMS ERROR", 10) == 0);
+        if (lineCallback) lineCallback(line);
+        if (isErr) return -1;
+
+        lineLen = 0;
+        continue;
+      }
+      if (lineLen < sizeof(line) - 1) {
+        line[lineLen++] = c;
+      } else {
+        // Line overflow - reset to avoid corrupt parses.
+        Log::warn(TAG, "cellAT line overflow - dropping");
+        lineLen = 0;
+      }
+    }
+    delay(2);
+  }
+  return 0;  // timeout
+}
+
+// Check if the modem is registered on the cellular network. URC-safe:
+// goes through cellAT instead of TinyGSM's getRegistrationStatus so a
+// +SMSUB: URC arriving during the response window is not eaten by the
+// modem.waitResponse(OK) parser.
+bool Cellular::isRegistered() {
+  // Try +CEREG? first (LTE-M / NB-IoT). Fall back to +CGREG? if the
+  // modem reports only GPRS-style registration. Format:
+  //   +CEREG: <n>,<stat>[,...]
+  //   stat values: 1 = registered home, 5 = registered roaming
+  bool home = false, roaming = false;
+  cellAT("+CEREG?", "OK", 2000UL, [&](const char* line) {
+    const char* p = strstr(line, "+CEREG:");
+    if (!p) return;
+    p = strchr(p, ',');
+    if (!p) return;
+    int stat = atoi(p + 1);
+    if (stat == 1) home    = true;
+    if (stat == 5) roaming = true;
+  });
+  if (home || roaming) return true;
+  cellAT("+CGREG?", "OK", 2000UL, [&](const char* line) {
+    const char* p = strstr(line, "+CGREG:");
+    if (!p) return;
+    p = strchr(p, ',');
+    if (!p) return;
+    int stat = atoi(p + 1);
+    if (stat == 1) home    = true;
+    if (stat == 5) roaming = true;
+  });
+  return (home || roaming);
+}
+
+// URC-safe replacement for modem.isGprsConnected(). Parses +CNACT? line
+//   +CNACT: 0,<state>,<ip>
+// state == 1 means the data context is active.
+bool Cellular::isGprsConnectedRaw() {
+  bool active = false;
+  cellAT("+CNACT?", "OK", 2000UL, [&](const char* line) {
+    const char* p = strstr(line, "+CNACT:");
+    if (!p) return;
+    p = strchr(p, ',');
+    if (!p) return;
+    int state = atoi(p + 1);
+    if (state == 1) active = true;
+  });
+  return active;
+}
+
+// URC-safe MQTT session check. Parses +SMSTATE: <state>; state == 1
+// means an MQTT session is up.
+bool Cellular::mqttIsConnected() {
+  bool up = false;
+  cellAT("+SMSTATE?", "OK", 2000UL, [&](const char* line) {
+    const char* p = strstr(line, "+SMSTATE:");
+    if (!p) return;
+    p += 9;
+    while (*p == ' ') p++;
+    if (atoi(p) == 1) up = true;
+  });
+  return up;
 }
 
 // ---------------------------------------------------------------------------
@@ -637,7 +794,7 @@ void Cellular::loop() {
   esp_task_wdt_reset();
 
   // Recovery: network dropped.
-  if (!isRegistered() || !modem.isGprsConnected()) {
+  if (!isRegistered() || !isGprsConnectedRaw()) {
     esp_task_wdt_reset();
     Log::warn(TAG, "Network lost - re-registering");
     _mqttConnected = false;
@@ -840,11 +997,23 @@ void Cellular::atPassthrough(const char* cmd, uint32_t timeoutMs,
 
 // Refresh _signalQuality from AT+CSQ at most every SIGNAL_SAMPLE_MS to avoid
 // monopolising the AT bus. Called from begin() and loop() while started.
+// Goes through cellAT so any +SMSUB: URC arriving during the response
+// window is delivered, not eaten by a TinyGSM-style waitResponse parser.
+//
 void Cellular::sampleSignalQuality() {
   uint32_t now = millis();
   if (_lastSignalSample != 0 && (now - _lastSignalSample) < SIGNAL_SAMPLE_MS) return;
   _lastSignalSample = now;
-  int rssi = modem.getSignalQuality();  // TinyGSM: 0..31, 99 = unknown
+
+  int rssi = 99;  // unknown
+  cellAT("+CSQ", "OK", 2000UL, [&](const char* line) {
+    // Format: +CSQ: <rssi>,<ber>
+    const char* p = strstr(line, "+CSQ:");
+    if (!p) return;
+    p += 5;
+    while (*p == ' ') p++;
+    rssi = atoi(p);  // 0..31 valid, 99 = unknown
+  });
   _signalQuality = rssi;
 }
 
@@ -914,14 +1083,13 @@ bool Cellular::smsub(const char* topic) {
 
 // Issue AT+SMSUB for every active subscription registered with MQTTClient.
 //
-// Wildcard support on SIM7080G fw 1951B17, validated 2026-05-07 on bench
-// with the DC3 power-cycle fix in place:
+// Bench observation on this SIM7080G modem firmware revision: with the
+// DC3 power-cycle fix in place,
 //   - Literal topics                          : reliable
 //   - Single-level `+` (e.g. cli/+)           : reliable
-//   - Multi-level  `#` (e.g. cli/#, <prefix>/#): DROPS URCs at scale
-//     (3/9 delivery in bench burst test)
+//   - Multi-level  `#` (e.g. cli/#, <prefix>/#): drops URCs under burst
 // So we mirror exactly what MQTTClient::_subs holds (cli/+ and literal
-// cmd/* topics today) and never widen to `#`.
+// cmd/* topics) and never widen to `#`.
 //
 // MAX_SUBS=4 stays under the SIM7080 session cap.
 bool Cellular::smsubAll() {
@@ -980,32 +1148,7 @@ void Cellular::pumpInbound() {
 #endif
       // Look for the +SMSUB: prefix; ignore everything else (other URCs,
       // stray AT responses that escaped TinyGSM's parser).
-      if (strncmp(line, "+SMSUB: ", 8) == 0) {
-        // Parse: +SMSUB: "<topic>","<payload>"
-        char* p = line + 8;
-        if (*p != '"') { lineLen = 0; continue; }
-        p++;
-        char* topicStart = p;
-        char* topicEnd   = strchr(p, '"');
-        if (!topicEnd) { lineLen = 0; continue; }
-        *topicEnd = '\0';
-        p = topicEnd + 1;
-        if (*p != ',' || *(p + 1) != '"') { lineLen = 0; continue; }
-        p += 2;
-        char* payloadStart = p;
-        // Find the closing quote (last quote on the line).
-        char* payloadEnd   = strrchr(p, '"');
-        if (!payloadEnd || payloadEnd == p - 1) { lineLen = 0; continue; }
-        *payloadEnd = '\0';
-
-        char dmsg[160];
-        snprintf(dmsg, sizeof(dmsg), "RX %s (%u B)", topicStart,
-                 (unsigned)(payloadEnd - payloadStart));
-        Log::info(TAG, dmsg);
-
-        MQTTClient::dispatchInbound(topicStart, payloadStart,
-                                    (size_t)(payloadEnd - payloadStart));
-      }
+      if (strncmp(line, "+SMSUB: ", 8) == 0) routeSmsubLine(line);
       lineLen = 0;
       continue;
     }
