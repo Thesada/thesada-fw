@@ -34,12 +34,34 @@ static const char* TAG = "Cellular";
 
 
 // ── Module state ─────────────────────────────────────────────────────────────
-bool     Cellular::_started        = false;
-bool     Cellular::_mqttConnected  = false;
-bool     Cellular::_publishGate    = false;
-bool     Cellular::_hasCACert      = false;
-int      Cellular::_signalQuality  = 99;
-uint32_t Cellular::_lastSignalSample = 0;
+bool              Cellular::_started        = false;
+bool              Cellular::_mqttConnected  = false;
+bool              Cellular::_publishGate    = false;
+bool              Cellular::_hasCACert      = false;
+int               Cellular::_signalQuality  = 99;
+uint32_t          Cellular::_lastSignalSample = 0;
+SemaphoreHandle_t Cellular::_atMutex        = nullptr;
+
+// Lazy init of the recursive AT-bus mutex. Called from every ATGuard
+// constructor so static init order across translation units does not
+// matter; first ATGuard wins, subsequent constructions skip the create.
+void Cellular::atMutexInit() {
+  if (_atMutex == nullptr) {
+    _atMutex = xSemaphoreCreateRecursiveMutex();
+  }
+}
+
+Cellular::ATGuard::ATGuard(uint32_t timeoutMs) : _held(false) {
+  atMutexInit();
+  if (_atMutex == nullptr) return;  // OOM at create time - degrade open
+  TickType_t to = (timeoutMs == 0) ? 0 : pdMS_TO_TICKS(timeoutMs);
+  if (xSemaphoreTakeRecursive(_atMutex, to) == pdTRUE) {
+    _held = true;
+  }
+}
+Cellular::ATGuard::~ATGuard() {
+  if (_held) xSemaphoreGiveRecursive(_atMutex);
+}
 
 // Serial port for TinyGSM
 static TinyGsm modem(Serial1);
@@ -50,15 +72,10 @@ static constexpr uint32_t SIGNAL_SAMPLE_MS = 30UL * 1000UL;
 // MQTT-active health probe cadence. Per-tick TinyGSM AT calls would
 // drain Serial1 of any +SMSUB: URC arriving between loop iterations,
 // so during MQTT-active phase we only run isRegistered + isGprsConnected
-// + mqttIsConnected once every HEALTH_PROBE_MS, with _atBusy set so
-// pumpInbound skips that single tick.
+// + mqttIsConnected once every HEALTH_PROBE_MS. The ATGuard mutex held
+// across the probe blocks pumpInbound for that one tick.
 static constexpr uint32_t HEALTH_PROBE_MS = 60UL * 1000UL;
 static uint32_t           s_lastHealthMs   = 0;
-
-// Mutual-exclusion flag between TinyGSM AT calls (or atPassthrough) and
-// pumpInbound. When true, pumpInbound returns immediately so it does not
-// race the AT response parser on the same Serial1 stream.
-static volatile bool      s_atBusy         = false;
 
 // TinyGSM waitResponse blocks the task for the full timeout without
 // feeding the 5 s task watchdog. This wrapper splits any long wait into
@@ -527,6 +544,16 @@ void Cellular::begin() {
   if (_started) return;  // already initialised - modem is up, only loop() needed
   Log::info(TAG, "Starting cellular path...");
 
+  // Take the AT bus for the entire bring-up. Long: registration alone
+  // can take 60-180 s on first SIM-card touch, plus CA upload + SMCONN.
+  // Any cross-task caller that hits Cellular::publish during boot will
+  // wait its turn rather than racing the registration AT chatter.
+  ATGuard g(300000UL);
+  if (!g.ok()) {
+    Log::error(TAG, "Cellular begin: AT bus stuck - aborting");
+    return;
+  }
+
   initPMU();
   if (!wakeModem()) {
     Log::error(TAG, "Modem did not wake - aborting cellular bring-up");
@@ -579,14 +606,15 @@ void Cellular::begin() {
 // WiFi-vs-cellular policy is handled by CellularModule, not here.
 //
 // Steady-state ordering:
-//   1. pumpInbound() drains +SMSUB: URCs. Owns Serial1 99 % of the time.
-//   2. Once per HEALTH_PROBE_MS, set s_atBusy=true, run the TinyGSM checks
+//   1. pumpInbound() drains +SMSUB: URCs. Self-guarded with a 0-tick
+//      try-acquire so it steps aside instantly when any AT caller (this
+//      task or another) holds the bus.
+//   2. Once per HEALTH_PROBE_MS, take an ATGuard, run the TinyGSM checks
 //      (isRegistered / isGprsConnected / mqttIsConnected / sampleSignalQuality),
-//      clear s_atBusy. pumpInbound bails on s_atBusy so the AT response
-//      parser does not race the URC reader.
+//      release on scope exit.
 //   3. If a probe finds the link broken, run the existing recovery
-//      (networkConnect + mqttConnect). s_atBusy stays true through
-//      recovery so URCs do not interleave with AT chatter.
+//      (networkConnect + mqttConnect) inside the same guard scope so URCs
+//      do not interleave with AT chatter.
 void Cellular::loop() {
   if (!_started) return;
 
@@ -598,7 +626,14 @@ void Cellular::loop() {
   }
   s_lastHealthMs = now;
 
-  s_atBusy = true;
+  ATGuard g;
+  if (!g.ok()) {
+    // Another task holds the bus past the 30 s budget - skip this tick
+    // and try next loop. Health probe is best-effort; a stuck guard will
+    // recover when the holder releases.
+    Log::warn(TAG, "Health probe skipped - AT bus busy");
+    return;
+  }
   esp_task_wdt_reset();
 
   // Recovery: network dropped.
@@ -615,7 +650,6 @@ void Cellular::loop() {
     }
     mqttBackoffReset();
     _mqttConnected = true;
-    s_atBusy = false;
     return;
   }
 
@@ -644,8 +678,6 @@ void Cellular::loop() {
   esp_task_wdt_reset();
   sampleSignalQuality();
   esp_task_wdt_reset();
-
-  s_atBusy = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -693,17 +725,22 @@ bool Cellular::isModemAlive() {
 // broker delivers anything sent during the GNSS window the moment
 // CFUN=1 returns.
 //
-// s_atBusy is held across the entire window so pumpInbound, publish()
+// ATGuard is held across the entire window so pumpInbound, publish()
 // and the health probe cannot race the AT bus. The window is bounded
 // by timeoutMs and the watchdog is fed every second so a 60 s cold fix
-// does not trip TWDT.
+// does not trip TWDT. Guard timeout = timeoutMs + 10 s slack so the
+// outer caller never wins the race against itself on a long cold fix.
 bool Cellular::gpsAcquireFix(uint32_t timeoutMs,
                              float* lat, float* lon,
                              float* alt, float* speed,
                              int* satsInView, int* satsUsed) {
   if (!_started) return false;
 
-  s_atBusy = true;
+  ATGuard g(timeoutMs + 10000UL);
+  if (!g.ok()) {
+    Log::warn(TAG, "GPS fix skipped - AT bus busy");
+    return false;
+  }
 
   bool fix = false;
   if (modem.enableGPS()) {
@@ -752,7 +789,6 @@ bool Cellular::gpsAcquireFix(uint32_t timeoutMs,
     esp_task_wdt_reset();
   }
 
-  s_atBusy = false;
   return fix;
 }
 
@@ -768,7 +804,11 @@ bool Cellular::gpsAcquireFix(uint32_t timeoutMs,
 // >= 120 s.
 void Cellular::atPassthrough(const char* cmd, uint32_t timeoutMs,
                              std::function<void(const char*)> emit) {
-  s_atBusy = true;
+  ATGuard g(timeoutMs + 5000UL);
+  if (!g.ok()) {
+    emit("ERROR: AT bus busy");
+    return;
+  }
   Serial1.printf("AT%s\r\n", cmd);
   uint32_t t0 = millis();
   String buf;
@@ -794,7 +834,6 @@ void Cellular::atPassthrough(const char* cmd, uint32_t timeoutMs,
     line.trim();
     if (line.length()) emit(line.c_str());
   }
-  s_atBusy = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -815,11 +854,16 @@ void Cellular::sampleSignalQuality() {
 bool Cellular::publish(const char* topic, const char* payload) {
   if (!connected()) return false;
 
+  ATGuard g;
+  if (!g.ok()) {
+    Log::warn(TAG, "Publish skipped - AT bus busy");
+    return false;
+  }
+
   size_t len = strlen(payload);
   char cmd[128];
   snprintf(cmd, sizeof(cmd), "+SMPUB=\"%s\",%d,1,0", topic, (int)len);
 
-  s_atBusy = true;
   // waitChunked feeds the watchdog every 1.5 s so we can give the modem
   // a generous timeout for slow SMPUB cycles without tripping the 5 s
   // task watchdog.
@@ -827,15 +871,12 @@ bool Cellular::publish(const char* topic, const char* payload) {
   if (waitChunked(5000UL, ">") != 1) {
     Log::warn(TAG, "No SMPUB prompt");
     _mqttConnected = false;
-    s_atBusy = false;
     return false;
   }
 
   modem.stream.write(payload, len);
 
-  bool ok = (waitChunked(8000UL) == 1);
-  s_atBusy = false;
-  if (ok) return true;
+  if (waitChunked(8000UL) == 1) return true;
 
   Log::warn(TAG, "SMPUB failed");
   _mqttConnected = false;
@@ -853,12 +894,15 @@ bool Cellular::publish(const char* topic, const char* payload) {
 // are not flipped until mqttConnect returns. The AT command itself
 // fails fast if the session is not actually up.
 bool Cellular::smsub(const char* topic) {
-  s_atBusy = true;
+  ATGuard g;
+  if (!g.ok()) {
+    Log::warn(TAG, "SMSUB skipped - AT bus busy");
+    return false;
+  }
   esp_task_wdt_reset();
   modem.sendAT("+SMSUB=\"", topic, "\",1");
   int res = modem.waitResponse(3000UL);
   esp_task_wdt_reset();
-  s_atBusy = false;
   if (res != 1) {
     char wmsg[80];
     snprintf(wmsg, sizeof(wmsg), "SMSUB failed for %s", topic);
@@ -909,15 +953,14 @@ bool Cellular::smsubAll() {
 // Topics and payloads are double-quoted ASCII. Embedded quotes / binary
 // in payloads is out of scope for v1 (filed).
 //
-// Stream ownership: this runs at the end of Cellular::loop() when no
-// TinyGSM AT call is in flight, so we do not race the AT response
-// parser. atPassthrough() is invoked from the shell drain after the
-// main-loop iteration, also serially.
+// Stream ownership: this takes the AT bus mutex with a 0-tick try-acquire;
+// if any caller (this task or another) currently holds the bus we step
+// aside and wait for the next loop iteration. The mutex makes the check
+// race-free where the previous cooperative s_atBusy flag was not.
 void Cellular::pumpInbound() {
   if (!_started) return;
-  // Skip if a TinyGSM AT call (or atPassthrough) is mid-flight - it owns
-  // Serial1 for the duration.
-  if (s_atBusy) return;
+  ATGuard g(0);
+  if (!g.ok()) return;
 
   static char    line[512];
   static size_t  lineLen = 0;

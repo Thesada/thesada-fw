@@ -9,9 +9,38 @@
 
 #include <Arduino.h>
 #include <functional>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 class Cellular {
 public:
+  // RAII guard for the SIM7080 AT bus. Every call site that touches
+  // Serial1 / TinyGSM must instantiate one of these at function entry.
+  // Replaces the older cooperative `s_atBusy` flag: a real
+  // FreeRTOS recursive mutex serializes caller-vs-caller (publish on
+  // one task vs the loop() health probe on another) and caller-vs-URC
+  // drainer (pumpInbound), which the boolean flag could not.
+  //
+  // Recursive: nested helpers (networkConnect -> writeCACert etc.) can
+  // re-acquire safely without self-deadlock if a future refactor moves
+  // the guard down a level.
+  //
+  // Default 30 s acquire window: long enough that a slow SMCONN inside
+  // an outer guard does not livelock another caller waiting on publish,
+  // short enough that a wedged AT bus surfaces as a returnable failure
+  // rather than an infinite block. Pass 0 for non-blocking try-acquire
+  // (used by pumpInbound to step aside without ever waiting).
+  class ATGuard {
+  public:
+    explicit ATGuard(uint32_t timeoutMs = 30000);
+    ~ATGuard();
+    bool ok() const { return _held; }
+    ATGuard(const ATGuard&) = delete;
+    ATGuard& operator=(const ATGuard&) = delete;
+  private:
+    bool _held;
+  };
+
   // Initialise PMU, wake modem, check SIM, write CA cert, register, MQTT connect.
   // Idempotent: returns immediately if already started.
   // Side-effect: leaves the publish gate open on success.
@@ -100,4 +129,9 @@ private:
   static bool     _hasCACert;
   static int      _signalQuality;
   static uint32_t _lastSignalSample;
+
+  // AT-bus mutex. Lazy-initialised (xSemaphoreCreateRecursiveMutex)
+  // on first ATGuard construction so static init order is irrelevant.
+  static SemaphoreHandle_t _atMutex;
+  static void atMutexInit();
 };
