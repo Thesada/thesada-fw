@@ -88,7 +88,7 @@ void Shell::execute(const char* line, ShellOutput out) {
   out(msg);
 }
 
-// Stage a command for main-loop execution (#62 deferred dispatcher).
+// Stage a command for main-loop execution via the deferred dispatcher.
 // Capture by-value of the sink intentional - the caller's lambda may
 // reference task-local state that goes out of scope before loop()
 // fires; std::function's small-buffer optimization keeps trivial
@@ -169,6 +169,27 @@ void Shell::loop() {
     execute(line, sink);
   } else if (mode == SlotMode::Handler && fn) {
     fn();
+  }
+}
+
+// Drain Serial (USB-CDC on debug envs, UART0 on production) one line at
+// a time and dispatch via execute(). Single console - safe to share buffer
+// state across callers because there is only one host typing at the
+// other end.
+void Shell::pumpConsole() {
+  static char  buf[Shell::DEFERRED_LINE_LEN];
+  static int   pos = 0;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      buf[pos] = '\0';
+      if (pos > 0) {
+        Shell::execute(buf, [](const char* line) { Serial.println(line); });
+      }
+      pos = 0;
+    } else if (pos < (int)sizeof(buf) - 1) {
+      buf[pos++] = c;
+    }
   }
 }
 
@@ -419,12 +440,17 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
     JsonVariant parent = doc.as<JsonVariant>();
     char* token = strtok(key, ".");
     while (token) {
-      if (parent.is<JsonObject>()) {
-        parent = parent[token];
-      } else {
+      if (!parent.is<JsonObject>()) {
         out("Parent key not found");
         return;
       }
+      // Auto-create missing intermediate objects so config.set can land
+      // a value into a section that does not exist yet (e.g. enabling a
+      // brand-new optional module like gnss).
+      if (parent[token].isNull()) {
+        parent[token].to<JsonObject>();
+      }
+      parent = parent[token];
       token = strtok(nullptr, ".");
     }
 

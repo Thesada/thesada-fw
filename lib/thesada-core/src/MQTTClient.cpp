@@ -130,6 +130,56 @@ bool     MQTTClient::_manifestPublished    = false;
 bool     MQTTClient::_manifestDirty        = false;
 uint32_t MQTTClient::_manifestDirtySinceMs = 0;
 
+// Cellular fallback hint - see header. When true, publish() drops on a
+// WiFi disconnect instead of enqueueing.
+static bool s_fallbackPublishing = false;
+
+// Cellular subscribe forwarder. When installed, MQTTClient::subscribe
+// also calls this so the cellular MQTT session mirrors the WiFi-side
+// subscription set as new entries are added at runtime.
+static std::function<void(const char*)> s_subForwarder;
+
+// Cellular publish forwarder. When installed and fallback publishing
+// is active, MQTTClient::publish routes here instead of enqueueing on a
+// WiFi-side disconnect. Returns true on successful hand-off to cellular,
+// false if the cellular transport is not ready (publish then drops).
+static std::function<bool(const char*, const char*, bool)> s_pubForwarder;
+
+// Tracks the millis() at which fallback publishing became active, so the
+// heap-stats trigger can defer its first firing until 30 s after the
+// cellular handoff completes. Initial post-ACTIVE burst (battery + rssi
+// + retained manifest re-emit) crowds the modem AT bus; deferring heap
+// keeps that window quiet.
+static uint32_t s_fallbackStartMs = 0;
+
+void MQTTClient::setFallbackPublishing(bool active) {
+  if (active && !s_fallbackPublishing) {
+    // Cellular took over from WiFi. The 8-slot WiFi ring queue holds
+    // stale (seconds-to-minutes old) battery/sensor samples buffered
+    // during the WiFi outage. Replaying them through the cellular
+    // forwarder right when battery + rssi telemetry is starting up
+    // would burst the modem AT bus precisely during the window we
+    // are most worried about. Drop the queue; sensors are level-
+    // triggered and will refire on their next module cycle if any
+    // alert condition still holds.
+    if (_queueCount > 0) {
+      char dmsg[80];
+      snprintf(dmsg, sizeof(dmsg),
+               "Cellular handoff: dropping %d queued WiFi msg(s)",
+               (int)_queueCount);
+      Log::info(TAG, dmsg);
+      for (uint8_t i = 0; i < MQTT_QUEUE_SIZE; ++i) _queue[i].valid = false;
+      _queueHead  = 0;
+      _queueTail  = 0;
+      _queueCount = 0;
+    }
+    s_fallbackStartMs = millis();
+  } else if (!active) {
+    s_fallbackStartMs = 0;
+  }
+  s_fallbackPublishing = active;
+}
+
 // ---------------------------------------------------------------------------
 
 // Initialize MQTT client, load TLS cert, and set up subscriptions
@@ -243,11 +293,11 @@ void MQTTClient::begin() {
       // Defer CLI command to the Shell ring - executing inside the
       // PubSubClient callback blocks keepalive and causes disconnects on
       // slow operations (LittleFS writes, config reload, etc). The
-      // generic shell-line path goes through Shell::enqueue (#62 phase A);
+      // generic shell-line path goes through Shell::enqueue;
       // binary-payload commands (fs.write, fs.cat chunked, cert.set) and
       // the response-shape contract (one cli/response message per
       // command, JSON array of output lines) need their own handler so
-      // they go through Shell::enqueueDeferred (#62 phase B). Same ring,
+      // they go through Shell::enqueueDeferred. Same ring,
       // same backpressure, single drain path.
       JsonObject  cfg    = Config::get();
       const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
@@ -302,7 +352,7 @@ void MQTTClient::connect() {
   Log::info(TAG, msg);
 
 #ifdef MQTT_TLS
-  // Force a fresh mbedtls context on every connect attempt (#121). When a
+  // Force a fresh mbedtls context on every connect attempt. When a
   // prior connect failed mid-handshake, WiFiClientSecure retains the
   // underlying mbedtls_ssl_context with whatever cert/key pointers were
   // configured at that time. A subsequent setCACert / setCertificate /
@@ -497,8 +547,24 @@ void MQTTClient::loop() {
     }
   }
 
-  // CLI commands are now drained from the Shell ring (#62 phase B) -
+  // CLI commands are now drained from the Shell ring -
   // see Shell::loop() drained from the main app loop. No poll needed here.
+
+  // Periodic heap telemetry. Transport-agnostic: fires whenever any
+  // transport (WiFi MQTT or cellular fallback) is publishing. Defers
+  // 30 s after a fresh cellular handoff so the post-ACTIVE burst
+  // (battery + rssi + retained manifest re-emit) clears first. 5 min
+  // interval -> <= 288 publishes/day per metric.
+  {
+    uint32_t hpNow = millis();
+    bool eligible = _client.connected() ||
+                    (s_fallbackPublishing && s_fallbackStartMs != 0 &&
+                     (hpNow - s_fallbackStartMs) >= 30000UL);
+    if (eligible &&
+        (_lastHeapPublishMs == 0 || (hpNow - _lastHeapPublishMs) >= HEAP_PUBLISH_MS)) {
+      publishHeapStats();
+    }
+  }
 
   // Late-arriving retained topics (e.g. SHT31 discovery published after the
   // initial connect()-time manifest) re-emit after a 5 s debounce so we do
@@ -567,13 +633,6 @@ void MQTTClient::loop() {
     _client.loop();
     _lastSuccessMs = millis();  // MQTT loop succeeded (keepalive worked)
 
-    // Periodic heap telemetry. Runs on the MQTT loop
-    // cadence but only when the 5 min interval has elapsed, so we get no
-    // more than 288 publishes/day per metric.
-    if (_lastHeapPublishMs == 0 || (now - _lastHeapPublishMs) >= HEAP_PUBLISH_MS) {
-      publishHeapStats();
-    }
-
     // Drain queued messages, respecting minimum send interval.
     if (_queueCount > 0) {
       if (_minIntervalMs == 0 || now - _lastPublishMs >= _minIntervalMs) {
@@ -629,16 +688,34 @@ void MQTTClient::publish(const char* topic, const char* payload) {
     _lastPublishTime = time(nullptr);
     return;
   }
+  // WiFi MQTT is down. If cellular has taken over, route through the
+  // installed publish forwarder so the broker still gets the message
+  // via the modem-native MQTT session. The WiFi ring is reserved for
+  // WiFi - we do NOT enqueue under fallback or it fills 8/8 forever
+  // and every new publish triggers "Queue full - dropping oldest"
+  // eviction.
+  if (s_fallbackPublishing) {
+    if (s_pubForwarder) s_pubForwarder(topic, payload, false);
+    return;
+  }
   enqueue(topic, payload);
 }
 
 // Publish a retained message (for HA discovery configs).
 // Records the topic in the retained-topics manifest so the platform can
-// clear it on device delete (#187).
+// clear it on device delete. Routes through the cellular forwarder when
+// WiFi MQTT is down and cellular fallback is publishing, so HA discovery
+// configs / availability / device info still land on the broker.
 void MQTTClient::publishRetained(const char* topic, const char* payload) {
   if (_client.connected()) {
     _client.publish(topic, (const uint8_t*)payload, strlen(payload), true);
     recordRetainedTopic(topic);
+    return;
+  }
+  if (s_fallbackPublishing && s_pubForwarder) {
+    if (s_pubForwarder(topic, payload, true)) {
+      recordRetainedTopic(topic);
+    }
   }
 }
 
@@ -667,7 +744,7 @@ void MQTTClient::recordRetainedTopic(const char* topic) {
 // out: publishes one retained MQTT message; topic itself is added to the
 // manifest list pre-publish so the device can also clean its own info.
 void MQTTClient::publishRetainedManifest() {
-  if (!_client.connected()) return;
+  if (!_client.connected() && !s_fallbackPublishing) return;
 
   JsonObject cfg = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
@@ -686,7 +763,13 @@ void MQTTClient::publishRetainedManifest() {
   String payload;
   serializeJson(doc, payload);
 
-  _client.publish(topic, (const uint8_t*)payload.c_str(), payload.length(), true);
+  bool ok = false;
+  if (_client.connected()) {
+    ok = _client.publish(topic, (const uint8_t*)payload.c_str(), payload.length(), true);
+  } else if (s_pubForwarder) {
+    ok = s_pubForwarder(topic, payload.c_str(), true);
+  }
+  if (!ok) return;
   _manifestPublished    = true;
   _manifestDirty        = false;
   _manifestDirtySinceMs = 0;
@@ -720,11 +803,75 @@ void MQTTClient::subscribe(const char* topic, MQTTCallback callback) {
     _client.subscribe(topic);
     _client.loop();
   }
+
+  // If cellular has installed a forwarder, mirror this subscription onto
+  // the cellular MQTT session too.
+  if (s_subForwarder) s_subForwarder(topic);
 }
 
 // ---------------------------------------------------------------------------
 
-// Route incoming messages to matching subscription callbacks
+// Capture topic in the rxRing and fire every active subscription whose
+// topic matches by exact string OR trailing /# OR trailing /+. Shared
+// between WiFi (onMessage) and cellular (dispatchInbound) so the two
+// transports never drift on wildcard semantics.
+void MQTTClient::matchAndDispatch(const char* topic, const char* payload) {
+  strncpy(_rxRing[_rxRingHead], topic, sizeof(_rxRing[0]) - 1);
+  _rxRing[_rxRingHead][sizeof(_rxRing[0]) - 1] = '\0';
+  _rxRingTs[_rxRingHead] = millis();
+  _rxRingHead = (_rxRingHead + 1) % RX_RING_SIZE;
+  if (_rxRingCount < RX_RING_SIZE) _rxRingCount++;
+
+  for (uint8_t i = 0; i < _subCount; i++) {
+    if (!_subs[i].active) continue;
+    size_t slen = strlen(_subs[i].topic);
+    // Trailing /# = multi-level wildcard.
+    if (slen >= 2 && _subs[i].topic[slen - 1] == '#' && _subs[i].topic[slen - 2] == '/') {
+      if (strncmp(_subs[i].topic, topic, slen - 1) == 0) {
+        _subs[i].callback(topic, payload);
+      }
+    }
+    // Trailing /+ = single-level wildcard. Match if the prefix up to /+
+    // matches and the remainder of the topic has no further '/'.
+    else if (slen >= 2 && _subs[i].topic[slen - 1] == '+' && _subs[i].topic[slen - 2] == '/') {
+      if (strncmp(_subs[i].topic, topic, slen - 1) == 0) {
+        const char* rest = topic + (slen - 1);
+        if (*rest != '\0' && strchr(rest, '/') == nullptr) {
+          _subs[i].callback(topic, payload);
+        }
+      }
+    }
+    else if (strcmp(_subs[i].topic, topic) == 0) {
+      _subs[i].callback(topic, payload);
+    }
+  }
+}
+
+// Route incoming messages to matching subscription callbacks.
+// Public dispatcher used by Cellular::pumpInbound to route +SMSUB: URCs
+// through the same subscription callbacks as the WiFi onMessage path.
+void MQTTClient::dispatchInbound(const char* topic, const char* payload, size_t length) {
+  matchAndDispatch(topic, payload);
+  (void)length;  // payload is null-terminated by caller
+}
+
+// Iterate every active subscription topic. Cellular bring-up uses this
+// to issue AT+SMSUB on every entry so the cellular transport carries the
+// same subscription set as the WiFi transport.
+void MQTTClient::forEachSubscription(std::function<void(const char*)> fn) {
+  for (uint8_t i = 0; i < _subCount; i++) {
+    if (_subs[i].active) fn(_subs[i].topic);
+  }
+}
+
+void MQTTClient::setSubscribeForwarder(std::function<void(const char*)> fn) {
+  s_subForwarder = fn;
+}
+
+void MQTTClient::setPublishForwarder(std::function<bool(const char*, const char*, bool)> fn) {
+  s_pubForwarder = fn;
+}
+
 void MQTTClient::onMessage(char* topic, uint8_t* payload, unsigned int length) {
   // Null-terminate the payload - heap-allocated to avoid stack overflow on WROOM-32.
   size_t bufSize = length + 1;
@@ -733,28 +880,7 @@ void MQTTClient::onMessage(char* topic, uint8_t* payload, unsigned int length) {
   memcpy(payloadBuf, payload, length);
   payloadBuf[length] = '\0';
 
-  // Debug RX ring: capture every received topic so `net.mqtt rx` can show it.
-  // Helps narrow broker-side delivery vs client-side dispatch when a
-  // subscription is active but its callback never fires.
-  strncpy(_rxRing[_rxRingHead], topic, sizeof(_rxRing[0]) - 1);
-  _rxRing[_rxRingHead][sizeof(_rxRing[0]) - 1] = '\0';
-  _rxRingTs[_rxRingHead] = millis();
-  _rxRingHead = (_rxRingHead + 1) % RX_RING_SIZE;
-  if (_rxRingCount < RX_RING_SIZE) _rxRingCount++;
-
-  // Route to matching subscription callbacks (exact or wildcard # match).
-  for (uint8_t i = 0; i < _subCount; i++) {
-    if (!_subs[i].active) continue;
-    // Check for trailing /# wildcard
-    size_t slen = strlen(_subs[i].topic);
-    if (slen >= 2 && _subs[i].topic[slen - 1] == '#' && _subs[i].topic[slen - 2] == '/') {
-      if (strncmp(_subs[i].topic, topic, slen - 1) == 0) {
-        _subs[i].callback(topic, payloadBuf);
-      }
-    } else if (strcmp(_subs[i].topic, topic) == 0) {
-      _subs[i].callback(topic, payloadBuf);
-    }
-  }
+  matchAndDispatch(topic, payloadBuf);
   free(payloadBuf);
 }
 
@@ -1251,12 +1377,15 @@ void MQTTClient::publishDiscovery() {
 
 // ---------------------------------------------------------------------------
 
-// Publish free heap, min free heap, max alloc block, and free PSRAM to
-// <prefix>/sensor/heap/*. Called on a 5 min timer from loop() and once from
-// publishDiscovery() for immediate HA visibility. Last sampled free heap is
-// cached in _lastHeapFree for alert tagging via currentFreeHeap().
+// Publish free heap, min free heap, max alloc block, free PSRAM, and
+// uptime to <prefix>/sensor/{heap,uptime}/*. Called on a 5 min timer
+// from loop() and once from publishDiscovery() for immediate HA
+// visibility. Last sampled free heap is cached in _lastHeapFree for
+// alert tagging via currentFreeHeap(). Routes through the static
+// publish() bus so cellular-only deployments get the same telemetry
+// (publish() picks WiFi or cellular forwarder based on s_fallbackPublishing).
 void MQTTClient::publishHeapStats() {
-  if (!_client.connected()) return;
+  if (!_client.connected() && !s_fallbackPublishing) return;
 
   JsonObject cfg = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
@@ -1274,23 +1403,23 @@ void MQTTClient::publishHeapStats() {
 
   snprintf(topic, sizeof(topic), "%s/sensor/heap/free", prefix);
   snprintf(value, sizeof(value), "%lu", (unsigned long)freeHeap);
-  _client.publish(topic, value);
+  publish(topic, value);
 
   snprintf(topic, sizeof(topic), "%s/sensor/heap/min_free", prefix);
   snprintf(value, sizeof(value), "%lu", (unsigned long)minFree);
-  _client.publish(topic, value);
+  publish(topic, value);
 
   snprintf(topic, sizeof(topic), "%s/sensor/heap/max_alloc_block", prefix);
   snprintf(value, sizeof(value), "%lu", (unsigned long)maxAlloc);
-  _client.publish(topic, value);
+  publish(topic, value);
 
   snprintf(topic, sizeof(topic), "%s/sensor/heap/psram_free", prefix);
   snprintf(value, sizeof(value), "%lu", (unsigned long)freePsram);
-  _client.publish(topic, value);
+  publish(topic, value);
 
   snprintf(topic, sizeof(topic), "%s/sensor/uptime", prefix);
   snprintf(value, sizeof(value), "%lu", (unsigned long)(millis() / 1000));
-  _client.publish(topic, value);
+  publish(topic, value);
 
   _lastHeapPublishMs = millis();
 }

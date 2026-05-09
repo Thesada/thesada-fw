@@ -1,1 +1,1 @@
-{"name":"thesada-mod-cellular","version":"1.2.7","build":{"libCompatMode":"off"}}
+{"name":"thesada-mod-cellular","version":"1.2.7","build":{"libCompatMode":"off"},"dependencies":{"thesada-mod-powermanager":"*"}}

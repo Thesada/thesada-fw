@@ -154,6 +154,58 @@ bool PowerManager::isCharging() {
   return _pmu.isCharging();
 }
 
+#ifdef ENABLE_CELLULAR
+// Configure modem Vcc (DC3=3.0V) and antenna rail (BLDO2=3.3V) on the
+// SIM7080G. Returns false if PMU is not available.
+//
+// The delay between disable and enable is load-bearing: SIM7080 bulk
+// capacitance holds Vcc above brownout, so a back-to-back disable/enable
+// does NOT actually power-cycle the modem. Without the gap, any
+// degraded modem-side state (URC routing wedged after CFUN=1,1 or
+// long-running session) survives ESP32 resets indefinitely.
+//
+// Drop BLDO2 (antenna rail) alongside DC3 (modem core), and hold both
+// off for 1000 ms. With a LiPo battery on the AXP2101 input, 200 ms is
+// not always enough to clear modem internal state - bench observation
+// after several hours of operation showed URC routing degraded even
+// with cold-boot 200 ms cycles. Deeper cycle aims to make the firmware-
+// only recovery match a physical battery+switch flip.
+bool PowerManager::setModemRails() {
+  if (!_pmuOk) return false;
+  _pmu.disableBLDO2();
+  _pmu.disableDC3();
+  delay(1000);
+  _pmu.setDC3Voltage(3000);
+  _pmu.enableDC3();
+  _pmu.setBLDO2Voltage(3300);
+  _pmu.enableBLDO2();
+  _pmu.disableTSPinMeasure();
+  return true;
+}
+
+// Hardware-reset the modem by dropping DC3 + BLDO2 for 1000 ms, then
+// re-enabling at the original voltages. Non-destructive replacement
+// for `+CFUN=1,1` when the modem AT bus is wedged or URC routing has
+// degraded. TS-pin config is not touched.
+//
+// AXP2101 disable*() clears the configured target voltage, so we must
+// re-program 3000 mV (DC3) and 3300 mV (BLDO2) before enabling or the
+// rails come up at the chip default and the SIM7080 fails to wake on
+// AT. Bench-observed: a runtime reset timed out on AT probe because
+// the rail came back at the wrong voltage.
+bool PowerManager::resetModem() {
+  if (!_pmuOk) return false;
+  _pmu.disableBLDO2();
+  _pmu.disableDC3();
+  delay(1000);
+  _pmu.setDC3Voltage(3000);
+  _pmu.enableDC3();
+  _pmu.setBLDO2Voltage(3300);
+  _pmu.enableBLDO2();
+  return true;
+}
+#endif // ENABLE_CELLULAR
+
 // Module wrapper for self-registration
 class PowerManagerModule : public Module {
 public:

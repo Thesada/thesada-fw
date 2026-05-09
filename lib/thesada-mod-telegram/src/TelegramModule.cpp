@@ -89,7 +89,7 @@ void TelegramModule::loop() {}
 // Send a message to a specific Telegram chat ID via the Bot API.
 // Skips the send if free heap is below TELEGRAM_HEAP_FLOOR_BYTES so the
 // TLS handshake here cannot starve the MQTT client of buffer space.
-// MQTT has hard priority because it carries OTA. (Forgejo #40 Phase 3)
+// MQTT has hard priority because it carries OTA.
 bool TelegramModule::sendTo(const char* chatId, const char* message) {
   if (!chatId || strlen(chatId) == 0 || !message || strlen(message) == 0) return false;
   if (!WiFiManager::connected()) { Log::warn(TAG, "WiFi down - skipping"); return false; }

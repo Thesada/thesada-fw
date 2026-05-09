@@ -36,7 +36,7 @@ void BatteryModule::begin() {
            (unsigned long)(_intervalMs / 1000), _lowPct);
   Log::info(TAG, msg);
 
-  // Register under the unified `sensors` CLI (#126). Use `sensors battery`.
+  // Register under the unified `sensors` CLI. Use `sensors battery`.
   SensorRegistry::add("battery", "voltage, percent, charging state (PMU)",
     [](ShellOutput out, void* /*ctx*/) {
       if (!PowerManager::isPmuOk())         { out("  PMU not available"); return; }

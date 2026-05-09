@@ -1,0 +1,1 @@
+{"name":"thesada-mod-gnss","version":"1.0.0","build":{"libCompatMode":"off"},"dependencies":{"thesada-mod-cellular":"*"}}

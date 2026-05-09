@@ -33,6 +33,7 @@
 
 // ── Connectivity modules ─────────────────────────────────────────────────────
 #define ENABLE_CELLULAR      // SIM7080G LTE-M/NB-IoT fallback
+// #define ENABLE_GNSS       // SIM7080G built-in GNSS receiver (requires ENABLE_CELLULAR)
 // #define ENABLE_ETH        // LAN8720A Ethernet (WT32-ETH01 and similar)
 // #define ENABLE_LORA       // LoRa/Meshtastic (future hardware)
 
@@ -53,6 +54,9 @@
 #endif
 #if defined(ENABLE_BATTERY) && !defined(ENABLE_PMU)
   #error "ENABLE_BATTERY requires ENABLE_PMU"
+#endif
+#if defined(ENABLE_GNSS) && !defined(ENABLE_CELLULAR)
+  #error "ENABLE_GNSS requires ENABLE_CELLULAR (shares the SIM7080 modem core)"
 #endif
 #if defined(ENABLE_WEBSERVER) && defined(ENABLE_LITESERVER)
   #error "ENABLE_WEBSERVER and ENABLE_LITESERVER are mutually exclusive"
@@ -167,7 +171,7 @@
 // Set to false only for local unencrypted testing brokers.
 #define MQTT_TLS  true
 
-// ── Phase 3 heap safeguards (Forgejo #40) ───────────────────────────────────
+// ── Phase 3 heap safeguards ───────────────────────────────────
 // Preventive reboot when free heap stays below the floor for the hold
 // window. Lands the device on a fresh, defragmented heap before mbedtls
 // allocations start failing inside the TLS stack. Set FLOOR=0 to disable.

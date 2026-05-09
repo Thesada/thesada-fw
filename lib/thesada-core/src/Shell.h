@@ -48,7 +48,7 @@ public:
   // in: command line, output callback. out: none.
   static void execute(const char* line, ShellOutput out);
 
-  // Stage a command for execution on the main loop task (Forgejo #62).
+  // Stage a command for execution on the main loop task.
   // Copies the command into a ring slot and returns true. Returns false
   // if the ring is full - the caller is expected to surface "shell busy"
   // to the user. The sink callback is invoked once per output line during
@@ -79,6 +79,13 @@ public:
   // Tab completion / help for a partial command. Returns matching commands.
   static void listCommands(ShellOutput out);
 
+  // Drain `Serial` for any bytes the host has typed and execute newline-
+  // terminated lines via `execute()`. Same buffer state is shared across
+  // every caller (it is the singleton USB-CDC / UART0 console), so this
+  // can be called from main.loop() and from any blocking inner loop that
+  // wants the shell to stay live (e.g. cellular network-connect polling).
+  static void pumpConsole();
+
   // Max commands
   static constexpr int MAX_COMMANDS = 40;
 
@@ -96,7 +103,7 @@ private:
   static int _commandCount;
   static char _parseBuf[256];  // mutable copy for tokenization
 
-  // Deferred-execution ring (#62). Each slot holds a buffered command line
+  // Deferred-execution ring. Each slot holds a buffered command line
   // plus the per-call output sink. `active` flips true on enqueue and back
   // to false at the end of the drain so the slot is reusable. `head` is
   // the next slot loop() will drain; `tail` is where enqueue() writes.
