@@ -41,6 +41,7 @@ bool              Cellular::_publishGate    = false;
 bool              Cellular::_hasCACert      = false;
 int               Cellular::_signalQuality  = 99;
 uint32_t          Cellular::_lastSignalSample = 0;
+uint32_t          Cellular::_lastSmpubMs    = 0;
 SemaphoreHandle_t Cellular::_atMutex        = nullptr;
 
 // Lazy init of the recursive AT-bus mutex. Called from every ATGuard
@@ -69,6 +70,12 @@ static TinyGsm modem(Serial1);
 
 // Sample AT+CSQ at most every 30 s to keep AT bus clean.
 static constexpr uint32_t SIGNAL_SAMPLE_MS = 30UL * 1000UL;
+
+// Minimum spacing between Cellular::publish() calls. Defensive guard
+// against the burst-wedge pattern: ~10 SMPUBs in the first ~10 s of
+// a fresh cellular MQTT session can wedge SIM7080G URC routing even
+// with cellATWrite on every publish, so spread bursts to <= 1 Hz.
+static constexpr uint32_t SMPUB_MIN_SPACING_MS = 1000UL;
 
 // MQTT-active health probe cadence. Per-tick TinyGSM AT calls would
 // drain Serial1 of any +SMSUB: URC arriving between loop iterations,
@@ -1192,14 +1199,37 @@ void Cellular::sampleSignalQuality() {
 // retain=true sets the AT+SMPUB retain flag so messages whose semantics
 // require broker-side retention (HA discovery, retained-topics manifest,
 // LWT availability) carry the same flag over the cellular leg.
+//
+// Enforces a 1 Hz minimum spacing between successive publishes
+// (defensive guard against the burst-wedge pattern: ~10 SMPUBs landing
+// in the first ~10 s of a fresh cellular MQTT session can wedge URC
+// routing on the SIM7080G even with cellATWrite routing URCs through
+// the prompt/OK windows). Bounded delay (<= 1000 ms) leaves TWDT
+// margin; ATGuard is acquired after the delay so other callers do
+// not stall behind a sleeping one.
 bool Cellular::publish(const char* topic, const char* payload, bool retain) {
   if (!connected()) return false;
+
+  // Rate-limit before AT-bus acquire so concurrent callers wait for the
+  // mutex, not for a sleeping publisher. Each successful publish updates
+  // _lastSmpubMs; the next caller pays the remaining quantum.
+  uint32_t now = millis();
+  if (_lastSmpubMs != 0 && (now - _lastSmpubMs) < SMPUB_MIN_SPACING_MS) {
+    uint32_t wait = SMPUB_MIN_SPACING_MS - (now - _lastSmpubMs);
+    while (wait > 0) {
+      uint32_t step = wait > 200 ? 200 : wait;
+      delay(step);
+      esp_task_wdt_reset();
+      wait -= step;
+    }
+  }
 
   ATGuard g;
   if (!g.ok()) {
     Log::warn(TAG, "Publish skipped - AT bus busy");
     return false;
   }
+  _lastSmpubMs = millis();
 
   size_t len = strlen(payload);
   char cmd[128];

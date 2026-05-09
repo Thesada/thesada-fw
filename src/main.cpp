@@ -107,8 +107,13 @@ void loop() {
   // WiFi management runs even with Ethernet - keeps fallback ready
   WiFiManager::loop();
 
+  // MQTTClient::loop runs on every tick regardless of WiFi/Eth state.
+  // The heap-stats trigger and other transport-agnostic work inside it
+  // need to fire when cellular fallback is active even though
+  // networkConnected() (WiFi/Eth-only) is false. The WiFi-specific
+  // reconnect path inside loop() is no-op when WiFi is down.
+  MQTTClient::loop();
   if (networkConnected()) {
-    MQTTClient::loop();
     OTAUpdate::loop();
   }
 

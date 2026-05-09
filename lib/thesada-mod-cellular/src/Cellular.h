@@ -196,6 +196,7 @@ private:
   static bool     _hasCACert;
   static int      _signalQuality;
   static uint32_t _lastSignalSample;
+  static uint32_t _lastSmpubMs;     // 1 Hz rate-limit on AT+SMPUB
 
   // AT-bus mutex. Lazy-initialised (xSemaphoreCreateRecursiveMutex)
   // on first ATGuard construction so static init order is irrelevant.
