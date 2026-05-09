@@ -1044,8 +1044,11 @@ void Cellular::sampleSignalQuality() {
 
 // ---------------------------------------------------------------------------
 
-// Publish a message via modem-native MQTT (AT+SMPUB)
-bool Cellular::publish(const char* topic, const char* payload) {
+// Publish a message via modem-native MQTT (AT+SMPUB).
+// retain=true sets the AT+SMPUB retain flag so messages whose semantics
+// require broker-side retention (HA discovery, retained-topics manifest,
+// LWT availability) carry the same flag over the cellular leg.
+bool Cellular::publish(const char* topic, const char* payload, bool retain) {
   if (!connected()) return false;
 
   ATGuard g;
@@ -1056,7 +1059,8 @@ bool Cellular::publish(const char* topic, const char* payload) {
 
   size_t len = strlen(payload);
   char cmd[128];
-  snprintf(cmd, sizeof(cmd), "+SMPUB=\"%s\",%d,1,0", topic, (int)len);
+  snprintf(cmd, sizeof(cmd), "+SMPUB=\"%s\",%d,1,%d",
+           topic, (int)len, retain ? 1 : 0);
 
   // waitChunked feeds the watchdog every 1.5 s so we can give the modem
   // a generous timeout for slow SMPUB cycles without tripping the 5 s

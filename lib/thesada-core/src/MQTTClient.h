@@ -103,7 +103,7 @@ public:
   //
   // in:  fn   forwarder closure, or nullptr to clear
   // out: none
-  static void setPublishForwarder(std::function<bool(const char* topic, const char* payload)> fn);
+  static void setPublishForwarder(std::function<bool(const char* topic, const char* payload, bool retain)> fn);
   // Parse stored cert PEM and fill info (caller-allocated, size >= 128).
   // Fields: CN, serial hex, not_before, not_after, issuer CN.
   // Returns true if cert parsed. Never touches private key.

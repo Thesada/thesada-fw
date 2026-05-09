@@ -60,9 +60,9 @@ uint32_t              CellularModule::_lastTelemetryMs = 0;
 // In:  none
 // Out: STANDBY state, MQTTClient publish forwarder installed.
 void CellularModule::begin() {
-  MQTTClient::setPublishForwarder([](const char* topic, const char* payload) -> bool {
+  MQTTClient::setPublishForwarder([](const char* topic, const char* payload, bool retain) -> bool {
     if (!Cellular::connected()) return false;
-    return Cellular::publish(topic, payload);
+    return Cellular::publish(topic, payload, retain);
   });
 
   // Cellular bring-up subscribes a root wildcard per top-level prefix

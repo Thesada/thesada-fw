@@ -143,7 +143,7 @@ static std::function<void(const char*)> s_subForwarder;
 // is active, MQTTClient::publish routes here instead of enqueueing on a
 // WiFi-side disconnect. Returns true on successful hand-off to cellular,
 // false if the cellular transport is not ready (publish then drops).
-static std::function<bool(const char*, const char*)> s_pubForwarder;
+static std::function<bool(const char*, const char*, bool)> s_pubForwarder;
 
 void MQTTClient::setFallbackPublishing(bool active) {
   s_fallbackPublishing = active;
@@ -655,7 +655,7 @@ void MQTTClient::publish(const char* topic, const char* payload) {
   // and every new publish triggers "Queue full - dropping oldest"
   // eviction.
   if (s_fallbackPublishing) {
-    if (s_pubForwarder) s_pubForwarder(topic, payload);
+    if (s_pubForwarder) s_pubForwarder(topic, payload, false);
     return;
   }
   enqueue(topic, payload);
@@ -814,7 +814,7 @@ void MQTTClient::setSubscribeForwarder(std::function<void(const char*)> fn) {
   s_subForwarder = fn;
 }
 
-void MQTTClient::setPublishForwarder(std::function<bool(const char*, const char*)> fn) {
+void MQTTClient::setPublishForwarder(std::function<bool(const char*, const char*, bool)> fn) {
   s_pubForwarder = fn;
 }
 

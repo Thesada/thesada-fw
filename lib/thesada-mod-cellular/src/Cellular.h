@@ -76,7 +76,10 @@ public:
   static int  getSignalQuality();
 
   // Publish via modem-native AT+SMPUB. Returns false if not connected.
-  static bool publish(const char* topic, const char* payload);
+  // retain=true sets the AT+SMPUB retain flag so HA discovery, retained-
+  // topics manifest, and LWT availability survive a cellular-leg publish
+  // the same way they do over WiFi.
+  static bool publish(const char* topic, const char* payload, bool retain = false);
 
   // Send a raw AT command to the SIM7080 modem and stream the response
   // back to `emit`. Bypasses TinyGSM so it can be used at any state, even
