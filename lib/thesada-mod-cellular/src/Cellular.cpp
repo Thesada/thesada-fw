@@ -633,6 +633,127 @@ int Cellular::cellAT(const char* cmd, const char* expect, uint32_t timeoutMs,
   return 0;  // timeout
 }
 
+// URC-safe SMPUB-style AT command. See header for contract.
+//
+// Why this exists: TinyGSM's waitResponse (used by Cellular::publish's
+// previous AT+SMPUB path) does not recognize +SMSUB: URCs and silently
+// consumes them out of the modem stream. Bench evidence (diag fork,
+// 1 s burst pubs against a wildcard sub): only 2/5 URCs delivered when
+// the firmware self-publishes a cli/response between bursts. With
+// 5 s spacing 5/5 deliver. cellATWrite reads bytes itself and routes
+// any +SMSUB: line through routeSmsubLine the same way pumpInbound and
+// cellAT do.
+int Cellular::cellATWrite(const char* cmd, const uint8_t* payload,
+                          size_t payloadLen, uint32_t promptTimeoutMs,
+                          uint32_t okTimeoutMs) {
+  // Phase 0: drain any straggler bytes already in the stream and route
+  // URCs (same as cellAT). Anything left over from a prior call must
+  // not pollute our prompt/response window.
+  {
+    char    line[512];
+    size_t  lineLen = 0;
+    while (Serial1.available()) {
+      char c = (char)Serial1.read();
+      if (c == '\r') continue;
+      if (c == '\n') {
+        line[lineLen] = '\0';
+        if (strncmp(line, "+SMSUB: ", 8) == 0) routeSmsubLine(line);
+        lineLen = 0;
+        continue;
+      }
+      if (lineLen < sizeof(line) - 1) line[lineLen++] = c;
+    }
+  }
+
+  // Phase 1: send command, wait for '>' prompt. Assemble lines in
+  // parallel so any +SMSUB: line arriving before the prompt is still
+  // routed (the modem can interleave URCs and the prompt). The prompt
+  // is a single '>' byte with no LF, so we scan byte-by-byte.
+  Serial1.print("AT");
+  Serial1.print(cmd);
+  Serial1.print("\r\n");
+
+  uint32_t end     = millis() + promptTimeoutMs;
+  uint32_t lastWdt = millis();
+  char     line[512];
+  size_t   lineLen = 0;
+  bool     gotPrompt = false;
+
+  while (!gotPrompt && millis() < end) {
+    if (millis() - lastWdt > 500) {
+      esp_task_wdt_reset();
+      lastWdt = millis();
+    }
+    while (Serial1.available()) {
+      char c = (char)Serial1.read();
+      if (c == '>') { gotPrompt = true; break; }
+      if (c == '\r') continue;
+      if (c == '\n') {
+        line[lineLen] = '\0';
+        if (lineLen > 0) {
+          if (strncmp(line, "+SMSUB: ", 8) == 0) routeSmsubLine(line);
+          else if (strcmp(line, "ERROR") == 0)  return -1;
+          else if (strncmp(line, "+CME ERROR", 10) == 0 ||
+                   strncmp(line, "+CMS ERROR", 10) == 0) return -1;
+        }
+        lineLen = 0;
+        continue;
+      }
+      if (lineLen < sizeof(line) - 1) {
+        line[lineLen++] = c;
+      } else {
+        Log::warn(TAG, "cellATWrite line overflow - dropping");
+        lineLen = 0;
+      }
+    }
+    if (!gotPrompt) delay(2);
+  }
+  if (!gotPrompt) return 0;
+
+  // Phase 2: write payload bytes.
+  Serial1.write(payload, payloadLen);
+
+  // Phase 3: wait for OK terminator. Same line loop as cellAT, with
+  // URC routing.
+  end     = millis() + okTimeoutMs;
+  lastWdt = millis();
+  lineLen = 0;
+
+  while (millis() < end) {
+    if (millis() - lastWdt > 500) {
+      esp_task_wdt_reset();
+      lastWdt = millis();
+    }
+    while (Serial1.available()) {
+      char c = (char)Serial1.read();
+      if (c == '\r') continue;
+      if (c == '\n') {
+        line[lineLen] = '\0';
+        if (lineLen == 0) continue;
+        if (strncmp(line, "+SMSUB: ", 8) == 0) {
+          routeSmsubLine(line);
+          lineLen = 0;
+          continue;
+        }
+        if (strcmp(line, "OK") == 0)    return 1;
+        if (strcmp(line, "ERROR") == 0) return -1;
+        if (strncmp(line, "+CME ERROR", 10) == 0 ||
+            strncmp(line, "+CMS ERROR", 10) == 0) return -1;
+        lineLen = 0;
+        continue;
+      }
+      if (lineLen < sizeof(line) - 1) {
+        line[lineLen++] = c;
+      } else {
+        Log::warn(TAG, "cellATWrite line overflow - dropping");
+        lineLen = 0;
+      }
+    }
+    delay(2);
+  }
+  return 0;  // timeout
+}
+
 // Check if the modem is registered on the cellular network. URC-safe:
 // goes through cellAT instead of TinyGSM's getRegistrationStatus so a
 // +SMSUB: URC arriving during the response window is not eaten by the
@@ -1062,21 +1183,16 @@ bool Cellular::publish(const char* topic, const char* payload, bool retain) {
   snprintf(cmd, sizeof(cmd), "+SMPUB=\"%s\",%d,1,%d",
            topic, (int)len, retain ? 1 : 0);
 
-  // waitChunked feeds the watchdog every 1.5 s so we can give the modem
-  // a generous timeout for slow SMPUB cycles without tripping the 5 s
-  // task watchdog.
-  modem.sendAT(cmd);
-  if (waitChunked(5000UL, ">") != 1) {
-    Log::warn(TAG, "No SMPUB prompt");
-    _mqttConnected = false;
-    return false;
-  }
+  // Use cellATWrite (raw Serial1 + URC routing) instead of TinyGSM's
+  // sendAT/waitResponse pair. waitResponse does not recognize +SMSUB:
+  // URCs, so any URC arriving inside the SMPUB '>' prompt or OK
+  // terminator window is silently consumed. cellATWrite routes those
+  // lines through routeSmsubLine -> dispatchInbound the same way
+  // pumpInbound and cellAT do.
+  int rc = cellATWrite(cmd, (const uint8_t*)payload, len, 5000UL, 8000UL);
+  if (rc == 1) return true;
 
-  modem.stream.write(payload, len);
-
-  if (waitChunked(8000UL) == 1) return true;
-
-  Log::warn(TAG, "SMPUB failed");
+  Log::warn(TAG, rc == 0 ? "SMPUB timeout" : "SMPUB failed");
   _mqttConnected = false;
   return false;
 }

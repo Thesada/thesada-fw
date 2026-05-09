@@ -156,6 +156,27 @@ private:
   // out: int           1 on expect match, 0 on timeout, -1 on ERROR
   static int  cellAT(const char* cmd, const char* expect, uint32_t timeoutMs,
                      std::function<void(const char*)> lineCallback);
+
+  // URC-safe variant for AT cmds with a "> prompt -> payload -> OK" cycle
+  // (AT+SMPUB, AT+CFSWFILE, etc). Sends "AT<cmd>\r\n", waits for the '>'
+  // prompt char, writes payload bytes, then waits for the success
+  // terminator. Routes any +SMSUB: line found in either wait phase via
+  // routeSmsubLine, so URCs arriving during SMPUB are not eaten by
+  // TinyGSM's waitResponse (which is the bug that drops 3/5 URCs in a
+  // 1 s burst test).
+  //
+  // Caller must hold the AT-bus mutex (ATGuard).
+  //
+  // in:  cmd               AT command without leading "AT" or trailing CRLF
+  //      payload           bytes to write after the '>' prompt
+  //      payloadLen        byte count
+  //      promptTimeoutMs   upper bound on '>' prompt wait
+  //      okTimeoutMs       upper bound on success terminator wait
+  // out: int                1 on OK terminator, 0 on timeout, -1 on ERROR
+  static int  cellATWrite(const char* cmd, const uint8_t* payload,
+                          size_t payloadLen, uint32_t promptTimeoutMs,
+                          uint32_t okTimeoutMs);
+
   static void routeSmsubLine(char* line);
   static bool isGprsConnectedRaw();
 
