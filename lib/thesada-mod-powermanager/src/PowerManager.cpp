@@ -187,12 +187,20 @@ bool PowerManager::setModemRails() {
 // re-enabling at the original voltages. Non-destructive replacement
 // for `+CFUN=1,1` when the modem AT bus is wedged or URC routing has
 // degraded. TS-pin config is not touched.
+//
+// AXP2101 disable*() clears the configured target voltage, so we must
+// re-program 3000 mV (DC3) and 3300 mV (BLDO2) before enabling or the
+// rails come up at the chip default and the SIM7080 fails to wake on
+// AT. Bench-observed: a runtime reset timed out on AT probe because
+// the rail came back at the wrong voltage.
 bool PowerManager::resetModem() {
   if (!_pmuOk) return false;
   _pmu.disableBLDO2();
   _pmu.disableDC3();
   delay(1000);
+  _pmu.setDC3Voltage(3000);
   _pmu.enableDC3();
+  _pmu.setBLDO2Voltage(3300);
   _pmu.enableBLDO2();
   return true;
 }

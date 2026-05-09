@@ -95,6 +95,15 @@ public:
   // need to be up for GNSS.
   static bool isModemAlive();
 
+  // Hardware-reset the modem: PowerManager::resetModem() (deeper DC3 +
+  // BLDO2 1 s cycle) followed by PWRKEY pulse and AT-probe wait. Last-
+  // resort recovery for the SIM7080G "URC routing wedged" state where
+  // SMSTATE / CEREG / CSQ all report healthy but `+SMSUB:` URCs stop
+  // surfacing. After this returns, _modemAlive / _started / _mqttConnected
+  // are all reset; CellularModule::loop() will re-walk activation on the
+  // next tick. Returns true if AT comes back within budget.
+  static bool hardReset();
+
   // Subscribe to an MQTT topic on the cellular modem-native MQTT session
   // (AT+SMSUB). Issued automatically for every entry in MQTTClient::_subs
   // when cellular MQTT comes up; also called from MQTTClient::subscribe()

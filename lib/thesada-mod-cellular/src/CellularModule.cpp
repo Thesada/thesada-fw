@@ -86,6 +86,14 @@ void CellularModule::begin() {
       if (cmd.indexOf("+COPS=?") >= 0) timeout = 180000;
       Cellular::atPassthrough(cmd.c_str(), timeout, out);
     });
+
+  Shell::registerCommand("cell.reset",
+    "Hardware-reset modem (DC3+BLDO2 cycle + PWRKEY) and re-walk bring-up",
+    [](int argc, char** argv, ShellOutput out) {
+      out("Hardware-resetting modem; re-registration will follow on next loop");
+      bool ok = Cellular::hardReset();
+      out(ok ? "Modem back after hardware reset" : "Modem hardware-reset timeout");
+    });
   Log::info(TAG, "Cellular module ready (standby)");
 }
 
@@ -141,6 +149,17 @@ void CellularModule::loop() {
     }
 
     case State::ACTIVE: {
+      // Cellular::hardReset() (shell or watchdog) drops _started back to
+      // false. Detect that and re-walk bring-up; Cellular::loop is a
+      // no-op while _started=false and would otherwise leave us stuck.
+      if (!Cellular::isModemAlive()) {
+        Log::warn(TAG, "Modem hard-reset detected - re-walking activation");
+        MQTTClient::setFallbackPublishing(false);
+        _state           = State::ACTIVATING;
+        _lastTelemetryMs = 0;
+        break;
+      }
+
       // Run cellular-side recovery (re-register on drop, MQTT reconnect).
       Cellular::loop();
 

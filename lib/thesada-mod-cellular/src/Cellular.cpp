@@ -172,6 +172,23 @@ static bool modemSoftReset() {
   return false;
 }
 
+// Public wrapper for the hardware reset. Drops state flags so the next
+// CellularModule::loop tick re-walks activation (networkConnect +
+// mqttConnect + smsubAll). Caller can be Shell, watchdog, or anything
+// that needs to recover a wedged modem.
+bool Cellular::hardReset() {
+  ATGuard g(120000UL);
+  if (!g.ok()) {
+    Log::error(TAG, "hardReset: AT bus stuck");
+    return false;
+  }
+  bool ok = modemSoftReset();
+  _modemAlive    = ok;
+  _started       = false;
+  _mqttConnected = false;
+  return ok;
+}
+
 // Slurp pending bytes from the modem stream for a short window and
 // return them as a one-line String (CR/LF replaced with " | "). Used
 // to capture +CME ERROR / SMSTATE chatter after an AT failure when
