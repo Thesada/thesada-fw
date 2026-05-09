@@ -154,6 +154,42 @@ bool PowerManager::isCharging() {
   return _pmu.isCharging();
 }
 
+#ifdef ENABLE_CELLULAR
+// Configure modem Vcc (DC3=3.0V) and antenna rail (BLDO2=3.3V) on the
+// SIM7080G. Returns false if PMU is not available.
+//
+// The 200 ms delay between disable and enable is load-bearing: SIM7080
+// bulk capacitance holds Vcc above the brownout threshold for ~tens of
+// us, so a back-to-back disable/enable does NOT actually power-cycle
+// the modem. Without the gap, any degraded modem-side state (e.g. URC
+// routing wedged after CFUN=1,1 on a prior session) survives ESP32
+// resets indefinitely. Matches LilyGO vendor reference timing.
+bool PowerManager::setModemRails() {
+  if (!_pmuOk) return false;
+  _pmu.disableDC3();
+  delay(200);
+  _pmu.setDC3Voltage(3000);
+  _pmu.enableDC3();
+  _pmu.setBLDO2Voltage(3300);
+  _pmu.enableBLDO2();
+  _pmu.disableTSPinMeasure();
+  return true;
+}
+
+// Hardware-reset the modem by dropping DC3 for 200 ms, then re-enabling
+// at the same configured voltage. Non-destructive replacement for
+// `+CFUN=1,1` when the modem AT bus is wedged or URC routing has
+// degraded. Voltage stays at whatever was previously set; antenna and
+// TS-pin config are not touched.
+bool PowerManager::resetModem() {
+  if (!_pmuOk) return false;
+  _pmu.disableDC3();
+  delay(200);
+  _pmu.enableDC3();
+  return true;
+}
+#endif // ENABLE_CELLULAR
+
 // Module wrapper for self-registration
 class PowerManagerModule : public Module {
 public:

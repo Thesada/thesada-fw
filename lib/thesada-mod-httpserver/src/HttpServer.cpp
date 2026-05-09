@@ -714,7 +714,7 @@ void HttpServer::setupRoutes() {
       String cmd = String((char*)data, len);
       cmd.trim();
       if (cmd.length() > 0) {
-        // Stage on the Shell deferred ring (#62) instead of running on
+        // Stage on the Shell deferred ring instead of running on
         // the AsyncTCP task. The async task stack is sized for WS frame
         // dispatch only - any command that reaches LittleFS / MQTT / TLS
         // can blow it. Look up the client by id at drain time so a

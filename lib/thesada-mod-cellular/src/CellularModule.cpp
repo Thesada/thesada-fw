@@ -29,6 +29,8 @@
 #include <WiFiManager.h>
 #include <ArduinoJson.h>
 #include <ModuleRegistry.h>
+#include <Shell.h>
+#include <MQTTClient.h>
 
 static const char* TAG = "CellularModule";
 
@@ -50,14 +52,40 @@ uint32_t              CellularModule::_lastTelemetryMs = 0;
 
 // ---------------------------------------------------------------------------
 
-// Subscribe to sensor events at boot regardless of activation state, so
-// the publish handlers exist the moment cellular comes up later. Each
-// handler is a no-op while Cellular::connected() is false.
+// Register the MQTTClient publish forwarder so every WiFi-disconnect
+// publish routes through Cellular::publish when this module is ACTIVE.
+// Single canonical publish path - source modules just call
+// MQTTClient::publish and the right transport carries it.
 //
 // In:  none
-// Out: STANDBY state, EventBus subscriptions registered.
+// Out: STANDBY state, MQTTClient publish forwarder installed.
 void CellularModule::begin() {
-  subscribeEvents();
+  MQTTClient::setPublishForwarder([](const char* topic, const char* payload) -> bool {
+    if (!Cellular::connected()) return false;
+    return Cellular::publish(topic, payload);
+  });
+
+  // Cellular bring-up subscribes a root wildcard per top-level prefix
+  // (smsubAll). Runtime additions to MQTTClient::_subs are already
+  // covered by that wildcard, so no per-topic forwarder is needed -
+  // installing one would push the modem past its ~4-subscription cap
+  // and silently break URC delivery.
+  // MQTTClient::setSubscribeForwarder(nullptr);  // explicit, but default is null
+
+  Shell::registerCommand("cell.at",
+    "Send raw AT command (cell.at <cmd>; e.g. cell.at +CSQ, cell.at +COPS=?)",
+    [](int argc, char** argv, ShellOutput out) {
+      if (argc < 2) { out("usage: cell.at <command-without-AT-prefix>"); return; }
+      String cmd;
+      for (int i = 1; i < argc; ++i) {
+        if (i > 1) cmd += " ";
+        cmd += argv[i];
+      }
+      uint32_t timeout = 5000;
+      // Operator scan can take a long time on cold radio.
+      if (cmd.indexOf("+COPS=?") >= 0) timeout = 180000;
+      Cellular::atPassthrough(cmd.c_str(), timeout, out);
+    });
   Log::info(TAG, "Cellular module ready (standby)");
 }
 
@@ -98,6 +126,9 @@ void CellularModule::loop() {
         _state           = State::ACTIVE;
         _wifiUpSince     = 0;
         _lastTelemetryMs = 0;
+        // Tell MQTTClient to stop enqueueing during the WiFi outage; cellular
+        // is now shipping the same data via EventBus.
+        MQTTClient::setFallbackPublishing(true);
         emitActive(1);
       } else {
         // begin() did not bring MQTT up. Drop back to STANDBY and reset
@@ -122,6 +153,7 @@ void CellularModule::loop() {
           // Re-takeover from a future WiFi drop only needs to re-open
           // the gate (Cellular::begin() is idempotent).
           Cellular::setPublishGate(false);
+          MQTTClient::setFallbackPublishing(false);
           _state         = State::STANDBY;
           _wifiDownSince = 0;
           _wifiUpSince   = 0;
@@ -172,92 +204,12 @@ void CellularModule::emitRssi() {
 
 // ---------------------------------------------------------------------------
 
-// Subscribe to EventBus sensor events and route them to Cellular::publish.
-// Subscriptions are unconditional; each lambda short-circuits while
-// Cellular::connected() is false (closed gate or modem down).
-//
-// In:  none (reads Config for topic_prefix)
-// Out: EventBus subscriptions registered for temperature/current/battery/alert
-void CellularModule::subscribeEvents() {
-  // Per-sensor topics (matches WiFi MQTT path).
-  EventBus::subscribe("temperature", [](JsonObject data) {
-    if (!Cellular::connected()) return;
-    JsonObject  cfg = Config::get();
-    const char* pfx = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-    JsonArray sensors = data["sensors"];
-    if (!sensors) return;
-    for (JsonObject s : sensors) {
-      const char* name = s["name"] | "unknown";
-      float temp = s["temp_c"] | -127.0f;
-      if (temp <= -126.0f) continue;
-      // Slugify name: "House Supply" -> "house_supply"
-      char slug[32];
-      int j = 0;
-      for (int i = 0; name[i] && j < (int)sizeof(slug) - 1; i++) {
-        slug[j++] = (name[i] == ' ') ? '_' : tolower(name[i]);
-      }
-      slug[j] = '\0';
-      char topic[96], val[16];
-      snprintf(topic, sizeof(topic), "%s/sensor/temperature/%s", pfx, slug);
-      snprintf(val, sizeof(val), "%.2f", temp);
-      Cellular::publish(topic, val);
-    }
-  });
-
-  EventBus::subscribe("current", [](JsonObject data) {
-    if (!Cellular::connected()) return;
-    JsonObject  cfg = Config::get();
-    const char* pfx = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-    JsonArray channels = data["channels"];
-    if (!channels) return;
-    for (JsonObject ch : channels) {
-      const char* name = ch["name"] | "unknown";
-      char slug[32];
-      int j = 0;
-      for (int i = 0; name[i] && j < (int)sizeof(slug) - 1; i++) {
-        slug[j++] = (name[i] == ' ') ? '_' : tolower(name[i]);
-      }
-      slug[j] = '\0';
-      char topic[96], val[16];
-      snprintf(topic, sizeof(topic), "%s/sensor/current/%s", pfx, slug);
-      snprintf(val, sizeof(val), "%.4f", ch["current_a"] | 0.0f);
-      Cellular::publish(topic, val);
-      snprintf(topic, sizeof(topic), "%s/sensor/power/%s", pfx, slug);
-      snprintf(val, sizeof(val), "%.1f", ch["power_w"] | 0.0f);
-      Cellular::publish(topic, val);
-    }
-  });
-
-  EventBus::subscribe("battery", [](JsonObject data) {
-    if (!Cellular::connected()) return;
-    JsonObject  cfg = Config::get();
-    const char* pfx = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-    bool present = data["present"] | false;
-    if (!present) return;
-    char topic[96], val[16];
-    snprintf(topic, sizeof(topic), "%s/sensor/battery/percent", pfx);
-    snprintf(val, sizeof(val), "%d", data["percent"] | -1);
-    Cellular::publish(topic, val);
-    snprintf(topic, sizeof(topic), "%s/sensor/battery/voltage", pfx);
-    snprintf(val, sizeof(val), "%.2f", data["voltage_v"] | 0.0f);
-    Cellular::publish(topic, val);
-    snprintf(topic, sizeof(topic), "%s/sensor/battery/charging", pfx);
-    Cellular::publish(topic, (data["charging"] | false) ? "Charging" : "Discharging");
-  });
-
-  EventBus::subscribe("alert", [](JsonObject data) {
-    if (!Cellular::connected()) return;
-    JsonObject  cfg = Config::get();
-    const char* pfx = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-    char topic[80];
-    snprintf(topic, sizeof(topic), "%s/alert", pfx);
-    String payload;
-    serializeJson(data, payload);
-    Cellular::publish(topic, payload.c_str());
-  });
-
-  Log::info(TAG, "Subscribed to sensor events");
-}
+// Retired: the per-event bridges (temperature/current/battery/alert
+// -> Cellular::publish) used to forward the same payloads each source
+// module already publishes through MQTTClient::publish. With the publish
+// forwarder installed in begin(), MQTTClient::publish routes directly to
+// Cellular::publish on a WiFi disconnect, so this duplicate path is gone.
+void CellularModule::subscribeEvents() {}
 
 // ---------------------------------------------------------------------------
 

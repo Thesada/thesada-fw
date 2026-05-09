@@ -8,6 +8,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <functional>
 
 class Cellular {
 public:
@@ -37,9 +38,55 @@ public:
   // Publish via modem-native AT+SMPUB. Returns false if not connected.
   static bool publish(const char* topic, const char* payload);
 
+  // Send a raw AT command to the SIM7080 modem and stream the response
+  // back to `emit`. Bypasses TinyGSM so it can be used at any state, even
+  // when the network connect path is mid-flight. Pass `cmd` without the
+  // "AT" prefix (e.g. "+CSQ", "+COPS=?"). `timeoutMs` should be generous
+  // for slow commands like operator scan (>= 120s).
+  static void atPassthrough(const char* cmd, uint32_t timeoutMs,
+                            std::function<void(const char*)> emit);
+
+  // True once Cellular::begin() has completed wakeModem() successfully
+  // (modem is powered and AT-responsive). Required precondition for any
+  // GNSS use - the SIM7080 GNSS receiver shares the same modem core.
+  // Cellular registration / MQTT do not need to be up for GNSS.
+  static bool isModemAlive();
+
+  // Subscribe to an MQTT topic on the cellular modem-native MQTT session
+  // (AT+SMSUB). Issued automatically for every entry in MQTTClient::_subs
+  // when cellular MQTT comes up; also called from MQTTClient::subscribe()
+  // when a subscription is added at runtime while cellular is active.
+  static bool smsub(const char* topic);
+  // Issue AT+SMSUB for every active subscription registered with MQTTClient.
+  // Called from mqttConnect() right after CONN succeeds.
+  static bool smsubAll();
+  // Drain Serial1 once per loop and dispatch any +SMSUB: URCs through
+  // MQTTClient::dispatchInbound. Non-blocking. Intended caller: end of
+  // Cellular::loop, after any TinyGSM AT traffic for this tick is done.
+  static void pumpInbound();
+
+  // GNSS fix acquisition. The SIM7080G time-shares its radio
+  // between LTE and GNSS - while CGNSPWR=1 the LTE data path is suspended,
+  // so any modem-native MQTT publish issued during that window fails. The
+  // correct cycle is CGNSPWR=1 -> wait fix -> CGNSPWR=0 -> CFUN=1, all in
+  // one atomic call so the LTE data path is restored before control
+  // returns to the caller. TCP/TLS sessions survive the window; the broker
+  // delivers anything sent during it once CFUN=1 wakes the LTE side.
+  //
+  // First cold fix: up to ~60 s. Warm fixes thereafter: a few seconds.
+  // Caller must verify isModemAlive() first; otherwise no-op false.
+  //
+  // in:  timeoutMs    upper bound on fix acquisition window
+  //      lat/lon/...  output pointers (any may be nullptr)
+  // out: bool         true if a 2D/3D fix was acquired within the window
+  static bool gpsAcquireFix(uint32_t timeoutMs,
+                            float* lat, float* lon,
+                            float* alt = nullptr, float* speed = nullptr,
+                            int* satsInView = nullptr, int* satsUsed = nullptr);
+
 private:
   static void initPMU();
-  static void wakeModem();
+  static bool wakeModem();
   static bool writeCACert();
   static bool networkConnect();
   static bool mqttConnect();

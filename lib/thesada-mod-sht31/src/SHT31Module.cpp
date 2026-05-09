@@ -46,7 +46,7 @@ static bool sht31Read(uint8_t addr, float& temp, float& humid) {
 // Initialize I2C and verify sensor is present
 void SHT31Module::begin() {
   JsonObject cfg = Config::get();
-  // Runtime gate (#116): nodes without the sensor soldered can set
+  // Runtime gate: nodes without the sensor soldered can set
   // sht31.enabled=false to skip the probe and silence the "no device" log.
   bool enabled = cfg["sht31"]["enabled"] | true;
   if (!enabled) {
@@ -76,9 +76,9 @@ void SHT31Module::begin() {
   // HA discovery is deferred to publishHaDiscovery(), invoked from loop()
   // once MQTT is connected. Calling MQTTClient::publishRetained() here would
   // short-circuit (MQTT is not up during module begin) so the configs would
-  // never land on the broker (#199).
+  // never land on the broker.
 
-  // Register under the unified `sensors` CLI (#126). The old standalone
+  // Register under the unified `sensors` CLI. The old standalone
   // `sht31` command is gone - use `sensors sht31` instead.
   SensorRegistry::add("sht31", "temperature + humidity (I2C)",
     [](ShellOutput out, void* ctx) {
@@ -94,7 +94,7 @@ void SHT31Module::begin() {
 }
 
 // Periodic sensor read at configured interval. Also drives the deferred
-// HA discovery publish (#199): module begin() runs before MQTT connects so
+// HA discovery publish: module begin() runs before MQTT connects so
 // the discovery configs cannot be published there. Once MQTT is up, the
 // next loop() tick lands them and remembers via _haPublished. Discovery
 // re-publishes on the next reconnect because MQTTClient::connect() resets

@@ -26,7 +26,7 @@ private:
   // Publish HA MQTT discovery (retained) for temperature + humidity. Idempotent;
   // sets _haPublished on success. Called from loop() once MQTT is connected,
   // because module begin() runs during boot before WiFi/MQTT are up - calling
-  // publishRetained then short-circuits and the configs never land (#199).
+  // publishRetained then short-circuits and the configs never land.
   // in: none (reads Config). out: publishes 2 retained MQTT messages.
   void publishHaDiscovery();
 

@@ -13,6 +13,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <thesada_config.h>
 
 class PowerManager {
 public:
@@ -32,6 +33,24 @@ public:
   // LED control - called by HeartbeatLED (core) when PMU is available.
   static void ledOn();
   static void ledOff();
+
+#ifdef ENABLE_CELLULAR
+  // Configure DC3 (modem Vcc) + BLDO2 (antenna rail) for the SIM7080G.
+  // Called by Cellular::initPMU at activation time. Routed through the
+  // static _pmu instance so the modem rails do not require a second
+  // XPowersPMU object - a stack-local one would deinit Wire1 on
+  // destruction and break later battery polls.
+  // Includes a 200 ms gap between disable/enable so Vcc actually drops
+  // below the SIM7080 brownout threshold and the modem starts from a
+  // clean state every cold boot.
+  static bool setModemRails();
+
+  // Hardware-reset the modem by dropping DC3 for 200 ms, then re-enabling.
+  // Use in place of `+CFUN=1,1` for recovery from a wedged modem state.
+  // Caller is responsible for re-pulsing PWRKEY and re-establishing the
+  // modem session afterwards.
+  static bool resetModem();
+#endif // ENABLE_CELLULAR
 
 private:
   static bool     _pmuOk;

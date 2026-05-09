@@ -15,6 +15,7 @@
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/pk.h>
 #include <mbedtls/version.h>
+#include <string>
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
 #include <esp_chip_info.h>
@@ -109,7 +110,6 @@ uint16_t         MQTTClient::_bufferOut      = 4096;
 
 MQTTSubscription MQTTClient::_subs[MQTT_MAX_SUBS];
 uint8_t          MQTTClient::_subCount = 0;
-DeferredCLI      MQTTClient::_deferred = { "", nullptr, 0, false };
 uint32_t         MQTTClient::_lastSuccessMs    = 0;
 uint32_t         MQTTClient::_connectedSinceMs = 0;
 bool             MQTTClient::_insecureFallback = false;
@@ -129,6 +129,25 @@ std::vector<String> MQTTClient::_retainedTopics;
 bool     MQTTClient::_manifestPublished    = false;
 bool     MQTTClient::_manifestDirty        = false;
 uint32_t MQTTClient::_manifestDirtySinceMs = 0;
+
+// Cellular fallback hint - see header. When true, publish() drops on a
+// WiFi disconnect instead of enqueueing.
+static bool s_fallbackPublishing = false;
+
+// Cellular subscribe forwarder. When installed, MQTTClient::subscribe
+// also calls this so the cellular MQTT session mirrors the WiFi-side
+// subscription set as new entries are added at runtime.
+static std::function<void(const char*)> s_subForwarder;
+
+// Cellular publish forwarder. When installed and fallback publishing
+// is active, MQTTClient::publish routes here instead of enqueueing on a
+// WiFi-side disconnect. Returns true on successful hand-off to cellular,
+// false if the cellular transport is not ready (publish then drops).
+static std::function<bool(const char*, const char*)> s_pubForwarder;
+
+void MQTTClient::setFallbackPublishing(bool active) {
+  s_fallbackPublishing = active;
+}
 
 // ---------------------------------------------------------------------------
 
@@ -237,39 +256,41 @@ void MQTTClient::begin() {
     JsonObject  cfg    = Config::get();
     const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
     char cliTopic[64];
-    snprintf(cliTopic, sizeof(cliTopic), "%s/cli/#", prefix);
-
-    // Store prefix length so the callback can extract the command name.
-    static char _cliPrefix[64];
-    snprintf(_cliPrefix, sizeof(_cliPrefix), "%s/cli/", prefix);
-    static size_t _cliPrefixLen = strlen(_cliPrefix);
+    snprintf(cliTopic, sizeof(cliTopic), "%s/cli/+", prefix);
 
     MQTTClient::subscribe(cliTopic, [](const char* topic, const char* payload) {
-      // Defer CLI command to loop() - executing inside the PubSubClient
-      // callback blocks keepalive and causes disconnects on slow operations
-      // (LittleFS writes, config reload, etc).
-      if (_deferred.pending) {
-        Log::warn("MQTT", "CLI busy - command dropped");
-        return;
-      }
-      strncpy(_deferred.topic, topic, sizeof(_deferred.topic) - 1);
-      _deferred.topic[sizeof(_deferred.topic) - 1] = '\0';
+      // Defer CLI command to the Shell ring - executing inside the
+      // PubSubClient callback blocks keepalive and causes disconnects on
+      // slow operations (LittleFS writes, config reload, etc). The
+      // generic shell-line path goes through Shell::enqueue;
+      // binary-payload commands (fs.write, fs.cat chunked, cert.set) and
+      // the response-shape contract (one cli/response message per
+      // command, JSON array of output lines) need their own handler so
+      // they go through Shell::enqueueDeferred. Same ring,
+      // same backpressure, single drain path.
+      JsonObject  cfg    = Config::get();
+      const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+      char cliPrefix[64];
+      snprintf(cliPrefix, sizeof(cliPrefix), "%s/cli/", prefix);
+      size_t prefixLen = strlen(cliPrefix);
+      if (strncmp(topic, cliPrefix, prefixLen) != 0) return;
+      const char* cmd = topic + prefixLen;
+      if (strlen(cmd) == 0 || strcmp(cmd, "response") == 0) return;
 
-      // Copy payload to heap (preserves newlines for file.write)
+      // Copy cmd + payload onto the heap so the lambda owns them past the
+      // lifetime of this callback. std::string capture handles destruction
+      // when the slot's DeferredFn is reset on drain.
+      std::string cmdCopy(cmd);
       size_t plen = payload ? strlen(payload) : 0;
-      if (_deferred.payload) { free(_deferred.payload); _deferred.payload = nullptr; }
-      if (plen > 0) {
-        _deferred.payload = (char*)malloc(plen + 1);
-        if (_deferred.payload) {
-          memcpy(_deferred.payload, payload, plen);
-          _deferred.payload[plen] = '\0';
-          _deferred.length = plen;
-        }
-      } else {
-        _deferred.payload = nullptr;
-        _deferred.length = 0;
-      }
-      _deferred.pending = true;
+      std::string payloadCopy(payload ? payload : "", plen);
+
+      bool ok = Shell::enqueueDeferred(
+        [cmdCopy = std::move(cmdCopy), payloadCopy = std::move(payloadCopy)]() {
+          MQTTClient::runCli(cmdCopy.c_str(),
+                             payloadCopy.empty() ? nullptr : payloadCopy.c_str(),
+                             payloadCopy.size());
+        });
+      if (!ok) Log::warn("MQTT", "CLI busy - command dropped");
     });
   }
 
@@ -300,7 +321,7 @@ void MQTTClient::connect() {
   Log::info(TAG, msg);
 
 #ifdef MQTT_TLS
-  // Force a fresh mbedtls context on every connect attempt (#121). When a
+  // Force a fresh mbedtls context on every connect attempt. When a
   // prior connect failed mid-handshake, WiFiClientSecure retains the
   // underlying mbedtls_ssl_context with whatever cert/key pointers were
   // configured at that time. A subsequent setCACert / setCertificate /
@@ -495,10 +516,8 @@ void MQTTClient::loop() {
     }
   }
 
-  // Process deferred CLI command outside the PubSubClient callback context.
-  if (_deferred.pending) {
-    processDeferredCLI();
-  }
+  // CLI commands are now drained from the Shell ring -
+  // see Shell::loop() drained from the main app loop. No poll needed here.
 
   // Late-arriving retained topics (e.g. SHT31 discovery published after the
   // initial connect()-time manifest) re-emit after a 5 s debounce so we do
@@ -629,12 +648,22 @@ void MQTTClient::publish(const char* topic, const char* payload) {
     _lastPublishTime = time(nullptr);
     return;
   }
+  // WiFi MQTT is down. If cellular has taken over, route through the
+  // installed publish forwarder so the broker still gets the message
+  // via the modem-native MQTT session. The WiFi ring is reserved for
+  // WiFi - we do NOT enqueue under fallback or it fills 8/8 forever
+  // and every new publish triggers "Queue full - dropping oldest"
+  // eviction.
+  if (s_fallbackPublishing) {
+    if (s_pubForwarder) s_pubForwarder(topic, payload);
+    return;
+  }
   enqueue(topic, payload);
 }
 
 // Publish a retained message (for HA discovery configs).
 // Records the topic in the retained-topics manifest so the platform can
-// clear it on device delete (#187).
+// clear it on device delete.
 void MQTTClient::publishRetained(const char* topic, const char* payload) {
   if (_client.connected()) {
     _client.publish(topic, (const uint8_t*)payload, strlen(payload), true);
@@ -720,11 +749,68 @@ void MQTTClient::subscribe(const char* topic, MQTTCallback callback) {
     _client.subscribe(topic);
     _client.loop();
   }
+
+  // If cellular has installed a forwarder, mirror this subscription onto
+  // the cellular MQTT session too.
+  if (s_subForwarder) s_subForwarder(topic);
 }
 
 // ---------------------------------------------------------------------------
 
 // Route incoming messages to matching subscription callbacks
+// Public dispatcher used by Cellular::pumpInbound to route +SMSUB: URCs
+// through the same subscription callbacks as the WiFi onMessage path.
+void MQTTClient::dispatchInbound(const char* topic, const char* payload, size_t length) {
+  // Mirror onMessage: rxRing capture + topic match (exact or trailing /#).
+  strncpy(_rxRing[_rxRingHead], topic, sizeof(_rxRing[0]) - 1);
+  _rxRing[_rxRingHead][sizeof(_rxRing[0]) - 1] = '\0';
+  _rxRingTs[_rxRingHead] = millis();
+  _rxRingHead = (_rxRingHead + 1) % RX_RING_SIZE;
+  if (_rxRingCount < RX_RING_SIZE) _rxRingCount++;
+
+  for (uint8_t i = 0; i < _subCount; i++) {
+    if (!_subs[i].active) continue;
+    size_t slen = strlen(_subs[i].topic);
+    // Trailing /# = multi-level wildcard.
+    if (slen >= 2 && _subs[i].topic[slen - 1] == '#' && _subs[i].topic[slen - 2] == '/') {
+      if (strncmp(_subs[i].topic, topic, slen - 1) == 0) {
+        _subs[i].callback(topic, payload);
+      }
+    }
+    // Trailing /+ = single-level wildcard. Match if the prefix up to /+
+    // matches and the remainder of the topic has no further '/'.
+    else if (slen >= 2 && _subs[i].topic[slen - 1] == '+' && _subs[i].topic[slen - 2] == '/') {
+      if (strncmp(_subs[i].topic, topic, slen - 1) == 0) {
+        const char* rest = topic + (slen - 1);
+        if (*rest != '\0' && strchr(rest, '/') == nullptr) {
+          _subs[i].callback(topic, payload);
+        }
+      }
+    }
+    else if (strcmp(_subs[i].topic, topic) == 0) {
+      _subs[i].callback(topic, payload);
+    }
+  }
+  (void)length;  // payload is null-terminated by caller
+}
+
+// Iterate every active subscription topic. Cellular bring-up uses this
+// to issue AT+SMSUB on every entry so the cellular transport carries the
+// same subscription set as the WiFi transport.
+void MQTTClient::forEachSubscription(std::function<void(const char*)> fn) {
+  for (uint8_t i = 0; i < _subCount; i++) {
+    if (_subs[i].active) fn(_subs[i].topic);
+  }
+}
+
+void MQTTClient::setSubscribeForwarder(std::function<void(const char*)> fn) {
+  s_subForwarder = fn;
+}
+
+void MQTTClient::setPublishForwarder(std::function<bool(const char*, const char*)> fn) {
+  s_pubForwarder = fn;
+}
+
 void MQTTClient::onMessage(char* topic, uint8_t* payload, unsigned int length) {
   // Null-terminate the payload - heap-allocated to avoid stack overflow on WROOM-32.
   size_t bufSize = length + 1;
@@ -760,23 +846,20 @@ void MQTTClient::onMessage(char* topic, uint8_t* payload, unsigned int length) {
 
 // ---------------------------------------------------------------------------
 
-// Process a deferred CLI command (runs in loop(), not in PubSubClient callback)
-void MQTTClient::processDeferredCLI() {
-  _deferred.pending = false;
+// Run a CLI command on the main loop (Shell::enqueueDeferred drain).
+// The PubSubClient callback already extracted cmd from the topic and
+// copied payload onto the heap (owned by the std::function capture);
+// this just dispatches by command name + binary-protocol special case.
+void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
+  if (!cmd || strlen(cmd) == 0) return;
 
-  // Extract command from topic after <prefix>/cli/
+  // Caller already filtered out empty cmd + the response topic itself,
+  // but the special-case branches still expect the locals to exist for
+  // the response-publish path so resolve prefix here.
   JsonObject cfg = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-  char cliPrefix[64];
-  snprintf(cliPrefix, sizeof(cliPrefix), "%s/cli/", prefix);
-  size_t prefixLen = strlen(cliPrefix);
-
-  const char* cmd = _deferred.topic + prefixLen;
-  if (strlen(cmd) == 0 || strcmp(cmd, "response") == 0) goto cleanup;
 
   {
-    const char* payload = _deferred.payload;
-    size_t plen = _deferred.length;
 
     // Special case: fs.write / fs.append / file.write (legacy alias)
     // First line of payload is the path, rest is content.
@@ -990,8 +1073,9 @@ void MQTTClient::processDeferredCLI() {
   }
 
 cleanup:
-  if (_deferred.payload) { free(_deferred.payload); _deferred.payload = nullptr; }
-  _deferred.length = 0;
+  // Payload is owned by the std::function capture in the Shell ring slot;
+  // it gets released when the slot is reset on drain. Nothing to free here.
+  return;
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,32 +1092,29 @@ void MQTTClient::reinitSubscriptions() {
   char cliTopic[64];
   snprintf(cliTopic, sizeof(cliTopic), "%s/cli/#", prefix);
 
-  static char _cliPrefix[64];
-  snprintf(_cliPrefix, sizeof(_cliPrefix), "%s/cli/", prefix);
-  static size_t _cliPrefixLen = strlen(_cliPrefix);
-
+  // Same Shell::enqueueDeferred path as begin()'s subscribe so config.reload
+  // does not split CLI dispatch between two mechanisms.
   MQTTClient::subscribe(cliTopic, [](const char* topic, const char* payload) {
-    if (_deferred.pending) {
-      Log::warn("MQTT", "CLI busy - command dropped");
-      return;
-    }
-    strncpy(_deferred.topic, topic, sizeof(_deferred.topic) - 1);
-    _deferred.topic[sizeof(_deferred.topic) - 1] = '\0';
+    JsonObject  cfgInner    = Config::get();
+    const char* prefixInner = cfgInner["mqtt"]["topic_prefix"] | "thesada/node";
+    char cliPrefixInner[64];
+    snprintf(cliPrefixInner, sizeof(cliPrefixInner), "%s/cli/", prefixInner);
+    size_t prefixLen = strlen(cliPrefixInner);
+    if (strncmp(topic, cliPrefixInner, prefixLen) != 0) return;
+    const char* cmd = topic + prefixLen;
+    if (strlen(cmd) == 0 || strcmp(cmd, "response") == 0) return;
 
+    std::string cmdCopy(cmd);
     size_t plen = payload ? strlen(payload) : 0;
-    if (_deferred.payload) { free(_deferred.payload); _deferred.payload = nullptr; }
-    if (plen > 0) {
-      _deferred.payload = (char*)malloc(plen + 1);
-      if (_deferred.payload) {
-        memcpy(_deferred.payload, payload, plen);
-        _deferred.payload[plen] = '\0';
-        _deferred.length = plen;
-      }
-    } else {
-      _deferred.payload = nullptr;
-      _deferred.length = 0;
-    }
-    _deferred.pending = true;
+    std::string payloadCopy(payload ? payload : "", plen);
+
+    bool ok = Shell::enqueueDeferred(
+      [cmdCopy = std::move(cmdCopy), payloadCopy = std::move(payloadCopy)]() {
+        MQTTClient::runCli(cmdCopy.c_str(),
+                           payloadCopy.empty() ? nullptr : payloadCopy.c_str(),
+                           payloadCopy.size());
+      });
+    if (!ok) Log::warn("MQTT", "CLI busy - command dropped");
   });
 
   OTAUpdate::begin();

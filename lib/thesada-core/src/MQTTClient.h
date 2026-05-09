@@ -34,14 +34,6 @@ struct MQTTSubscription {
   bool active;
 };
 
-// Deferred CLI command - stored in callback, executed in loop()
-struct DeferredCLI {
-  char topic[96];
-  char* payload;     // heap-allocated, freed after processing
-  uint16_t length;
-  bool pending;
-};
-
 class MQTTClient {
 public:
   static void begin();
@@ -75,6 +67,43 @@ public:
   static bool clearClientCert();
   // True if both cert and key are present in NVS.
   static bool hasClientCert();
+
+  // Dispatch an inbound MQTT message into the registered subscription
+  // callbacks the same way the WiFi PubSubClient onMessage callback does.
+  // Used by Cellular::pumpInbound to share one subscription registry across
+  // both transports. Wildcard / exact match logic identical.
+  static void dispatchInbound(const char* topic, const char* payload, size_t length);
+
+  // Iterate active subscription topics. Callback receives each topic
+  // string. Used by Cellular::smsubAll to issue AT+SMSUB on cellular MQTT
+  // bring-up so the same set works on both transports.
+  static void forEachSubscription(std::function<void(const char* topic)> fn);
+
+  // Optional cross-transport forwarder. Cellular installs a hook here on
+  // bring-up so any subscribe() called at runtime (e.g. Lua mqtt.subscribe)
+  // also lands on the cellular MQTT session. Pass nullptr to clear.
+  static void setSubscribeForwarder(std::function<void(const char* topic)> fn);
+
+  // Fallback transport hint. CellularModule sets this true while cellular
+  // MQTT is publishing on this device's behalf. When true, MQTTClient::publish
+  // routes to the registered publish-forwarder (see setPublishForwarder)
+  // instead of enqueueing on a WiFi-side disconnect; the WiFi-side ring is
+  // preserved untouched until WiFi MQTT comes back.
+  static void setFallbackPublishing(bool active);
+
+  // Register a fallback publish forwarder. Cellular installs one on
+  // bring-up that wraps Cellular::publish; when WiFi MQTT is down and
+  // fallback publishing is active, MQTTClient::publish calls the
+  // forwarder so every publish (sensors, gnss, cli responses, ad-hoc)
+  // reaches the broker over cellular through a single canonical path.
+  // Forwarder returns true on accepted-and-shipped, false to mean
+  // "transport not ready"; in the false case publish() drops instead
+  // of enqueueing (the WiFi-side ring is reserved for WiFi).  Pass
+  // nullptr to clear.
+  //
+  // in:  fn   forwarder closure, or nullptr to clear
+  // out: none
+  static void setPublishForwarder(std::function<bool(const char* topic, const char* payload)> fn);
   // Parse stored cert PEM and fill info (caller-allocated, size >= 128).
   // Fields: CN, serial hex, not_before, not_after, issuer CN.
   // Returns true if cert parsed. Never touches private key.
@@ -94,7 +123,7 @@ private:
   // Cleared at the start of each connect(), filled by recordRetainedTopic()
   // from each retained-publish site (LWT, /info, HA discovery, modules), then
   // serialized to <prefix>/info/retained_topics by publishRetainedManifest()
-  // so the platform can clear them all on device delete (#187 / #184 PR 3).
+  // so the platform can clear them all on device delete.
   // in: topic string. out: appended to _retainedTopics if not already present.
   static std::vector<String> _retainedTopics;
   static bool     _manifestPublished;     // initial manifest emitted at least once
@@ -133,8 +162,15 @@ public:
   static uint16_t      _bufferIn;
   static uint16_t      _bufferOut;
 
-  static DeferredCLI   _deferred;
-  static void          processDeferredCLI();
+  // CLI handler invoked on the main loop (Shell::enqueueDeferred drain).
+  // Receives the command name extracted from the cli/<cmd> topic and a heap
+  // copy of the raw payload. Special-cases binary protocols (fs.write,
+  // fs.cat chunked, cert.set) before falling through to Shell::execute.
+  // The caller (PubSubClient subscribe lambda) builds the std::function
+  // capture and enqueues - this is just the body that runs at drain time.
+  // in: cmd string, payload buffer (may be nullptr), payload length.
+  // out: publishes to <prefix>/cli/response.
+  static void          runCli(const char* cmd, const char* payload, size_t plen);
 
   static uint32_t      _lastSuccessMs;      // millis() of last successful publish or MQTT loop
   static uint32_t      _connectedSinceMs;   // millis() when current connection was established
@@ -143,7 +179,7 @@ public:
   static uint32_t      _lastHeapPublishMs;  // millis() of last heap stats publish
   static uint32_t      _lastHeapFree;       // last sampled ESP.getFreeHeap() for alert tagging
 
-  // #40 Phase 3 preventive reboot: track when free heap first dropped below
+  // Preventive reboot watchdog: track when free heap first dropped below
   // HEAP_REBOOT_FLOOR_BYTES. If it stays under for HEAP_REBOOT_HOLD_MS, the
   // device reboots itself rather than crashing in a malloc inside the TLS
   // stack. 0 means heap is currently above the floor.

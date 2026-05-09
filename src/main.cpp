@@ -6,6 +6,7 @@
 
 #include <Arduino.h>
 #include <esp_task_wdt.h>
+#include <esp_log.h>
 #include "thesada_config.h"
 #include <Config.h>
 #include <ModuleRegistry.h>
@@ -18,15 +19,6 @@
 #ifdef ENABLE_ETH
 #include <EthModule.h>
 #endif
-
-// Serial line buffer for the shell.
-static char _serialBuf[256];
-static uint8_t _serialPos = 0;
-
-// Serial output callback for the shell
-static void serialOut(const char* line) {
-  Serial.println(line);
-}
 
 // Return true if any network transport is connected
 static bool networkConnected() {
@@ -58,6 +50,13 @@ void setup() {
 
   Serial.println("[INF][Boot] thesada-fw v" FIRMWARE_VERSION " (" __DATE__ " " __TIME__ ")");
 
+  // Quiet the IDF VFS layer's "file does not exist" ERROR logs. Every
+  // LittleFS.exists("/foo") for a missing file emits one, even when our
+  // application code handles the not-found case immediately. Suppressing
+  // the tag turns the noise off without hiding real VFS issues - real
+  // mount/IO failures are reported by our own module code.
+  esp_log_level_set("vfs_api", ESP_LOG_NONE);
+
   Config::load();
 
   // Network priority: Ethernet -> WiFi -> AP fallback.
@@ -76,8 +75,15 @@ void setup() {
     // If an update is found, the device flashes and reboots - never reaches MQTT.
     OTAUpdate::begin();
     OTAUpdate::checkNow();  // immediate check while heap is clean
-    MQTTClient::begin();
   }
+  // MQTTClient::begin runs unconditionally. It registers the subscription
+  // set (cli/#, cmd/lua/reload, etc) and starts the subscription registry
+  // that Cellular::smsubAll mirrors onto the cellular MQTT session when
+  // the failover path activates. With this gated on WiFi, a WiFi-down boot
+  // would leave the subscription list empty and cellular MQTT inbound
+  // would have nothing to dispatch.
+  // connect() is a no-op if WiFi is down; loop() retries.
+  MQTTClient::begin();
 
   Shell::begin();
   HeartbeatLED::begin();
@@ -93,19 +99,10 @@ void setup() {
 void loop() {
   esp_task_wdt_reset();
 
-  // Serial shell - read characters, execute on newline.
-  while (Serial.available()) {
-    char c = Serial.read();
-    if (c == '\n' || c == '\r') {
-      _serialBuf[_serialPos] = '\0';
-      if (_serialPos > 0) {
-        Shell::execute(_serialBuf, serialOut);
-      }
-      _serialPos = 0;
-    } else if (_serialPos < sizeof(_serialBuf) - 1) {
-      _serialBuf[_serialPos++] = c;
-    }
-  }
+  // Serial shell - drain console input. Same helper is reused inside
+  // long-running blocking loops (e.g. cellular registration polling) so
+  // the shell stays interactive during failover bring-up.
+  Shell::pumpConsole();
 
   // WiFi management runs even with Ethernet - keeps fallback ready
   WiFiManager::loop();
@@ -115,7 +112,7 @@ void loop() {
     OTAUpdate::loop();
   }
 
-  // Drain the deferred Shell ring (#62). Commands enqueued from non-main
+  // Drain the deferred Shell ring. Commands enqueued from non-main
   // task contexts (WS serial, future BLE/Telegram CLIs) execute here with
   // full main-loop stack instead of inside an AsyncTCP / mbedtls callback.
   Shell::loop();

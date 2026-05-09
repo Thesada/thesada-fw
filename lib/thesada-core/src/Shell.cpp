@@ -88,7 +88,7 @@ void Shell::execute(const char* line, ShellOutput out) {
   out(msg);
 }
 
-// Stage a command for main-loop execution (#62 deferred dispatcher).
+// Stage a command for main-loop execution via the deferred dispatcher.
 // Capture by-value of the sink intentional - the caller's lambda may
 // reference task-local state that goes out of scope before loop()
 // fires; std::function's small-buffer optimization keeps trivial
@@ -100,9 +100,33 @@ bool Shell::enqueue(const char* line, ShellOutput sink) {
   uint8_t next = (uint8_t)((_ringTail + 1) % DEFERRED_RING_SIZE);
   if (next != _ringHead) {  // not full
     DeferredSlot& slot = _ring[_ringTail];
+    slot.mode = SlotMode::Shell;
     strncpy(slot.line, line, sizeof(slot.line) - 1);
     slot.line[sizeof(slot.line) - 1] = '\0';
     slot.sink = sink;
+    slot.fn = nullptr;
+    slot.active = true;
+    _ringTail = next;
+    accepted = true;
+  }
+  taskEXIT_CRITICAL(&_shellRingMux);
+  return accepted;
+}
+
+// Stage an arbitrary callable. Same ring + same backpressure as enqueue();
+// drain dispatches by mode. Captures live inside std::function (heap on
+// non-trivial captures) - acceptable given the ring's 4-slot ceiling.
+bool Shell::enqueueDeferred(DeferredFn fn) {
+  if (!fn) return false;
+  bool accepted = false;
+  taskENTER_CRITICAL(&_shellRingMux);
+  uint8_t next = (uint8_t)((_ringTail + 1) % DEFERRED_RING_SIZE);
+  if (next != _ringHead) {
+    DeferredSlot& slot = _ring[_ringTail];
+    slot.mode = SlotMode::Handler;
+    slot.line[0] = '\0';
+    slot.sink = nullptr;
+    slot.fn = std::move(fn);
     slot.active = true;
     _ringTail = next;
     accepted = true;
@@ -120,21 +144,53 @@ bool Shell::enqueue(const char* line, ShellOutput sink) {
 void Shell::loop() {
   char line[DEFERRED_LINE_LEN];
   ShellOutput sink;
-  bool have = false;
+  DeferredFn  fn;
+  SlotMode    mode = SlotMode::Empty;
 
   taskENTER_CRITICAL(&_shellRingMux);
   if (_ringHead != _ringTail && _ring[_ringHead].active) {
     DeferredSlot& slot = _ring[_ringHead];
-    memcpy(line, slot.line, sizeof(line));
-    sink = slot.sink;
+    mode = slot.mode;
+    if (mode == SlotMode::Shell) {
+      memcpy(line, slot.line, sizeof(line));
+      sink = slot.sink;
+    } else if (mode == SlotMode::Handler) {
+      fn = std::move(slot.fn);
+    }
+    slot.mode = SlotMode::Empty;
     slot.sink = nullptr;     // drop captured state asap
+    slot.fn = nullptr;
     slot.active = false;
     _ringHead = (uint8_t)((_ringHead + 1) % DEFERRED_RING_SIZE);
-    have = true;
   }
   taskEXIT_CRITICAL(&_shellRingMux);
 
-  if (have) execute(line, sink);
+  if (mode == SlotMode::Shell) {
+    execute(line, sink);
+  } else if (mode == SlotMode::Handler && fn) {
+    fn();
+  }
+}
+
+// Drain Serial (USB-CDC on debug envs, UART0 on production) one line at
+// a time and dispatch via execute(). Single console - safe to share buffer
+// state across callers because there is only one host typing at the
+// other end.
+void Shell::pumpConsole() {
+  static char  buf[Shell::DEFERRED_LINE_LEN];
+  static int   pos = 0;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      buf[pos] = '\0';
+      if (pos > 0) {
+        Shell::execute(buf, [](const char* line) { Serial.println(line); });
+      }
+      pos = 0;
+    } else if (pos < (int)sizeof(buf) - 1) {
+      buf[pos++] = c;
+    }
+  }
 }
 
 // Print all registered commands with their help text
@@ -384,12 +440,17 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
     JsonVariant parent = doc.as<JsonVariant>();
     char* token = strtok(key, ".");
     while (token) {
-      if (parent.is<JsonObject>()) {
-        parent = parent[token];
-      } else {
+      if (!parent.is<JsonObject>()) {
         out("Parent key not found");
         return;
       }
+      // Auto-create missing intermediate objects so config.set can land
+      // a value into a section that does not exist yet (e.g. enabling a
+      // brand-new optional module like gnss).
+      if (parent[token].isNull()) {
+        parent[token].to<JsonObject>();
+      }
+      parent = parent[token];
       token = strtok(nullptr, ".");
     }
 
