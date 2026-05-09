@@ -468,7 +468,13 @@ bool Cellular::mqttConnect() {
     return false;
   }
 
-  modem.sendAT("+SMCONF=\"KEEPTIME\",60");
+  // KEEPTIME=15 forces MQTT PINGREQ every 15 s. Default 60 s on
+  // some IoT cellular carriers leaves a long drift window where
+  // inbound MQTT forwarding silently stops while outbound SMPUB
+  // still works - looks like asymmetric NAT timeout on the broker->
+  // modem direction. 15 s pings keep that path warm. Bench-observed
+  // on multiple roaming partners.
+  modem.sendAT("+SMCONF=\"KEEPTIME\",15");
   modem.waitResponse();
 
   modem.sendAT("+SMCONF=\"CLEANSS\",1");
