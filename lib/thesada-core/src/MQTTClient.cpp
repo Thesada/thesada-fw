@@ -1421,6 +1421,22 @@ void MQTTClient::publishHeapStats() {
   snprintf(value, sizeof(value), "%lu", (unsigned long)(millis() / 1000));
   publish(topic, value);
 
+  // WiFi diagnostics. Only meaningful when WiFi is the active transport;
+  // cellular-only deployments skip these. publishDiscovery seeds them once
+  // at MQTT connect, but with a stable session there is no further refresh,
+  // so dashboards drift stale. Re-publish on the same 5 min trigger as heap.
+  if (WiFi.status() == WL_CONNECTED) {
+    snprintf(topic, sizeof(topic), "%s/sensor/wifi/rssi", prefix);
+    snprintf(value, sizeof(value), "%d", (int)WiFi.RSSI());
+    publish(topic, value);
+
+    snprintf(topic, sizeof(topic), "%s/sensor/wifi/ssid", prefix);
+    publish(topic, WiFi.SSID().c_str());
+
+    snprintf(topic, sizeof(topic), "%s/sensor/wifi/ip", prefix);
+    publish(topic, WiFi.localIP().toString().c_str());
+  }
+
   _lastHeapPublishMs = millis();
 }
 
