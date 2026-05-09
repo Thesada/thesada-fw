@@ -34,6 +34,7 @@ static const char* TAG = "Cellular";
 
 
 // ── Module state ─────────────────────────────────────────────────────────────
+bool              Cellular::_modemAlive    = false;
 bool              Cellular::_started        = false;
 bool              Cellular::_mqttConnected  = false;
 bool              Cellular::_publishGate    = false;
@@ -696,24 +697,48 @@ bool Cellular::mqttIsConnected() {
 
 // ---------------------------------------------------------------------------
 
-// Initialize PMU, modem, SIM, CA cert, network, and MQTT connection
-void Cellular::begin() {
-  if (_started) return;  // already initialised - modem is up, only loop() needed
-  Log::info(TAG, "Starting cellular path...");
+// Power up the modem only. PMU rails on, PWRKEY pulsed, AT verified.
+// Idempotent on _modemAlive. Independent of network/MQTT bring-up so
+// the GNSS module can warm the modem without taking over network duty.
+bool Cellular::powerOn() {
+  if (_modemAlive) return true;
 
-  // Take the AT bus for the entire bring-up. Long: registration alone
-  // can take 60-180 s on first SIM-card touch, plus CA upload + SMCONN.
-  // Any cross-task caller that hits Cellular::publish during boot will
-  // wait its turn rather than racing the registration AT chatter.
-  ATGuard g(300000UL);
+  ATGuard g(120000UL);
   if (!g.ok()) {
-    Log::error(TAG, "Cellular begin: AT bus stuck - aborting");
-    return;
+    Log::error(TAG, "powerOn: AT bus stuck");
+    return false;
   }
 
   initPMU();
   if (!wakeModem()) {
-    Log::error(TAG, "Modem did not wake - aborting cellular bring-up");
+    Log::error(TAG, "Modem did not wake");
+    return false;
+  }
+  _modemAlive = true;
+  return true;
+}
+
+// Initialize PMU, modem, SIM, CA cert, network, and MQTT connection.
+// Calls powerOn() first; if the modem is already alive (e.g. GNSS
+// warmed it earlier), powerOn is a no-op. Returns immediately if the
+// full path has already completed.
+void Cellular::begin() {
+  if (_started) return;  // already fully initialised
+  Log::info(TAG, "Starting cellular path...");
+
+  if (!powerOn()) {
+    Log::error(TAG, "Modem powerOn failed - aborting cellular bring-up");
+    return;
+  }
+
+  // Take the AT bus for the rest of the bring-up. Long: registration
+  // alone can take 60-180 s on first SIM-card touch, plus CA upload +
+  // SMCONN. Any cross-task caller that hits Cellular::publish during
+  // boot will wait its turn rather than racing the registration AT
+  // chatter.
+  ATGuard g(300000UL);
+  if (!g.ok()) {
+    Log::error(TAG, "Cellular begin: AT bus stuck - aborting");
     return;
   }
 
@@ -867,7 +892,7 @@ int Cellular::getSignalQuality() {
 // True once the modem has been woken and is AT-responsive. GNSS callers
 // gate on this; cellular registration / MQTT need not be up.
 bool Cellular::isModemAlive() {
-  return _started;
+  return _modemAlive;
 }
 
 // ---------------------------------------------------------------------------
@@ -891,7 +916,7 @@ bool Cellular::gpsAcquireFix(uint32_t timeoutMs,
                              float* lat, float* lon,
                              float* alt, float* speed,
                              int* satsInView, int* satsUsed) {
-  if (!_started) return false;
+  if (!_modemAlive) return false;
 
   ATGuard g(timeoutMs + 10000UL);
   if (!g.ok()) {

@@ -41,9 +41,20 @@ public:
     bool _held;
   };
 
+  // Power up the modem only - PMU rails on, PWRKEY pulsed, AT verified.
+  // Does NOT register on the network or connect MQTT. Lets the GNSS path
+  // bring the modem up without taking over network duty (the SIM7080
+  // GNSS receiver shares the modem core; reading it requires the modem
+  // be powered, but not registered or MQTT-connected).
+  // Idempotent: returns immediately if the modem is already AT-responsive.
+  // Caller-safe from any task; takes the AT-bus mutex internally.
+  // out: true if modem AT-OK after the call.
+  static bool powerOn();
+
   // Initialise PMU, wake modem, check SIM, write CA cert, register, MQTT connect.
-  // Idempotent: returns immediately if already started.
-  // Side-effect: leaves the publish gate open on success.
+  // Calls powerOn() first; powerOn is idempotent if the modem is already up
+  // (e.g. GNSS warmed it earlier). Returns immediately if MQTT is already
+  // connected. Side-effect: leaves the publish gate open on success.
   static void begin();
 
   // Cellular-only recovery loop: re-register on network drop, reconnect MQTT
@@ -75,10 +86,10 @@ public:
   static void atPassthrough(const char* cmd, uint32_t timeoutMs,
                             std::function<void(const char*)> emit);
 
-  // True once Cellular::begin() has completed wakeModem() successfully
-  // (modem is powered and AT-responsive). Required precondition for any
-  // GNSS use - the SIM7080 GNSS receiver shares the same modem core.
-  // Cellular registration / MQTT do not need to be up for GNSS.
+  // True once the modem is powered and AT-responsive (after powerOn() or
+  // begin()). Required precondition for any GNSS use - the SIM7080 GNSS
+  // receiver shares the same modem core. Registration / MQTT do not
+  // need to be up for GNSS.
   static bool isModemAlive();
 
   // Subscribe to an MQTT topic on the cellular modem-native MQTT session
@@ -145,7 +156,8 @@ private:
   static void routeSmsubLine(char* line);
   static bool isGprsConnectedRaw();
 
-  static bool     _started;
+  static bool     _modemAlive;     // PMU + wakeModem ok (powerOn complete)
+  static bool     _started;        // begin() fully completed (MQTT up)
   static bool     _mqttConnected;
   static bool     _publishGate;
   static bool     _hasCACert;

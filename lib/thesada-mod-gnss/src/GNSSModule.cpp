@@ -42,11 +42,21 @@ void GNSSModule::begin() {
 // stays free for MQTT.
 void GNSSModule::loop() {
   if (!_enabled) return;
-  if (!Cellular::isModemAlive()) return;
 
   uint32_t now = millis();
   if (_lastReadMs != 0 && now - _lastReadMs < _intervalMs) return;
   _lastReadMs = now;
+
+  // GNSS does not depend on cellular registration / MQTT; it just needs
+  // the modem powered. If something else (CellularModule activation)
+  // already brought the modem up, powerOn() is a no-op. Otherwise it
+  // brings up PMU + wakeModem so this GNSS read can proceed.
+  if (!Cellular::isModemAlive()) {
+    if (!Cellular::powerOn()) {
+      Log::warn(TAG, "Modem powerOn failed - GNSS read deferred");
+      return;
+    }
+  }
   readAndPublish();
 }
 
