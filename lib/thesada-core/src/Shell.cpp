@@ -202,6 +202,98 @@ void Shell::listCommands(ShellOutput out) {
   }
 }
 
+// Categorised help. With nullptr / empty filter: enumerate dot-prefix
+// categories (each shown once with command count) + emit no-dot
+// commands inline so `restart`, `version`, etc remain discoverable.
+// With filter "cell": print every command whose first dot-token equals
+// "cell", showing full name + help text.
+//
+// Buckets are derived on the fly (no separate registry) - any newly
+// registered cell.* / net.* / etc command shows up automatically.
+void Shell::printHelp(const char* filter, ShellOutput out) {
+  bool listing = (filter != nullptr && filter[0] != '\0');
+
+  if (listing) {
+    // Filter mode: dump every command whose first dot-token matches.
+    size_t flen = strlen(filter);
+    char header[64];
+    snprintf(header, sizeof(header), "%s.* commands:", filter);
+    out(header);
+    int hits = 0;
+    for (int i = 0; i < _commandCount; i++) {
+      const char* name = _commands[i].name;
+      const char* dot  = strchr(name, '.');
+      // Match if name starts with filter AND either filter is the full
+      // command (no-dot match) or filter ends right at the first '.'.
+      bool match = false;
+      if (dot) {
+        if ((size_t)(dot - name) == flen && strncasecmp(name, filter, flen) == 0) match = true;
+      } else if (strcasecmp(name, filter) == 0) {
+        match = true;
+      }
+      if (!match) continue;
+      char line[128];
+      snprintf(line, sizeof(line), "  %-20s %s", name, _commands[i].help);
+      out(line);
+      hits++;
+    }
+    if (hits == 0) {
+      out("  (no commands in that category - try `help` for the list)");
+    }
+    return;
+  }
+
+  // Bucket mode: dedupe categories, count members. Tracks at most
+  // MAX_COMMANDS distinct prefixes which is more than we will ever
+  // hit (one bucket per command at worst).
+  out("thesada-fw shell - commands grouped by category");
+  out("type `help <category>` to expand (e.g. `help cell`)");
+  out("");
+  out("Categories:");
+
+  char    seen[MAX_COMMANDS][20];
+  int     counts[MAX_COMMANDS] = {0};
+  int     bucketCount = 0;
+
+  for (int i = 0; i < _commandCount; i++) {
+    const char* name = _commands[i].name;
+    const char* dot  = strchr(name, '.');
+    if (!dot) continue;
+    size_t pfxLen = dot - name;
+    if (pfxLen >= sizeof(seen[0])) pfxLen = sizeof(seen[0]) - 1;
+    int found = -1;
+    for (int j = 0; j < bucketCount; j++) {
+      if (strncmp(seen[j], name, pfxLen) == 0 && seen[j][pfxLen] == '\0') {
+        found = j; break;
+      }
+    }
+    if (found < 0) {
+      if (bucketCount >= MAX_COMMANDS) continue;
+      memcpy(seen[bucketCount], name, pfxLen);
+      seen[bucketCount][pfxLen] = '\0';
+      counts[bucketCount] = 1;
+      bucketCount++;
+    } else {
+      counts[found]++;
+    }
+  }
+  for (int j = 0; j < bucketCount; j++) {
+    char line[64];
+    snprintf(line, sizeof(line), "  %-12s (%d cmd%s)",
+             seen[j], counts[j], counts[j] == 1 ? "" : "s");
+    out(line);
+  }
+
+  out("");
+  out("Top-level:");
+  for (int i = 0; i < _commandCount; i++) {
+    if (strchr(_commands[i].name, '.')) continue;
+    char line[128];
+    snprintf(line, sizeof(line), "  %-20s %s", _commands[i].name, _commands[i].help);
+    out(line);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Filesystem commands
 // ---------------------------------------------------------------------------
@@ -1164,11 +1256,14 @@ static void cmd_version(int argc, char** argv, ShellOutput out) {
   out(line);
 }
 
-// Show all available shell commands
+// Show shell commands. With no arg: collapse dotted commands into
+// category buckets (cell.*, fs.*, etc) and list each bucket once with
+// a count, plus all top-level (no-dot) commands inline. With an arg:
+// expand that bucket only (so `help cell` shows every cell.* command
+// with its description). Avoids the multi-screen wall the flat list
+// became as command count grew.
 static void cmd_help(int argc, char** argv, ShellOutput out) {
-  out("thesada-fw shell");
-  out("");
-  Shell::listCommands(out);
+  Shell::printHelp(argc > 1 ? argv[1] : nullptr, out);
 }
 
 // Unified sensors command backed by SensorRegistry. Modules self-register
@@ -1331,7 +1426,7 @@ static void cmd_selftest(int argc, char** argv, ShellOutput out) {
 // Register all built-in shell commands
 void Shell::registerBuiltins() {
   // System
-  registerCommand("help",          "Show all commands",             cmd_help);
+  registerCommand("help",          "Show categories or expand one (help <cat>)", cmd_help);
   registerCommand("version",       "Firmware version and build",    cmd_version);
   registerCommand("restart",       "Reboot device",                 cmd_restart);
   registerCommand("heap",          "Free heap memory",              cmd_heap);

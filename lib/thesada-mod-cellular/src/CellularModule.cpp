@@ -30,6 +30,7 @@
 #include <ArduinoJson.h>
 #include <ModuleRegistry.h>
 #include <Shell.h>
+#include <esp_task_wdt.h>
 #include <MQTTClient.h>
 
 static const char* TAG = "CellularModule";
@@ -94,6 +95,77 @@ void CellularModule::begin() {
       bool ok = Cellular::hardReset();
       out(ok ? "Modem back after hardware reset" : "Modem hardware-reset timeout");
     });
+
+  // cell.cert.test: read back the size of the modem-side client.crt
+  // (filled by mqttConnect's writeClientCert) and try CSSLCFG CONVERT
+  // with several ssltype slots. Lets us pin down whether mTLS failures
+  // are upload-side (file empty / not on FS) or convert-side (wrong
+  // ssltype enum for this SIM7080 firmware revision) without waiting
+  // for the next backoff window.
+  Shell::registerCommand("cell.cert.test",
+    "Probe modem-side client.crt: file size + CSSLCFG CONVERT slot tests",
+    [](int argc, char** argv, ShellOutput out) {
+      out("--- CFSINIT ---");
+      Cellular::atPassthrough("+CFSINIT", 5000, out);
+      out("--- CFSGFIS client.crt (size) ---");
+      Cellular::atPassthrough("+CFSGFIS=3,\"client.crt\"", 5000, out);
+      out("--- CFSGFIS server-ca.crt (size, control) ---");
+      Cellular::atPassthrough("+CFSGFIS=3,\"server-ca.crt\"", 5000, out);
+      out("--- CFSTERM ---");
+      Cellular::atPassthrough("+CFSTERM", 5000, out);
+      out("--- CONVERT 2 server-ca.crt (control - known good) ---");
+      Cellular::atPassthrough("+CSSLCFG=\"CONVERT\",2,\"server-ca.crt\"", 5000, out);
+      out("--- CONVERT 1 client.crt (current code path) ---");
+      Cellular::atPassthrough("+CSSLCFG=\"CONVERT\",1,\"client.crt\"", 5000, out);
+      out("--- CONVERT 2 client.crt (alt - if fw enum differs) ---");
+      Cellular::atPassthrough("+CSSLCFG=\"CONVERT\",2,\"client.crt\"", 5000, out);
+      out("--- CONVERT 3 client.crt (alt - some fw uses type 3) ---");
+      Cellular::atPassthrough("+CSSLCFG=\"CONVERT\",3,\"client.crt\"", 5000, out);
+      out("--- done ---");
+    });
+
+  // cell.smconn.test: tear down + reconnect cycle that lets us see the
+  // SIM7080's real handshake error. Existing mqttConnect() drainModemTail
+  // misses post-ERROR chatter on slow handshakes; this command issues
+  // SMDISC, configures SMSSL=2 mTLS, runs SMCONN, then idles 5 s and
+  // dumps everything Serial1 emits in that window. Run while cellular
+  // is in a Retry MQTT backoff (the AT bus pause now releases it).
+  // cell.cert.dump: read modem-side client.crt back as ASCII. CFSRFILE
+  // appears to need CFSINIT + CFSRFILE + CFSTERM in one continuous AT
+  // session on this fw rev; running them via three separate cell.at
+  // shell calls (each its own ATGuard) returns ERROR. Issuing them
+  // back-to-back inside one atPassthrough chain via the same shell
+  // command works.
+  Shell::registerCommand("cell.cert.dump",
+    "Read modem-side client.crt content (CFSINIT/CFSRFILE/CFSTERM in one chain)",
+    [](int argc, char** argv, ShellOutput out) {
+      out("--- CFSINIT ---");
+      Cellular::atPassthrough("+CFSINIT", 5000, out);
+      out("--- CFSRFILE 1024 B from offset 0 ---");
+      Cellular::atPassthrough("+CFSRFILE=3,\"client.crt\",0,1024,0", 8000, out);
+      out("--- CFSRFILE next 1024 B from offset 1024 ---");
+      Cellular::atPassthrough("+CFSRFILE=3,\"client.crt\",0,1024,1024", 8000, out);
+      out("--- CFSTERM ---");
+      Cellular::atPassthrough("+CFSTERM", 5000, out);
+      out("--- done ---");
+    });
+
+  Shell::registerCommand("cell.smconn.test",
+    "Manual SMCONN attempt with extended error drain (use during retry)",
+    [](int argc, char** argv, ShellOutput out) {
+      out("--- SMDISC ---");
+      Cellular::atPassthrough("+SMDISC", 5000, out);
+      out("--- SMSSL=2 mTLS attach ---");
+      Cellular::atPassthrough("+SMSSL=2,\"server-ca.crt\",\"client.crt\"", 5000, out);
+      out("--- SMCONN (15s + 5s idle for late chatter) ---");
+      Cellular::atPassthrough("+SMCONN", 15000, out);
+      // Idle drain - the real cause often arrives after the bare ERROR.
+      // Chunk the wait + feed TWDT so the 30s task watchdog stays happy.
+      for (int i = 0; i < 10; ++i) { delay(500); esp_task_wdt_reset(); }
+      Cellular::atPassthrough("+SMSTATE?", 3000, out);
+      out("--- done ---");
+    });
+
   Log::info(TAG, "Cellular module ready (standby)");
 }
 

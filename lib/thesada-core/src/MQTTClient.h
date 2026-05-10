@@ -57,16 +57,29 @@ public:
   // Cert/key are PEM-encoded. Max size per NVS blob: ~4000 B.
   // ECDSA P-256 certs ~800 B, keys ~250 B - well within limit.
   //
+  // Public so cellular and any other transport can size buffers passed
+  // into loadClientCert. Was a file-static in MQTTClient.cpp, promoted
+  // 2026-05-09 for the SIM7080 modem-MQTT mTLS path (Cellular::writeClientCert).
+  static constexpr size_t CERT_MAX_LEN = 4000;
   // storeClientCert writes to NVS. Pass nullptr or empty to store only
   // one half. Returns true on success.
   static bool storeClientCert(const char* certPEM, const char* keyPEM);
   // loadClientCert fills cert and key (both must be non-null buffers of
-  // size maxLen >= 4096). Returns true if both are present in NVS.
+  // size maxLen >= CERT_MAX_LEN). Returns true if both are present in NVS.
   static bool loadClientCert(char* cert, char* key, size_t maxLen);
   // Clears both cert and key from NVS. Returns true on success.
+  // Fires the optional cert-cleared hook (setOnClientCertCleared) after
+  // a successful clear so transports holding a cached upload can drop it.
   static bool clearClientCert();
   // True if both cert and key are present in NVS.
   static bool hasClientCert();
+
+  // Optional hook fired from clearClientCert after the NVS rows are gone.
+  // The cellular module installs one at bring-up so its modem-side cert
+  // cache invalidates and any active modem-MQTT session drops, forcing
+  // a reconnect under the new auth mode (user/pass after the clear).
+  // Pass nullptr to clear the hook.
+  static void setOnClientCertCleared(std::function<void()> fn);
 
   // Dispatch an inbound MQTT message into the registered subscription
   // callbacks the same way the WiFi PubSubClient onMessage callback does.
