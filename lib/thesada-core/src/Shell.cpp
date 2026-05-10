@@ -459,9 +459,25 @@ static void cmd_format(int argc, char** argv, ShellOutput out) {
 // Config commands
 // ---------------------------------------------------------------------------
 
-// Read a config value by dot-notation key
+// Parse `tok` as an unsigned integer for use as a JsonArray index.
+// in:  tok    candidate token string
+// out: bool   true if every char is a digit (and at least one digit), idx filled
+static bool parseArrayIndex(const char* tok, size_t& idx) {
+  if (!tok || !*tok) return false;
+  size_t v = 0;
+  for (const char* p = tok; *p; ++p) {
+    if (*p < '0' || *p > '9') return false;
+    v = v * 10 + (size_t)(*p - '0');
+  }
+  idx = v;
+  return true;
+}
+
+// Read a config value by dot-notation key. Supports array indices
+// (e.g. wifi.networks.0.ssid - "0" descends into the JsonArray returned
+// by wifi.networks).
 static void cmd_config_get(int argc, char** argv, ShellOutput out) {
-  if (argc < 2) { out("Usage: config.get <key>  (dot notation, e.g. mqtt.broker)"); return; }
+  if (argc < 2) { out("Usage: config.get <key>  (dot notation, e.g. wifi.networks.0.ssid)"); return; }
 
   JsonObject cfg = Config::get();
   JsonVariant current = cfg;
@@ -472,7 +488,12 @@ static void cmd_config_get(int argc, char** argv, ShellOutput out) {
 
   char* token = strtok(key, ".");
   while (token) {
-    if (current.is<JsonObject>()) {
+    size_t idx;
+    if (current.is<JsonArray>() && parseArrayIndex(token, idx)) {
+      JsonArray arr = current.as<JsonArray>();
+      if (idx >= arr.size()) { out("Array index out of range"); return; }
+      current = arr[idx];
+    } else if (current.is<JsonObject>()) {
       current = current[token];
     } else {
       out("Key not found");
@@ -532,44 +553,90 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
     JsonVariant parent = doc.as<JsonVariant>();
     char* token = strtok(key, ".");
     while (token) {
-      if (!parent.is<JsonObject>()) {
+      size_t idx;
+      if (parent.is<JsonArray>() && parseArrayIndex(token, idx)) {
+        JsonArray arr = parent.as<JsonArray>();
+        if (idx >= arr.size()) { out("Parent array index out of range"); return; }
+        parent = arr[idx];
+      } else if (parent.is<JsonObject>()) {
+        // Auto-create missing intermediate objects so config.set can land
+        // a value into a section that does not exist yet (e.g. enabling a
+        // brand-new optional module like gnss). Does not auto-create
+        // arrays - explicit `config.set foo.bar []` does that.
+        if (parent[token].isNull()) {
+          parent[token].to<JsonObject>();
+        }
+        parent = parent[token];
+      } else {
         out("Parent key not found");
         return;
       }
-      // Auto-create missing intermediate objects so config.set can land
-      // a value into a section that does not exist yet (e.g. enabling a
-      // brand-new optional module like gnss).
-      if (parent[token].isNull()) {
-        parent[token].to<JsonObject>();
-      }
-      parent = parent[token];
       token = strtok(nullptr, ".");
     }
 
-    if (!parent.is<JsonObject>()) { out("Parent is not an object"); return; }
+    // Resolve a writable target for the final key. JsonObject member
+    // assignment + JsonArray index assignment use different ArduinoJson
+    // APIs; capture the destination as a JsonVariant once so the value
+    // detection below is target-agnostic.
+    JsonVariant target;
+    size_t finalIdx;
+    if (parent.is<JsonArray>() && parseArrayIndex(finalKey, finalIdx)) {
+      JsonArray arr = parent.as<JsonArray>();
+      if (finalIdx >= arr.size()) { out("Array index out of range"); return; }
+      target = arr[finalIdx];
+    } else if (parent.is<JsonObject>()) {
+      target = parent[finalKey];
+    } else {
+      out("Parent is not an object or array");
+      return;
+    }
 
     // Delete key if value is "--delete"
     if (value == "--delete") {
-      parent[finalKey].clear();
-      parent.as<JsonObject>().remove(finalKey);
-      // Write back + reload below
+      if (parent.is<JsonObject>()) {
+        parent[finalKey].clear();
+        parent.as<JsonObject>().remove(finalKey);
+      } else {
+        // For arrays we set the slot to null; remove() would shift
+        // indices and silently break sibling references.
+        target.clear();
+      }
       goto save;
     }
 
+    // JSON literal? Parse and assign as a Variant so config.set
+    // wifi.networks [{"ssid":"..."}] stores a real JsonArray, not a
+    // stringified blob (the prior fallthrough behaviour).
+    {
+      String trimmed = value;
+      trimmed.trim();
+      if (trimmed.length() > 0 &&
+          (trimmed.charAt(0) == '{' || trimmed.charAt(0) == '[')) {
+        JsonDocument lit;
+        DeserializationError lerr = deserializeJson(lit, trimmed);
+        if (!lerr) {
+          target.set(lit.as<JsonVariant>());
+          goto save;
+        }
+        // Parse failed - fall through to scalar detection. The user
+        // probably typed a string that just happens to start with `{`.
+      }
+    }
+
     // Try to detect type: number, boolean, or string.
-    if (value == "true") parent[finalKey] = true;
-    else if (value == "false") parent[finalKey] = false;
+    if (value == "true") target.set(true);
+    else if (value == "false") target.set(false);
     else {
       char* end;
       long lv = strtol(value.c_str(), &end, 10);
       if (*end == '\0' && value.length() > 0) {
-        parent[finalKey] = lv;
+        target.set(lv);
       } else {
         float fv = strtof(value.c_str(), &end);
         if (*end == '\0' && value.length() > 0) {
-          parent[finalKey] = fv;
+          target.set(fv);
         } else {
-          parent[finalKey] = value;
+          target.set(value);
         }
       }
     }
