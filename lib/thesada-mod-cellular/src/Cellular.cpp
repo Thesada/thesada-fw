@@ -400,87 +400,101 @@ bool Cellular::writeCACert() {
 
 // ---------------------------------------------------------------------------
 
-// Upload the NVS-stored client cert + key as a single concatenated PEM
-// file (`client.crt`) to the modem FS for SIM7080G mutual TLS. SIM7080
-// fw 1951B17's AT+SMSSL mode 2 references one client filename whose
-// contents must hold both the certificate and the private key (PEM
-// blocks back-to-back). Mirrors writeCACert's chunked CFSWFILE write.
+// Chunked CFSWFILE upload helper. Same flow as writeCACert: open a
+// session via CFSINIT, walk the buffer in <= 10 KB chunks via CFSWFILE
+// (truncate write on chunk 0, append on subsequent), close with CFSTERM.
+// Caller owns the AT bus mutex.
 //
-// in:  none (NVS via MQTTClient::loadClientCert; AT bus via outer ATGuard)
-// out: bool  true on full upload + CFSTERM ack; false if NVS empty,
-//             alloc fails, or any AT step errors out
-bool Cellular::writeClientCert() {
-  if (!MQTTClient::hasClientCert()) return false;
-
-  // One contiguous heap buffer holds cert at [0..maxLen) and key at
-  // [maxLen+1..2*maxLen+1). After load we re-pack cert + '\n' + key
-  // into the front of the buffer with one memmove so the upload uses
-  // a single base pointer.
-  const size_t maxLen = MQTTClient::CERT_MAX_LEN;
-  char* buf = (char*)malloc(maxLen * 2 + 2);
-  if (!buf) {
-    Log::error(TAG, "writeClientCert: heap alloc failed");
-    return false;
-  }
-  char* certPtr = buf;
-  char* keyPtr  = buf + maxLen + 1;
-
-  if (!MQTTClient::loadClientCert(certPtr, keyPtr, maxLen)) {
-    Log::warn(TAG, "writeClientCert: NVS load failed");
-    free(buf);
-    return false;
-  }
-  size_t certLen = strlen(certPtr);
-  size_t keyLen  = strlen(keyPtr);
-  if (certLen == 0 || keyLen == 0) {
-    Log::warn(TAG, "writeClientCert: empty cert or key");
-    free(buf);
-    return false;
-  }
-  // Ensure the cert's PEM block ends with a newline before the key
-  // is appended; stray "-----END CERTIFICATE-----\n-----BEGIN ..." is
-  // what SIM7080's PEM parser walks.
-  if (certPtr[certLen - 1] != '\n') {
-    certPtr[certLen++] = '\n';
-  }
-  // memmove tolerates overlapping ranges, but the source (keyPtr) sits
-  // beyond the cert's tail by design (offset maxLen+1) so there is no
-  // overlap with the destination here.
-  memmove(certPtr + certLen, keyPtr, keyLen + 1);
-  size_t total = certLen + keyLen;
-
+// in:  filename  modem-side file name (in OEM partition, index 3)
+//      data      pointer to PEM bytes
+//      length    byte count
+// out: bool      true on success
+static bool writeModemFile(TinyGsm& modem, const char* filename,
+                           const uint8_t* data, size_t length) {
   modem.sendAT("+CFSTERM");
   modem.waitResponse();
   modem.sendAT("+CFSINIT");
-  if (modem.waitResponse() != 1) {
-    Log::error(TAG, "writeClientCert: CFSINIT failed");
-    free(buf);
-    return false;
-  }
+  if (modem.waitResponse() != 1) return false;
 
-  size_t remaining = total;
+  size_t remaining = length;
   size_t written   = 0;
   while (remaining > 0) {
     size_t chunk = remaining > 10000 ? 10000 : remaining;
-    modem.sendAT("+CFSWFILE=", 3, ",\"client.crt\",",
+    modem.sendAT("+CFSWFILE=", 3, ",\"", filename, "\",",
                  (written > 0 ? 1 : 0), ",", chunk, ",10000");
     waitChunked(30000UL, "DOWNLOAD");
-    modem.stream.write((const uint8_t*)certPtr + written, chunk);
+    modem.stream.write(data + written, chunk);
     if (waitChunked(30000UL) == 1) {
       written   += chunk;
       remaining -= chunk;
     } else {
-      Log::warn(TAG, "client.crt chunk write failed - retrying");
       delay(1000);
     }
   }
 
   modem.sendAT("+CFSTERM");
   modem.waitResponse();
-  free(buf);
-  char msg[64];
-  snprintf(msg, sizeof(msg), "Client cert+key written to modem (%u B)",
-           (unsigned)total);
+  return true;
+}
+
+// Upload the NVS-stored client cert and private key as TWO separate
+// PEM files on the modem FS - `client.crt` for the certificate,
+// `client.key` for the private key. SIM7080G fw 1951B17 wants
+// CSSLCFG type 1 with the 4-arg form (cert filename + key filename
+// as separate args), so the two-file layout matches what mqttConnect's
+// CSSLCFG + SMSSL sequence references.
+//
+// Earlier impl concatenated cert+key into one PEM and used SMSSL=2,
+// which silently fails the TLS handshake on this fw rev (broker logs
+// `unexpected eof while reading`, modem closes mid-handshake). Pattern
+// here mirrors the LilyGo SIMCom AT samples (AWS IoT + ATT mosquitto)
+// that work on the same modem family.
+//
+// in:  none (NVS via MQTTClient::loadClientCert; AT bus via outer ATGuard)
+// out: bool  true on full upload + CFSTERM ack for both files; false if
+//             NVS empty, alloc fails, or any AT step errors out
+bool Cellular::writeClientCert() {
+  if (!MQTTClient::hasClientCert()) return false;
+
+  const size_t maxLen = MQTTClient::CERT_MAX_LEN;
+  char* certBuf = (char*)malloc(maxLen);
+  char* keyBuf  = (char*)malloc(maxLen);
+  if (!certBuf || !keyBuf) {
+    Log::error(TAG, "writeClientCert: heap alloc failed");
+    free(certBuf); free(keyBuf);
+    return false;
+  }
+
+  if (!MQTTClient::loadClientCert(certBuf, keyBuf, maxLen)) {
+    Log::warn(TAG, "writeClientCert: NVS load failed");
+    free(certBuf); free(keyBuf);
+    return false;
+  }
+  size_t certLen = strlen(certBuf);
+  size_t keyLen  = strlen(keyBuf);
+  if (certLen == 0 || keyLen == 0) {
+    Log::warn(TAG, "writeClientCert: empty cert or key");
+    free(certBuf); free(keyBuf);
+    return false;
+  }
+
+  bool ok = writeModemFile(modem, "client.crt",
+                           (const uint8_t*)certBuf, certLen);
+  if (ok) {
+    ok = writeModemFile(modem, "client.key",
+                        (const uint8_t*)keyBuf, keyLen);
+  }
+
+  free(certBuf); free(keyBuf);
+  if (!ok) {
+    Log::error(TAG, "writeClientCert: upload failed");
+    return false;
+  }
+
+  char msg[80];
+  snprintf(msg, sizeof(msg),
+           "Client cert+key written to modem (cert %u B, key %u B)",
+           (unsigned)certLen, (unsigned)keyLen);
   Log::info(TAG, msg);
   return true;
 }
@@ -712,26 +726,37 @@ bool Cellular::mqttConnect() {
   modem.waitResponse();
 
   if (wantMTLS) {
-    // CSSLCFG CONVERT ssltype on SIM7080G fw 1951B17: type 2 accepts
-    // both server CA PEM and client (cert+key concat) PEM. Bench
-    // diagnostic 2026-05-09 confirmed CONVERT 1 returns ERROR while
-    // CONVERT 2 returns OK for the client.crt blob, even though
-    // SIMCom's published AT manual nominally documents type 1 as the
-    // client cert slot. Stay on type 2 here - the manual's convention
-    // does not match this firmware revision.
-    // Both entries persist across SMDISC; re-running CONVERT when a
-    // file is already in the converted slot returns OK.
+    // CSSLCFG CONVERT slot semantics on SIM7080G (fw 1951B17 verified):
+    //   type 1 = client certificate, takes 4-arg form with separate
+    //            key filename: CONVERT,1,"<cert>","<key>"
+    //   type 2 = CA list (single PEM file)
+    // Sequence + filenames mirror the LilyGo SIMCom samples (AWS IoT +
+    // ATT mosquitto) - bench-validated wedge pattern; using SMSSL=2 +
+    // a concatenated cert/key file aborted the TLS handshake mid-way
+    // even though CONVERT 2 returned OK. The 4-arg CONVERT 1 flow with
+    // separate cert/key files is what the modem actually wires through
+    // to mbedtls for client auth.
     modem.sendAT("+CSSLCFG=\"CONVERT\",2,\"server-ca.crt\"");
     if (modem.waitResponse() != 1) { Log::error(TAG, "CA convert failed"); return false; }
 
-    modem.sendAT("+CSSLCFG=\"CONVERT\",2,\"client.crt\"");
+    modem.sendAT("+CSSLCFG=\"CONVERT\",1,\"client.crt\",\"client.key\"");
     if (modem.waitResponse() != 1) { Log::error(TAG, "Client cert convert failed"); return false; }
 
-    // SMSSL mode 2 = mutual TLS. Server CA verifies the broker; the
-    // client cert+key in client.crt authenticates this device. Broker
-    // dynsec with use_identity_as_username reads the cert CN as the
-    // MQTT username for ACL purposes.
-    modem.sendAT("+SMSSL=2,\"server-ca.crt\",\"client.crt\"");
+    // Optional SNI: AWS IoT + Cloudflare-fronted brokers need it to
+    // route to the right backend. Mosquitto direct (no SNI required)
+    // ignores it harmlessly. CSSLCFG SNI is per-CTX (index 0 = default
+    // SSL context, the one SMSSL drives).
+    char sniCmd[160];
+    snprintf(sniCmd, sizeof(sniCmd), "+CSSLCFG=\"sni\",0,\"%s\"", broker);
+    modem.sendAT(sniCmd);
+    modem.waitResponse();
+
+    // SMSSL mode 1 with both CA + client cert filenames = mutual TLS.
+    // Mode 1 is the catch-all "verify server + present client cert if
+    // configured" knob on this fw rev; mode 2 has different semantics
+    // and bench-failed the handshake. The client-cert side is wired
+    // by the prior CSSLCFG CONVERT 1 call referencing client.crt + key.
+    modem.sendAT("+SMSSL=1,\"server-ca.crt\",\"client.crt\"");
     if (modem.waitResponse() != 1) { Log::error(TAG, "mTLS SSL attach failed"); return false; }
   } else if (_hasCACert) {
     modem.sendAT("+CSSLCFG=\"CONVERT\",2,\"server-ca.crt\"");
