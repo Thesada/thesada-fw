@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
-#define FIRMWARE_VERSION "1.4.1"  // bump on each release
+#define FIRMWARE_VERSION "1.4.2"  // bump on each release
 
 // ── Memory tuning defaults ──────────────────────────────────────────────────
 // Board overrides below redefine these for heap-constrained boards (CYD/WROOM).
