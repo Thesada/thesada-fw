@@ -39,6 +39,7 @@ bool              Cellular::_started        = false;
 bool              Cellular::_mqttConnected  = false;
 bool              Cellular::_publishGate    = false;
 bool              Cellular::_hasCACert      = false;
+bool              Cellular::_hasClientCertOnModem = false;
 int               Cellular::_signalQuality  = 99;
 uint32_t          Cellular::_lastSignalSample = 0;
 uint32_t          Cellular::_lastSmpubMs    = 0;
@@ -63,6 +64,44 @@ Cellular::ATGuard::ATGuard(uint32_t timeoutMs) : _held(false) {
 }
 Cellular::ATGuard::~ATGuard() {
   if (_held) xSemaphoreGiveRecursive(_atMutex);
+}
+
+// Temporarily release the bus, chunked-sleep with shell + WDT pumps,
+// then re-acquire before returning. Used by mqttBackoffWait so a long
+// MQTT retry backoff inside Cellular::begin does not starve the main
+// loop (Shell, console, cell.at debug commands, URC pump). See header
+// for caller contract: no AT commands while paused.
+void Cellular::ATGuard::pause(uint32_t pauseMs) {
+  bool wasHeld = _held;
+  if (wasHeld) {
+    xSemaphoreGiveRecursive(_atMutex);
+    _held = false;
+  }
+
+  uint32_t remaining = pauseMs;
+  while (remaining) {
+    uint32_t step = remaining > 100UL ? 100UL : remaining;
+    delay(step);
+    esp_task_wdt_reset();
+    // Service the console so the user can issue cell.at / cell.cert.*
+    // / restart while the cellular bring-up retry is paused. pumpConsole
+    // is non-blocking; if there is no input, it returns immediately.
+    Shell::pumpConsole();
+    remaining -= step;
+  }
+
+  if (wasHeld) {
+    // Re-acquire with a 60 s budget. If another holder appeared during
+    // the pause and will not release, leave _held=false so the caller
+    // sees ok()==false and bails the retry loop instead of issuing AT
+    // commands without the bus.
+    TickType_t to = pdMS_TO_TICKS(60000UL);
+    if (xSemaphoreTakeRecursive(_atMutex, to) == pdTRUE) {
+      _held = true;
+    } else {
+      Log::warn("Cellular", "ATGuard pause: re-acquire timed out");
+    }
+  }
 }
 
 // Serial port for TinyGSM
@@ -116,19 +155,28 @@ static uint32_t           s_mqttRetryMs      = MQTT_RETRY_INIT_MS;
 // MQTT_RETRY_MAX_MS), feeding the task watchdog every 500 ms so a
 // long backoff does not trip TWDT.
 //
-// in:  none (uses module-static s_mqttRetryMs)
-// out: none
-static void mqttBackoffWait() {
+// If `guard` is non-null, it is paused for the backoff so the AT bus
+// is released and the shell console pumps for cell.at / cell.cert.*
+// debug commands. begin()'s retry loop passes its own guard; older
+// callers without a guard get a plain delay loop (no console pump).
+//
+// in:  guard  optional ATGuard to pause during the sleep, or nullptr
+// out: none (uses module-static s_mqttRetryMs)
+static void mqttBackoffWait(Cellular::ATGuard* guard = nullptr) {
   uint32_t ms = s_mqttRetryMs;
   char msg[64];
   snprintf(msg, sizeof(msg), "Retry MQTT in %lu s", (unsigned long)(ms / 1000UL));
   Log::warn(TAG, msg);
-  uint32_t remaining = ms;
-  while (remaining) {
-    uint32_t step = remaining > 500UL ? 500UL : remaining;
-    delay(step);
-    esp_task_wdt_reset();
-    remaining -= step;
+  if (guard) {
+    guard->pause(ms);
+  } else {
+    uint32_t remaining = ms;
+    while (remaining) {
+      uint32_t step = remaining > 500UL ? 500UL : remaining;
+      delay(step);
+      esp_task_wdt_reset();
+      remaining -= step;
+    }
   }
   uint32_t next = ms * 2UL;
   s_mqttRetryMs = (next > MQTT_RETRY_MAX_MS) ? MQTT_RETRY_MAX_MS : next;
@@ -179,6 +227,31 @@ static bool modemSoftReset() {
   return false;
 }
 
+// Drop the modem-side cached client cert (next mqttConnect re-decides
+// based on current NVS state) AND tear down any live SMCONN so the
+// next reconnect cycle uses the new auth mode. Wired to MQTTClient's
+// cert-cleared hook from begin(); also safe to call directly. No-op
+// when cellular MQTT was never up. Held briefly on the AT bus.
+void Cellular::invalidateClientCert() {
+  _hasClientCertOnModem = false;
+  if (!_modemAlive) return;
+
+  ATGuard g(5000UL);
+  if (!g.ok()) {
+    // The bus is busy - the next health probe / reconnect will pick
+    // up _hasClientCertOnModem=false and re-decide; the live session
+    // continues until then. Acceptable for a runtime cert.clear.
+    Log::warn(TAG, "invalidateClientCert: AT bus busy - deferring SMDISC");
+    return;
+  }
+  if (_mqttConnected) {
+    Log::info(TAG, "cert.clear: dropping modem MQTT session");
+    modem.sendAT("+SMDISC");
+    modem.waitResponse(5000UL);
+    _mqttConnected = false;
+  }
+}
+
 // Public wrapper for the hardware reset. Drops state flags so the next
 // CellularModule::loop tick re-walks activation (networkConnect +
 // mqttConnect + smsubAll). Caller can be Shell, watchdog, or anything
@@ -193,6 +266,9 @@ bool Cellular::hardReset() {
   _modemAlive    = ok;
   _started       = false;
   _mqttConnected = false;
+  // Modem FS does not survive a DC3 power cycle - any prior cert
+  // upload is gone, force a re-upload on the next mqttConnect.
+  _hasClientCertOnModem = false;
   return ok;
 }
 
@@ -319,6 +395,107 @@ bool Cellular::writeCACert() {
   modem.waitResponse();
   _hasCACert = true;
   Log::info(TAG, "CA cert written to modem");
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+
+// Chunked CFSWFILE upload helper. Same flow as writeCACert: open a
+// session via CFSINIT, walk the buffer in <= 10 KB chunks via CFSWFILE
+// (truncate write on chunk 0, append on subsequent), close with CFSTERM.
+// Caller owns the AT bus mutex.
+//
+// in:  filename  modem-side file name (in OEM partition, index 3)
+//      data      pointer to PEM bytes
+//      length    byte count
+// out: bool      true on success
+static bool writeModemFile(TinyGsm& modem, const char* filename,
+                           const uint8_t* data, size_t length) {
+  modem.sendAT("+CFSTERM");
+  modem.waitResponse();
+  modem.sendAT("+CFSINIT");
+  if (modem.waitResponse() != 1) return false;
+
+  size_t remaining = length;
+  size_t written   = 0;
+  while (remaining > 0) {
+    size_t chunk = remaining > 10000 ? 10000 : remaining;
+    modem.sendAT("+CFSWFILE=", 3, ",\"", filename, "\",",
+                 (written > 0 ? 1 : 0), ",", chunk, ",10000");
+    waitChunked(30000UL, "DOWNLOAD");
+    modem.stream.write(data + written, chunk);
+    if (waitChunked(30000UL) == 1) {
+      written   += chunk;
+      remaining -= chunk;
+    } else {
+      delay(1000);
+    }
+  }
+
+  modem.sendAT("+CFSTERM");
+  modem.waitResponse();
+  return true;
+}
+
+// Upload the NVS-stored client cert and private key as TWO separate
+// PEM files on the modem FS - `client.crt` for the certificate,
+// `client.key` for the private key. SIM7080G fw 1951B17 wants
+// CSSLCFG type 1 with the 4-arg form (cert filename + key filename
+// as separate args), so the two-file layout matches what mqttConnect's
+// CSSLCFG + SMSSL sequence references.
+//
+// Earlier impl concatenated cert+key into one PEM and used SMSSL=2,
+// which silently fails the TLS handshake on this fw rev (broker logs
+// `unexpected eof while reading`, modem closes mid-handshake). Pattern
+// here mirrors the LilyGo SIMCom AT samples (AWS IoT + ATT mosquitto)
+// that work on the same modem family.
+//
+// in:  none (NVS via MQTTClient::loadClientCert; AT bus via outer ATGuard)
+// out: bool  true on full upload + CFSTERM ack for both files; false if
+//             NVS empty, alloc fails, or any AT step errors out
+bool Cellular::writeClientCert() {
+  if (!MQTTClient::hasClientCert()) return false;
+
+  const size_t maxLen = MQTTClient::CERT_MAX_LEN;
+  char* certBuf = (char*)malloc(maxLen);
+  char* keyBuf  = (char*)malloc(maxLen);
+  if (!certBuf || !keyBuf) {
+    Log::error(TAG, "writeClientCert: heap alloc failed");
+    free(certBuf); free(keyBuf);
+    return false;
+  }
+
+  if (!MQTTClient::loadClientCert(certBuf, keyBuf, maxLen)) {
+    Log::warn(TAG, "writeClientCert: NVS load failed");
+    free(certBuf); free(keyBuf);
+    return false;
+  }
+  size_t certLen = strlen(certBuf);
+  size_t keyLen  = strlen(keyBuf);
+  if (certLen == 0 || keyLen == 0) {
+    Log::warn(TAG, "writeClientCert: empty cert or key");
+    free(certBuf); free(keyBuf);
+    return false;
+  }
+
+  bool ok = writeModemFile(modem, "client.crt",
+                           (const uint8_t*)certBuf, certLen);
+  if (ok) {
+    ok = writeModemFile(modem, "client.key",
+                        (const uint8_t*)keyBuf, keyLen);
+  }
+
+  free(certBuf); free(keyBuf);
+  if (!ok) {
+    Log::error(TAG, "writeClientCert: upload failed");
+    return false;
+  }
+
+  char msg[80];
+  snprintf(msg, sizeof(msg),
+           "Client cert+key written to modem (cert %u B, key %u B)",
+           (unsigned)certLen, (unsigned)keyLen);
+  Log::info(TAG, msg);
   return true;
 }
 
@@ -468,6 +645,10 @@ bool Cellular::mqttConnect() {
     // CA upload and network registration before retrying SMCONF.
     Log::warn(TAG, "SMSTATE no response - modem wedged");
     if (!modemSoftReset()) return false;
+    // Modem FS cleared by the power cycle; next CFSWFILE writes the
+    // CA + (if mTLS) the client cert+key from a clean slate.
+    _hasCACert = false;
+    _hasClientCertOnModem = false;
     writeCACert();
     if (!networkConnect()) return false;
   } else if (smState != 0) {
@@ -507,17 +688,77 @@ bool Cellular::mqttConnect() {
   modem.sendAT("+SMCONF=\"CLIENTID\",\"", devName, "\"");
   if (modem.waitResponse() != 1) { Log::error(TAG, "MQTT ClientID failed"); return false; }
 
-  modem.sendAT("+SMCONF=\"USERNAME\",\"", user, "\"");
-  if (modem.waitResponse() != 1) { Log::error(TAG, "MQTT Username failed"); return false; }
+  // mTLS detection: NVS holds a client cert AND we already wrote (or
+  // can now write) the matching cert+key onto the modem FS. Skip the
+  // upload if the cache flag says it is already there from a prior
+  // session - the modem FS persists across SMDISC, just not across
+  // a hardware power cycle (handled by hardReset / modemSoftReset).
+  bool wantMTLS = MQTTClient::hasClientCert() && _hasCACert;
+  if (wantMTLS && !_hasClientCertOnModem) {
+    if (writeClientCert()) {
+      _hasClientCertOnModem = true;
+    } else {
+      Log::warn(TAG, "Client cert upload failed - falling back to user/pass");
+      wantMTLS = false;
+    }
+  }
 
-  modem.sendAT("+SMCONF=\"PASSWORD\",\"", password, "\"");
-  if (modem.waitResponse() != 1) { Log::error(TAG, "MQTT Password failed"); return false; }
+  if (!wantMTLS) {
+    modem.sendAT("+SMCONF=\"USERNAME\",\"", user, "\"");
+    if (modem.waitResponse() != 1) { Log::error(TAG, "MQTT Username failed"); return false; }
+
+    modem.sendAT("+SMCONF=\"PASSWORD\",\"", password, "\"");
+    if (modem.waitResponse() != 1) { Log::error(TAG, "MQTT Password failed"); return false; }
+  } else {
+    // The modem retains SMCONF entries across SMDISC, so a previous
+    // user/pass cycle leaves USERNAME/PASSWORD set. Brokers using
+    // use_identity_as_username (mTLS-only ACLs) reject the connect
+    // when both cert AND user/pass arrive. Clear them explicitly.
+    modem.sendAT("+SMCONF=\"USERNAME\",\"\"");
+    modem.waitResponse();
+    modem.sendAT("+SMCONF=\"PASSWORD\",\"\"");
+    modem.waitResponse();
+    Log::info(TAG, "mTLS active - using client cert (no user/pass)");
+  }
 
   // TLS 1.2
   modem.sendAT("+CSSLCFG=\"SSLVERSION\",0,3");
   modem.waitResponse();
 
-  if (_hasCACert) {
+  if (wantMTLS) {
+    // CSSLCFG CONVERT slot semantics on SIM7080G (fw 1951B17 verified):
+    //   type 1 = client certificate, takes 4-arg form with separate
+    //            key filename: CONVERT,1,"<cert>","<key>"
+    //   type 2 = CA list (single PEM file)
+    // Sequence + filenames mirror the LilyGo SIMCom samples (AWS IoT +
+    // ATT mosquitto) - bench-validated wedge pattern; using SMSSL=2 +
+    // a concatenated cert/key file aborted the TLS handshake mid-way
+    // even though CONVERT 2 returned OK. The 4-arg CONVERT 1 flow with
+    // separate cert/key files is what the modem actually wires through
+    // to mbedtls for client auth.
+    modem.sendAT("+CSSLCFG=\"CONVERT\",2,\"server-ca.crt\"");
+    if (modem.waitResponse() != 1) { Log::error(TAG, "CA convert failed"); return false; }
+
+    modem.sendAT("+CSSLCFG=\"CONVERT\",1,\"client.crt\",\"client.key\"");
+    if (modem.waitResponse() != 1) { Log::error(TAG, "Client cert convert failed"); return false; }
+
+    // Optional SNI: AWS IoT + Cloudflare-fronted brokers need it to
+    // route to the right backend. Mosquitto direct (no SNI required)
+    // ignores it harmlessly. CSSLCFG SNI is per-CTX (index 0 = default
+    // SSL context, the one SMSSL drives).
+    char sniCmd[160];
+    snprintf(sniCmd, sizeof(sniCmd), "+CSSLCFG=\"sni\",0,\"%s\"", broker);
+    modem.sendAT(sniCmd);
+    modem.waitResponse();
+
+    // SMSSL mode 1 with both CA + client cert filenames = mutual TLS.
+    // Mode 1 is the catch-all "verify server + present client cert if
+    // configured" knob on this fw rev; mode 2 has different semantics
+    // and bench-failed the handshake. The client-cert side is wired
+    // by the prior CSSLCFG CONVERT 1 call referencing client.crt + key.
+    modem.sendAT("+SMSSL=1,\"server-ca.crt\",\"client.crt\"");
+    if (modem.waitResponse() != 1) { Log::error(TAG, "mTLS SSL attach failed"); return false; }
+  } else if (_hasCACert) {
     modem.sendAT("+CSSLCFG=\"CONVERT\",2,\"server-ca.crt\"");
     if (modem.waitResponse() != 1) { Log::error(TAG, "CA convert failed"); return false; }
 
@@ -532,8 +773,11 @@ bool Cellular::mqttConnect() {
   Log::info(TAG, "Connecting MQTT...");
   modem.sendAT("+SMCONN");
   if (waitChunked(30000UL) != 1) {
-    String tail = drainModemTail();
-    char line[256];
+    // SIM7080G emits the actual cause (CME/SSL error) hundreds of ms
+    // to a few seconds after the bare ERROR; 5 s window catches the
+    // full chatter so the log line carries the real reason.
+    String tail = drainModemTail(5000UL);
+    char line[384];
     snprintf(line, sizeof(line), "MQTT connect failed: %s", tail.c_str());
     Log::error(TAG, line);
     return false;
@@ -877,6 +1121,14 @@ void Cellular::begin() {
   if (_started) return;  // already fully initialised
   Log::info(TAG, "Starting cellular path...");
 
+  // Wire the MQTTClient cert-cleared hook so cert.clear from any path
+  // (Shell, MQTT CLI, WS) drops our modem-side cache + active session
+  // and triggers a reconnect under the new auth mode. Idempotent -
+  // begin() is gated by _started so this fires once per boot.
+  MQTTClient::setOnClientCertCleared([]() {
+    Cellular::invalidateClientCert();
+  });
+
   if (!powerOn()) {
     Log::error(TAG, "Modem powerOn failed - aborting cellular bring-up");
     return;
@@ -916,13 +1168,16 @@ void Cellular::begin() {
 
   writeCACert();
 
-  // Retry network + MQTT until both succeed.
+  // Retry network + MQTT until both succeed. Both loops yield the AT
+  // bus + pump shell during the sleep so a stuck retry phase does not
+  // freeze the main loop (otherwise cell.at / cell.cert.* / restart
+  // commands cannot be entered while we hammer the broker).
   while (!networkConnect()) {
     Log::warn(TAG, "Network connect failed, retry in 10s");
-    for (int i = 0; i < 20; ++i) { delay(500); esp_task_wdt_reset(); }
+    g.pause(10000UL);
   }
   while (!mqttConnect()) {
-    mqttBackoffWait();
+    mqttBackoffWait(&g);
   }
   mqttBackoffReset();
 
@@ -976,10 +1231,15 @@ void Cellular::loop() {
     _mqttConnected = false;
     while (!networkConnect()) {
       Log::warn(TAG, "Retry network in 10s");
-      for (int i = 0; i < 20; ++i) { delay(500); esp_task_wdt_reset(); }
+      // Release the AT bus + pump shell during the sleep so restart /
+      // cell.* / config.* commands stay reachable while we hammer
+      // re-registration. Without this the main loop is frozen until
+      // the modem recovers, and a stuck modem can require a physical
+      // power cycle to escape.
+      g.pause(10000UL);
     }
     while (!mqttConnect()) {
-      mqttBackoffWait();
+      mqttBackoffWait(&g);
     }
     mqttBackoffReset();
     _mqttConnected = true;
@@ -997,7 +1257,7 @@ void Cellular::loop() {
       _mqttConnected = true;
       mqttBackoffReset();
     } else {
-      mqttBackoffWait();
+      mqttBackoffWait(&g);
     }
   } else if (!_mqttConnected) {
     // Modem session is up but our flag drifted false (e.g. a slow SMPUB

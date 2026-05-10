@@ -35,6 +35,17 @@ public:
     explicit ATGuard(uint32_t timeoutMs = 30000);
     ~ATGuard();
     bool ok() const { return _held; }
+    // Temporarily release the AT bus mutex for ~pauseMs and re-acquire
+    // before returning. The chunked sleep inside also pumps the shell
+    // console + task watchdog, so commands typed during the pause
+    // (cell.at, etc) can run interleaved instead of starving the main
+    // loop. Caller MUST NOT issue any AT commands or touch Serial1
+    // while paused. No-op if the guard does not currently hold the
+    // mutex (best-effort - caller still gets the requested delay).
+    // Re-acquire budget is fixed at 60 s; if another holder won't
+    // release in that window, pause() returns with _held=false and
+    // ok() will reflect the loss.
+    void pause(uint32_t pauseMs);
     ATGuard(const ATGuard&) = delete;
     ATGuard& operator=(const ATGuard&) = delete;
   private:
@@ -117,6 +128,14 @@ public:
   // Cellular::loop, after any TinyGSM AT traffic for this tick is done.
   static void pumpInbound();
 
+  // Drop the modem-side cached client cert (next mqttConnect re-uploads
+  // from current NVS or falls back to user/pass if NVS is now empty)
+  // AND tear down any active modem-MQTT session so it reconnects under
+  // the new auth mode. Wired to MQTTClient::setOnClientCertCleared in
+  // begin(); also safe to call directly. No-op if cellular MQTT was
+  // never up.
+  static void invalidateClientCert();
+
   // GNSS fix acquisition. The SIM7080G time-shares its radio
   // between LTE and GNSS - while CGNSPWR=1 the LTE data path is suspended,
   // so any modem-native MQTT publish issued during that window fails. The
@@ -140,6 +159,12 @@ private:
   static void initPMU();
   static bool wakeModem();
   static bool writeCACert();
+  // Upload the NVS-stored MQTT client cert + key as a single concatenated
+  // PEM file (`client.crt` on the modem FS) for SIM7080 mTLS. Mirrors
+  // writeCACert's CFSWFILE chunked write. Returns false if NVS is empty
+  // or any AT step fails - caller falls back to non-mTLS path. Safe to
+  // call only when an ATGuard is held by an outer scope.
+  static bool writeClientCert();
   static bool networkConnect();
   static bool mqttConnect();
   static bool isRegistered();
@@ -194,6 +219,14 @@ private:
   static bool     _mqttConnected;
   static bool     _publishGate;
   static bool     _hasCACert;
+  // True once the NVS client cert + key have been uploaded to the modem
+  // FS (`client.crt`) and CSSLCFG-converted. Reset to false on
+  // hardReset / modemSoftReset (modem FS clears across power cycle) and
+  // on cert.clear via the MQTTClient cert-cleared hook. mqttConnect
+  // re-uploads on the next cycle when the flag is false and NVS still
+  // has a cert - cheap one-shot cache, avoids the 4-8 KB AT FS write
+  // on every reconnect.
+  static bool     _hasClientCertOnModem;
   static int      _signalQuality;
   static uint32_t _lastSignalSample;
   static uint32_t _lastSmpubMs;     // 1 Hz rate-limit on AT+SMPUB

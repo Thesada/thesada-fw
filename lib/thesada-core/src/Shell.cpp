@@ -202,6 +202,98 @@ void Shell::listCommands(ShellOutput out) {
   }
 }
 
+// Categorised help. With nullptr / empty filter: enumerate dot-prefix
+// categories (each shown once with command count) + emit no-dot
+// commands inline so `restart`, `version`, etc remain discoverable.
+// With filter "cell": print every command whose first dot-token equals
+// "cell", showing full name + help text.
+//
+// Buckets are derived on the fly (no separate registry) - any newly
+// registered cell.* / net.* / etc command shows up automatically.
+void Shell::printHelp(const char* filter, ShellOutput out) {
+  bool listing = (filter != nullptr && filter[0] != '\0');
+
+  if (listing) {
+    // Filter mode: dump every command whose first dot-token matches.
+    size_t flen = strlen(filter);
+    char header[64];
+    snprintf(header, sizeof(header), "%s.* commands:", filter);
+    out(header);
+    int hits = 0;
+    for (int i = 0; i < _commandCount; i++) {
+      const char* name = _commands[i].name;
+      const char* dot  = strchr(name, '.');
+      // Match if name starts with filter AND either filter is the full
+      // command (no-dot match) or filter ends right at the first '.'.
+      bool match = false;
+      if (dot) {
+        if ((size_t)(dot - name) == flen && strncasecmp(name, filter, flen) == 0) match = true;
+      } else if (strcasecmp(name, filter) == 0) {
+        match = true;
+      }
+      if (!match) continue;
+      char line[128];
+      snprintf(line, sizeof(line), "  %-20s %s", name, _commands[i].help);
+      out(line);
+      hits++;
+    }
+    if (hits == 0) {
+      out("  (no commands in that category - try `help` for the list)");
+    }
+    return;
+  }
+
+  // Bucket mode: dedupe categories, count members. Tracks at most
+  // MAX_COMMANDS distinct prefixes which is more than we will ever
+  // hit (one bucket per command at worst).
+  out("thesada-fw shell - commands grouped by category");
+  out("type `help <category>` to expand (e.g. `help cell`)");
+  out("");
+  out("Categories:");
+
+  char    seen[MAX_COMMANDS][20];
+  int     counts[MAX_COMMANDS] = {0};
+  int     bucketCount = 0;
+
+  for (int i = 0; i < _commandCount; i++) {
+    const char* name = _commands[i].name;
+    const char* dot  = strchr(name, '.');
+    if (!dot) continue;
+    size_t pfxLen = dot - name;
+    if (pfxLen >= sizeof(seen[0])) pfxLen = sizeof(seen[0]) - 1;
+    int found = -1;
+    for (int j = 0; j < bucketCount; j++) {
+      if (strncmp(seen[j], name, pfxLen) == 0 && seen[j][pfxLen] == '\0') {
+        found = j; break;
+      }
+    }
+    if (found < 0) {
+      if (bucketCount >= MAX_COMMANDS) continue;
+      memcpy(seen[bucketCount], name, pfxLen);
+      seen[bucketCount][pfxLen] = '\0';
+      counts[bucketCount] = 1;
+      bucketCount++;
+    } else {
+      counts[found]++;
+    }
+  }
+  for (int j = 0; j < bucketCount; j++) {
+    char line[64];
+    snprintf(line, sizeof(line), "  %-12s (%d cmd%s)",
+             seen[j], counts[j], counts[j] == 1 ? "" : "s");
+    out(line);
+  }
+
+  out("");
+  out("Top-level:");
+  for (int i = 0; i < _commandCount; i++) {
+    if (strchr(_commands[i].name, '.')) continue;
+    char line[128];
+    snprintf(line, sizeof(line), "  %-20s %s", _commands[i].name, _commands[i].help);
+    out(line);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Filesystem commands
 // ---------------------------------------------------------------------------
@@ -367,9 +459,25 @@ static void cmd_format(int argc, char** argv, ShellOutput out) {
 // Config commands
 // ---------------------------------------------------------------------------
 
-// Read a config value by dot-notation key
+// Parse `tok` as an unsigned integer for use as a JsonArray index.
+// in:  tok    candidate token string
+// out: bool   true if every char is a digit (and at least one digit), idx filled
+static bool parseArrayIndex(const char* tok, size_t& idx) {
+  if (!tok || !*tok) return false;
+  size_t v = 0;
+  for (const char* p = tok; *p; ++p) {
+    if (*p < '0' || *p > '9') return false;
+    v = v * 10 + (size_t)(*p - '0');
+  }
+  idx = v;
+  return true;
+}
+
+// Read a config value by dot-notation key. Supports array indices
+// (e.g. wifi.networks.0.ssid - "0" descends into the JsonArray returned
+// by wifi.networks).
 static void cmd_config_get(int argc, char** argv, ShellOutput out) {
-  if (argc < 2) { out("Usage: config.get <key>  (dot notation, e.g. mqtt.broker)"); return; }
+  if (argc < 2) { out("Usage: config.get <key>  (dot notation, e.g. wifi.networks.0.ssid)"); return; }
 
   JsonObject cfg = Config::get();
   JsonVariant current = cfg;
@@ -380,7 +488,12 @@ static void cmd_config_get(int argc, char** argv, ShellOutput out) {
 
   char* token = strtok(key, ".");
   while (token) {
-    if (current.is<JsonObject>()) {
+    size_t idx;
+    if (current.is<JsonArray>() && parseArrayIndex(token, idx)) {
+      JsonArray arr = current.as<JsonArray>();
+      if (idx >= arr.size()) { out("Array index out of range"); return; }
+      current = arr[idx];
+    } else if (current.is<JsonObject>()) {
       current = current[token];
     } else {
       out("Key not found");
@@ -440,44 +553,90 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
     JsonVariant parent = doc.as<JsonVariant>();
     char* token = strtok(key, ".");
     while (token) {
-      if (!parent.is<JsonObject>()) {
+      size_t idx;
+      if (parent.is<JsonArray>() && parseArrayIndex(token, idx)) {
+        JsonArray arr = parent.as<JsonArray>();
+        if (idx >= arr.size()) { out("Parent array index out of range"); return; }
+        parent = arr[idx];
+      } else if (parent.is<JsonObject>()) {
+        // Auto-create missing intermediate objects so config.set can land
+        // a value into a section that does not exist yet (e.g. enabling a
+        // brand-new optional module like gnss). Does not auto-create
+        // arrays - explicit `config.set foo.bar []` does that.
+        if (parent[token].isNull()) {
+          parent[token].to<JsonObject>();
+        }
+        parent = parent[token];
+      } else {
         out("Parent key not found");
         return;
       }
-      // Auto-create missing intermediate objects so config.set can land
-      // a value into a section that does not exist yet (e.g. enabling a
-      // brand-new optional module like gnss).
-      if (parent[token].isNull()) {
-        parent[token].to<JsonObject>();
-      }
-      parent = parent[token];
       token = strtok(nullptr, ".");
     }
 
-    if (!parent.is<JsonObject>()) { out("Parent is not an object"); return; }
+    // Resolve a writable target for the final key. JsonObject member
+    // assignment + JsonArray index assignment use different ArduinoJson
+    // APIs; capture the destination as a JsonVariant once so the value
+    // detection below is target-agnostic.
+    JsonVariant target;
+    size_t finalIdx;
+    if (parent.is<JsonArray>() && parseArrayIndex(finalKey, finalIdx)) {
+      JsonArray arr = parent.as<JsonArray>();
+      if (finalIdx >= arr.size()) { out("Array index out of range"); return; }
+      target = arr[finalIdx];
+    } else if (parent.is<JsonObject>()) {
+      target = parent[finalKey];
+    } else {
+      out("Parent is not an object or array");
+      return;
+    }
 
     // Delete key if value is "--delete"
     if (value == "--delete") {
-      parent[finalKey].clear();
-      parent.as<JsonObject>().remove(finalKey);
-      // Write back + reload below
+      if (parent.is<JsonObject>()) {
+        parent[finalKey].clear();
+        parent.as<JsonObject>().remove(finalKey);
+      } else {
+        // For arrays we set the slot to null; remove() would shift
+        // indices and silently break sibling references.
+        target.clear();
+      }
       goto save;
     }
 
+    // JSON literal? Parse and assign as a Variant so config.set
+    // wifi.networks [{"ssid":"..."}] stores a real JsonArray, not a
+    // stringified blob (the prior fallthrough behaviour).
+    {
+      String trimmed = value;
+      trimmed.trim();
+      if (trimmed.length() > 0 &&
+          (trimmed.charAt(0) == '{' || trimmed.charAt(0) == '[')) {
+        JsonDocument lit;
+        DeserializationError lerr = deserializeJson(lit, trimmed);
+        if (!lerr) {
+          target.set(lit.as<JsonVariant>());
+          goto save;
+        }
+        // Parse failed - fall through to scalar detection. The user
+        // probably typed a string that just happens to start with `{`.
+      }
+    }
+
     // Try to detect type: number, boolean, or string.
-    if (value == "true") parent[finalKey] = true;
-    else if (value == "false") parent[finalKey] = false;
+    if (value == "true") target.set(true);
+    else if (value == "false") target.set(false);
     else {
       char* end;
       long lv = strtol(value.c_str(), &end, 10);
       if (*end == '\0' && value.length() > 0) {
-        parent[finalKey] = lv;
+        target.set(lv);
       } else {
         float fv = strtof(value.c_str(), &end);
         if (*end == '\0' && value.length() > 0) {
-          parent[finalKey] = fv;
+          target.set(fv);
         } else {
-          parent[finalKey] = value;
+          target.set(value);
         }
       }
     }
@@ -1164,11 +1323,14 @@ static void cmd_version(int argc, char** argv, ShellOutput out) {
   out(line);
 }
 
-// Show all available shell commands
+// Show shell commands. With no arg: collapse dotted commands into
+// category buckets (cell.*, fs.*, etc) and list each bucket once with
+// a count, plus all top-level (no-dot) commands inline. With an arg:
+// expand that bucket only (so `help cell` shows every cell.* command
+// with its description). Avoids the multi-screen wall the flat list
+// became as command count grew.
 static void cmd_help(int argc, char** argv, ShellOutput out) {
-  out("thesada-fw shell");
-  out("");
-  Shell::listCommands(out);
+  Shell::printHelp(argc > 1 ? argv[1] : nullptr, out);
 }
 
 // Unified sensors command backed by SensorRegistry. Modules self-register
@@ -1331,7 +1493,7 @@ static void cmd_selftest(int argc, char** argv, ShellOutput out) {
 // Register all built-in shell commands
 void Shell::registerBuiltins() {
   // System
-  registerCommand("help",          "Show all commands",             cmd_help);
+  registerCommand("help",          "Show categories or expand one (help <cat>)", cmd_help);
   registerCommand("version",       "Firmware version and build",    cmd_version);
   registerCommand("restart",       "Reboot device",                 cmd_restart);
   registerCommand("heap",          "Free heap memory",              cmd_heap);

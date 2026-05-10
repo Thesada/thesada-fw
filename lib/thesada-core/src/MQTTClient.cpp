@@ -29,7 +29,15 @@
 static const char* CERT_NS        = "thesada-tls";
 static const char* CERT_KEY_CERT  = "client_cert";
 static const char* CERT_KEY_KEY   = "client_key";
-static constexpr size_t CERT_MAX_LEN = 4000;  // ESP32 NVS blob size limit
+// CERT_MAX_LEN is now MQTTClient::CERT_MAX_LEN (header) so transports
+// that load via loadClientCert can size buffers without copy-pasting
+// the constant. ESP32 NVS string blob limit drives the value.
+
+// Optional hook fired after a successful clearClientCert. Cellular
+// installs one at bring-up so the modem-side cert cache invalidates
+// and any live SMCONN session drops. nullptr when no transport
+// registered an interest.
+static std::function<void()> _onCertClearedHook = nullptr;
 
 static const char* TAG = "MQTT";
 
@@ -1691,6 +1699,8 @@ bool MQTTClient::loadClientCert(char* cert, char* key, size_t maxLen) {
 }
 
 // Erase client cert + key from NVS. Safe to call when absent.
+// Fires the cert-cleared hook after the rows are gone so cellular (or
+// any other transport) can drop its cached upload + active session.
 // out: true if both keys were cleared (or were already absent)
 bool MQTTClient::clearClientCert() {
   Preferences prefs;
@@ -1698,7 +1708,14 @@ bool MQTTClient::clearClientCert() {
   prefs.remove(CERT_KEY_CERT);
   prefs.remove(CERT_KEY_KEY);
   prefs.end();
+  if (_onCertClearedHook) _onCertClearedHook();
   return true;
+}
+
+// Register a callback fired from clearClientCert. Idempotent; pass
+// nullptr to drop the hook. See header for full contract.
+void MQTTClient::setOnClientCertCleared(std::function<void()> fn) {
+  _onCertClearedHook = fn;
 }
 
 // True if both cert and key are present in NVS (non-zero length).

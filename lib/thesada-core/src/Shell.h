@@ -79,6 +79,12 @@ public:
   // Tab completion / help for a partial command. Returns matching commands.
   static void listCommands(ShellOutput out);
 
+  // Categorised help: nullptr / empty filter shows category buckets +
+  // ungrouped commands; filter "cell" shows every cell.* command with
+  // its description. Backs the `help` shell command. Splits dotted
+  // names on the first '.' for grouping.
+  static void printHelp(const char* filter, ShellOutput out);
+
   // Drain `Serial` for any bytes the host has typed and execute newline-
   // terminated lines via `execute()`. Same buffer state is shared across
   // every caller (it is the singleton USB-CDC / UART0 console), so this
@@ -87,7 +93,7 @@ public:
   static void pumpConsole();
 
   // Max commands
-  static constexpr int MAX_COMMANDS = 40;
+  static constexpr int MAX_COMMANDS = 56;
 
   // Deferred-execution ring depth. 4 slots covers concurrent serial + WS +
   // MQTT CLI bursts without runaway memory. Bump if "shell busy" starts
