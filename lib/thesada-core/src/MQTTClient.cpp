@@ -137,6 +137,7 @@ std::vector<String> MQTTClient::_retainedTopics;
 bool     MQTTClient::_manifestPublished    = false;
 bool     MQTTClient::_manifestDirty        = false;
 uint32_t MQTTClient::_manifestDirtySinceMs = 0;
+bool     MQTTClient::_retainedPublishedThisSession = false;
 
 // Cellular fallback hint - see header. When true, publish() drops on a
 // WiFi disconnect instead of enqueueing.
@@ -184,6 +185,11 @@ void MQTTClient::setFallbackPublishing(bool active) {
     s_fallbackStartMs = millis();
   } else if (!active) {
     s_fallbackStartMs = 0;
+    // Yielding back to WiFi: clear the cellular-side republish guard so
+    // the next cellular handoff republishes the retained set. WiFi
+    // reconnect will run publishRetainedSet(true) via connect() and
+    // re-set the flag.
+    _retainedPublishedThisSession = false;
   }
   s_fallbackPublishing = active;
 }
@@ -474,13 +480,10 @@ void MQTTClient::connect() {
     _manifestDirty        = false;
     _manifestDirtySinceMs = 0;
 
-    // Publish online status (retained) - LWT handles offline
-    _client.publish(availTopic, "online", true);
-    recordRetainedTopic(availTopic);
     resubscribeAll();
-    publishDiscovery();
-    publishDeviceInfo();
-    publishRetainedManifest();
+    // WiFi reconnect always republishes the retained set (force=true) so
+    // a stale cellular-side flag does not block the WiFi-side refresh.
+    publishRetainedSet(true);
     flushQueue();
   } else {
     char err[64];
@@ -782,6 +785,39 @@ void MQTTClient::publishRetainedManifest() {
   _manifestDirty        = false;
   _manifestDirtySinceMs = 0;
   Log::info(TAG, (String("retained-topics manifest: ") + _retainedTopics.size() + " entries").c_str());
+}
+
+// ---------------------------------------------------------------------------
+
+// Republish the device's full retained-state set: availability "online", HA
+// discovery configs, /info, retained-topics manifest. Routes through
+// publishRetained so the cellular forwarder picks it up when WiFi MQTT is
+// down.
+//
+// Called from connect() (WiFi reconnect, force=true) and from
+// CellularModule on the STANDBY -> ACTIVE transition (force=false).
+// The session flag prevents republishing on every cellular STANDBY -> ACTIVE
+// bounce within a single fallback window; setFallbackPublishing(false)
+// clears it so a fresh fallback window republishes.
+//
+// in:  force - skip the session-flag check.
+// out: none.
+void MQTTClient::publishRetainedSet(bool force) {
+  if (!_client.connected() && !s_fallbackPublishing) return;
+  if (!force && _retainedPublishedThisSession) return;
+
+  JsonObject cfg = Config::get();
+  const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+
+  char availTopic[64];
+  snprintf(availTopic, sizeof(availTopic), "%s/status", prefix);
+  publishRetained(availTopic, "online");
+
+  publishDiscovery();
+  publishDeviceInfo();
+  publishRetainedManifest();
+
+  _retainedPublishedThisSession = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1239,11 +1275,12 @@ void MQTTClient::publishDiscovery() {
 
     char payload[640];
     serializeJson(doc, payload, sizeof(payload));
-    _client.publish(topic, (const uint8_t*)payload, strlen(payload), true);
-    recordRetainedTopic(topic);
+    publishRetained(topic, payload);
     // Drain TCP buffer between retained publishes. Without this, small
     // MQTT buffers (CYD 1024B) overflow and spam EAGAIN socket errors.
-    _client.loop();
+    // Cellular forwarder serializes via ATGuard so the loop()/yield is a
+    // no-op on that path but harmless.
+    if (_client.connected()) _client.loop();
     yield();
   };
 
@@ -1494,7 +1531,9 @@ static void sha256File(const char* path, char* out) {
 }
 
 void MQTTClient::publishDeviceInfo() {
-  if (!_client.connected()) return;
+  // No transport gate here - publishRetained handles WiFi-vs-cellular
+  // routing. Drops only if neither transport is available.
+  if (!_client.connected() && !s_fallbackPublishing) return;
 
   JsonObject cfg = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
@@ -1575,8 +1614,7 @@ void MQTTClient::publishDeviceInfo() {
 
   char topic[96];
   snprintf(topic, sizeof(topic), "%s/info", prefix);
-  _client.publish(topic, payload, true);
-  recordRetainedTopic(topic);
+  publishRetained(topic, payload);
 }
 
 // ---------------------------------------------------------------------------

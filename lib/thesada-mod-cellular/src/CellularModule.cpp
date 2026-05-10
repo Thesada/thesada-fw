@@ -209,6 +209,12 @@ void CellularModule::loop() {
         // Tell MQTTClient to stop enqueueing during the WiFi outage; cellular
         // is now shipping the same data via EventBus.
         MQTTClient::setFallbackPublishing(true);
+        // Republish retained state (availability "online", HA discovery,
+        // /info, retained manifest) over the cellular leg so cellular-only
+        // sessions converge to the same broker-side state as WiFi sessions.
+        // Session-flag inside publishRetainedSet guards against repeats on
+        // STANDBY -> ACTIVE bouncing within one fallback window.
+        MQTTClient::publishRetainedSet();
         emitActive(1);
       } else {
         // begin() did not bring MQTT up. Drop back to STANDBY and reset
