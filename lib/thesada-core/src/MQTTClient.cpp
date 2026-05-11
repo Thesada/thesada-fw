@@ -1124,9 +1124,15 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
       goto cleanup;
     }
 
-    // Build command line: "<cmd> <payload>"
+    // Build command line: "<cmd> <payload>". An empty JSON object payload
+    // is treated as no-arg - the platform side substitutes "{}" for empty
+    // payloads as a SIM7080G workaround (empty SMSUB URCs get silently
+    // dropped on cellular), and Shell command handlers should not see
+    // that substitution as a literal argument.
     char line[1024];
-    if (payload && plen > 0) {
+    bool isEmptyJson =
+      payload && plen == 2 && payload[0] == '{' && payload[1] == '}';
+    if (payload && plen > 0 && !isEmptyJson) {
       snprintf(line, sizeof(line), "%s %s", cmd, payload);
     } else {
       snprintf(line, sizeof(line), "%s", cmd);
