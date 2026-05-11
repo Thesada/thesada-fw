@@ -578,12 +578,25 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
     // assignment + JsonArray index assignment use different ArduinoJson
     // APIs; capture the destination as a JsonVariant once so the value
     // detection below is target-agnostic.
+    //
+    // Append semantics on arrays: if the terminal index equals
+    // arr.size() the slot is appended via arr.add<JsonVariant>() so
+    // numeric-suffix config.set paths naturally extend an array. Strict
+    // idx > size rejection still prevents a sparse array from ever
+    // forming.
     JsonVariant target;
     size_t finalIdx;
     if (parent.is<JsonArray>() && parseArrayIndex(finalKey, finalIdx)) {
       JsonArray arr = parent.as<JsonArray>();
-      if (finalIdx >= arr.size()) { out("Array index out of range"); return; }
-      target = arr[finalIdx];
+      if (finalIdx > arr.size()) {
+        out("Array index out of range (would leave hole)");
+        return;
+      }
+      if (finalIdx == arr.size()) {
+        target = arr.add<JsonVariant>();
+      } else {
+        target = arr[finalIdx];
+      }
     } else if (parent.is<JsonObject>()) {
       target = parent[finalKey];
     } else {
