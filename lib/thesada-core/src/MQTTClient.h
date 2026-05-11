@@ -104,6 +104,19 @@ public:
   // preserved untouched until WiFi MQTT comes back.
   static void setFallbackPublishing(bool active);
 
+  // Publish the retained-state set this device owns: availability "online",
+  // HA discovery configs, /info, retained-topics manifest. Routes through
+  // publishRetained so the cellular forwarder picks it up when WiFi MQTT
+  // is down. Called from connect() on WiFi reconnect (force=true) and
+  // from CellularModule on the transition to ACTIVE so cellular-only
+  // sessions converge to the same broker-side state as WiFi sessions.
+  // The session-flag check guards against republishing on every cellular
+  // STANDBY -> ACTIVE bounce within a single fallback window; it clears
+  // on setFallbackPublishing(false) so a new fallback window republishes.
+  // in: force - skip the session-flag check (WiFi reconnect always republishes).
+  // out: none.
+  static void publishRetainedSet(bool force = false);
+
   // Register a fallback publish forwarder. Cellular installs one on
   // bring-up that wraps Cellular::publish; when WiFi MQTT is down and
   // fallback publishing is active, MQTTClient::publish calls the
@@ -149,6 +162,7 @@ private:
   static bool     _manifestPublished;     // initial manifest emitted at least once
   static bool     _manifestDirty;         // a topic was added after last emit
   static uint32_t _manifestDirtySinceMs;  // first dirty-set timestamp for debounce
+  static bool     _retainedPublishedThisSession;  // gate cellular republish bouncing
   static void recordRetainedTopic(const char* topic);
   static void publishRetainedManifest();
 
