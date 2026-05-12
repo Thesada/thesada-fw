@@ -1,0 +1,21 @@
+# Partition table for bare ESP32-S3 modules with 8 MB flash (GD25Q64).
+# Used by [env:esp32-s3-debug] and [env:esp32-s3-debug-rescue].
+#
+# Layout:
+#   - nvs       20 KB     device cert + WiFi creds + sensor calibration
+#   - otadata    8 KB     OTA boot selector (must be 0x2000)
+#   - app0       3.25 MB  primary OTA slot
+#   - app1       3.25 MB  secondary OTA slot
+#   - spiffs     1.375 MB littlefs
+#   - coredump   64 KB    post-panic forensics
+# Total: 0x800000 = 8 MB exactly. Mirrors partitions_owb_16mb.csv structure
+# (minus the larger app/spiffs) so a successful OTA migration on this bench
+# validates the same path for the OWB 16 MB rollout.
+# Factory rescue partition intentionally omitted (separate follow-up).
+# Name,     Type, SubType,  Offset,    Size,     Flags
+nvs,        data, nvs,      0x9000,    0x5000,
+otadata,    data, ota,      0xe000,    0x2000,
+app0,       app,  ota_0,    0x10000,   0x340000,
+app1,       app,  ota_1,    0x350000,  0x340000,
+spiffs,     data, spiffs,   0x690000,  0x160000,
+coredump,   data, coredump, 0x7f0000,  0x10000,
