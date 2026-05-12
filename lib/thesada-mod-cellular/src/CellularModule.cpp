@@ -30,6 +30,7 @@
 #include <ArduinoJson.h>
 #include <ModuleRegistry.h>
 #include <Shell.h>
+#include <algorithm>
 #include <esp_task_wdt.h>
 #include <MQTTClient.h>
 
@@ -163,6 +164,97 @@ void CellularModule::begin() {
       // Chunk the wait + feed TWDT so the 30s task watchdog stays happy.
       for (int i = 0; i < 10; ++i) { delay(500); esp_task_wdt_reset(); }
       Cellular::atPassthrough("+SMSTATE?", 3000, out);
+      out("--- done ---");
+    });
+
+  // cell.http: HTTPS GET via the modem-native SSL socket layer
+  // (TinyGsmClientSecure -> AT+CAOPEN / AT+CASEND / AT+CARECV).
+  //
+  // Why not the SH HTTP service: SIM7080G fw 1951B17 rejects every
+  // executive SH command (SHSSL, SHCONN, ...) with "CME ERROR:
+  // operation not allowed". The lilygo SIM7080G HTTP/HTTPS reference
+  // example uses TinyGsmClientSecure for the same reason; CAOPEN is
+  // the supported HTTPS path on this fw rev.
+  //
+  // Standalone validation tool for the cellular OTA path. Prints body
+  // length + first <=512 bytes of payload so an operator can verify
+  // the manifest fetch end-to-end before the C++ wrapper is wired into
+  // OTAUpdate.
+  Shell::registerCommand("cell.http",
+    "HTTPS GET via modem-native SSL socket (cell.http <url>)",
+    [](int argc, char** argv, ShellOutput out) {
+      if (argc < 2) { out("usage: cell.http <https-url>"); return; }
+      const char* url = argv[1];
+
+      // Parse host + path + port from URL.
+      const char* p = url;
+      uint16_t port = 443;
+      if (strncmp(p, "https://", 8) == 0) { p += 8; port = 443; }
+      else if (strncmp(p, "http://", 7) == 0) { p += 7; port = 80; }
+      char host[128];
+      const char* slash = strchr(p, '/');
+      const char* hostEnd = slash ? slash : p + strlen(p);
+      size_t hostLen = hostEnd - p;
+      if (hostLen >= sizeof(host)) { out("host too long"); return; }
+      memcpy(host, p, hostLen);
+      host[hostLen] = '\0';
+      // Port override "host:443/path".
+      char* colon = strchr(host, ':');
+      if (colon) { *colon = '\0'; port = atoi(colon + 1); }
+      const char* path = slash ? slash : "/";
+
+      char msg[200];
+      snprintf(msg, sizeof(msg), "GET https://%s:%u%s", host, port, path);
+      out(msg);
+
+      // Accumulate body into a 1 KB preview buffer; total length comes
+      // from the callback's running sum (works whether server sent a
+      // Content-Length header or used chunked encoding).
+      char     preview[1024];
+      size_t   previewLen = 0;
+      size_t   totalLen   = 0;
+      auto cb = [&](const uint8_t* buf, size_t len) -> bool {
+        totalLen += len;
+        size_t copy = (previewLen < sizeof(preview))
+                        ? std::min(len, sizeof(preview) - previewLen)
+                        : 0;
+        if (copy > 0) {
+          memcpy(preview + previewLen, buf, copy);
+          previewLen += copy;
+        }
+        return true;
+      };
+
+      int status = 0;
+      bool ok = Cellular::httpsGet(host, path, port, cb, &status);
+
+      snprintf(msg, sizeof(msg), "status=%d ok=%d body=%u bytes (preview <=%u)",
+               status, (int)ok, (unsigned)totalLen, (unsigned)previewLen);
+      out(msg);
+
+      if (previewLen > 0) {
+        // Emit preview line-by-line so the shell output stays clean.
+        size_t start = 0;
+        for (size_t i = 0; i < previewLen; ++i) {
+          if (preview[i] == '\n' || preview[i] == '\r') {
+            if (i > start) {
+              char line[256];
+              size_t n = std::min(i - start, sizeof(line) - 1);
+              memcpy(line, preview + start, n);
+              line[n] = '\0';
+              out(line);
+            }
+            start = i + 1;
+          }
+        }
+        if (start < previewLen) {
+          char line[256];
+          size_t n = std::min(previewLen - start, sizeof(line) - 1);
+          memcpy(line, preview + start, n);
+          line[n] = '\0';
+          out(line);
+        }
+      }
       out("--- done ---");
     });
 

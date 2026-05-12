@@ -41,8 +41,8 @@ public:
   static void checkNow();
 
 private:
-  static bool fetchManifest(const char* url, String& version, String& binUrl, String& sha256);
-  static bool applyUpdate(const String& binUrl, const String& expectedSha256);
+  static bool fetchManifest(const char* url, String& version, String& binUrl, String& sha256, size_t& size);
+  static bool applyUpdate(const String& binUrl, const String& expectedSha256, size_t expectedSize);
   static bool isNewer(const char* remote, const char* local);
 
   static uint32_t _lastCheck;

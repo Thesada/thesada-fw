@@ -136,6 +136,53 @@ public:
   // never up.
   static void invalidateClientCert();
 
+  // HTTPS GET via the modem-native SSL socket layer (CAOPEN + CASSL,
+  // wrapped by TinyGsmClientSecure). Used by the cellular-fallback OTA
+  // path so a device with WiFi down can still pull firmware updates.
+  //
+  // Why not the SH HTTP service: SIM7080G firmware 1951B17 implements
+  // SHSSL + SHCONF as test commands but rejects every executive SH call
+  // (SHSSL, SHCONN, SHREQ) with "CME ERROR: operation not allowed". The
+  // lilygo SIM7080G HTTP/HTTPS example uses TinyGsmClientSecure for the
+  // same reason - the socket layer is the supported HTTPS path on this
+  // fw rev. Coexists with the modem-native MQTT (SM) session because
+  // they use independent socket slots.
+  //
+  // Pre-conditions: modem powered, registered, +CNACT slot 0 activated.
+  // The CA cert at /ca.crt on LittleFS must already be uploaded to the
+  // modem FS as `server-ca.crt` (writeCACert handles this on first
+  // begin()). For host validation TinyGsmClientSecure binds the CA via
+  // CSSLCFG slot 0 - same slot MQTT uses for its server-cert auth.
+  //
+  // `writeCallback` is invoked with each chunk of the response BODY
+  // (status line + headers are parsed away). Returning false from the
+  // callback aborts the transfer; the socket is still cleanly closed.
+  //
+  // in:  host         hostname without scheme (e.g. "ota.thesada.app")
+  //      path         path with leading slash (e.g. "/latest/foo.json")
+  //      port         TCP port (443 for HTTPS)
+  //      writeCallback per-chunk body delivery
+  //      rangeStart, rangeEndInclusive  optional Range request bounds.
+  //                   When rangeEndInclusive > 0, the helper adds
+  //                   `Range: bytes=<start>-<end>` to the GET and
+  //                   expects a 206 response. Used by the cellular OTA
+  //                   path to defeat SIM7080G HTTP-session degradation
+  //                   past ~500-900 KB observed on fw 1951B17: each
+  //                   chunk is its own short-lived TLS socket so the
+  //                   modem-internal state resets between requests.
+  // out: httpStatus   HTTP response status code on the wire, or 0 on
+  //                   transport failure (connect / TLS handshake / EOF
+  //                   before status line)
+  // returns: true if the request completed and (when a Content-Length
+  //          was advertised) at least that many body bytes reached the
+  //          callback. false on transport failure, callback abort, or
+  //          short body.
+  static bool httpsGet(const char* host, const char* path, uint16_t port,
+                       std::function<bool(const uint8_t*, size_t)> writeCallback,
+                       int* httpStatus,
+                       size_t rangeStart = 0,
+                       size_t rangeEndInclusive = 0);
+
   // GNSS fix acquisition. The SIM7080G time-shares its radio
   // between LTE and GNSS - while CGNSPWR=1 the LTE data path is suspended,
   // so any modem-native MQTT publish issued during that window fails. The

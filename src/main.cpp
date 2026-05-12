@@ -19,6 +19,9 @@
 #ifdef ENABLE_ETH
 #include <EthModule.h>
 #endif
+#ifdef ENABLE_CELLULAR
+#include <Cellular.h>
+#endif
 
 // Return true if any network transport is connected
 static bool networkConnected() {
@@ -26,6 +29,17 @@ static bool networkConnected() {
   if (EthModule::connected()) return true;
 #endif
   return WiFiManager::connected();
+}
+
+// Return true if any OTA-capable transport is up. Wider than
+// networkConnected(): includes the cellular path so OTAUpdate::loop()
+// still ticks when WiFi is down and the modem holds the link (#220).
+static bool otaTransportUp() {
+  if (networkConnected()) return true;
+#ifdef ENABLE_CELLULAR
+  if (Cellular::connected()) return true;
+#endif
+  return false;
 }
 
 void setup() {
@@ -113,7 +127,7 @@ void loop() {
   // networkConnected() (WiFi/Eth-only) is false. The WiFi-specific
   // reconnect path inside loop() is no-op when WiFi is down.
   MQTTClient::loop();
-  if (networkConnected()) {
+  if (otaTransportUp()) {
     OTAUpdate::loop();
   }
 

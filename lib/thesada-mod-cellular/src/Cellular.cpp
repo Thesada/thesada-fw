@@ -12,6 +12,8 @@
 #include <esp_task_wdt.h>
 #include <Shell.h>
 #include <MQTTClient.h>
+#include <memory>
+#include <new>
 
 // ── TinyGSM ─────────────────────────────────────────────────────────────────
 // TINY_GSM_MODEM_SIM7080 and TINY_GSM_RX_BUFFER=1024 set via build_flags.
@@ -1618,6 +1620,223 @@ void Cellular::pumpInbound() {
       lineLen = 0;
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+
+// HTTPS GET via TinyGsmClientSecure. See header for contract.
+//
+// Coexistence with modem-native MQTT: TinyGsmClientSecure on SIM7080G
+// drives AT+CAOPEN / AT+CASEND / AT+CARECV which use the modem's
+// general-purpose TCP socket slots, while AT+SMCONN holds the dedicated
+// MQTT session on its own internal slot. They do not collide in
+// practice. We still take the AT-bus mutex for the whole call so other
+// AT traffic on this firmware (CSQ probes, cell.at calls, the MQTT
+// pumpInbound URC drain) serialises behind the request.
+//
+// Status-line + header parsing is line-oriented: collect bytes until
+// CRLF, dispatch on the line, switch to body-streaming after the empty
+// line separator. Each body chunk reaches `writeCallback` directly so
+// the caller can stream to Update.write() / mbedtls_sha256_update()
+// without ever buffering the full payload.
+bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
+                        std::function<bool(const uint8_t*, size_t)> writeCallback,
+                        int* httpStatus,
+                        size_t rangeStart, size_t rangeEndInclusive) {
+  if (httpStatus) *httpStatus = 0;
+  if (!_modemAlive) {
+    Log::warn(TAG, "httpsGet: modem not alive");
+    return false;
+  }
+
+  // Generous overall budget: TLS handshake against a CDN can take 8 s,
+  // and a multi-MB firmware download is the eventual caller (typical
+  // 1.5 MB binary @ ~8 KB/s LTE-M = ~3 min). Cap at 15 min so a slow or
+  // stalled cellular link gives up gracefully instead of holding the AT
+  // bus forever.
+  ATGuard g(15UL * 60UL * 1000UL);
+  if (!g.ok()) {
+    Log::warn(TAG, "httpsGet: AT bus busy");
+    return false;
+  }
+
+  // TinyGsmClientSecure holds its rx_buffer (TINY_GSM_RX_BUFFER, 4 KB on
+  // cellular envs) as a member array. Stack-allocating it would consume
+  // half of the 8 KB Arduino loop task stack and risk overflow under a
+  // deep call chain. Heap allocation routes through PSRAM on ESP32-S3
+  // when internal SRAM is tight (CONFIG_SPIRAM_USE_MALLOC + the
+  // arduino-esp32 default policy), leaving the loop stack free.
+  auto* clientPtr = new (std::nothrow) TinyGsmClientSecure(modem, 0);
+  if (!clientPtr) {
+    Log::error(TAG, "httpsGet: heap allocation failed");
+    return false;
+  }
+  std::unique_ptr<TinyGsmClientSecure> clientOwner(clientPtr);
+  TinyGsmClientSecure& client = *clientPtr;
+  client.setTimeout(30000);
+
+  {
+    char msg[200];
+    snprintf(msg, sizeof(msg), "httpsGet: connect %s:%u", host, port);
+    Log::info(TAG, msg);
+  }
+  if (!client.connect(host, port, 30)) {
+    Log::error(TAG, "httpsGet: connect failed");
+    return false;
+  }
+
+  // Build + send GET. Keep request small (well under MTU) so a single
+  // CASEND covers it. Optional Range header for chunked downloads.
+  char rangeHdr[64];
+  rangeHdr[0] = '\0';
+  if (rangeEndInclusive > 0) {
+    snprintf(rangeHdr, sizeof(rangeHdr),
+             "Range: bytes=%u-%u\r\n",
+             (unsigned)rangeStart, (unsigned)rangeEndInclusive);
+  }
+  char req[500];
+  int reqLen = snprintf(req, sizeof(req),
+    "GET %s HTTP/1.1\r\n"
+    "Host: %s\r\n"
+    "Connection: close\r\n"
+    "User-Agent: thesada-fw\r\n"
+    "Accept: */*\r\n"
+    "%s"
+    "\r\n",
+    path, host, rangeHdr);
+  if (reqLen <= 0 || reqLen >= (int)sizeof(req)) {
+    Log::error(TAG, "httpsGet: request buffer overflow");
+    client.stop();
+    return false;
+  }
+  client.write((const uint8_t*)req, reqLen);
+
+  // Read response: status line, headers, then stream body.
+  enum { STATUS, HEADERS, BODY } phase = STATUS;
+  char lineBuf[256];
+  size_t lineLen = 0;
+  int status = 0;
+  int contentLen = -1;  // -1 = unknown / chunked / no header
+  size_t bodyBytes = 0;
+  // Per-stall budget: how long the body loop will wait with zero bytes
+  // available before giving up. Cellular reads can pause briefly at chunk
+  // boundaries (CARECV cycle); a TinyGSM "disconnected" reading needs to
+  // be cross-checked against this rather than trusted blindly, because
+  // TinyGSM on SIM7080G flips its internal connected flag as soon as the
+  // server-side FIN arrives - even when ~1 MB is still buffered modem-side
+  // waiting for CARECV to drain. Empirically a multi-second idle is the
+  // signal we've actually run out of data, not the connected flag.
+  static constexpr uint32_t kBodyIdleTimeoutMs = 15000UL;
+  uint32_t deadline = millis() + 5UL * 60UL * 1000UL;  // 5 min global cap
+  uint32_t lastWdt  = millis();
+  uint32_t lastByte = millis();
+
+  while (millis() < deadline) {
+    // Belt + braces: feed task watchdog every 200 ms even if the body
+    // loop never sleeps. Yield each iteration so the Arduino loop's
+    // other cooperative tasks (USB CDC, Shell pump, etc) get cycles
+    // while we're holding the AT bus for a multi-minute download.
+    if (millis() - lastWdt > 200) {
+      esp_task_wdt_reset();
+      lastWdt = millis();
+    }
+    yield();
+
+    if (phase != BODY) {
+      // Header phase: read line-by-line. Bail if connection drops before
+      // headers complete (server hangup mid-response).
+      if (!client.connected() && !client.available()) {
+        Log::warn(TAG, "httpsGet: disconnected before headers");
+        break;
+      }
+      if (!client.available()) { delay(10); continue; }
+      while (client.available()) {
+        char c = (char)client.read();
+        if (c == '\r') continue;
+        if (c == '\n') {
+          lineBuf[lineLen] = '\0';
+          if (phase == STATUS) {
+            // "HTTP/1.1 200 OK"
+            const char* sp = strchr(lineBuf, ' ');
+            if (sp) status = atoi(sp + 1);
+            if (httpStatus) *httpStatus = status;
+            phase = HEADERS;
+          } else if (phase == HEADERS) {
+            if (lineLen == 0) {
+              // Empty line: header/body separator.
+              phase = BODY;
+              lineLen = 0;
+              lastByte = millis();
+              break;
+            }
+            if (strncasecmp(lineBuf, "content-length:", 15) == 0) {
+              contentLen = atoi(lineBuf + 15);
+            }
+          }
+          lineLen = 0;
+        } else {
+          if (lineLen < sizeof(lineBuf) - 1) lineBuf[lineLen++] = c;
+        }
+      }
+      continue;
+    }
+
+    // Body phase. Trust Content-Length over TinyGSM's connected flag:
+    // exit when we have the full payload, or after kBodyIdleTimeoutMs of
+    // no data when the server hasn't told us how big the body is.
+    if (contentLen > 0 && bodyBytes >= (size_t)contentLen) break;
+
+    // 1024 B per read keeps each CARECV cycle aligned with a full TCP
+    // segment from the modem's socket buffer, reducing the number of
+    // round-trips needed to drain a multi-MB download. Larger reads risk
+    // TinyGSM ring buffer overflow on TINY_GSM_RX_BUFFER (set to 4096
+    // in platformio.ini for the cellular envs).
+    uint8_t chunk[1024];
+    int n = client.read(chunk, sizeof(chunk));
+    if (n > 0) {
+      bodyBytes += n;
+      lastByte = millis();
+      if (writeCallback && !writeCallback(chunk, n)) {
+        Log::warn(TAG, "httpsGet: callback aborted transfer");
+        client.stop();
+        if (httpStatus) *httpStatus = status;
+        return false;
+      }
+      continue;
+    }
+    // No bytes this iteration. Decide between wait and exit.
+    if (millis() - lastByte > kBodyIdleTimeoutMs) {
+      if (contentLen > 0 && bodyBytes < (size_t)contentLen) {
+        char msg[120];
+        snprintf(msg, sizeof(msg),
+                 "httpsGet: body stall %u/%d bytes after %u ms idle - aborting",
+                 (unsigned)bodyBytes, contentLen,
+                 (unsigned)(millis() - lastByte));
+        Log::error(TAG, msg);
+      }
+      break;
+    }
+    delay(20);
+  }
+
+  client.stop();
+
+  if (status == 0) {
+    Log::error(TAG, "httpsGet: no status line received");
+    return false;
+  }
+  {
+    char msg[120];
+    snprintf(msg, sizeof(msg),
+             "httpsGet: done status=%d body=%u bytes (content-length header=%d)",
+             status, (unsigned)bodyBytes, contentLen);
+    Log::info(TAG, msg);
+  }
+  // Treat short body (got fewer bytes than Content-Length declared) as a
+  // transport failure so the OTA caller does not run SHA on a truncated
+  // stream and report a hash mismatch. Status code stays correct.
+  if (contentLen > 0 && bodyBytes < (size_t)contentLen) return false;
+  return true;
 }
 
 #endif // ENABLE_CELLULAR
