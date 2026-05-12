@@ -420,15 +420,23 @@ static void cmd_mv(int argc, char** argv, ShellOutput out) {
   }
 }
 
-// Show disk usage for LittleFS and SD card
+// Show disk usage for LittleFS and SD card.
+// LittleFS.totalBytes() returns 0 when the volume is not mounted (fresh
+// flash, mount failure, post-partition-table migration). The previous
+// version divided by total to compute a free-percent and panic'ed with
+// IntegerDivideByZero in exactly that case.
 static void cmd_df(int argc, char** argv, ShellOutput out) {
   char line[128];
 
   size_t total = LittleFS.totalBytes();
   size_t used  = LittleFS.usedBytes();
-  snprintf(line, sizeof(line), "LittleFS: %d / %d bytes used (%d%% free)",
-           (int)used, (int)total, (int)((total - used) * 100 / total));
-  out(line);
+  if (total == 0) {
+    out("LittleFS: not mounted");
+  } else {
+    snprintf(line, sizeof(line), "LittleFS: %d / %d bytes used (%d%% free)",
+             (int)used, (int)total, (int)((total - used) * 100 / total));
+    out(line);
+  }
 
   // SD card info is reported by SDModule::status() via module.status command
 }
