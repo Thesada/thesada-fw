@@ -13,9 +13,6 @@
 #include <WiFi.h>
 #include <DNSServer.h>
 #include <time.h>
-#ifdef ENABLE_ETH
-  #include <ETH.h>
-#endif
 #include <esp_sntp.h>
 
 static const char* TAG = "WiFi";
@@ -255,11 +252,6 @@ void WiFiManager::loop() {
 
   // While on cellular, recheckWiFi() handles the re-scan on a timer.
   if (_status == WiFiStatus::ALL_FAILED) return;
-
-  // Skip WiFi reconnect when Ethernet is the primary transport
-#ifdef ENABLE_ETH
-  if (ETH.linkUp()) return;
-#endif
 
   if (WiFi.status() != WL_CONNECTED) {
     Log::warn(TAG, "Connection lost - re-scanning");

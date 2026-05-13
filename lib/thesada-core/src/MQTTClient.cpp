@@ -20,9 +20,6 @@
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
 #include <esp_chip_info.h>
-#ifdef ENABLE_ETH
-  #include <ETH.h>
-#endif
 
 // NVS namespace + keys for per-device mTLS client certificate.
 // Kept separate from Config so cert survives factory reset of config.json
@@ -1404,34 +1401,6 @@ void MQTTClient::publishDiscovery() {
     _client.publish(t, WiFi.localIP().toString().c_str());
   }
 
-#ifdef ENABLE_ETH
-  // -- Ethernet diagnostics (disabled by default in HA) --
-  snprintf(uid, sizeof(uid), "%s_eth_ip", devId);
-  snprintf(stBuf, sizeof(stBuf), "%s/sensor/eth/ip", prefix);
-  disc("sensor", uid, "Ethernet IP", stBuf, "", "", "", "diagnostic");
-
-  snprintf(uid, sizeof(uid), "%s_eth_speed", devId);
-  snprintf(stBuf, sizeof(stBuf), "%s/sensor/eth/speed", prefix);
-  disc("sensor", uid, "Ethernet Speed", stBuf, "Mbps", "", "measurement", "diagnostic");
-
-  snprintf(uid, sizeof(uid), "%s_eth_mac", devId);
-  snprintf(stBuf, sizeof(stBuf), "%s/sensor/eth/mac", prefix);
-  disc("sensor", uid, "Ethernet MAC", stBuf, "", "", "", "diagnostic");
-
-  // Publish ETH stats now
-  if (ETH.linkUp()) {
-    char t[96], v[32];
-    snprintf(t, sizeof(t), "%s/sensor/eth/ip", prefix);
-    _client.publish(t, ETH.localIP().toString().c_str());
-
-    snprintf(t, sizeof(t), "%s/sensor/eth/speed", prefix);
-    snprintf(v, sizeof(v), "%d", ETH.linkSpeed());
-    _client.publish(t, v);
-
-    snprintf(t, sizeof(t), "%s/sensor/eth/mac", prefix);
-    _client.publish(t, ETH.macAddress().c_str());
-  }
-#endif
 
   // -- Heap + PSRAM diagnostics --
   snprintf(uid, sizeof(uid), "%s_heap_free", devId);
@@ -1583,14 +1552,8 @@ void MQTTClient::publishDeviceInfo() {
     "owb-rescue";
 #elif defined(BOARD_S3_BARE)
     "s3-bare";
-#elif defined(BOARD_CYD)
-    "cyd";
-#elif defined(BOARD_WROOM)
-    "wroom";
-#elif defined(BOARD_ETH)
-    "eth";
 #else
-    "unknown";
+    "owb";
 #endif
 
   esp_chip_info_t chip;

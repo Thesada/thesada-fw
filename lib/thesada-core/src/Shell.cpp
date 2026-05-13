@@ -1280,18 +1280,6 @@ static void cmd_module_list(int argc, char** argv, ShellOutput out) {
   #else
   out("  [ ] lora");
   #endif
-
-  #ifdef ENABLE_DISPLAY
-  out("  [x] display");
-  #else
-  out("  [ ] display");
-  #endif
-
-  #ifdef ENABLE_TFT
-  out("  [x] tftdisplay");
-  #else
-  out("  [ ] tftdisplay");
-  #endif
 }
 
 // Show runtime status of each registered module
