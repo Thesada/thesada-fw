@@ -467,8 +467,8 @@ void HttpServer::setupRoutes() {
     // runs on the main-loop task instead of inside the AsyncTCP onRequest
     // callback. The async task stack is sized for WS-frame dispatch only -
     // any shell command that reaches LittleFS / MQTT / TLS / Lua exec can
-    // overflow it from here (same risk that motivated the WS refactor in
-    // #62 phase B, commit e431211).
+    // overflow it from here (same risk that motivated the earlier WS
+    // dispatch refactor).
     //
     // Shared state: output buffer + done flag carried by shared_ptr so the
     // capture survives this callback's return. Done flag flips after the

@@ -760,6 +760,15 @@ static void cmd_config_reload(int argc, char** argv, ShellOutput out) {
     MQTTClient::reinitSubscriptions();
   }
 
+  // Republish the retained set (status, HA discovery, /info, retained-topics
+  // manifest) so any subscriber polling those topics sees fresh state
+  // without waiting for a reboot or MQTT session drop. /info carries the
+  // config_hash that downstream consumers diff to decide whether to pull
+  // the new config. HA discovery refresh is also useful when sensor names
+  // or units moved in the config. Force=true bypasses the once-per-session
+  // guard.
+  MQTTClient::publishRetainedSet(true);
+
   char msg[96];
   snprintf(msg, sizeof(msg), "Config reloaded from /config.json (device: %s)", name);
   out(msg);

@@ -98,10 +98,10 @@ void GNSSModule::readAndPublish() {
   JsonObject cfg = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
 
-  // Per-attribute topics for thesada-app's per-metric telemetry ingest
-  // (handleSensor records one row per sensor/<metric>, value column is
-  // numeric only). Mirrors BatteryModule's pattern. Only publish when
-  // we actually have a fix - emitting 0.0 for lat/lon would land as
+  // Per-attribute topics for telemetry ingest (one row per sensor/<metric>,
+  // numeric value column only). Mirrors BatteryModule's pattern. Only
+  // publish when we actually have a fix - emitting 0.0 for lat/lon would
+  // land as
   // valid telemetry rows and skew charts.
   char perTopic[80], val[24];
   snprintf(perTopic, sizeof(perTopic), "%s/sensor/gnss/fix", prefix);

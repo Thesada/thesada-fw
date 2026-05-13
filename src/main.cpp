@@ -27,7 +27,7 @@ static bool networkConnected() {
 
 // Return true if any OTA-capable transport is up. Wider than
 // networkConnected(): includes the cellular path so OTAUpdate::loop()
-// still ticks when WiFi is down and the modem holds the link (#220).
+// still ticks when WiFi is down and the modem holds the link.
 static bool otaTransportUp() {
   if (networkConnected()) return true;
 #ifdef ENABLE_CELLULAR

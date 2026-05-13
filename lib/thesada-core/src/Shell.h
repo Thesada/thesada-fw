@@ -86,7 +86,7 @@ public:
   // Policy:
   //   - reject empty
   //   - require leading '/' (every legitimate caller emits absolute paths;
-  //     thesada-app and dashboard JS both already do this)
+  //     the dashboard JS already does this)
   //   - reject ".." anywhere (parent-dir traversal)
   //   - reject "//" anywhere (normaliser-escape variants)
   // in:  null-terminated path. out: true if safe to pass to FS.

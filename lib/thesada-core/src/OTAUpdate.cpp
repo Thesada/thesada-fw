@@ -586,7 +586,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
 // so a stall here (TLS handshake, hung socket read on a flaky upstream)
 // cannot block this task long enough to trip TWDT. Goes through the
 // unified otaHttpGet helper so the same call site works over WiFi or
-// the SIM7080G modem-native SSL socket (#220).
+// the SIM7080G modem-native SSL socket.
 bool OTAUpdate::fetchManifest(const char* url,
                                String& version, String& binUrl, String& sha256,
                                size_t& size) {
