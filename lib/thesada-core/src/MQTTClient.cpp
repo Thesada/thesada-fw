@@ -1578,13 +1578,16 @@ void MQTTClient::publishDeviceInfo() {
   psram = psramFound();
 #endif
 
-  // Compute config + script hashes for drift detection
+  // Compute config + script hashes for drift detection. config_hash MUST
+  // match what an external consumer gets when it sha256s /config.json
+  // raw bytes via /api/config (or any other channel that reads the file).
+  // Re-serialising Config::get() produced the compact-canonical form
+  // (no whitespace, ArduinoJson default order) which never matched the
+  // raw-file hash - drift detection sat broken regardless of when this
+  // payload was republished. Hash the file directly so on-disk content
+  // is the single source of truth.
   char configHash[65], mainHash[65], rulesHash[65];
-  {
-    String cfgJson;
-    serializeJson(Config::get(), cfgJson);
-    sha256Hex(cfgJson.c_str(), cfgJson.length(), configHash);
-  }
+  sha256File("/config.json", configHash);
   sha256File("/scripts/main.lua", mainHash);
   sha256File("/scripts/rules.lua", rulesHash);
 
