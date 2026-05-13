@@ -73,6 +73,10 @@ static void loadCaCert() {
 // Short socket + handshake timeouts so a flaky upstream cannot block
 // readBytes() long enough to trip the task watchdog. WiFiClientSecure
 // defaults to ~60s read timeout, far past the ~5s TWDT window.
+//
+// When /ca.crt is missing OTAUpdate::begin() refuses to enable OTA unless
+// ota.allow_insecure is set in config.json, so by the time we get here we
+// already know either the CA cert is loaded or the operator has opted in.
 static void configureSecureClient(WiFiClientSecure& client) {
   loadCaCert();
   if (_otaCaCert.isEmpty()) {
@@ -352,6 +356,22 @@ void OTAUpdate::begin() {
     _enabled = false;
   }
 
+  // Refuse to bring OTA up without a CA cert unless ota.allow_insecure is
+  // explicitly set in config.json. With no cert, both manifest and binary
+  // come over an unverified HTTPS channel - the SHA256 in the manifest is
+  // not MITM protection because an attacker who can MITM controls both.
+  // Dev workflows that legitimately need to bypass set the opt-in.
+  if (_enabled) {
+    loadCaCert();
+    bool allowInsecure = cfg["ota"]["allow_insecure"] | false;
+    if (_otaCaCert.isEmpty() && !allowInsecure) {
+      Log::error(TAG, "OTA disabled - no /ca.crt and ota.allow_insecure not set");
+      _enabled = false;
+    } else if (_otaCaCert.isEmpty() && allowInsecure) {
+      Log::warn(TAG, "OTA: ota.allow_insecure=true - HTTPS without cert verification");
+    }
+  }
+
   if (_enabled) {
     char msg[128];
     snprintf(msg, sizeof(msg), "Enabled - check every %lus, manifest: %.80s",
@@ -471,6 +491,19 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
 
   if (strlen(url) == 0) {
     Log::error(TAG, "No manifest URL");
+    return;
+  }
+
+  // Mirror the begin()-time refusal so a triggered check (cli/ota.check or
+  // cmd_topic publish) cannot bypass it. begin() may have set _enabled=false,
+  // but triggerCheck() -> loop() runs check() regardless of _enabled to allow
+  // operator-driven retries; without this gate, an attacker who can publish
+  // to the OTA cmd_topic could still force an insecure HTTPS fetch even
+  // though begin() refused at boot.
+  loadCaCert();
+  bool allowInsecure = cfg["ota"]["allow_insecure"] | false;
+  if (_otaCaCert.isEmpty() && !allowInsecure) {
+    Log::error(TAG, "OTA check refused - no /ca.crt and ota.allow_insecure not set");
     return;
   }
 

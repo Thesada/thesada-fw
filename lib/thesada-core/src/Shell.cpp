@@ -141,6 +141,15 @@ bool Shell::enqueueDeferred(DeferredFn fn) {
 // then run execute() outside the critical section so a long-running
 // command (fs reads, LittleFS writes, MQTT publishes) does not block
 // concurrent enqueuers.
+//
+// Move (not copy) the std::function payloads into locals while inside the
+// portMUX critical section. Previous behaviour copied sink and then nulled
+// slot.sink/slot.fn under the lock - the assignment destroyed the captured
+// state (heap allocations, std::string captures) inside the spinlock,
+// which on ESP-IDF can deadlock the allocator if it takes its internal
+// lock. Moving leaves the slot's std::function in the empty/moved-from
+// state (no destruction needed); destructors of the locals run at function
+// return, outside the critical section.
 void Shell::loop() {
   char line[DEFERRED_LINE_LEN];
   ShellOutput sink;
@@ -153,14 +162,15 @@ void Shell::loop() {
     mode = slot.mode;
     if (mode == SlotMode::Shell) {
       memcpy(line, slot.line, sizeof(line));
-      sink = slot.sink;
+      sink = std::move(slot.sink);
     } else if (mode == SlotMode::Handler) {
       fn = std::move(slot.fn);
     }
     slot.mode = SlotMode::Empty;
-    slot.sink = nullptr;     // drop captured state asap
-    slot.fn = nullptr;
     slot.active = false;
+    // Do NOT null slot.sink / slot.fn here - they are already in the
+    // moved-from (empty) state. Nulling would run the destructor of the
+    // previous payload inside the critical section.
     _ringHead = (uint8_t)((_ringHead + 1) % DEFERRED_RING_SIZE);
   }
   taskEXIT_CRITICAL(&_shellRingMux);
@@ -310,9 +320,22 @@ static const char* stripPrefix(const char* path) {
   return path;
 }
 
+// Validate a filesystem path before any LittleFS call. Centralised so every
+// transport (Shell-over-serial/WS, HTTP /api/file, MQTT CLI binary handlers)
+// shares one policy. See Shell::pathSafe doc in Shell.h.
+// in:  null-terminated path. out: true if safe.
+bool Shell::pathSafe(const char* path) {
+  if (!path || !*path) return false;
+  if (path[0] != '/') return false;
+  if (strstr(path, "..") != nullptr) return false;
+  if (strstr(path, "//") != nullptr) return false;
+  return true;
+}
+
 // List files in a directory
 static void cmd_ls(int argc, char** argv, ShellOutput out) {
   const char* path = (argc > 1) ? argv[1] : "/";
+  if (!Shell::pathSafe(path)) { out("Invalid path"); return; }
   FS* fs = resolveFS(path);
   const char* fsPath = stripPrefix(path);
 
@@ -351,6 +374,7 @@ static void cmd_ls(int argc, char** argv, ShellOutput out) {
 // Print file contents line by line
 static void cmd_cat(int argc, char** argv, ShellOutput out) {
   if (argc < 2) { out("Usage: cat <path>"); return; }
+  if (!Shell::pathSafe(argv[1])) { out("Invalid path"); return; }
   FS* fs = resolveFS(argv[1]);
   const char* fsPath = stripPrefix(argv[1]);
 
@@ -368,6 +392,7 @@ static void cmd_cat(int argc, char** argv, ShellOutput out) {
 // Remove a file from the filesystem
 static void cmd_rm(int argc, char** argv, ShellOutput out) {
   if (argc < 2) { out("Usage: rm <path>"); return; }
+  if (!Shell::pathSafe(argv[1])) { out("Invalid path"); return; }
   FS* fs = resolveFS(argv[1]);
   const char* fsPath = stripPrefix(argv[1]);
 
@@ -384,6 +409,7 @@ static void cmd_rm(int argc, char** argv, ShellOutput out) {
 static void cmd_write(int argc, char** argv, ShellOutput out) {
   // write <path> <content...>
   if (argc < 3) { out("Usage: write <path> <content...>"); return; }
+  if (!Shell::pathSafe(argv[1])) { out("Invalid path"); return; }
   FS* fs = resolveFS(argv[1]);
   const char* fsPath = stripPrefix(argv[1]);
 
@@ -407,6 +433,9 @@ static void cmd_write(int argc, char** argv, ShellOutput out) {
 // Rename or move a file
 static void cmd_mv(int argc, char** argv, ShellOutput out) {
   if (argc < 3) { out("Usage: mv <src> <dst>"); return; }
+  if (!Shell::pathSafe(argv[1]) || !Shell::pathSafe(argv[2])) {
+    out("Invalid path"); return;
+  }
   FS* fs = resolveFS(argv[1]);
   const char* src = stripPrefix(argv[1]);
   const char* dst = stripPrefix(argv[2]);

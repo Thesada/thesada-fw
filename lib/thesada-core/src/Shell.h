@@ -76,6 +76,22 @@ public:
   // Register a command. Called internally by begin() and by modules.
   static void registerCommand(const char* name, const char* help, ShellCommand handler);
 
+  // Validate a filesystem path before passing it to LittleFS.open() / similar.
+  // Every transport that accepts a path from an external source (HTTP, Shell
+  // over serial / WS / MQTT CLI, future BLE) MUST run the argument through
+  // pathSafe() before any FS call. Centralized here so the policy is single-
+  // source: any new caller that forgets the check is the only thing that has
+  // to change when the policy tightens further.
+  //
+  // Policy:
+  //   - reject empty
+  //   - require leading '/' (every legitimate caller emits absolute paths;
+  //     thesada-app and dashboard JS both already do this)
+  //   - reject ".." anywhere (parent-dir traversal)
+  //   - reject "//" anywhere (normaliser-escape variants)
+  // in:  null-terminated path. out: true if safe to pass to FS.
+  static bool pathSafe(const char* path);
+
   // Tab completion / help for a partial command. Returns matching commands.
   static void listCommands(ShellOutput out);
 

@@ -14,6 +14,7 @@
 #include <MQTTClient.h>
 #include <memory>
 #include <new>
+#include <mbedtls/platform_util.h>
 
 // ── TinyGSM ─────────────────────────────────────────────────────────────────
 // TINY_GSM_MODEM_SIM7080 and TINY_GSM_RX_BUFFER=1024 set via build_flags.
@@ -461,22 +462,32 @@ bool Cellular::writeClientCert() {
   const size_t maxLen = MQTTClient::CERT_MAX_LEN;
   char* certBuf = (char*)malloc(maxLen);
   char* keyBuf  = (char*)malloc(maxLen);
+
+  // Zero + free helper - the private key half of the pair must never linger
+  // in heap past use. mbedtls_platform_zeroize cannot be optimised away by
+  // the compiler, unlike memset which is legal to skip on a buffer that is
+  // about to be free'd.
+  auto wipe_and_free = [maxLen](char*& cert, char*& key) {
+    if (cert) { mbedtls_platform_zeroize(cert, maxLen); free(cert); cert = nullptr; }
+    if (key)  { mbedtls_platform_zeroize(key,  maxLen); free(key);  key  = nullptr; }
+  };
+
   if (!certBuf || !keyBuf) {
     Log::error(TAG, "writeClientCert: heap alloc failed");
-    free(certBuf); free(keyBuf);
+    wipe_and_free(certBuf, keyBuf);
     return false;
   }
 
   if (!MQTTClient::loadClientCert(certBuf, keyBuf, maxLen)) {
     Log::warn(TAG, "writeClientCert: NVS load failed");
-    free(certBuf); free(keyBuf);
+    wipe_and_free(certBuf, keyBuf);
     return false;
   }
   size_t certLen = strlen(certBuf);
   size_t keyLen  = strlen(keyBuf);
   if (certLen == 0 || keyLen == 0) {
     Log::warn(TAG, "writeClientCert: empty cert or key");
-    free(certBuf); free(keyBuf);
+    wipe_and_free(certBuf, keyBuf);
     return false;
   }
 
@@ -487,7 +498,7 @@ bool Cellular::writeClientCert() {
                         (const uint8_t*)keyBuf, keyLen);
   }
 
-  free(certBuf); free(keyBuf);
+  wipe_and_free(certBuf, keyBuf);
   if (!ok) {
     Log::error(TAG, "writeClientCert: upload failed");
     return false;

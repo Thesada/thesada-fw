@@ -14,6 +14,7 @@
 #include <mbedtls/sha256.h>
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/pk.h>
+#include <mbedtls/platform_util.h>
 #include <mbedtls/version.h>
 #include <string>
 #include <lwip/sockets.h>
@@ -965,6 +966,20 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
         const char* content = nl + 1;
         size_t contentLen = plen - pathLen - 1;
 
+        // Reject path traversal before any LittleFS call - the cli/<cmd>
+        // topic is the device's remote attack surface (broker ACL is the
+        // only thing between an external publisher and this handler).
+        if (!Shell::pathSafe(path)) {
+          resp["ok"] = false;
+          resp["output"][0] = "Invalid path";
+          char respTopic[64];
+          snprintf(respTopic, sizeof(respTopic), "%s/cli/response", prefix);
+          size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
+          char* rp = (char*)malloc(bufSz);
+          if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
+          goto cleanup;
+        }
+
         File f = LittleFS.open(path, mode);
         if (f) {
           size_t written = f.write((const uint8_t*)content, contentLen);
@@ -1013,6 +1028,19 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
 
         JsonDocument resp;
         resp["cmd"] = cmd;
+
+        // Reject path traversal before LittleFS - same surface as fs.write
+        // above, same broker-ACL-only mitigation pre-pathSafe.
+        if (!Shell::pathSafe(path)) {
+          resp["ok"] = false;
+          resp["output"][0] = "Invalid path";
+          char respTopic[64];
+          snprintf(respTopic, sizeof(respTopic), "%s/cli/response", prefix);
+          size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
+          char* rp = (char*)malloc(bufSz);
+          if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
+          goto cleanup;
+        }
 
         File f = LittleFS.open(path, "r");
         if (!f) {
@@ -1106,6 +1134,12 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
             memcpy(buf, pem, pemLen);
             buf[pemLen] = '\0';
             bool ok = storeClientCert(nullptr, buf);
+            // Zero the heap copy of the private key before free - leaving
+            // it lingering in heap means any future feature that dumps /
+            // inspects heap (debug command, crash uploader, remote heap
+            // inspector) leaks the key. mbedtls_platform_zeroize is not
+            // optimised away by the compiler.
+            mbedtls_platform_zeroize(buf, pemLen + 1);
             free(buf);
             resp["ok"] = ok;
             resp["output"][0] = ok ? "Client key stored in NVS" : "NVS write failed";
