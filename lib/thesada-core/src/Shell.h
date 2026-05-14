@@ -31,6 +31,12 @@ using DeferredFn = std::function<void()>;
 // Command handler signature: argc, argv, output callback.
 using ShellCommand = std::function<void(int argc, char** argv, ShellOutput out)>;
 
+// Disk-usage probe for a registered filesystem. Modules whose fs::FS
+// subclass exposes byte counts (SD_MMC, SD) supply a pair of these so
+// fs.df can report them without core knowing the concrete subclass.
+// Returns bytes; 0 is a valid "empty / not mounted" answer.
+using FSDfFn = uint64_t(*)();
+
 struct ShellEntry {
   const char* name;         // e.g. "ls", "config.get"
   const char* help;         // one-line description
@@ -89,6 +95,29 @@ public:
   // underlying FS sees "/log042.csv".
   // in: prefix, fs pointer. out: true if registered, false if table full.
   static bool registerFS(const char* prefix, fs::FS* fs);
+
+  // registerFS overload for filesystems that can report disk usage. The
+  // fs::FS base class has no totalBytes()/usedBytes() - those are subclass-
+  // specific - so a module that wants its volume to show up in fs.df passes
+  // wrappers around its concrete subclass calls here. dfUsed/dfTotal may be
+  // nullptr (equivalent to the 2-arg overload). cmd_df walks the registry
+  // and prints a line for every mount that advertises both pointers.
+  // in: prefix, fs pointer, used-bytes fn, total-bytes fn. out: true if registered.
+  static bool registerFS(const char* prefix, fs::FS* fs, FSDfFn dfUsed, FSDfFn dfTotal);
+
+  // Print one `[MOUNT] <prefix>` line per registered FS mount prefix.
+  // Backs the discovery line that bare `fs.ls` appends after the LittleFS
+  // root listing so an operator sees mounted volumes without knowing the
+  // prefix in advance.
+  // in: output callback. out: none.
+  static void listMounts(ShellOutput out);
+
+  // Print a df line for every registered mount whose FSMount entry carries
+  // dfUsed + dfTotal pointers. cmd_df handles LittleFS inline and calls
+  // this for the rest - member function so it can reach the private
+  // FSMount registry that a free command handler cannot.
+  // in: output callback. out: none.
+  static void printRegisteredDf(ShellOutput out);
 
   // Resolve a path to the filesystem that backs it. Returns &LittleFS for
   // any path not matching a registered prefix. Never returns nullptr.
@@ -160,6 +189,8 @@ private:
     const char* prefix;
     size_t      prefixLen;
     fs::FS*     fs;
+    FSDfFn      dfUsed;   // nullptr = no df support for this mount
+    FSDfFn      dfTotal;  // nullptr = no df support for this mount
   };
   static FSMount _fsMounts[FS_MOUNTS_MAX];
   static int     _fsMountCount;

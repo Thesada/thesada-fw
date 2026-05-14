@@ -355,6 +355,10 @@ const char* Shell::stripPrefix(const char* path) {
 }
 
 bool Shell::registerFS(const char* prefix, fs::FS* fs) {
+  return registerFS(prefix, fs, nullptr, nullptr);
+}
+
+bool Shell::registerFS(const char* prefix, fs::FS* fs, FSDfFn dfUsed, FSDfFn dfTotal) {
   if (!prefix || !fs) return false;
   if (prefix[0] != '/') return false;
   size_t len = strlen(prefix);
@@ -363,11 +367,42 @@ bool Shell::registerFS(const char* prefix, fs::FS* fs) {
     Log::warn("Shell", "FS mount table full");
     return false;
   }
-  _fsMounts[_fsMountCount++] = { prefix, len, fs };
+  _fsMounts[_fsMountCount++] = { prefix, len, fs, dfUsed, dfTotal };
   char msg[64];
   snprintf(msg, sizeof(msg), "FS mount: %s -> %p", prefix, (void*)fs);
   Log::info("Shell", msg);
   return true;
+}
+
+// Print one line per registered FS mount prefix. See Shell.h.
+void Shell::listMounts(ShellOutput out) {
+  char line[64];
+  for (int i = 0; i < _fsMountCount; i++) {
+    snprintf(line, sizeof(line), "  [MOUNT] %s", _fsMounts[i].prefix);
+    out(line);
+  }
+}
+
+// Print a df line for every registered mount that advertises disk-usage
+// support. Member function so it can reach the private FSMount registry;
+// cmd_df (a free function) handles LittleFS inline then calls this.
+void Shell::printRegisteredDf(ShellOutput out) {
+  char line[128];
+  for (int i = 0; i < _fsMountCount; i++) {
+    const FSMount& m = _fsMounts[i];
+    if (!m.dfUsed || !m.dfTotal) continue;
+    uint64_t mtotal = m.dfTotal();
+    uint64_t mused  = m.dfUsed();
+    if (mtotal == 0) {
+      snprintf(line, sizeof(line), "%s: not mounted", m.prefix);
+    } else {
+      snprintf(line, sizeof(line),
+               "%s: %llu / %llu bytes used (%llu%% free)",
+               m.prefix, (unsigned long long)mused, (unsigned long long)mtotal,
+               (unsigned long long)((mtotal - mused) * 100 / mtotal));
+    }
+    out(line);
+  }
 }
 
 // Validate a filesystem path before any LittleFS call. Centralised so every
@@ -418,6 +453,15 @@ static void cmd_ls(int argc, char** argv, ShellOutput out) {
     while (dbl) { memmove(dbl, dbl + 1, strlen(dbl)); dbl = strstr(line, "//"); }
     out(line);
     entry = dir.openNextFile();
+  }
+
+  // Bare `fs.ls` lists the LittleFS root only. Append a discovery line per
+  // registered mount prefix so an SD card (or future external volume) is
+  // visible without the operator already knowing to type `fs.ls /sd`.
+  // An explicit path argument suppresses this - the caller asked for a
+  // specific directory, not the mount overview.
+  if (argc <= 1) {
+    Shell::listMounts(out);
   }
 }
 
@@ -499,11 +543,16 @@ static void cmd_mv(int argc, char** argv, ShellOutput out) {
   }
 }
 
-// Show disk usage for LittleFS and SD card.
-// LittleFS.totalBytes() returns 0 when the volume is not mounted (fresh
-// flash, mount failure, post-partition-table migration). The previous
-// version divided by total to compute a free-percent and panic'ed with
-// IntegerDivideByZero in exactly that case.
+// Show disk usage for LittleFS plus every registered filesystem that
+// advertises df support (dfUsed/dfTotal pointers in its FSMount entry).
+// LittleFS is handled inline - it is always present and core owns it.
+// Other volumes (SD via SDModule) come from the mount registry so core
+// stays one-way independent of the modules: cmd_df never calls SDModule.
+//
+// totalBytes() returns 0 when a volume is not mounted (fresh flash, mount
+// failure, post-partition-table migration). The previous version divided
+// by total to compute free-percent and panic'ed with IntegerDivideByZero
+// in exactly that case - every branch here guards total == 0.
 static void cmd_df(int argc, char** argv, ShellOutput out) {
   char line[128];
 
@@ -517,7 +566,7 @@ static void cmd_df(int argc, char** argv, ShellOutput out) {
     out(line);
   }
 
-  // SD card info is reported by SDModule::status() via module.status command
+  Shell::printRegisteredDf(out);
 }
 
 // Reformat LittleFS - destroys every file. Requires `fs.format --yes` so

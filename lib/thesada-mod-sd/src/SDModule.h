@@ -35,4 +35,9 @@ private:
 
   static bool _openNextLog();
   static void _rotate();
+
+  // fs.df probes registered with Shell::registerFS. Static so they match
+  // the FSDfFn (uint64_t(*)()) pointer type; pick SD vs SD_MMC by _spiMode.
+  static uint64_t _dfUsed();
+  static uint64_t _dfTotal();
 };

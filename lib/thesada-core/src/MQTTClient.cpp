@@ -1221,29 +1221,65 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
       snprintf(line, sizeof(line), "%s", cmd);
     }
 
-    // Execute through Shell and collect output.
-    JsonDocument resp;
-    resp["cmd"] = cmd;
-    if (hasReqId) resp["req_id"] = reqId;
-    resp["ok"]  = true;
-    JsonArray output = resp["output"].to<JsonArray>();
+    // Execute through Shell and collect output, paginating the response so
+    // a command that produces more output than fits in one cli/response
+    // payload (fs.ls on a large SD dir, help, module dumps) is not silently
+    // truncated by serializeJson. The output sink measures the running JSON
+    // size; when the next line would overflow the publish buffer it ships
+    // the current page with more=true and starts a fresh one. The final
+    // page carries more=false. Single-page output - the common case - is
+    // page 0 / more=false, the same shape any consumer that ignores the
+    // new fields already sees.
+    size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
+    // Headroom for the envelope serializeJson writes around the output
+    // array (cmd, req_id, ok, page, more keys) plus the trailing NUL.
+    const size_t PAGE_MARGIN = 160;
+    size_t pageLimit = bufSz > PAGE_MARGIN ? bufSz - PAGE_MARGIN : bufSz / 2;
 
-    Shell::execute(line, [&output](const char* outLine) {
+    JsonDocument resp;
+    int pageNum = 0;
+
+    auto startPage = [&]() -> JsonArray {
+      resp.clear();
+      resp["cmd"] = cmd;
+      if (hasReqId) resp["req_id"] = reqId;
+      resp["ok"]   = true;
+      resp["page"] = pageNum;
+      return resp["output"].to<JsonArray>();
+    };
+
+    auto publishPage = [&](bool more) {
+      resp["more"] = more;
+      // Re-read prefix every publish - config.reload mid-command may have
+      // invalidated it, and a multi-page command spans more wall time.
+      JsonObject cfgAfter = Config::get();
+      const char* pfxAfter = cfgAfter["mqtt"]["topic_prefix"] | "thesada/node";
+      char respTopic[64];
+      snprintf(respTopic, sizeof(respTopic), "%s/cli/response", pfxAfter);
+      char* rp = (char*)malloc(bufSz);
+      if (rp) {
+        serializeJson(resp, rp, bufSz);
+        MQTTClient::publish(respTopic, rp);
+        free(rp);
+      }
+    };
+
+    JsonArray output = startPage();
+
+    Shell::execute(line, [&](const char* outLine) {
+      // strlen + slack covers ASCII shell output (the common path); a
+      // pathological line full of escaped bytes still publishes, it just
+      // risks one truncated page rather than dropping silently.
+      size_t lineCost = strlen(outLine) + 8;
+      if (output.size() > 0 && measureJson(resp) + lineCost > pageLimit) {
+        publishPage(true);
+        pageNum++;
+        output = startPage();
+      }
       output.add(outLine);
     });
 
-    // Re-read prefix after execute (config.reload may have invalidated it)
-    JsonObject cfgAfter = Config::get();
-    const char* pfxAfter = cfgAfter["mqtt"]["topic_prefix"] | "thesada/node";
-    char respTopic[64];
-    snprintf(respTopic, sizeof(respTopic), "%s/cli/response", pfxAfter);
-    size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
-    char* respPayload = (char*)malloc(bufSz);
-    if (respPayload) {
-      serializeJson(resp, respPayload, bufSz);
-      MQTTClient::publish(respTopic, respPayload);
-      free(respPayload);
-    }
+    publishPage(false);
   }
 
 cleanup:
