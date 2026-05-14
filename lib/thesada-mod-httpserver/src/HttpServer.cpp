@@ -85,10 +85,11 @@ static void _rlReset(const String& ip) {
 }
 
 // Reject path traversal attempts. Returns true if path is safe.
-// Blocks ".." segments that could escape the intended directory.
+// Delegates to Shell::pathSafe so HTTP, Shell (serial/WS), and MQTT CLI
+// share one policy - any tightening lands in one place. See Shell.h.
 // in: path string. out: true if safe, false if traversal detected.
 static bool _pathSafe(const String& path) {
-  return path.indexOf("..") < 0;
+  return Shell::pathSafe(path.c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -460,28 +461,62 @@ void HttpServer::setupRoutes() {
       req->send(400, "application/json", "{\"ok\":false,\"error\":\"expected {\\\"cmd\\\":\\\"...\\\"}\"}");
       return;
     }
-    String cmdStr = doc["cmd"].as<String>();  // copy before doc goes out of scope
+    String cmdStr = doc["cmd"].as<String>();
 
-    // Collect all output lines; escape for JSON inline.
-    String output = "[";
-    bool first = true;
-    Shell::execute(cmdStr.c_str(), [&output, &first](const char* line) {
-      if (!first) output += ",";
-      output += "\"";
-      for (const char* p = line; *p; ++p) {
-        if      (*p == '"')  output += "\\\"";
-        else if (*p == '\\') output += "\\\\";
-        else if (*p == '\n') output += "\\n";
-        else if (*p == '\r') output += "\\r";
-        else                 output += *p;
-      }
-      output += "\"";
-      first = false;
+    // Dispatch through the Shell deferred ring so the actual Shell::execute
+    // runs on the main-loop task instead of inside the AsyncTCP onRequest
+    // callback. The async task stack is sized for WS-frame dispatch only -
+    // any shell command that reaches LittleFS / MQTT / TLS / Lua exec can
+    // overflow it from here (same risk that motivated the earlier WS
+    // dispatch refactor).
+    //
+    // Shared state: output buffer + done flag carried by shared_ptr so the
+    // capture survives this callback's return. Done flag flips after the
+    // ring drains the lambda - on the AsyncTCP task we spin-poll with
+    // delay() yielding to other tasks (including main, which is the one
+    // doing the drain) until either done flips or the timeout expires.
+    auto output = std::make_shared<String>("[");
+    auto first  = std::make_shared<bool>(true);
+    auto done   = std::make_shared<bool>(false);
+
+    bool ok = Shell::enqueueDeferred([cmdStr, output, first, done]() {
+      Shell::execute(cmdStr.c_str(), [output, first](const char* line) {
+        if (!*first) *output += ",";
+        *output += "\"";
+        for (const char* p = line; *p; ++p) {
+          if      (*p == '"')  *output += "\\\"";
+          else if (*p == '\\') *output += "\\\\";
+          else if (*p == '\n') *output += "\\n";
+          else if (*p == '\r') *output += "\\r";
+          else                 *output += *p;
+        }
+        *output += "\"";
+        *first = false;
+      });
+      *output += "]";
+      *done = true;
     });
-    output += "]";
+    if (!ok) {
+      req->send(503, "application/json", "{\"ok\":false,\"error\":\"shell busy\"}");
+      return;
+    }
+
+    // Spin-yield up to 5 s for the ring to drain. AsyncTCP task yielding
+    // here lets the main loop's Shell::loop() pick up our slot. delay(5)
+    // ~= 5 ms FreeRTOS tick yield. 1000 iters = 5 s ceiling - matches the
+    // WiFi/MQTT timeouts a single CLI command is allowed to consume.
+    const uint32_t pollMs   = 5;
+    const uint32_t maxPolls = 1000;
+    for (uint32_t i = 0; i < maxPolls && !*done; i++) delay(pollMs);
+
+    if (!*done) {
+      req->send(504, "application/json",
+                "{\"ok\":false,\"error\":\"shell timeout (5s)\"}");
+      return;
+    }
 
     String resp = "{\"ok\":true,\"output\":";
-    resp += output;
+    resp += *output;
     resp += "}";
     req->send(200, "application/json", resp);
   });

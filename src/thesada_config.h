@@ -4,10 +4,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
-#define FIRMWARE_VERSION "1.4.4"  // bump on each release
+#define FIRMWARE_VERSION "1.4.5"  // bump on each release
 
 // ── Memory tuning defaults ──────────────────────────────────────────────────
-// Board overrides below redefine these for heap-constrained boards (CYD/WROOM).
 #define LOG_RING_SIZE       50    // log replay lines for WS terminal
 #define LOG_LINE_LEN        220   // max chars per log line
 #define MQTT_QUEUE_SIZE     8     // offline publish queue depth
@@ -27,14 +26,11 @@
 #define ENABLE_BATTERY       // AXP2101 battery monitoring (via PowerManager)
 #define ENABLE_PMU           // AXP2101 power management (charging, LED, voltage rails)
 // #define ENABLE_PWM        // PWM output (e.g. fan control)
-// #define ENABLE_DISPLAY    // SSD1306 OLED display (I2C, 128x64)
-// #define ENABLE_TFT        // ILI9341 TFT + XPT2046 touch (CYD board)
 #define ENABLE_SD            // SD card data logger (SD_MMC 1-bit)
 
 // ── Connectivity modules ─────────────────────────────────────────────────────
 #define ENABLE_CELLULAR      // SIM7080G LTE-M/NB-IoT fallback
 // #define ENABLE_GNSS       // SIM7080G built-in GNSS receiver (requires ENABLE_CELLULAR)
-// #define ENABLE_ETH        // LAN8720A Ethernet (WT32-ETH01 and similar)
 // #define ENABLE_LORA       // LoRa/Meshtastic (future hardware)
 
 // ── Notification / alerting ──────────────────────────────────────────────────
@@ -63,9 +59,9 @@
 #endif
 
 // ── Board pinout ─────────────────────────────────────────────────────────────
-// Board is set via platformio.ini build_flags (-DBOARD_WROOM32 etc).
-// Default is LILYGO if no board flag is set.
-#if !defined(BOARD_WROOM32) && !defined(BOARD_S3_BARE) && !defined(BOARD_ETH)
+// Board is set via platformio.ini build_flags (-DBOARD_S3_BARE for bare S3
+// devkit, otherwise defaults to LILYGO T-SIM7080G-S3).
+#ifndef BOARD_S3_BARE
   #define BOARD_LILYGO_T_SIM7080_S3
 #endif
 
@@ -80,32 +76,6 @@
   #undef ENABLE_TEMPERATURE
   #ifndef ENABLE_SHT31
     #define ENABLE_SHT31
-  #endif
-  #undef BOARD_LILYGO_T_SIM7080_S3
-#endif
-
-// WROOM32 has no cellular, PMU, battery, SD, or LILYGO-specific hardware.
-#ifdef BOARD_WROOM32
-  #undef ENABLE_CELLULAR
-  #undef ENABLE_PMU
-  #undef ENABLE_BATTERY
-  #undef ENABLE_SD
-  #undef ENABLE_TEMPERATURE
-  #undef ENABLE_ADS1115
-  #undef BOARD_LILYGO_T_SIM7080_S3
-#endif
-
-// WT32-ETH01 (or similar ESP32 + LAN8720A) - Ethernet primary, WiFi fallback.
-// Sensors via remaining GPIOs (IO4=1-Wire, IO14/IO15=I2C).
-#ifdef BOARD_ETH
-  #undef ENABLE_CELLULAR
-  #undef ENABLE_PMU
-  #undef ENABLE_BATTERY
-  #undef ENABLE_SD
-  #undef ENABLE_DISPLAY
-  #undef ENABLE_TFT
-  #ifndef ENABLE_ETH
-    #define ENABLE_ETH
   #endif
   #undef BOARD_LILYGO_T_SIM7080_S3
 #endif
@@ -127,42 +97,7 @@
   #undef ENABLE_LITESERVER
   #undef ENABLE_SCRIPTENGINE
   #undef ENABLE_PWM
-  #undef ENABLE_DISPLAY
-  #undef ENABLE_TFT
   // ENABLE_PMU stays - AXP2101 must be initialized or board rejects VBUS
-#endif
-
-// CYD is a display-only node with TFT touch, RGB LED, LDR.
-// LiteServer replaces full WebServer (not enough heap for AsyncTCP on WROOM-32).
-#ifdef BOARD_CYD
-  #undef ENABLE_CELLULAR
-  #undef ENABLE_PMU
-  #undef ENABLE_BATTERY
-  #undef ENABLE_TEMPERATURE
-  #undef ENABLE_ADS1115
-  #undef ENABLE_DISPLAY
-  #undef ENABLE_WEBSERVER
-  // Strip LiteServer + Telegram + SD on CYD: heap budget for TLS.
-  // OTA via MQTT CLI (cli/ota.check --force) + boot-time check. USB fallback for brick.
-  // Telegram unused on CYD (alerts fire on OWB). SD has no sensors to log on CYD;
-  // when the album-art cache feature lands it will mount SD on demand.
-  #undef ENABLE_LITESERVER
-  #undef ENABLE_TELEGRAM
-  #undef ENABLE_SD
-  #undef BOARD_LILYGO_T_SIM7080_S3
-  #ifndef ENABLE_TFT
-    #define ENABLE_TFT
-  #endif
-  // Memory tuning - WROOM-32 has no PSRAM, 32KB max contiguous heap.
-  // Shrink static buffers to free ~10KB for TLS reconnects and OTA.
-  #undef  LOG_RING_SIZE
-  #define LOG_RING_SIZE       20
-  #undef  LOG_LINE_LEN
-  #define LOG_LINE_LEN        160
-  #undef  MQTT_QUEUE_SIZE
-  #define MQTT_QUEUE_SIZE     4
-  #undef  MQTT_RX_RING_SIZE
-  #define MQTT_RX_RING_SIZE   4
 #endif
 
 // ── MQTT transport ───────────────────────────────────────────────────────────

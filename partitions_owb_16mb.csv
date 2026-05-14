@@ -1,0 +1,22 @@
+# Partition table for LILYGO T-SIM7080G-S3 N16R8 (16 MB flash, 8 MB PSRAM).
+# Replaces the arduino-esp32 default 4 MB layout. Reclaims the 12 MB of
+# physical flash that the default config does not address.
+#
+# Layout:
+#   - nvs       20 KB     device cert + WiFi creds + sensor calibration
+#   - otadata    8 KB     OTA boot selector (must be 0x2000)
+#   - app0       6 MB     primary OTA slot
+#   - app1       6 MB     secondary OTA slot
+#   - spiffs     3.875 MB littlefs: scripts/main.lua, /scripts/*.lua, /config.json, /ca.crt
+#   - coredump   64 KB    post-panic forensics
+# Total: 0x1000000 = 16 MB exactly.
+# Factory rescue partition intentionally omitted from this stage - tracked
+# as a separate follow-up so the size-check doesn't gate the headline
+# expansion on factory_slot >= largest app image.
+# Name,     Type, SubType,  Offset,    Size,     Flags
+nvs,        data, nvs,      0x9000,    0x5000,
+otadata,    data, ota,      0xe000,    0x2000,
+app0,       app,  ota_0,    0x10000,   0x600000,
+app1,       app,  ota_1,    0x610000,  0x600000,
+spiffs,     data, spiffs,   0xc10000,  0x3e0000,
+coredump,   data, coredump, 0xff0000,  0x10000,

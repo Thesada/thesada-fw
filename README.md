@@ -1,6 +1,6 @@
 # thesada-fw
 
-Modular ESP32 firmware for property monitoring nodes. Built from scratch in C++17 on the Arduino framework using PlatformIO. Runs on multiple board targets - from LILYGO S3 with cellular fallback, to WROOM-32 with OLED, to CYD touch displays, to Ethernet nodes. WiFi, Ethernet, or LTE-M - the node stays connected and publishing.
+Modular ESP32 firmware for property monitoring nodes. Built from scratch in C++17 on the Arduino framework using PlatformIO. Targets the ESP32-S3 family - primary board is the LILYGO T-SIM7080G-S3 with WiFi + LTE-M/NB-IoT fallback. The node stays connected and publishing whether the access point is up or the cell tower is the only thing reachable.
 
 **Currently deployed:** monitoring an outdoor wood boiler (temperature, pump current, Telegram alerts) and indoor climate (SHT31). Running 24/7 in the field.
 
@@ -30,7 +30,6 @@ Full documentation: [thesada.io/firmware](https://thesada.io/firmware/)
 - Battery monitoring with configurable low-battery alerts [ENABLE_BATTERY]
 - Configurable charge current (0-1000mA) and cutoff voltage (4.0-4.4V)
 - Deep sleep with RTC memory persistence (boot count, OTA check time)
-- SSD1306 OLED display (128x64, I2C) - Lua-driven rendering, remote MQTT data [ENABLE_DISPLAY]
 
 **Data**
 - SD card CSV logging with per-boot files and configurable log rotation (SD handling fully in SDModule)
@@ -40,7 +39,7 @@ Full documentation: [thesada.io/firmware](https://thesada.io/firmware/)
 - MQTT file ops: `fs.write` (truncate), `fs.append`, `fs.cat` with chunked reads (offset/length for large files)
 - Home Assistant MQTT auto-discovery (per-sensor topics, availability via LWT, WiFi diagnostics)
 - Lua 5.3 scripting engine - hot-reloadable event rules without recompiling
-- Lua bindings: MQTT.subscribe, JSON.decode, Display.*, EventBus, Config, Node, Telegram
+- Lua bindings: MQTT.subscribe, JSON.decode, EventBus, Config, Node, Telegram
 
 **Web interface**
 - Live sensor dashboard (temperature, current, battery %) - no login required for read-only data
@@ -90,13 +89,12 @@ Full documentation: [thesada.io/firmware](https://thesada.io/firmware/)
 +-- Optional modules (ENABLE_*) -------------------------+
 |  Temperature  SHT31  ADS1115  Battery  SD  PowerManager |
 |  HttpServer  LiteServer  ScriptEngine  Cellular         |
-|  Ethernet  Telegram  Display (OLED)  TftDisplay (CYD)   |
-|  PWM                                                    |
+|  Telegram  PWM                                          |
 +---------------------------------------------------------+
 |  Core (always compiled)                                 |
 |  WiFiManager + NTP  MQTTClient  OTAUpdate               |
-|  Shell (35+ cmds)   EventBus    SleepManager             |
-|  ModuleRegistry     Config      Log  HeartbeatLED        |
+|  Shell (35+ cmds)   EventBus    SleepManager            |
+|  ModuleRegistry     Config      Log  HeartbeatLED       |
 +---------------------------------------------------------+
 ```
 
@@ -106,7 +104,7 @@ Config is split: `thesada_config.h` for compile-time module enables, `config.jso
 
 **Core (always compiled):** Config, EventBus, Log, Shell, ModuleRegistry, WiFiManager, MQTTClient, OTAUpdate, SleepManager, HeartbeatLED
 
-**Optional modules (ENABLE_* guards):** Temperature, SHT31, ADS1115, Battery, PMU, SD, Cellular, Ethernet, Telegram, HttpServer, LiteServer, ScriptEngine, Display (OLED), TftDisplay (CYD), PWM, PowerManager
+**Optional modules (ENABLE_* guards):** Temperature, SHT31, ADS1115, Battery, PMU, SD, Cellular, Telegram, HttpServer, LiteServer, ScriptEngine, PWM, PowerManager
 
 Minimal build (core only) saves ~313 KB flash. Full build with all modules: 1.4 MB. Release includes both `firmware.bin` (full) and `firmware_minimal.bin` (core only).
 
@@ -116,15 +114,13 @@ Minimal build (core only) saves ~313 KB flash. Full build with all modules: 1.4 
 
 | Board | PIO environment | Notes |
 |---|---|---|
-| LILYGO T-SIM7080-S3 | `esp32-owb` | Primary target - all modules, PSRAM |
-| ESP32-S3 bare devkit | `esp32-s3-debug` | USB CDC serial, SHT31 enabled (BOARD_S3_BARE) |
-| ESP32-WROOM-32 | `esp32-wroom` | No cellular/PMU/SD - OLED display, WiFi, MQTT |
-| CYD (ESP32-2432S028R) | `esp32-cyd` | 2.8" TFT touch, LiteServer, SD (SPI) |
-| WT32-ETH01 | `esp32-eth` | LAN8720A Ethernet, WiFi fallback, well pump node |
-| LILYGO T-SIM7080-S3 | `esp32-owb-rescue` | Stripped rescue build (~1070 KB) for remote recovery |
+| LILYGO T-SIM7080G-S3 | `esp32-owb` | Primary target - all modules, PSRAM, cellular |
+| LILYGO T-SIM7080G-S3 | `esp32-owb-debug` | Same hardware, verbose logging + DEBUG_AT_COMMANDS |
+| LILYGO T-SIM7080G-S3 | `esp32-owb-rescue` | Stripped rescue build (~1070 KB) for remote recovery |
+| ESP32-S3 bare devkit | `esp32-s3-debug` | USB CDC serial, SHT31 enabled (`BOARD_S3_BARE`) |
 | ESP32-S3 bare devkit | `esp32-s3-debug-rescue` | Rescue twin for lab validation |
 
-Board-specific module overrides are in `thesada_config.h` (e.g. `BOARD_ETH` enables Ethernet and disables cellular/PMU). Rescue builds strip all optional modules except PMU via `BOARD_OWB_RESCUE` - used for OTA recovery on weak links where the full binary fails mid-download.
+Rescue builds strip all optional modules except PMU via `BOARD_OWB_RESCUE` - used for OTA recovery on weak links where the full binary fails mid-download. Bare-S3 builds (`BOARD_S3_BARE`) drop the LILYGO-specific hardware (cellular, PMU, battery, SD) and switch the default sensor to SHT31 for desk testing.
 
 ---
 
@@ -136,8 +132,7 @@ cp examples/config.json.example data/config.json
 # edit data/config.json (WiFi, MQTT, sensor pins)
 # optionally copy example scripts:
 #   cp examples/scripts/rules.lua.example data/scripts/rules.lua
-#   cp examples/scripts/display.lua.example data/scripts/display.lua  (OLED display)
-pio run -e esp32-owb --target upload      # or esp32-wroom, esp32-cyd, etc.
+pio run -e esp32-owb --target upload      # or esp32-s3-debug for bare-S3
 pio run -e esp32-owb --target uploadfs
 ```
 
@@ -156,14 +151,12 @@ thesada-fw/
     thesada-mod-ads1115/
     thesada-mod-battery/
     thesada-mod-cellular/
-    thesada-mod-display/
     thesada-mod-httpserver/
     thesada-mod-powermanager/
     thesada-mod-pwm/
     thesada-mod-scriptengine/
     thesada-mod-sd/
     thesada-mod-telegram/
-    thesada-mod-tftdisplay/
   scripts/
     add_framework_libs.py     # PlatformIO framework lib discovery
     ota_upload.py             # push OTA to a device over HTTP

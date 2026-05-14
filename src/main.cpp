@@ -1,7 +1,7 @@
 // thesada-fw - main.cpp
 // Boot sequence: Config -> Network -> MQTT -> OTA -> Shell -> modules.
-// Network priority: Ethernet (if ENABLE_ETH) -> WiFi -> AP fallback.
-// If all fail, CellularModule (PRIORITY_NETWORK) handles cellular fallback.
+// Network priority: WiFi -> AP fallback.
+// If WiFi is down, CellularModule (PRIORITY_NETWORK) handles cellular fallback.
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include <Arduino.h>
@@ -16,16 +16,24 @@
 #include <Shell.h>
 #include <SleepManager.h>
 #include <HeartbeatLED.h>
-#ifdef ENABLE_ETH
-#include <EthModule.h>
+#ifdef ENABLE_CELLULAR
+#include <Cellular.h>
 #endif
 
-// Return true if any network transport is connected
+// Return true if WiFi (or the AP fallback) reports a usable link
 static bool networkConnected() {
-#ifdef ENABLE_ETH
-  if (EthModule::connected()) return true;
-#endif
   return WiFiManager::connected();
+}
+
+// Return true if any OTA-capable transport is up. Wider than
+// networkConnected(): includes the cellular path so OTAUpdate::loop()
+// still ticks when WiFi is down and the modem holds the link.
+static bool otaTransportUp() {
+  if (networkConnected()) return true;
+#ifdef ENABLE_CELLULAR
+  if (Cellular::connected()) return true;
+#endif
+  return false;
 }
 
 void setup() {
@@ -59,11 +67,8 @@ void setup() {
 
   Config::load();
 
-  // Network priority: Ethernet -> WiFi -> AP fallback.
-#ifdef ENABLE_ETH
-  EthModule::earlyInit();
-#endif
-
+  // Bring WiFi up. CellularModule registers later via PRIORITY_NETWORK
+  // and handles the fallback path if WiFi never associates.
   if (!networkConnected()) {
     WiFiManager::begin();
   }
@@ -113,7 +118,7 @@ void loop() {
   // networkConnected() (WiFi/Eth-only) is false. The WiFi-specific
   // reconnect path inside loop() is no-op when WiFi is down.
   MQTTClient::loop();
-  if (networkConnected()) {
+  if (otaTransportUp()) {
     OTAUpdate::loop();
   }
 

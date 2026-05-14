@@ -29,6 +29,9 @@ ShellEntry Shell::_commands[MAX_COMMANDS];
 int Shell::_commandCount = 0;
 char Shell::_parseBuf[256];
 
+Shell::FSMount Shell::_fsMounts[Shell::FS_MOUNTS_MAX] = {};
+int            Shell::_fsMountCount = 0;
+
 Shell::DeferredSlot Shell::_ring[Shell::DEFERRED_RING_SIZE] = {};
 uint8_t             Shell::_ringHead = 0;
 uint8_t             Shell::_ringTail = 0;
@@ -141,6 +144,15 @@ bool Shell::enqueueDeferred(DeferredFn fn) {
 // then run execute() outside the critical section so a long-running
 // command (fs reads, LittleFS writes, MQTT publishes) does not block
 // concurrent enqueuers.
+//
+// Move (not copy) the std::function payloads into locals while inside the
+// portMUX critical section. Previous behaviour copied sink and then nulled
+// slot.sink/slot.fn under the lock - the assignment destroyed the captured
+// state (heap allocations, std::string captures) inside the spinlock,
+// which on ESP-IDF can deadlock the allocator if it takes its internal
+// lock. Moving leaves the slot's std::function in the empty/moved-from
+// state (no destruction needed); destructors of the locals run at function
+// return, outside the critical section.
 void Shell::loop() {
   char line[DEFERRED_LINE_LEN];
   ShellOutput sink;
@@ -153,14 +165,15 @@ void Shell::loop() {
     mode = slot.mode;
     if (mode == SlotMode::Shell) {
       memcpy(line, slot.line, sizeof(line));
-      sink = slot.sink;
+      sink = std::move(slot.sink);
     } else if (mode == SlotMode::Handler) {
       fn = std::move(slot.fn);
     }
     slot.mode = SlotMode::Empty;
-    slot.sink = nullptr;     // drop captured state asap
-    slot.fn = nullptr;
     slot.active = false;
+    // Do NOT null slot.sink / slot.fn here - they are already in the
+    // moved-from (empty) state. Nulling would run the destructor of the
+    // previous payload inside the critical section.
     _ringHead = (uint8_t)((_ringHead + 1) % DEFERRED_RING_SIZE);
   }
   taskEXIT_CRITICAL(&_shellRingMux);
@@ -298,21 +311,81 @@ void Shell::printHelp(const char* filter, ShellOutput out) {
 // Filesystem commands
 // ---------------------------------------------------------------------------
 
-// All filesystem commands use LittleFS by default.
-// SD card paths (/sd/*) are handled by SDModule which registers
-// its own fs.sd.ls, fs.sd.cat etc commands in begin().
-static FS* resolveFS(const char* /*path*/) {
+// File-scope forwarders so the existing cmd_* call sites keep working
+// without qualifying every line as `Shell::resolveFS(...)`.
+static FS* resolveFS(const char* path) { return Shell::resolveFS(path); }
+static const char* stripPrefix(const char* path) {
+  return Shell::stripPrefix(path);
+}
+
+// fs.* commands dispatch to the right backing filesystem by matching the
+// path's leading segment against the prefix registry. SDModule registers
+// "/sd" in its begin() after a successful mount; everything else falls
+// through to LittleFS. Same dispatch is used by the MQTT cli binary
+// handlers (fs.write / fs.cat chunked) so all transports see the same
+// routing.
+fs::FS* Shell::resolveFS(const char* path) {
+  if (!path) return &LittleFS;
+  for (int i = 0; i < _fsMountCount; i++) {
+    const FSMount& m = _fsMounts[i];
+    // Match either the bare prefix (e.g. "/sd") or prefix-with-separator
+    // (e.g. "/sd/log042.csv"). Anything else falls through.
+    if (strncmp(path, m.prefix, m.prefixLen) == 0 &&
+        (path[m.prefixLen] == '\0' || path[m.prefixLen] == '/')) {
+      return m.fs;
+    }
+  }
   return &LittleFS;
 }
 
-// Strip path prefix (no-op now, kept for compatibility)
-static const char* stripPrefix(const char* path) {
+const char* Shell::stripPrefix(const char* path) {
+  if (!path) return path;
+  for (int i = 0; i < _fsMountCount; i++) {
+    const FSMount& m = _fsMounts[i];
+    if (strncmp(path, m.prefix, m.prefixLen) == 0 &&
+        (path[m.prefixLen] == '\0' || path[m.prefixLen] == '/')) {
+      // Bare prefix or trailing slash -> root of underlying FS.
+      const char* rest = path + m.prefixLen;
+      if (*rest == '\0') return "/";
+      if (rest[0] == '/' && rest[1] == '\0') return "/";
+      return rest;
+    }
+  }
   return path;
+}
+
+bool Shell::registerFS(const char* prefix, fs::FS* fs) {
+  if (!prefix || !fs) return false;
+  if (prefix[0] != '/') return false;
+  size_t len = strlen(prefix);
+  if (len < 2 || prefix[len - 1] == '/') return false;
+  if (_fsMountCount >= FS_MOUNTS_MAX) {
+    Log::warn("Shell", "FS mount table full");
+    return false;
+  }
+  _fsMounts[_fsMountCount++] = { prefix, len, fs };
+  char msg[64];
+  snprintf(msg, sizeof(msg), "FS mount: %s -> %p", prefix, (void*)fs);
+  Log::info("Shell", msg);
+  return true;
+}
+
+// Validate a filesystem path before any LittleFS call. Centralised so every
+// transport (Shell-over-serial/WS, HTTP /api/file, MQTT CLI binary handlers)
+// shares one policy. See Shell::pathSafe doc in Shell.h.
+// in:  null-terminated path. out: true if safe.
+bool Shell::pathSafe(const char* path) {
+  if (!path || !*path) return false;
+  if (path[0] != '/') return false;
+  if (strstr(path, "..") != nullptr) return false;
+  if (strstr(path, "//") != nullptr) return false;
+  return true;
 }
 
 // List files in a directory
 static void cmd_ls(int argc, char** argv, ShellOutput out) {
   const char* path = (argc > 1) ? argv[1] : "/";
+  if (!Shell::pathSafe(path)) { out("Invalid path"); return; }
   FS* fs = resolveFS(path);
   const char* fsPath = stripPrefix(path);
 
@@ -351,6 +424,7 @@ static void cmd_ls(int argc, char** argv, ShellOutput out) {
 // Print file contents line by line
 static void cmd_cat(int argc, char** argv, ShellOutput out) {
   if (argc < 2) { out("Usage: cat <path>"); return; }
+  if (!Shell::pathSafe(argv[1])) { out("Invalid path"); return; }
   FS* fs = resolveFS(argv[1]);
   const char* fsPath = stripPrefix(argv[1]);
 
@@ -368,6 +442,7 @@ static void cmd_cat(int argc, char** argv, ShellOutput out) {
 // Remove a file from the filesystem
 static void cmd_rm(int argc, char** argv, ShellOutput out) {
   if (argc < 2) { out("Usage: rm <path>"); return; }
+  if (!Shell::pathSafe(argv[1])) { out("Invalid path"); return; }
   FS* fs = resolveFS(argv[1]);
   const char* fsPath = stripPrefix(argv[1]);
 
@@ -384,6 +459,7 @@ static void cmd_rm(int argc, char** argv, ShellOutput out) {
 static void cmd_write(int argc, char** argv, ShellOutput out) {
   // write <path> <content...>
   if (argc < 3) { out("Usage: write <path> <content...>"); return; }
+  if (!Shell::pathSafe(argv[1])) { out("Invalid path"); return; }
   FS* fs = resolveFS(argv[1]);
   const char* fsPath = stripPrefix(argv[1]);
 
@@ -407,6 +483,9 @@ static void cmd_write(int argc, char** argv, ShellOutput out) {
 // Rename or move a file
 static void cmd_mv(int argc, char** argv, ShellOutput out) {
   if (argc < 3) { out("Usage: mv <src> <dst>"); return; }
+  if (!Shell::pathSafe(argv[1]) || !Shell::pathSafe(argv[2])) {
+    out("Invalid path"); return;
+  }
   FS* fs = resolveFS(argv[1]);
   const char* src = stripPrefix(argv[1]);
   const char* dst = stripPrefix(argv[2]);
@@ -420,15 +499,23 @@ static void cmd_mv(int argc, char** argv, ShellOutput out) {
   }
 }
 
-// Show disk usage for LittleFS and SD card
+// Show disk usage for LittleFS and SD card.
+// LittleFS.totalBytes() returns 0 when the volume is not mounted (fresh
+// flash, mount failure, post-partition-table migration). The previous
+// version divided by total to compute a free-percent and panic'ed with
+// IntegerDivideByZero in exactly that case.
 static void cmd_df(int argc, char** argv, ShellOutput out) {
   char line[128];
 
   size_t total = LittleFS.totalBytes();
   size_t used  = LittleFS.usedBytes();
-  snprintf(line, sizeof(line), "LittleFS: %d / %d bytes used (%d%% free)",
-           (int)used, (int)total, (int)((total - used) * 100 / total));
-  out(line);
+  if (total == 0) {
+    out("LittleFS: not mounted");
+  } else {
+    snprintf(line, sizeof(line), "LittleFS: %d / %d bytes used (%d%% free)",
+             (int)used, (int)total, (int)((total - used) * 100 / total));
+    out(line);
+  }
 
   // SD card info is reported by SDModule::status() via module.status command
 }
@@ -722,6 +809,15 @@ static void cmd_config_reload(int argc, char** argv, ShellOutput out) {
     out("Network config changed - reinitializing MQTT subscriptions");
     MQTTClient::reinitSubscriptions();
   }
+
+  // Republish the retained set (status, HA discovery, /info, retained-topics
+  // manifest) so any subscriber polling those topics sees fresh state
+  // without waiting for a reboot or MQTT session drop. /info carries the
+  // config_hash that downstream consumers diff to decide whether to pull
+  // the new config. HA discovery refresh is also useful when sensor names
+  // or units moved in the config. Force=true bypasses the once-per-session
+  // guard.
+  MQTTClient::publishRetainedSet(true);
 
   char msg[96];
   snprintf(msg, sizeof(msg), "Config reloaded from /config.json (device: %s)", name);
@@ -1242,18 +1338,6 @@ static void cmd_module_list(int argc, char** argv, ShellOutput out) {
   out("  [x] lora");
   #else
   out("  [ ] lora");
-  #endif
-
-  #ifdef ENABLE_DISPLAY
-  out("  [x] display");
-  #else
-  out("  [ ] display");
-  #endif
-
-  #ifdef ENABLE_TFT
-  out("  [x] tftdisplay");
-  #else
-  out("  [ ] tftdisplay");
   #endif
 }
 

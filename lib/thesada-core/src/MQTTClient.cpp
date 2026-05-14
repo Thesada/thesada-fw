@@ -14,14 +14,12 @@
 #include <mbedtls/sha256.h>
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/pk.h>
+#include <mbedtls/platform_util.h>
 #include <mbedtls/version.h>
 #include <string>
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
 #include <esp_chip_info.h>
-#ifdef ENABLE_ETH
-  #include <ETH.h>
-#endif
 
 // NVS namespace + keys for per-device mTLS client certificate.
 // Kept separate from Config so cert survives factory reset of config.json
@@ -943,6 +941,47 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
   JsonObject cfg = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
 
+  // CLI correlation envelope: `{"req_id":<id>, "args":<string>}` where both
+  // fields are optional. req_id is echoed back on every cli/response so the
+  // app can match requests against responses on the shared cli/response
+  // topic. args, when present as a string, is unwrapped and used as the
+  // command payload for every downstream handler (binary fs.write /
+  // fs.append / cert.set + chunked fs.cat + Shell::execute fall-through).
+  // Non-envelope callers (raw plain-text args, raw binary path\ncontent)
+  // keep working - the envelope is recognised by payload[0]=='{' + valid
+  // JSON object shape; anything else falls through untouched.
+  //
+  // reqDoc stays in scope for the whole function so reqId and the args
+  // string view remain valid at every publish + dispatch site.
+  JsonDocument reqDoc;
+  JsonVariantConst reqId;
+  bool hasReqId = false;
+  bool reqIdOnlyPayload = false;
+  if (payload && plen > 0 && payload[0] == '{') {
+    if (deserializeJson(reqDoc, payload, plen) == DeserializationError::Ok &&
+        reqDoc.is<JsonObject>()) {
+      JsonObjectConst obj = reqDoc.as<JsonObjectConst>();
+      if (!obj["req_id"].isNull()) {
+        reqId = obj["req_id"];
+        hasReqId = true;
+      }
+      // Unwrap args: every downstream handler sees the inner string
+      // instead of the JSON envelope. Binary handlers still get raw bytes
+      // (the path\ncontent / type\nPEM format lives inside the args
+      // string). fs.cat chunked still gets "path offset length".
+      const char* argsStr = obj["args"];
+      if (argsStr) {
+        payload = argsStr;
+        plen    = strlen(argsStr);
+      }
+      // {"req_id":...} with no other keys (or {"req_id":..., "args":""}
+      // after unwrap) = no-arg command. Falls through to the Shell path
+      // bare instead of carrying the envelope as a literal arg.
+      reqIdOnlyPayload = hasReqId && (obj.size() == 1 ||
+                                      (argsStr && plen == 0));
+    }
+  }
+
   {
 
     // Special case: fs.write / fs.append / file.write (legacy alias)
@@ -954,6 +993,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
       const char* nl = strchr(payload, '\n');
       JsonDocument resp;
       resp["cmd"] = cmd;
+      if (hasReqId) resp["req_id"] = reqId;
       if (!nl) {
         resp["ok"] = false;
         resp["output"][0] = "Usage: payload = <path>\\n<content>";
@@ -965,7 +1005,23 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
         const char* content = nl + 1;
         size_t contentLen = plen - pathLen - 1;
 
-        File f = LittleFS.open(path, mode);
+        // Reject path traversal before any LittleFS call - the cli/<cmd>
+        // topic is the device's remote attack surface (broker ACL is the
+        // only thing between an external publisher and this handler).
+        if (!Shell::pathSafe(path)) {
+          resp["ok"] = false;
+          resp["output"][0] = "Invalid path";
+          char respTopic[64];
+          snprintf(respTopic, sizeof(respTopic), "%s/cli/response", prefix);
+          size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
+          char* rp = (char*)malloc(bufSz);
+          if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
+          goto cleanup;
+        }
+
+        fs::FS* fs = Shell::resolveFS(path);
+        const char* fsPath = Shell::stripPrefix(path);
+        File f = fs->open(fsPath, mode);
         if (f) {
           size_t written = f.write((const uint8_t*)content, contentLen);
           f.close();
@@ -1013,8 +1069,24 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
 
         JsonDocument resp;
         resp["cmd"] = cmd;
+        if (hasReqId) resp["req_id"] = reqId;
 
-        File f = LittleFS.open(path, "r");
+        // Reject path traversal before LittleFS - same surface as fs.write
+        // above, same broker-ACL-only mitigation pre-pathSafe.
+        if (!Shell::pathSafe(path)) {
+          resp["ok"] = false;
+          resp["output"][0] = "Invalid path";
+          char respTopic[64];
+          snprintf(respTopic, sizeof(respTopic), "%s/cli/response", prefix);
+          size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
+          char* rp = (char*)malloc(bufSz);
+          if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
+          goto cleanup;
+        }
+
+        fs::FS* catfs = Shell::resolveFS(path);
+        const char* catFsPath = Shell::stripPrefix(path);
+        File f = catfs->open(catFsPath, "r");
         if (!f) {
           resp["ok"] = false;
           resp["output"][0] = "File not found";
@@ -1067,6 +1139,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
     if (strcmp(cmd, "cert.set") == 0 && payload && plen > 0) {
       JsonDocument resp;
       resp["cmd"] = cmd;
+      if (hasReqId) resp["req_id"] = reqId;
 
       const char* nl = strchr(payload, '\n');
       if (!nl) {
@@ -1106,6 +1179,12 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
             memcpy(buf, pem, pemLen);
             buf[pemLen] = '\0';
             bool ok = storeClientCert(nullptr, buf);
+            // Zero the heap copy of the private key before free - leaving
+            // it lingering in heap means any future feature that dumps /
+            // inspects heap (debug command, crash uploader, remote heap
+            // inspector) leaks the key. mbedtls_platform_zeroize is not
+            // optimised away by the compiler.
+            mbedtls_platform_zeroize(buf, pemLen + 1);
             free(buf);
             resp["ok"] = ok;
             resp["output"][0] = ok ? "Client key stored in NVS" : "NVS write failed";
@@ -1132,7 +1211,11 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
     char line[1024];
     bool isEmptyJson =
       payload && plen == 2 && payload[0] == '{' && payload[1] == '}';
-    if (payload && plen > 0 && !isEmptyJson) {
+    // {"req_id": ...} with no other keys is also a no-arg invocation -
+    // the envelope is purely for correlation, not arguments. Without
+    // this the envelope JSON would be passed verbatim as a literal arg
+    // and Shell command parsers would see it as garbage.
+    if (payload && plen > 0 && !isEmptyJson && !reqIdOnlyPayload) {
       snprintf(line, sizeof(line), "%s %s", cmd, payload);
     } else {
       snprintf(line, sizeof(line), "%s", cmd);
@@ -1141,6 +1224,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
     // Execute through Shell and collect output.
     JsonDocument resp;
     resp["cmd"] = cmd;
+    if (hasReqId) resp["req_id"] = reqId;
     resp["ok"]  = true;
     JsonArray output = resp["output"].to<JsonArray>();
 
@@ -1370,34 +1454,6 @@ void MQTTClient::publishDiscovery() {
     _client.publish(t, WiFi.localIP().toString().c_str());
   }
 
-#ifdef ENABLE_ETH
-  // -- Ethernet diagnostics (disabled by default in HA) --
-  snprintf(uid, sizeof(uid), "%s_eth_ip", devId);
-  snprintf(stBuf, sizeof(stBuf), "%s/sensor/eth/ip", prefix);
-  disc("sensor", uid, "Ethernet IP", stBuf, "", "", "", "diagnostic");
-
-  snprintf(uid, sizeof(uid), "%s_eth_speed", devId);
-  snprintf(stBuf, sizeof(stBuf), "%s/sensor/eth/speed", prefix);
-  disc("sensor", uid, "Ethernet Speed", stBuf, "Mbps", "", "measurement", "diagnostic");
-
-  snprintf(uid, sizeof(uid), "%s_eth_mac", devId);
-  snprintf(stBuf, sizeof(stBuf), "%s/sensor/eth/mac", prefix);
-  disc("sensor", uid, "Ethernet MAC", stBuf, "", "", "", "diagnostic");
-
-  // Publish ETH stats now
-  if (ETH.linkUp()) {
-    char t[96], v[32];
-    snprintf(t, sizeof(t), "%s/sensor/eth/ip", prefix);
-    _client.publish(t, ETH.localIP().toString().c_str());
-
-    snprintf(t, sizeof(t), "%s/sensor/eth/speed", prefix);
-    snprintf(v, sizeof(v), "%d", ETH.linkSpeed());
-    _client.publish(t, v);
-
-    snprintf(t, sizeof(t), "%s/sensor/eth/mac", prefix);
-    _client.publish(t, ETH.macAddress().c_str());
-  }
-#endif
 
   // -- Heap + PSRAM diagnostics --
   snprintf(uid, sizeof(uid), "%s_heap_free", devId);
@@ -1549,14 +1605,8 @@ void MQTTClient::publishDeviceInfo() {
     "owb-rescue";
 #elif defined(BOARD_S3_BARE)
     "s3-bare";
-#elif defined(BOARD_CYD)
-    "cyd";
-#elif defined(BOARD_WROOM)
-    "wroom";
-#elif defined(BOARD_ETH)
-    "eth";
 #else
-    "unknown";
+    "owb";
 #endif
 
   esp_chip_info_t chip;
@@ -1581,13 +1631,16 @@ void MQTTClient::publishDeviceInfo() {
   psram = psramFound();
 #endif
 
-  // Compute config + script hashes for drift detection
+  // Compute config + script hashes for drift detection. config_hash MUST
+  // match what an external consumer gets when it sha256s /config.json
+  // raw bytes via /api/config (or any other channel that reads the file).
+  // Re-serialising Config::get() produced the compact-canonical form
+  // (no whitespace, ArduinoJson default order) which never matched the
+  // raw-file hash - drift detection sat broken regardless of when this
+  // payload was republished. Hash the file directly so on-disk content
+  // is the single source of truth.
   char configHash[65], mainHash[65], rulesHash[65];
-  {
-    String cfgJson;
-    serializeJson(Config::get(), cfgJson);
-    sha256Hex(cfgJson.c_str(), cfgJson.length(), configHash);
-  }
+  sha256File("/config.json", configHash);
   sha256File("/scripts/main.lua", mainHash);
   sha256File("/scripts/rules.lua", rulesHash);
 

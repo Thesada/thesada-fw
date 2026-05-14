@@ -10,12 +10,10 @@
 #include "WiFiManager.h"
 #include "Config.h"
 #include "Log.h"
+#include "Shell.h"
 #include <WiFi.h>
 #include <DNSServer.h>
 #include <time.h>
-#ifdef ENABLE_ETH
-  #include <ETH.h>
-#endif
 #include <esp_sntp.h>
 
 static const char* TAG = "WiFi";
@@ -136,6 +134,7 @@ void WiFiManager::scanAndConnect() {
           uint32_t t0 = millis();
           while (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED &&
                  millis() - t0 < 15000) {
+            Shell::pumpConsole();
             delay(200);
           }
           if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
@@ -181,6 +180,7 @@ bool WiFiManager::tryConnect(const char* ssid, const char* password, uint32_t ti
       WiFi.disconnect(true);
       return false;
     }
+    Shell::pumpConsole();
     delay(250);
   }
   return true;
@@ -255,11 +255,6 @@ void WiFiManager::loop() {
 
   // While on cellular, recheckWiFi() handles the re-scan on a timer.
   if (_status == WiFiStatus::ALL_FAILED) return;
-
-  // Skip WiFi reconnect when Ethernet is the primary transport
-#ifdef ENABLE_ETH
-  if (ETH.linkUp()) return;
-#endif
 
   if (WiFi.status() != WL_CONNECTED) {
     Log::warn(TAG, "Connection lost - re-scanning");

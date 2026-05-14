@@ -16,6 +16,8 @@
 #include <Arduino.h>
 #include <functional>
 
+namespace fs { class FS; }
+
 // Output callback - shell commands write through this.
 // Serial handler prints to Serial. WebSocket handler sends to client.
 using ShellOutput = std::function<void(const char* line)>;
@@ -76,6 +78,48 @@ public:
   // Register a command. Called internally by begin() and by modules.
   static void registerCommand(const char* name, const char* help, ShellCommand handler);
 
+  // Register a mount prefix -> filesystem mapping. Modules with their own
+  // filesystem (SD card, future external storage) call this in begin()
+  // after a successful mount. fs.* commands route by matching the path's
+  // leading segment against registered prefixes. LittleFS is the default
+  // for any path that does not match a registered prefix.
+  //
+  // Prefix MUST start with '/' and MUST NOT end with '/'. Example: "/sd"
+  // routes "/sd/log042.csv" to the SD FS with the prefix stripped so the
+  // underlying FS sees "/log042.csv".
+  // in: prefix, fs pointer. out: true if registered, false if table full.
+  static bool registerFS(const char* prefix, fs::FS* fs);
+
+  // Resolve a path to the filesystem that backs it. Returns &LittleFS for
+  // any path not matching a registered prefix. Never returns nullptr.
+  // in: absolute path. out: filesystem pointer.
+  static fs::FS* resolveFS(const char* path);
+
+  // Strip a registered mount prefix from a path so the underlying fs::FS
+  // sees the path relative to its own root. Paths that do not match a
+  // registered prefix are returned unchanged. The exact prefix "/sd" maps
+  // to "/" (root listing). Returns a pointer into the input buffer for
+  // the non-root case; "/" is returned as a literal for the root case so
+  // the caller must NOT modify the returned pointer.
+  // in: absolute path. out: path relative to the resolved FS root.
+  static const char* stripPrefix(const char* path);
+
+  // Validate a filesystem path before passing it to LittleFS.open() / similar.
+  // Every transport that accepts a path from an external source (HTTP, Shell
+  // over serial / WS / MQTT CLI, future BLE) MUST run the argument through
+  // pathSafe() before any FS call. Centralized here so the policy is single-
+  // source: any new caller that forgets the check is the only thing that has
+  // to change when the policy tightens further.
+  //
+  // Policy:
+  //   - reject empty
+  //   - require leading '/' (every legitimate caller emits absolute paths;
+  //     the dashboard JS already does this)
+  //   - reject ".." anywhere (parent-dir traversal)
+  //   - reject "//" anywhere (normaliser-escape variants)
+  // in:  null-terminated path. out: true if safe to pass to FS.
+  static bool pathSafe(const char* path);
+
   // Tab completion / help for a partial command. Returns matching commands.
   static void listCommands(ShellOutput out);
 
@@ -108,6 +152,17 @@ private:
   static ShellEntry _commands[MAX_COMMANDS];
   static int _commandCount;
   static char _parseBuf[256];  // mutable copy for tokenization
+
+  // FS mount registry. Slots large enough for LittleFS + SD + future
+  // external storage. resolveFS walks this in registration order.
+  static constexpr int FS_MOUNTS_MAX = 4;
+  struct FSMount {
+    const char* prefix;
+    size_t      prefixLen;
+    fs::FS*     fs;
+  };
+  static FSMount _fsMounts[FS_MOUNTS_MAX];
+  static int     _fsMountCount;
 
   // Deferred-execution ring. Each slot holds a buffered command line
   // plus the per-call output sink. `active` flips true on enqueue and back
