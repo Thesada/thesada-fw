@@ -30,6 +30,18 @@ fs::FS* SDModule::fs() {
   return &SD_MMC;
 }
 
+// fs.df probes for the SD volume. The fs::FS base class has no byte-count
+// API - totalBytes()/usedBytes() live on the SD / SD_MMC subclasses - so
+// these wrappers pick the right concrete object by _spiMode and get
+// registered with the FS mount so Shell::cmd_df can report SD without
+// core depending on this module. Returns 0 when no card is mounted.
+uint64_t SDModule::_dfTotal() {
+  return _spiMode ? SD.totalBytes() : SD_MMC.totalBytes();
+}
+uint64_t SDModule::_dfUsed() {
+  return _spiMode ? SD.usedBytes() : SD_MMC.usedBytes();
+}
+
 // Find the next free log slot (log001-log999) and create a CSV file with header
 bool SDModule::_openNextLog() {
   static const char* HEADER = "timestamp,sensor,data\n";
@@ -103,7 +115,7 @@ void SDModule::begin() {
     snprintf(info, sizeof(info), "Mounted (SPI, CS=%d) - %.1f MB",
              cs, (float)SD.totalBytes() / (1024.0f * 1024.0f));
     Log::info(TAG, info);
-    Shell::registerFS("/sd", &SD);
+    Shell::registerFS("/sd", &SD, _dfUsed, _dfTotal);
   } else {
     // SD_MMC mode - LILYGO and boards with dedicated SDMMC pins
     uint8_t pinClk  = cfg["sd"]["pin_clk"]  | 38;
@@ -125,7 +137,7 @@ void SDModule::begin() {
     snprintf(info, sizeof(info), "Mounted (SD_MMC) - %.1f MB",
              (float)SD_MMC.totalBytes() / (1024.0f * 1024.0f));
     Log::info(TAG, info);
-    Shell::registerFS("/sd", &SD_MMC);
+    Shell::registerFS("/sd", &SD_MMC, _dfUsed, _dfTotal);
   }
 
   if (!_openNextLog()) {

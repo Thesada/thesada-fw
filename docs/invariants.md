@@ -318,6 +318,28 @@ publish site. Every `resp["cmd"] = cmd` is paired with
 
 Source: `lib/thesada-core/src/MQTTClient.cpp::runCli`.
 
+### `cli/response` paginates oversized command output
+
+The general shell path in `runCli` measures the running serialized
+JSON size as it collects output lines; when the next line would
+overflow the `_bufferOut` publish buffer it ships the current page
+with `"more": true` and starts a fresh one. The final page carries
+`"more": false`. Every page carries a 0-indexed `"page"` field.
+Single-page output - the common case - is `page: 0, more: false`,
+the same shape a consumer that ignores both fields already sees.
+
+Without this, `serializeJson` silently truncates any command whose
+output exceeds the buffer (`fs.ls` on a large SD directory, `help`,
+module dumps) and the consumer receives clipped, unparseable JSON.
+
+How enforced: the general path publishes only through the paginating
+sink (`startPage` / `publishPage` lambdas in `runCli`). The
+special-case handlers (`fs.write`, `fs.cat` chunked, `cert.set`)
+publish single fixed-shape responses and are exempt - their output
+is bounded by construction.
+
+Source: `lib/thesada-core/src/MQTTClient.cpp::runCli`.
+
 ### Dashboard / shell HTML output is escaped via the browser's serializer
 
 Dashboard XSS path uses `_escEl.textContent = s; return _escEl.innerHTML`
