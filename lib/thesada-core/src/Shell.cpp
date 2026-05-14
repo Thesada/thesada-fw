@@ -29,6 +29,9 @@ ShellEntry Shell::_commands[MAX_COMMANDS];
 int Shell::_commandCount = 0;
 char Shell::_parseBuf[256];
 
+Shell::FSMount Shell::_fsMounts[Shell::FS_MOUNTS_MAX] = {};
+int            Shell::_fsMountCount = 0;
+
 Shell::DeferredSlot Shell::_ring[Shell::DEFERRED_RING_SIZE] = {};
 uint8_t             Shell::_ringHead = 0;
 uint8_t             Shell::_ringTail = 0;
@@ -308,16 +311,63 @@ void Shell::printHelp(const char* filter, ShellOutput out) {
 // Filesystem commands
 // ---------------------------------------------------------------------------
 
-// All filesystem commands use LittleFS by default.
-// SD card paths (/sd/*) are handled by SDModule which registers
-// its own fs.sd.ls, fs.sd.cat etc commands in begin().
-static FS* resolveFS(const char* /*path*/) {
+// File-scope forwarders so the existing cmd_* call sites keep working
+// without qualifying every line as `Shell::resolveFS(...)`.
+static FS* resolveFS(const char* path) { return Shell::resolveFS(path); }
+static const char* stripPrefix(const char* path) {
+  return Shell::stripPrefix(path);
+}
+
+// fs.* commands dispatch to the right backing filesystem by matching the
+// path's leading segment against the prefix registry. SDModule registers
+// "/sd" in its begin() after a successful mount; everything else falls
+// through to LittleFS. Same dispatch is used by the MQTT cli binary
+// handlers (fs.write / fs.cat chunked) so all transports see the same
+// routing.
+fs::FS* Shell::resolveFS(const char* path) {
+  if (!path) return &LittleFS;
+  for (int i = 0; i < _fsMountCount; i++) {
+    const FSMount& m = _fsMounts[i];
+    // Match either the bare prefix (e.g. "/sd") or prefix-with-separator
+    // (e.g. "/sd/log042.csv"). Anything else falls through.
+    if (strncmp(path, m.prefix, m.prefixLen) == 0 &&
+        (path[m.prefixLen] == '\0' || path[m.prefixLen] == '/')) {
+      return m.fs;
+    }
+  }
   return &LittleFS;
 }
 
-// Strip path prefix (no-op now, kept for compatibility)
-static const char* stripPrefix(const char* path) {
+const char* Shell::stripPrefix(const char* path) {
+  if (!path) return path;
+  for (int i = 0; i < _fsMountCount; i++) {
+    const FSMount& m = _fsMounts[i];
+    if (strncmp(path, m.prefix, m.prefixLen) == 0 &&
+        (path[m.prefixLen] == '\0' || path[m.prefixLen] == '/')) {
+      // Bare prefix or trailing slash -> root of underlying FS.
+      const char* rest = path + m.prefixLen;
+      if (*rest == '\0') return "/";
+      if (rest[0] == '/' && rest[1] == '\0') return "/";
+      return rest;
+    }
+  }
   return path;
+}
+
+bool Shell::registerFS(const char* prefix, fs::FS* fs) {
+  if (!prefix || !fs) return false;
+  if (prefix[0] != '/') return false;
+  size_t len = strlen(prefix);
+  if (len < 2 || prefix[len - 1] == '/') return false;
+  if (_fsMountCount >= FS_MOUNTS_MAX) {
+    Log::warn("Shell", "FS mount table full");
+    return false;
+  }
+  _fsMounts[_fsMountCount++] = { prefix, len, fs };
+  char msg[64];
+  snprintf(msg, sizeof(msg), "FS mount: %s -> %p", prefix, (void*)fs);
+  Log::info("Shell", msg);
+  return true;
 }
 
 // Validate a filesystem path before any LittleFS call. Centralised so every

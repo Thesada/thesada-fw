@@ -941,6 +941,47 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
   JsonObject cfg = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
 
+  // CLI correlation envelope: `{"req_id":<id>, "args":<string>}` where both
+  // fields are optional. req_id is echoed back on every cli/response so the
+  // app can match requests against responses on the shared cli/response
+  // topic. args, when present as a string, is unwrapped and used as the
+  // command payload for every downstream handler (binary fs.write /
+  // fs.append / cert.set + chunked fs.cat + Shell::execute fall-through).
+  // Non-envelope callers (raw plain-text args, raw binary path\ncontent)
+  // keep working - the envelope is recognised by payload[0]=='{' + valid
+  // JSON object shape; anything else falls through untouched.
+  //
+  // reqDoc stays in scope for the whole function so reqId and the args
+  // string view remain valid at every publish + dispatch site.
+  JsonDocument reqDoc;
+  JsonVariantConst reqId;
+  bool hasReqId = false;
+  bool reqIdOnlyPayload = false;
+  if (payload && plen > 0 && payload[0] == '{') {
+    if (deserializeJson(reqDoc, payload, plen) == DeserializationError::Ok &&
+        reqDoc.is<JsonObject>()) {
+      JsonObjectConst obj = reqDoc.as<JsonObjectConst>();
+      if (!obj["req_id"].isNull()) {
+        reqId = obj["req_id"];
+        hasReqId = true;
+      }
+      // Unwrap args: every downstream handler sees the inner string
+      // instead of the JSON envelope. Binary handlers still get raw bytes
+      // (the path\ncontent / type\nPEM format lives inside the args
+      // string). fs.cat chunked still gets "path offset length".
+      const char* argsStr = obj["args"];
+      if (argsStr) {
+        payload = argsStr;
+        plen    = strlen(argsStr);
+      }
+      // {"req_id":...} with no other keys (or {"req_id":..., "args":""}
+      // after unwrap) = no-arg command. Falls through to the Shell path
+      // bare instead of carrying the envelope as a literal arg.
+      reqIdOnlyPayload = hasReqId && (obj.size() == 1 ||
+                                      (argsStr && plen == 0));
+    }
+  }
+
   {
 
     // Special case: fs.write / fs.append / file.write (legacy alias)
@@ -952,6 +993,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
       const char* nl = strchr(payload, '\n');
       JsonDocument resp;
       resp["cmd"] = cmd;
+      if (hasReqId) resp["req_id"] = reqId;
       if (!nl) {
         resp["ok"] = false;
         resp["output"][0] = "Usage: payload = <path>\\n<content>";
@@ -977,7 +1019,9 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
           goto cleanup;
         }
 
-        File f = LittleFS.open(path, mode);
+        fs::FS* fs = Shell::resolveFS(path);
+        const char* fsPath = Shell::stripPrefix(path);
+        File f = fs->open(fsPath, mode);
         if (f) {
           size_t written = f.write((const uint8_t*)content, contentLen);
           f.close();
@@ -1025,6 +1069,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
 
         JsonDocument resp;
         resp["cmd"] = cmd;
+        if (hasReqId) resp["req_id"] = reqId;
 
         // Reject path traversal before LittleFS - same surface as fs.write
         // above, same broker-ACL-only mitigation pre-pathSafe.
@@ -1039,7 +1084,9 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
           goto cleanup;
         }
 
-        File f = LittleFS.open(path, "r");
+        fs::FS* catfs = Shell::resolveFS(path);
+        const char* catFsPath = Shell::stripPrefix(path);
+        File f = catfs->open(catFsPath, "r");
         if (!f) {
           resp["ok"] = false;
           resp["output"][0] = "File not found";
@@ -1092,6 +1139,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
     if (strcmp(cmd, "cert.set") == 0 && payload && plen > 0) {
       JsonDocument resp;
       resp["cmd"] = cmd;
+      if (hasReqId) resp["req_id"] = reqId;
 
       const char* nl = strchr(payload, '\n');
       if (!nl) {
@@ -1163,7 +1211,11 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
     char line[1024];
     bool isEmptyJson =
       payload && plen == 2 && payload[0] == '{' && payload[1] == '}';
-    if (payload && plen > 0 && !isEmptyJson) {
+    // {"req_id": ...} with no other keys is also a no-arg invocation -
+    // the envelope is purely for correlation, not arguments. Without
+    // this the envelope JSON would be passed verbatim as a literal arg
+    // and Shell command parsers would see it as garbage.
+    if (payload && plen > 0 && !isEmptyJson && !reqIdOnlyPayload) {
       snprintf(line, sizeof(line), "%s %s", cmd, payload);
     } else {
       snprintf(line, sizeof(line), "%s", cmd);
@@ -1172,6 +1224,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
     // Execute through Shell and collect output.
     JsonDocument resp;
     resp["cmd"] = cmd;
+    if (hasReqId) resp["req_id"] = reqId;
     resp["ok"]  = true;
     JsonArray output = resp["output"].to<JsonArray>();
 

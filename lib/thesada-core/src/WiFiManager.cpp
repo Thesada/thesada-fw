@@ -10,6 +10,7 @@
 #include "WiFiManager.h"
 #include "Config.h"
 #include "Log.h"
+#include "Shell.h"
 #include <WiFi.h>
 #include <DNSServer.h>
 #include <time.h>
@@ -133,6 +134,7 @@ void WiFiManager::scanAndConnect() {
           uint32_t t0 = millis();
           while (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED &&
                  millis() - t0 < 15000) {
+            Shell::pumpConsole();
             delay(200);
           }
           if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
@@ -178,6 +180,7 @@ bool WiFiManager::tryConnect(const char* ssid, const char* password, uint32_t ti
       WiFi.disconnect(true);
       return false;
     }
+    Shell::pumpConsole();
     delay(250);
   }
   return true;

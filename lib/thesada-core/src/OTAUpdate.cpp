@@ -25,6 +25,7 @@
 #include "MQTTClient.h"
 #include "SleepManager.h"
 #include "Log.h"
+#include "Shell.h"
 #include <thesada_config.h>
 
 #include <HTTPClient.h>
@@ -137,6 +138,7 @@ static bool otaHttpGetWiFi(const char* url,
   uint32_t deadline = millis() + 5UL * 60UL * 1000UL;  // 5 min cap
   while (millis() < deadline) {
     yield(); esp_task_wdt_reset();
+    Shell::pumpConsole();
     if (!stream->connected() && !stream->available()) break;
     int avail = stream->available();
     if (avail <= 0) { delay(10); continue; }
@@ -295,12 +297,17 @@ static bool downloadBinaryChunkedCellular(
       Cellular::atPassthrough("+CNACT=0,1", 10000UL, [](const char*){});
       // CNACT activation completes asynchronously via +APP PDP URC;
       // a short settle window before the next handshake is reliable.
-      for (int i = 0; i < 20; ++i) { delay(100); esp_task_wdt_reset(); }
+      for (int i = 0; i < 20; ++i) {
+        Shell::pumpConsole();
+        delay(100);
+        esp_task_wdt_reset();
+      }
     }
 
     // Inter-chunk pacing while feeding the watchdog.
     uint32_t paceUntil = millis() + CHUNK_GAP_MS;
     while (millis() < paceUntil) {
+      Shell::pumpConsole();
       esp_task_wdt_reset();
       delay(200);
     }

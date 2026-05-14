@@ -4,7 +4,7 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-05-12 (initial). Bump the date on every edit.
+Dated 2026-05-13. Bump the date on every edit.
 
 ---
 
@@ -25,6 +25,34 @@ How enforced: every new handler that accepts a path must call
 Source: `lib/thesada-core/src/Shell.h`, `Shell.cpp`,
 `lib/thesada-core/src/MQTTClient.cpp` (cli binary handlers),
 `lib/thesada-mod-httpserver/src/HttpServer.cpp` (`_pathSafe`).
+
+### fs.* command routing goes through `Shell::resolveFS` / `Shell::stripPrefix`
+
+Every `fs.*` Shell command and every MQTT cli binary handler that
+opens a file must resolve the backing filesystem via
+`Shell::resolveFS(path)` and translate the path via
+`Shell::stripPrefix(path)` before the `fs::FS->open()` call. The
+registry maps mount prefixes to `fs::FS*` pointers; SDModule
+registers `/sd` -> `SD_MMC` (or `SD` in SPI mode) at the end of a
+successful mount. Unknown prefixes fall through to LittleFS.
+
+Hardcoded `LittleFS.open` is allow-listed only for paths the firmware
+itself owns end-to-end: `/ca.crt`, `/config.json`, `/scripts/*.lua`.
+Any new caller that accepts an externally supplied path must route
+through the registry so SD-path support stays automatic.
+
+Path validation via `Shell::pathSafe` runs BEFORE resolution - so
+`/sd/../config.json` is rejected on the `..` rule regardless of which
+filesystem the prefix would have routed to. Cross-FS escape via the
+prefix is structurally impossible.
+
+How enforced: core does not depend on the SD module (one-way: SD
+module depends on core). Modules call `Shell::registerFS` in their
+own `begin()` after mount; core never imports SD-mod headers.
+
+Source: `lib/thesada-core/src/Shell.cpp::resolveFS`, `stripPrefix`,
+`registerFS`; `lib/thesada-mod-sd/src/SDModule.cpp::begin` (caller);
+`lib/thesada-core/src/MQTTClient.cpp::runCli` (consumer).
 
 ---
 
@@ -52,6 +80,22 @@ without flipping the boot partition. Inactive flash partition stays
 invalidated cleanly.
 
 Source: `lib/thesada-core/src/OTAUpdate.cpp` flashFromCallback path.
+
+### OTA-over-cellular shares the WiFi cert-verification gate
+
+The cellular OTA path (manifest fetch + binary fetch over the SIM7080
+HTTPS stack) is gated by the same `/ca.crt`-present-or-allow-insecure
+refusal as WiFi OTA. The check runs in `OTAUpdate::configureSecureClient`
+before any transport is selected, so cellular cannot quietly bypass
+the gate that was written for WiFi. `setInsecure()` on the cellular
+HTTPS client is rejected under the same rule.
+
+How enforced: when a new transport gets added to OTA, route it through
+`configureSecureClient` rather than letting the transport hold its own
+TLS config.
+
+Source: `lib/thesada-core/src/OTAUpdate.cpp::configureSecureClient`,
+`lib/thesada-mod-cellular/src/Cellular.cpp` HTTPS client wiring.
 
 ---
 
@@ -148,6 +192,30 @@ move-then-exit pattern.
 
 Source: `lib/thesada-core/src/Shell.cpp::loop`.
 
+### Long blocking inner loops in core modules pump the console between iterations
+
+Any inner loop in `lib/thesada-core` or `lib/thesada-mod-cellular` that
+can hold the main-loop task for more than ~1 s must call
+`Shell::pumpConsole()` between iterations. Without it, typed serial
+commands queue in the OS RX FIFO until the loop exits and the board
+appears frozen during normal operation (WiFi association, NTP sync,
+OTA download, cellular registration polling, inter-chunk pacing).
+
+Pump call is a one-line drop-in: reentrant-safe (single console,
+single static buffer), idempotent on partial-line state, and
+dispatches whole lines via `Shell::execute()` which has its own ring.
+Worst case a typed command runs inside the inner loop's stack frame
+instead of the main one - acceptable for debug operations.
+
+How enforced: every new blocking loop with a per-iteration delay
+>= 100 ms in core / cellular modules adds the pump call. Reviewers
+check this on PRs that introduce new wait loops. Async/state-machine
+refactors of these modules are out of scope - the pump call is the
+contract.
+
+Source: `lib/thesada-core/src/Shell.cpp::pumpConsole` and call sites
+in `WiFiManager.cpp`, `OTAUpdate.cpp`, `Cellular.cpp`, `main.cpp`.
+
 ---
 
 ## Concurrency
@@ -213,6 +281,42 @@ extra subs run on WiFi only and are silently absent on cellular.
 
 Source: `lib/thesada-core/src/MQTTClient.cpp::subscribe`,
 `lib/thesada-mod-cellular/src/Cellular.cpp::smsubAll`.
+
+### `<prefix>/info config_hash` is sha256 of `/config.json` on-disk bytes
+
+Not the re-serialized in-memory `Config`. The companion app's drift
+detection compares this hash against the file it stores; hashing the
+canonical in-memory form (key ordering, whitespace, numeric formatting
+from `serializeJson`) produces a different value for identical
+content and breaks drift detection silently.
+
+How enforced: hash via `sha256File("/config.json")`, never
+`serializeJson(Config::get(), ...)` into a hash. Any future
+config-hash producer (e.g. a `cli/info` handler) must use the file.
+
+Source: `lib/thesada-core/src/MQTTClient.cpp::publishDeviceInfo`.
+
+### `cli/response` echoes caller-supplied `req_id` when payload is JSON
+
+When the `cli/<cmd>` payload parses as a JSON object with a top-level
+`req_id` (string or number), every response message published to
+`cli/response` for that command carries the same `req_id` verbatim.
+Multiple in-flight CLI commands share the single `cli/response` topic
+and the broker delivers them in publish order; without correlation
+the consumer cannot match a response to its request, and a response
+arriving within milliseconds of the next request is mis-routed.
+
+Non-JSON payloads (binary protocols: `fs.write`, `fs.append`,
+`cert.set`; legacy plain-text args) have no `req_id` and the response
+simply omits the field. `{"req_id": N}` with no other keys is a
+no-arg invocation - the envelope is correlation metadata, not args.
+
+How enforced: a single `deserializeJson` at the top of `runCli`; the
+`JsonDocument` stays in scope so the variant remains valid at every
+publish site. Every `resp["cmd"] = cmd` is paired with
+`if (hasReqId) resp["req_id"] = reqId`.
+
+Source: `lib/thesada-core/src/MQTTClient.cpp::runCli`.
 
 ### Dashboard / shell HTML output is escaped via the browser's serializer
 

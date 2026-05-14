@@ -4,7 +4,7 @@ How to write firmware in this repo. Reference material for PR review.
 Sibling to [docs/invariants.md](docs/invariants.md) (the load-bearing
 rules).
 
-Dated 2026-05-12. Bump on every edit.
+Dated 2026-05-13. Bump on every edit.
 
 ---
 
@@ -296,8 +296,56 @@ Process:
 2. Read the surrounding code for the pattern that allowed it.
 3. Grep the rest of the codebase for the same pattern.
 4. Fix all instances in one PR (or document why some are different).
-5. Add the pattern to [docs/invariants.md](docs/invariants.md) if it
-   is not already there.
+5. Update [docs/invariants.md](docs/invariants.md) in the SAME commit -
+   add the pattern if missing, and bump the `Dated` line. See "Ledger
+   discipline" below.
+
+---
+
+## Ledger discipline
+
+### The invariants ledger is updated in the same commit that establishes the invariant
+
+[docs/invariants.md](docs/invariants.md) lists load-bearing rules this
+firmware relies on. Every commit that establishes a new invariant -
+or relies on one not already there - updates the ledger in the same
+commit. Not in a follow-up. Not in the next PR.
+
+The documentation and the fix are the same deliverable. If the ledger
+drifts behind the code, it stops being load-bearing: a reviewer six
+months from now cannot tell which rules the code currently depends on
+versus which ones got quietly removed.
+
+How enforced:
+
+- Pre-commit hook (`scripts/hooks/pre-commit`) refuses commits that
+  touch load-bearing source paths (OTA, MQTT, Shell, Config, HTTP
+  server, Cellular) unless `docs/invariants.md` is also staged. Bypass
+  is explicit: `INVARIANT_OK=1 git commit ...` (audit-traceable).
+- Install via `./scripts/hooks/install.sh` after clone.
+- When a new file becomes load-bearing, add its path to the
+  `SENSITIVE_REGEX` in `scripts/hooks/pre-commit`.
+
+What counts as "establishes a new invariant":
+
+- New silent fallback you're keeping (document why - see "Silent
+  fallbacks" above).
+- New security-sensitive code path (TLS, cert handling, path
+  validation, deferred dispatch, key zeroing).
+- New cross-module assumption that would break if violated
+  (single-task readers, retained-message semantics, hash provenance).
+- Refactor that moves an existing invariant to a new file or function -
+  update the `Source:` pointer in the ledger.
+
+What does not need a ledger entry (use the `INVARIANT_OK=1` bypass):
+
+- Doc-only changes to source comments.
+- Pure refactor that preserves all invariants in their existing files.
+- New feature behind a flag that has no security/correctness coupling.
+
+Date bump: every edit to `docs/invariants.md` updates the `Dated`
+line to today's date. That line is the heartbeat - a stale date is
+a signal the ledger has drifted.
 
 ---
 

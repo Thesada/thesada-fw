@@ -93,8 +93,8 @@ Full documentation: [thesada.io/firmware](https://thesada.io/firmware/)
 +---------------------------------------------------------+
 |  Core (always compiled)                                 |
 |  WiFiManager + NTP  MQTTClient  OTAUpdate               |
-|  Shell (35+ cmds)   EventBus    SleepManager             |
-|  ModuleRegistry     Config      Log  HeartbeatLED        |
+|  Shell (35+ cmds)   EventBus    SleepManager            |
+|  ModuleRegistry     Config      Log  HeartbeatLED       |
 +---------------------------------------------------------+
 ```
 

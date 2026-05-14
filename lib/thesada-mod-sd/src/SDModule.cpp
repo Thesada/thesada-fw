@@ -6,6 +6,7 @@
 #include <Config.h>
 #include <EventBus.h>
 #include <Log.h>
+#include <Shell.h>
 #include <SD_MMC.h>
 #include <SD.h>
 #include <SPI.h>
@@ -102,6 +103,7 @@ void SDModule::begin() {
     snprintf(info, sizeof(info), "Mounted (SPI, CS=%d) - %.1f MB",
              cs, (float)SD.totalBytes() / (1024.0f * 1024.0f));
     Log::info(TAG, info);
+    Shell::registerFS("/sd", &SD);
   } else {
     // SD_MMC mode - LILYGO and boards with dedicated SDMMC pins
     uint8_t pinClk  = cfg["sd"]["pin_clk"]  | 38;
@@ -123,6 +125,7 @@ void SDModule::begin() {
     snprintf(info, sizeof(info), "Mounted (SD_MMC) - %.1f MB",
              (float)SD_MMC.totalBytes() / (1024.0f * 1024.0f));
     Log::info(TAG, info);
+    Shell::registerFS("/sd", &SD_MMC);
   }
 
   if (!_openNextLog()) {
