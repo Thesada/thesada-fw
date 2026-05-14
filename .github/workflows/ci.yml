@@ -37,26 +37,19 @@ jobs:
         run: |
           mkdir -p build/boards
 
-          # OWB (LILYGO S3 - primary, all modules)
+          # OWB (LILYGO T-SIM7080G-S3 - primary production, all modules)
           pio run -e esp32-owb
           cp .pio/build/esp32-owb/firmware.bin build/boards/firmware-owb.bin
           cp build/firmware.json build/boards/firmware-owb.json
 
-          # CYD (ESP32-2432S028R - TFT touch + LiteServer)
-          pio run -e esp32-cyd
-          cp .pio/build/esp32-cyd/firmware.bin build/boards/firmware-cyd.bin
+          # OWB rescue (core + PMU only - remote unbricking stepping-stone)
+          pio run -e esp32-owb-rescue
+          cp .pio/build/esp32-owb-rescue/firmware.bin build/boards/firmware-owb-rescue.bin
 
-          # WROOM (ESP32-WROOM-32 - OLED + WebServer)
-          pio run -e esp32-wroom
-          cp .pio/build/esp32-wroom/firmware.bin build/boards/firmware-wroom.bin
-
-          # ETH (WT32-ETH01 - Ethernet + WiFi fallback)
-          pio run -e esp32-eth
-          cp .pio/build/esp32-eth/firmware.bin build/boards/firmware-eth.bin
-
-          # S3 bare (debug, SHT31)
+          # Bench/debug envs - compile coverage only, not shipped as releases.
+          pio run -e esp32-owb-debug
           pio run -e esp32-s3-debug
-          cp .pio/build/esp32-s3-debug/firmware.bin build/boards/firmware-s3bare.bin
+          pio run -e esp32-s3-debug-rescue
 
           # Keep OWB as the default firmware.bin for backwards compat
           cp build/boards/firmware-owb.bin build/firmware.bin
@@ -157,9 +150,6 @@ jobs:
             artifacts/firmware_minimal.bin \
             artifacts/firmware.json \
             artifacts/boards/firmware-owb.bin \
-            artifacts/boards/firmware-cyd.bin \
-            artifacts/boards/firmware-wroom.bin \
-            artifacts/boards/firmware-eth.bin \
-            artifacts/boards/firmware-s3bare.bin \
+            artifacts/boards/firmware-owb-rescue.bin \
             --title "thesada-fw $TAG" \
             --notes-file /tmp/notes.md
