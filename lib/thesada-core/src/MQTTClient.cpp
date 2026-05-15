@@ -424,6 +424,12 @@ void MQTTClient::connect() {
         Log::warn(TAG, "mTLS: stored cert/key failed mbedtls validation - password fallback");
       }
     } else {
+      // Partial malloc (one buffer allocated, the other failed) or NVS
+      // load failure: free whatever was allocated and null both. Holding
+      // a stranded 4 KB buffer only starves the next attempt's malloc -
+      // free(nullptr) is safe so this covers every failure shape.
+      free(_clientCert); _clientCert = nullptr;
+      free(_clientKey);  _clientKey  = nullptr;
       Log::warn(TAG, "mTLS: NVS load failed, falling back to password auth");
     }
   }
@@ -1208,6 +1214,16 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
     // payloads as a SIM7080G workaround (empty SMSUB URCs get silently
     // dropped on cellular), and Shell command handlers should not see
     // that substitution as a literal argument.
+    //
+    // Contract for new MQTT CLI commands: a command reached here goes
+    // through Shell::execute as a flat "<cmd> <payload>" string. It must
+    // therefore either (a) take its payload as plain space-delimited
+    // args, or (b) accept "{}" / a req_id-only envelope as a valid
+    // no-arg invocation. A command that needs a STRUCTURED JSON payload
+    // cannot use this path - "{}" would be swallowed as no-arg and any
+    // other JSON passed verbatim as a single garbage arg. Such commands
+    // must be added as a special-case binary-payload handler ABOVE this
+    // point (see cert.set / the offset/length file-read block).
     char line[1024];
     bool isEmptyJson =
       payload && plen == 2 && payload[0] == '{' && payload[1] == '}';
