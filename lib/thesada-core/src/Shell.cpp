@@ -504,13 +504,18 @@ static void cmd_rm(int argc, char** argv, ShellOutput out) {
   }
 }
 
-// Write content to a file
+// Write content to a file. Registered for both fs.write (truncate) and
+// fs.append (append) - the open mode is selected from argv[0] so the two
+// commands share one handler. Mirrors the MQTT binary-handler path in
+// MQTTClient::runCli, which already keys the mode off the command name.
 static void cmd_write(int argc, char** argv, ShellOutput out) {
-  // write <path> <content...>
+  // fs.write|fs.append <path> <content...>
   if (argc < 3) { out("Usage: write <path> <content...>"); return; }
   if (!Shell::pathSafe(argv[1])) { out("Invalid path"); return; }
   FS* fs = resolveFS(argv[1]);
   const char* fsPath = stripPrefix(argv[1]);
+
+  bool append = (strcasecmp(argv[0], "fs.append") == 0);
 
   // Reconstruct content from remaining args.
   String content;
@@ -519,13 +524,14 @@ static void cmd_write(int argc, char** argv, ShellOutput out) {
     content += argv[i];
   }
 
-  File f = fs->open(fsPath, "w");
+  File f = fs->open(fsPath, append ? "a" : "w");
   if (!f) { out("Failed to open for writing"); return; }
   f.print(content);
   f.close();
 
   char msg[64];
-  snprintf(msg, sizeof(msg), "Wrote %d bytes to %s", content.length(), fsPath);
+  snprintf(msg, sizeof(msg), "%s %d bytes to %s",
+           append ? "Appended" : "Wrote", content.length(), fsPath);
   out(msg);
 }
 
