@@ -10,6 +10,11 @@
 
 using EventCallback = std::function<void(JsonObject)>;
 
+// Single-task invariant: both subscribe() and publish() touch the shared
+// _subscribers map with no locking. Every caller must run on the main
+// loop task. Do NOT call either from an ISR or a secondary FreeRTOS task -
+// concurrent map access corrupts it. If a second task ever needs the bus,
+// add a mutex here first.
 class EventBus {
 public:
   static void subscribe(const std::string& event, EventCallback cb);

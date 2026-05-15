@@ -126,17 +126,29 @@ static const char* _createToken() {
   return _tokens[slot].token;
 }
 
-// Validate a Bearer token
+// Constant-time byte compare - no early return on first mismatch, so
+// the time taken does not leak how many leading bytes were correct.
+static bool _constTimeEq(const char* a, const char* b, size_t len) {
+  uint8_t diff = 0;
+  for (size_t i = 0; i < len; i++) diff |= (uint8_t)(a[i] ^ b[i]);
+  return diff == 0;
+}
+
+// Validate a Bearer token. Compares in constant time and walks every
+// slot regardless of an early match, so neither the per-byte compare
+// nor the slot loop leaks token correctness via response timing.
 static bool _validateToken(const char* token) {
-  if (!token || strlen(token) == 0) return false;
+  if (!token) return false;
+  size_t tlen = strlen(token);
+  if (tlen != TOKEN_LEN * 2) return false;
   uint32_t now = millis();
+  bool found = false;
   for (uint8_t i = 0; i < MAX_TOKENS; i++) {
-    if (_tokens[i].expiry > 0 && now < _tokens[i].expiry &&
-        strcmp(_tokens[i].token, token) == 0) {
-      return true;
-    }
+    bool active = (_tokens[i].expiry > 0 && now < _tokens[i].expiry);
+    bool match  = _constTimeEq(_tokens[i].token, token, tlen);
+    if (active && match) found = true;
   }
-  return false;
+  return found;
 }
 
 // Check auth: Basic Auth OR Bearer token. Returns true if authorized.
