@@ -202,6 +202,37 @@ public:
                             float* alt = nullptr, float* speed = nullptr,
                             int* satsInView = nullptr, int* satsUsed = nullptr);
 
+  // --- net.* transport-abstraction helpers --------------------------------
+  // Wired into Net::CellularProvider by CellularModule::begin() so the
+  // thesada-core net.* shell commands keep working on the cellular leg
+  // when WiFi is down. Each takes the AT-bus mutex internally and is safe
+  // to call from the shell task.
+
+  // True when the modem is registered AND the data context (CNACT slot 0)
+  // is active - the precondition for DNS / NTP / HTTPS over the modem.
+  static bool dataLinkUp();
+
+  // Close the data context (CNACT slot 0) and modem MQTT session while
+  // leaving the modem powered and network-registered. Drops _started so
+  // a future re-takeover re-walks begin(). Used on WiFi return when
+  // link_mode is "fallback" so an idle PDP context does not burn data.
+  static void dataLinkDown();
+
+  // Emit operator (AT+COPS?), modem IP (AT+CNACT?), cached signal quality,
+  // and IMEI (AT+GSN) as human-readable lines via `emit`. Best-effort.
+  static void netInfo(std::function<void(const char*)> emit);
+
+  // Resolve `host` to a dotted-quad string via AT+CDNSGIP. Returns true
+  // and writes a NUL-terminated address into `out` (capped to outLen) on
+  // success. Requires the data context to be up (see dataLinkUp).
+  static bool resolveHost(const char* host, char* out, size_t outLen);
+
+  // Sync the ESP32 system clock from the modem: AT+CNTP against `server`,
+  // then read AT+CCLK? and settimeofday() with the resulting UTC epoch.
+  // Recovers the clock when WiFi never associated and the WiFiManager
+  // SNTP path never ran. Returns true on success.
+  static bool ntpSync(const char* server, uint32_t timeoutMs);
+
 private:
   static void initPMU();
   static bool wakeModem();
