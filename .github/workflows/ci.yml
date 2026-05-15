@@ -80,8 +80,24 @@ jobs:
             build/firmware.json
             build/boards/
 
+  lua-tests:
+    # Host-side Lua harness - exercises data/scripts/*.lua against the
+    # mocked firmware bindings (tests/lua/). Fast, no PlatformIO needed;
+    # runs in parallel with the board builds and gates the release.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lua 5.3
+        run: sudo apt-get update && sudo apt-get install -y lua5.3
+
+      - name: Run Lua test suite
+        run: lua5.3 tests/lua/run_all.lua
+
   release:
-    needs: build
+    needs: [build, lua-tests]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:

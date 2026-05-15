@@ -26,6 +26,10 @@ CMakeLists.txt
 data/config.json
 data/scripts/**.lua
 data/ca.crt
+# ...except the canonical placeholder scripts - tracked as the firmware
+# image default and the host-side Lua test fixtures.
+!data/scripts/main.lua
+!data/scripts/rules.lua
 
 # Test artifacts
 tests/__pycache__

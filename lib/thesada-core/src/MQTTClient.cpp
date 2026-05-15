@@ -1768,7 +1768,10 @@ void MQTTClient::flushQueue() {
 
 // Return whether the MQTT client is currently connected
 bool MQTTClient::connected() {
-  return _client.connected();
+  // _client is the WiFi-path PubSubClient only. On cellular fallback the
+  // MQTT session runs through the forwarder, so s_fallbackPublishing is
+  // the connected signal there - same pattern the publish guards use.
+  return _client.connected() || s_fallbackPublishing;
 }
 
 // Return the wall-clock time of the last successful publish

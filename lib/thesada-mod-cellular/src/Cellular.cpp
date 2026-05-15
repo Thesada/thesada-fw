@@ -12,6 +12,8 @@
 #include <esp_task_wdt.h>
 #include <Shell.h>
 #include <MQTTClient.h>
+#include <sys/time.h>
+#include <time.h>
 #include <memory>
 #include <new>
 #include <mbedtls/platform_util.h>
@@ -1847,6 +1849,275 @@ bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
   // transport failure so the OTA caller does not run SHA on a truncated
   // stream and report a hash mismatch. Status code stays correct.
   if (contentLen > 0 && bodyBytes < (size_t)contentLen) return false;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// net.* transport-abstraction helpers (wired into Net::CellularProvider)
+// ---------------------------------------------------------------------------
+
+// True when the modem is registered and the CNACT data context is up.
+// Both sub-checks go through cellAT, which needs the AT-bus mutex held -
+// so this takes a short ATGuard for the whole probe.
+//
+// In:  none (reads modem state over the AT bus)
+// Out: bool - true when DNS / NTP / HTTPS over the modem can be expected
+//      to work.
+bool Cellular::dataLinkUp() {
+  if (!_modemAlive) return false;
+  ATGuard g(5000UL);
+  if (!g.ok()) return false;
+  return isRegistered() && isGprsConnectedRaw();
+}
+
+// ---------------------------------------------------------------------------
+
+// Close the data context and modem MQTT session, leaving the modem
+// powered and registered. Clears _started so a future re-takeover
+// re-walks begin() - powerOn() is then a no-op (modem still alive),
+// writeCACert() is gated by _hasCACert, networkConnect() re-opens CNACT
+// and mqttConnect() re-establishes the session.
+//
+// In:  none (AT bus via internal ATGuard)
+// Out: CNACT slot 0 closed; modem stays CFUN=1 registered.
+void Cellular::dataLinkDown() {
+  if (!_modemAlive) return;
+  ATGuard g(15000UL);
+  if (!g.ok()) {
+    Log::warn(TAG, "dataLinkDown: AT bus stuck - skipping teardown");
+    return;
+  }
+  modem.sendAT("+SMDISC");
+  modem.waitResponse(5000UL);
+  modem.sendAT("+CNACT=0,0");
+  modem.waitResponse(5000UL);
+  _started       = false;
+  _mqttConnected = false;
+  _publishGate   = false;
+  Log::info(TAG, "Cellular data context closed (modem still registered)");
+}
+
+// Emit a human-readable summary of the cellular link: operator, modem IP,
+// signal quality, IMEI. Best-effort - any field that cannot be read is
+// reported as unknown rather than aborting the whole dump.
+//
+// In:  emit - sink called once per output line
+// Out: 3-4 lines emitted via the callback
+void Cellular::netInfo(std::function<void(const char*)> emit) {
+  ATGuard g(10000UL);
+  if (!g.ok()) { emit("cellular: AT bus busy"); return; }
+  char line[128];
+
+  // Operator: AT+COPS? -> +COPS: <mode>,<format>,"<oper>"[,<act>]
+  String oper;
+  cellAT("+COPS?", "OK", 5000UL, [&](const char* l) {
+    const char* p = strstr(l, "+COPS:");
+    if (!p) return;
+    const char* q = strchr(p, '"');
+    if (!q) return;
+    q++;
+    const char* e = strchr(q, '"');
+    if (e && e > q) oper = String(q).substring(0, e - q);
+  });
+  snprintf(line, sizeof(line), "operator: %s",
+           oper.length() ? oper.c_str() : "(unknown)");
+  emit(line);
+
+  // Modem IP: AT+CNACT? -> +CNACT: <pdpidx>,<status>,<addr>
+  String ip;
+  cellAT("+CNACT?", "OK", 3000UL, [&](const char* l) {
+    const char* p = strstr(l, "+CNACT:");
+    if (!p) return;
+    const char* c1 = strchr(p, ',');
+    if (!c1) return;
+    const char* c2 = strchr(c1 + 1, ',');
+    if (!c2) return;
+    // Status field sits between c1 and c2. Only the active context (1)
+    // carries a real address; inactive PDP indices report 0.0.0.0 and
+    // would clobber the IP since this callback fires per +CNACT: line.
+    const char* st = c1 + 1;
+    while (*st == ' ') st++;
+    if (*st != '1') return;
+    const char* a = c2 + 1;
+    while (*a == ' ' || *a == '"') a++;
+    String s(a);
+    int q = s.indexOf('"');
+    if (q >= 0) s = s.substring(0, q);
+    s.trim();
+    ip = s;
+  });
+  snprintf(line, sizeof(line), "ip: %s", ip.length() ? ip.c_str() : "(none)");
+  emit(line);
+
+  // Signal: cached AT+CSQ value (0..31 valid, 99 = unknown). Convert the
+  // valid range to dBm for an operator-friendly number.
+  int csq = _signalQuality;
+  if (csq >= 0 && csq <= 31) {
+    snprintf(line, sizeof(line), "signal: %d/31 (%d dBm)", csq, -113 + 2 * csq);
+  } else {
+    snprintf(line, sizeof(line), "signal: unknown");
+  }
+  emit(line);
+
+  // IMEI: AT+GSN emits the bare 15-digit IMEI on its own line before OK.
+  String imei;
+  cellAT("+GSN", "OK", 3000UL, [&](const char* l) {
+    const char* p = l;
+    while (*p == ' ') p++;
+    size_t n = strlen(p);
+    bool digits = n >= 14 && n <= 17;
+    for (size_t i = 0; i < n && digits; ++i) {
+      if (p[i] < '0' || p[i] > '9') digits = false;
+    }
+    if (digits) imei = p;
+  });
+  if (imei.length()) {
+    snprintf(line, sizeof(line), "imei: %s", imei.c_str());
+    emit(line);
+  }
+}
+
+// Resolve a hostname via the modem DNS (AT+CDNSGIP). The modem answers
+// OK immediately, then sends the result as a +CDNSGIP: URC a moment
+// later, so we issue the command via cellAT and then drain Serial1 for
+// the URC line.
+//   +CDNSGIP: 1,"host","IP1"[,"IP2"]   on success
+//   +CDNSGIP: 0,<err>                  on failure
+//
+// In:  host    hostname to resolve
+//      out     buffer for the dotted-quad result (NUL-terminated)
+//      outLen  size of out
+// Out: bool - true and out filled on success
+bool Cellular::resolveHost(const char* host, char* out, size_t outLen) {
+  if (!host || !out || outLen == 0) return false;
+  out[0] = '\0';
+
+  ATGuard g(15000UL);
+  if (!g.ok()) return false;
+
+  // recount 2, per-try timeout 5000 ms.
+  char cmd[160];
+  snprintf(cmd, sizeof(cmd), "+CDNSGIP=\"%s\",2,5000", host);
+  if (cellAT(cmd, "OK", 8000UL, nullptr) != 1) return false;
+
+  // Drain Serial1 for the +CDNSGIP: URC (arrives after the OK).
+  char     foundIp[48] = {0};
+  bool     resolved    = false;
+  uint32_t t0          = millis();
+  String   buf;
+  buf.reserve(256);
+  while (millis() - t0 < 10000UL) {
+    while (Serial1.available()) buf += (char)Serial1.read();
+    int idx = buf.indexOf("+CDNSGIP:");
+    if (idx >= 0) {
+      int nl = buf.indexOf('\n', idx);
+      if (nl < 0) { delay(20); esp_task_wdt_reset(); continue; }
+      String l = buf.substring(idx, nl);
+      // +CDNSGIP: 1,"host","ip"...  -> status field is 1
+      int firstComma = l.indexOf(',');
+      if (firstComma > 0 && l.substring(9, firstComma).indexOf('1') >= 0) {
+        int q1 = l.indexOf('"', firstComma);          // open host
+        int q2 = l.indexOf('"', q1 + 1);              // close host
+        int q3 = l.indexOf('"', q2 + 1);              // open ip
+        int q4 = l.indexOf('"', q3 + 1);              // close ip
+        if (q3 > 0 && q4 > q3) {
+          String ipStr = l.substring(q3 + 1, q4);
+          strncpy(foundIp, ipStr.c_str(), sizeof(foundIp) - 1);
+          resolved = true;
+        }
+      }
+      break;
+    }
+    delay(20);
+    esp_task_wdt_reset();
+  }
+
+  if (resolved) {
+    strncpy(out, foundIp, outLen - 1);
+    out[outLen - 1] = '\0';
+  }
+  return resolved;
+}
+
+// Sync the ESP32 system clock off the modem. Runs AT+CNTP against
+// `server`, waits for the +CNTP: <code> URC, then reads the modem RTC
+// with AT+CCLK? and pushes the UTC epoch to settimeofday().
+//
+// Why both steps: AT+CNTP sets the *modem* RTC, not the ESP32 clock; the
+// CCLK read + settimeofday is what actually moves the system clock.
+//
+// In:  server     NTP server hostname
+//      timeoutMs  upper bound on the +CNTP: result wait
+// Out: bool - true once settimeofday() ran with a post-2023 epoch
+bool Cellular::ntpSync(const char* server, uint32_t timeoutMs) {
+  if (!server) return false;
+
+  ATGuard g(timeoutMs + 5000UL);
+  if (!g.ok()) return false;
+
+  // CNTPCID must be 0 on the SIM7080 (TinyGsmClientSIM7080 notes CID 1
+  // does not work on this part).
+  cellAT("+CNTPCID=0", "OK", 5000UL, nullptr);
+
+  // tz 0 -> modem keeps UTC; the ESP32 clock stores a UTC epoch.
+  char cmd[128];
+  snprintf(cmd, sizeof(cmd), "+CNTP=\"%s\",0", server);
+  if (cellAT(cmd, "OK", 5000UL, nullptr) != 1) return false;
+
+  // Execute the sync. Result is a +CNTP: <code> URC after the OK; the
+  // SIM7080 reports code 1 on success.
+  if (cellAT("+CNTP", "OK", 5000UL, nullptr) != 1) return false;
+
+  int      code = 0;
+  uint32_t t0   = millis();
+  String   buf;
+  buf.reserve(128);
+  while (millis() - t0 < timeoutMs) {
+    while (Serial1.available()) buf += (char)Serial1.read();
+    int idx = buf.indexOf("+CNTP:");
+    if (idx >= 0) {
+      int nl = buf.indexOf('\n', idx);
+      if (nl < 0) { delay(20); esp_task_wdt_reset(); continue; }
+      code = atoi(buf.c_str() + idx + 6);
+      break;
+    }
+    delay(50);
+    esp_task_wdt_reset();
+  }
+  if (code != 1) return false;
+
+  // Modem RTC is now UTC. Read it and push to the ESP32 clock.
+  //   +CCLK: "yy/MM/dd,hh:mm:ss+zz"
+  struct tm tmv      = {};
+  bool      gotClock = false;
+  cellAT("+CCLK?", "OK", 3000UL, [&](const char* l) {
+    const char* p = strstr(l, "+CCLK:");
+    if (!p) return;
+    p = strchr(p, '"');
+    if (!p) return;
+    p++;
+    int yy, mo, dd, hh, mi, ss;
+    if (sscanf(p, "%d/%d/%d,%d:%d:%d", &yy, &mo, &dd, &hh, &mi, &ss) == 6) {
+      tmv.tm_year = yy + 100;  // modem gives 2-digit year >= 2000
+      tmv.tm_mon  = mo - 1;
+      tmv.tm_mday = dd;
+      tmv.tm_hour  = hh;
+      tmv.tm_min   = mi;
+      tmv.tm_sec   = ss;
+      tmv.tm_isdst = 0;
+      gotClock = true;
+    }
+  });
+  if (!gotClock) return false;
+
+  // mktime() interprets tmv in the process TZ. This path only runs when
+  // WiFi never associated, so WiFiManager's configTime() never set a
+  // non-UTC zone - the default newlib TZ is UTC, making mktime == UTC
+  // here. Matches the mktime use in Shell.cpp's `net.ntp set`.
+  time_t epoch = mktime(&tmv);
+  if (epoch < 1700000000L) return false;
+  struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+  settimeofday(&tv, nullptr);
   return true;
 }
 

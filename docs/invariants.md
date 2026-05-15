@@ -4,7 +4,7 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-05-13. Bump the date on every edit.
+Dated 2026-05-14. Bump the date on every edit.
 
 ---
 
@@ -347,6 +347,30 @@ to escape any user-influenced string before it lands in HTML. Avoids
 hand-rolling escape tables.
 
 Source: `data/dashboard.html` `_esc` helper.
+
+---
+
+## Transport abstraction
+
+### `net.*` shell commands reach cellular only through the `Net` provider hook
+
+`net.ip` / `net.ping` / `net.ntp` / `net.http` live in `thesada-core`,
+which must not depend on the optional cellular module. The cellular
+module registers a `Net::CellularProvider` (function-pointer table) in
+its `begin()`; the `net.*` commands consult `Net::cellular()` and fall
+back to the modem path when WiFi is down. When no cellular module is
+compiled in, `Net::cellular()` returns `nullptr` and the commands stay
+WiFi-only with no dead code.
+
+Same one-way-dependency rule as the `Shell::FSMount` registry: core
+declares the hook, the module fills it, core never imports module
+headers. Any new transport-aware shell command routes through the
+provider rather than `#include`-ing `Cellular.h`.
+
+Source: `lib/thesada-core/src/Net.h`, `Net.cpp`;
+`lib/thesada-core/src/Shell.cpp` (`cmd_ifconfig`, `cmd_ping`, `cmd_ntp`,
+`cmd_mqtt`, `cmd_http`);
+`lib/thesada-mod-cellular/src/CellularModule.cpp::begin` (registrant).
 
 ---
 

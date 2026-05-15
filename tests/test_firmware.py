@@ -283,9 +283,9 @@ class MqttShell:
 
 # ── MQTT CLI test suite ──────────────────────────────────────────────────────
 
-def _mqtt_check(r, name, cmd, check_fn, detail=""):
+def _mqtt_check(r, name, cmd, check_fn, detail="", wait=10):
     """Run a CLI command via MQTT and check the result."""
-    out = r.sh.cmd(cmd, wait=10)
+    out = r.sh.cmd(cmd, wait=wait)
     if out and check_fn(out):
         r.ok(name, detail)
     elif out:
@@ -318,9 +318,34 @@ def test_mqtt_cli(r):
                 lambda out: any("IP:" in l or "WiFi:" in l for l in out),
                 "network info returned")
 
+    # net.ip also reports the cellular stack separately (v1.4.7+).
+    _mqtt_check(r, "net.ip cellular line", "net.ip",
+                lambda out: any("Cellular:" in l for l in out),
+                "cellular transport line present")
+
     _mqtt_check(r, "net.mqtt", "net.mqtt",
                 lambda out: any("connected" in l.lower() for l in out),
                 "MQTT connected")
+
+    # net.mqtt surfaces the active transport (v1.4.7+).
+    _mqtt_check(r, "net.mqtt transport", "net.mqtt",
+                lambda out: any("transport:" in l for l in out),
+                "transport line present")
+
+    # net.http: HTTPS GET over the deferred-CLI path. This is the exact
+    # path where the WiFi TLS handshake used to overflow the main-loop
+    # stack and silently reset the board - --insecure keeps it CA-agnostic
+    # so the test does not depend on which roots are in /ca.crt.
+    _mqtt_check(r, "net.http", "net.http --insecure https://example.com",
+                lambda out: any("status=" in l for l in out)
+                            and any("--- done ---" in l for l in out),
+                "HTTPS GET completed", wait=35)
+
+    # Regression guard for the net.http WDT reset: the device must still
+    # answer after net.http ran.
+    _mqtt_check(r, "net.http (no reset)", "uptime",
+                lambda out: len(out) > 0 and "d " in out[0],
+                "device alive after net.http")
 
     _mqtt_check(r, "module.list", "module.list",
                 lambda out: any("[x]" in l or "[ ]" in l for l in out),
@@ -529,7 +554,7 @@ def test_filesystem(r):
     # fs.cat /config.json
     lines = sh.cmd("fs.cat /config.json", wait=2.0)
     combined = " ".join(lines)
-    if "{" in combined and "net.mqtt" in combined:
+    if "{" in combined and '"broker"' in combined:
         r.ok("fs.cat /config.json", "valid JSON content")
     else:
         r.fail("fs.cat /config.json", "missing expected content")
@@ -651,11 +676,21 @@ def test_config(r):
         r.fail("config.dump", "no JSON or missing expected keys")
 
 
+def _uptime_secs(sh):
+    """Parse `uptime` (e.g. '0d 00:02:25') to total seconds, or None."""
+    for l in sh.cmd("uptime"):
+        m = re.search(r'(\d+)d\s+(\d+):(\d+):(\d+)', l)
+        if m:
+            d, h, mi, s = map(int, m.groups())
+            return d * 86400 + h * 3600 + mi * 60 + s
+    return None
+
+
 def test_network(r):
     r.group("4 · Network")
     sh = r.sh
 
-    # ifconfig
+    # net.ip - WiFi block
     lines = sh.cmd("net.ip")
     wifi_line = lines[0] if lines else ""
     if "connected" in wifi_line and "disconnected" not in wifi_line:
@@ -664,10 +699,23 @@ def test_network(r):
     else:
         r.fail("net.ip WiFi", wifi_line)
 
-    # net.ping (DNS resolve)
+    # net.ip - cellular stack reported separately (v1.4.7+). On a build
+    # with the cellular module a "Cellular:" line is always present
+    # (connected or down); builds without it omit the line entirely.
+    cell_line = next((l for l in lines if "Cellular:" in l), "")
+    if cell_line:
+        r.ok("net.ip cellular line", cell_line.strip())
+    else:
+        r.warn("net.ip cellular line", "no Cellular line (cellular module not built in?)")
+
+    # net.ping (DNS resolve) - output now tags the transport (via WiFi /
+    # via cellular).
     lines = sh.cmd("net.ping 8.8.8.8", wait=3.0)
-    if lines and "resolved to" in lines[0]:
-        r.ok("net.ping (DNS resolve)", lines[0])
+    ping_line = lines[0] if lines else ""
+    if "resolved to" in ping_line and "via" in ping_line:
+        r.ok("net.ping (DNS resolve)", ping_line)
+    elif "resolved to" in ping_line:
+        r.warn("net.ping (DNS resolve)", f"resolved but no transport tag: {ping_line}")
     else:
         r.fail("net.ping (DNS resolve)", f"output: {lines}")
 
@@ -701,6 +749,16 @@ def test_network(r):
     else:
         r.fail("net.ntp set (invalid)", err_line)
 
+    # net.ntp sync (v1.4.7+) - with WiFi up the device reports the SNTP
+    # client is already handling it; with WiFi down + cellular it would
+    # drive AT+CNTP. Either acknowledgement line is a pass.
+    lines = sh.cmd("net.ntp sync", wait=5.0)
+    sync_line = lines[0] if lines else ""
+    if any(k in sync_line for k in ("WiFi up", "Synced", "Syncing", "No transport")):
+        r.ok("net.ntp sync", sync_line)
+    else:
+        r.fail("net.ntp sync", f"output: {lines}")
+
     # mqtt
     lines = sh.cmd("net.mqtt")
     mqtt_line = lines[0] if lines else ""
@@ -709,6 +767,32 @@ def test_network(r):
         r.ok("net.mqtt", broker_line.strip() if broker_line else mqtt_line)
     else:
         r.fail("net.mqtt", mqtt_line)
+
+    # net.mqtt transport line (v1.4.7+)
+    transport_line = next((l for l in lines if "transport:" in l), "")
+    if transport_line:
+        r.ok("net.mqtt transport", transport_line.strip())
+    else:
+        r.fail("net.mqtt transport", "no transport line")
+
+    # net.http (v1.4.7+) - single auto-routing HTTPS GET command. The
+    # WiFi path runs on a dedicated deep-stack task; before that fix the
+    # TLS handshake overflowed the main-loop stack and silently reset the
+    # board. --insecure keeps the test CA-agnostic. The command must
+    # return a clean status line + done marker, AND the device must not
+    # reset (uptime must not go backwards).
+    before = _uptime_secs(sh)
+    lines = sh.cmd("net.http --insecure https://example.com", wait=30.0)
+    status_line = next((l for l in lines if "status=" in l), "")
+    got_done    = any("--- done ---" in l for l in lines)
+    after = _uptime_secs(sh)
+    reset = before is not None and after is not None and after < before
+    if reset or after is None:
+        r.fail("net.http", "device reset during net.http (stack overflow regression?)")
+    elif status_line and got_done:
+        r.ok("net.http", status_line.strip())
+    else:
+        r.fail("net.http", f"output: {lines[:3]}")
 
 
 def test_shell(r):
@@ -903,7 +987,7 @@ def test_manual_ads1115(r):
 
 
 def test_manual_mqtt_publish(r):
-    key = "net.mqtt"
+    key = "mqtt"   # matches the documented --skip group name
     r.group("9 · MQTT publish (manual)")
     if r.is_skipped(key):
         r.skip("mqtt publish test")

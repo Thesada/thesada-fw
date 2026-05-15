@@ -11,9 +11,11 @@
 #include "ModuleRegistry.h"
 #include "OTAUpdate.h"
 #include "SensorRegistry.h"
+#include "Net.h"
 #include <thesada_config.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
+#include <esp_task_wdt.h>
 #include <esp_chip_info.h>
 #include <esp_flash.h>
 #include <esp_system.h>
@@ -21,9 +23,12 @@
 
 #include <LittleFS.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <sys/time.h>
+#include <algorithm>
 
 ShellEntry Shell::_commands[MAX_COMMANDS];
 int Shell::_commandCount = 0;
@@ -499,13 +504,18 @@ static void cmd_rm(int argc, char** argv, ShellOutput out) {
   }
 }
 
-// Write content to a file
+// Write content to a file. Registered for both fs.write (truncate) and
+// fs.append (append) - the open mode is selected from argv[0] so the two
+// commands share one handler. Mirrors the MQTT binary-handler path in
+// MQTTClient::runCli, which already keys the mode off the command name.
 static void cmd_write(int argc, char** argv, ShellOutput out) {
-  // write <path> <content...>
+  // fs.write|fs.append <path> <content...>
   if (argc < 3) { out("Usage: write <path> <content...>"); return; }
   if (!Shell::pathSafe(argv[1])) { out("Invalid path"); return; }
   FS* fs = resolveFS(argv[1]);
   const char* fsPath = stripPrefix(argv[1]);
+
+  bool append = (strcasecmp(argv[0], "fs.append") == 0);
 
   // Reconstruct content from remaining args.
   String content;
@@ -514,13 +524,14 @@ static void cmd_write(int argc, char** argv, ShellOutput out) {
     content += argv[i];
   }
 
-  File f = fs->open(fsPath, "w");
+  File f = fs->open(fsPath, append ? "a" : "w");
   if (!f) { out("Failed to open for writing"); return; }
   f.print(content);
   f.close();
 
   char msg[64];
-  snprintf(msg, sizeof(msg), "Wrote %d bytes to %s", content.length(), fsPath);
+  snprintf(msg, sizeof(msg), "%s %d bytes to %s",
+           append ? "Appended" : "Wrote", content.length(), fsPath);
   out(msg);
 }
 
@@ -906,23 +917,64 @@ static void cmd_ifconfig(int argc, char** argv, ShellOutput out) {
     snprintf(line, sizeof(line), "  MAC:  %s", WiFi.macAddress().c_str());
     out(line);
   }
+
+  // Cellular transport - shown only when the cellular module is compiled
+  // in. Reported as a separate stack from WiFi; no claim is made about
+  // which one the OS routes through when both are up.
+  const Net::CellularProvider* cell = Net::cellular();
+  if (cell && cell->linkUp && cell->linkUp()) {
+    out("Cellular: connected");
+    if (cell->linkInfo) {
+      cell->linkInfo([&](const char* info) {
+        char l[160];
+        snprintf(l, sizeof(l), "  %s", info);
+        out(l);
+      });
+    }
+  } else if (cell) {
+    out("Cellular: down");
+  }
 }
 
-// Test connectivity by resolving a hostname via DNS
+// Test connectivity by resolving a hostname via DNS. Routes by transport:
+// WiFi up -> lwIP DNS; WiFi down + cellular up -> modem DNS (AT+CDNSGIP),
+// because with WiFi down lwIP has no default route and WiFi.hostByName
+// would never reach a resolver.
 static void cmd_ping(int argc, char** argv, ShellOutput out) {
   if (argc < 2) { out("Usage: ping <host>"); return; }
 
   // ESP32 Arduino doesn't have a real ping. Use DNS resolve as a connectivity test.
-  IPAddress ip;
-  if (WiFi.hostByName(argv[1], ip)) {
-    char msg[64];
-    snprintf(msg, sizeof(msg), "%s resolved to %s", argv[1], ip.toString().c_str());
-    out(msg);
-  } else {
-    char msg[64];
-    snprintf(msg, sizeof(msg), "Failed to resolve %s", argv[1]);
-    out(msg);
+  if (WiFiManager::connected()) {
+    IPAddress ip;
+    if (WiFi.hostByName(argv[1], ip)) {
+      char msg[96];
+      snprintf(msg, sizeof(msg), "%s resolved to %s (via WiFi)",
+               argv[1], ip.toString().c_str());
+      out(msg);
+    } else {
+      char msg[96];
+      snprintf(msg, sizeof(msg), "Failed to resolve %s (via WiFi)", argv[1]);
+      out(msg);
+    }
+    return;
   }
+
+  const Net::CellularProvider* cell = Net::cellular();
+  if (cell && cell->linkUp && cell->linkUp() && cell->resolve) {
+    char ip[48];
+    if (cell->resolve(argv[1], ip, sizeof(ip))) {
+      char msg[96];
+      snprintf(msg, sizeof(msg), "%s resolved to %s (via cellular)", argv[1], ip);
+      out(msg);
+    } else {
+      char msg[96];
+      snprintf(msg, sizeof(msg), "Failed to resolve %s (via cellular)", argv[1]);
+      out(msg);
+    }
+    return;
+  }
+
+  out("No transport up - cannot resolve");
 }
 
 // Show NTP status or manually set system time
@@ -957,6 +1009,37 @@ static void cmd_ntp(int argc, char** argv, ShellOutput out) {
     } else {
       out("Invalid time. Usage: ntp set <epoch> or ntp set 2026-03-24T12:00:00Z");
     }
+    return;
+  }
+
+  // ntp sync - force a sync now. Over WiFi the SNTP client runs in the
+  // background already; over cellular nothing syncs the clock unless the
+  // modem is asked (AT+CNTP), so this is the recovery path for the
+  // "WiFi never associated, clock stuck at 1970" case.
+  if (argc >= 2 && strcmp(argv[1], "sync") == 0) {
+    JsonObject  scfg   = Config::get();
+    const char* server = scfg["ntp"]["server"] | "pool.ntp.org";
+    if (WiFiManager::connected()) {
+      out("WiFi up - SNTP client already syncing in background");
+      return;
+    }
+    const Net::CellularProvider* cell = Net::cellular();
+    if (cell && cell->linkUp && cell->linkUp() && cell->ntpSync) {
+      uint32_t timeoutMs = (scfg["ntp"]["cell_timeout_s"] | 60) * 1000UL;
+      out("Syncing clock via cellular NTP...");
+      if (cell->ntpSync(server, timeoutMs)) {
+        time_t now = time(nullptr);
+        struct tm* t = gmtime(&now);
+        char ts[32];
+        strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", t);
+        snprintf(line, sizeof(line), "Synced via cellular - UTC: %s", ts);
+        out(line);
+      } else {
+        out("Cellular NTP sync failed");
+      }
+      return;
+    }
+    out("No transport up - cannot sync");
     return;
   }
 
@@ -996,6 +1079,14 @@ static void cmd_mqtt(int argc, char** argv, ShellOutput out) {
   snprintf(line, sizeof(line), "  broker: %s:%d  prefix: %s", broker, port, prefix);
   out(line);
 
+  // Surface which transport carries the session - cellular takes over
+  // when WiFi is down (see CellularModule's STANDBY/ACTIVE policy), so a
+  // debug session sees the carrier without grepping serial logs.
+  const Net::CellularProvider* cell = Net::cellular();
+  bool viaCellular = cell && cell->linkUp && cell->linkUp() && !WiFiManager::connected();
+  snprintf(line, sizeof(line), "  transport: %s", viaCellular ? "cellular" : "WiFi");
+  out(line);
+
   snprintf(line, sizeof(line), "  subs: %u/%u", (unsigned)MQTTClient::_subCount, (unsigned)MQTT_MAX_SUBS);
   out(line);
   for (uint8_t i = 0; i < MQTTClient::_subCount; i++) {
@@ -1021,6 +1112,250 @@ static void cmd_mqtt(int argc, char** argv, ShellOutput out) {
     snprintf(line, sizeof(line), "    %us ago: %s", (unsigned)(ageMs / 1000), MQTTClient::_rxRing[idx]);
     out(line);
   }
+}
+
+// net.http body-preview cap: the first N bytes of the response body are
+// echoed back to the shell; the rest is counted but discarded.
+static const size_t HTTP_PREVIEW_CAP = 1024;
+static const size_t HTTP_URL_MAX     = 256;
+
+// One net.http WiFi fetch. Heap-allocated by cmd_http and handed to
+// httpFetchTask; cmd_http owns it and frees it once `done` is observed.
+struct HttpFetchJob {
+  // in
+  char          url[HTTP_URL_MAX];
+  bool          https;
+  bool          insecure;
+  // out
+  char          preview[HTTP_PREVIEW_CAP];
+  size_t        previewLen;
+  size_t        totalLen;
+  int           status;
+  bool          ok;
+  const char*   err;        // static message, nullptr on success
+  volatile bool done;       // task sets this last; cmd_http polls it
+};
+
+// Run the WiFi HTTPS fetch on a dedicated deep-stack task.
+//
+// Why a task: the mbedtls TLS handshake needs ~6 KB of stack, and
+// net.http executes deep in the deferred-CLI call chain on the main-loop
+// task (loop -> Shell::loop -> deferred drain -> execute -> cmd_http).
+// Doing the handshake there overflows the 8 KB loop-task stack - the
+// board resets silently (panic out the other UART, USB-CDC dead). This
+// task gets its own 12 KB stack; cmd_http blocks on job->done.
+//
+// The task is not subscribed to the task watchdog, so it does not feed
+// it - the main-loop task keeps feeding its own wdt from cmd_http's wait
+// loop. Every exit path sets job->done and self-deletes.
+// in:  arg - HttpFetchJob* (owned by cmd_http). out: job fields filled.
+static void httpFetchTask(void* arg) {
+  HttpFetchJob* job = static_cast<HttpFetchJob*>(arg);
+
+  WiFiClientSecure tls;
+  WiFiClient       plain;
+  tls.setHandshakeTimeout(10);  // seconds; the 120 s default is past any sane bound
+
+  if (job->https) {
+    // Reuse the same CA the OTA path uses - no second copy in code.
+    File ca = LittleFS.open("/ca.crt", "r");
+    if (ca) {
+      String pem = ca.readString();
+      ca.close();
+      tls.setCACert(pem.c_str());
+    } else if (job->insecure) {
+      tls.setInsecure();
+    } else {
+      job->err  = "no /ca.crt on flash - pass --insecure to skip verification";
+      job->done = true;
+      vTaskDelete(nullptr);
+      return;
+    }
+  }
+
+  HTTPClient http;
+  bool begun = job->https ? http.begin(tls, job->url)
+                          : http.begin(plain, job->url);
+  if (!begun) {
+    job->err  = "http.begin failed";
+    job->done = true;
+    vTaskDelete(nullptr);
+    return;
+  }
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setConnectTimeout(10000);
+  http.setTimeout(10000);
+
+  job->status = http.GET();
+  if (job->status > 0) {
+    job->ok = true;
+    int         len      = http.getSize();  // -1 when chunked / unknown
+    WiFiClient* s        = http.getStreamPtr();
+    uint8_t     chunk[512];
+    uint32_t    deadline = millis() + 20000UL;
+    while (millis() < deadline) {
+      if (!s->connected() && !s->available()) break;
+      int avail = s->available();
+      if (avail <= 0) { delay(10); continue; }
+      int n = s->readBytes(chunk, std::min((size_t)avail, sizeof(chunk)));
+      if (n <= 0) break;
+      job->totalLen += n;
+      if (job->previewLen < HTTP_PREVIEW_CAP) {
+        size_t copy = std::min((size_t)n, HTTP_PREVIEW_CAP - job->previewLen);
+        memcpy(job->preview + job->previewLen, chunk, copy);
+        job->previewLen += copy;
+      }
+      if (len > 0 && (int)job->totalLen >= len) break;
+    }
+  }
+  http.end();
+  job->done = true;
+  vTaskDelete(nullptr);
+}
+
+// HTTPS GET via whichever transport is up - the single HTTPS-GET shell
+// command, auto-routed. WiFi -> a deep-stack task running HTTPClient +
+// WiFiClientSecure (CA loaded from /ca.crt). WiFi down + cellular up ->
+// the modem SSL socket via the Net cellular provider (no ESP-side
+// mbedtls, so it runs inline). Output: status code, body length, first
+// <=1 KB preview. HTTPS-only by default; plain HTTP needs --insecure.
+//
+// in:  argv - optional "--insecure", then the URL
+// out: status / length / preview lines via the shell sink
+static void cmd_http(int argc, char** argv, ShellOutput out) {
+  if (argc < 2) { out("usage: net.http [--insecure] <url>"); return; }
+
+  bool        insecure = false;
+  const char* url      = nullptr;
+  for (int i = 1; i < argc; ++i) {
+    if (strcmp(argv[i], "--insecure") == 0) insecure = true;
+    else                                    url = argv[i];
+  }
+  if (!url) { out("usage: net.http [--insecure] <url>"); return; }
+  if (strlen(url) >= HTTP_URL_MAX) { out("url too long"); return; }
+
+  // Parse scheme / host / port / path.
+  const char* p     = url;
+  uint16_t    port  = 443;
+  bool        https = true;
+  if (strncmp(p, "https://", 8) == 0)     { p += 8; port = 443; https = true; }
+  else if (strncmp(p, "http://", 7) == 0) { p += 7; port = 80;  https = false; }
+  else { out("url must start with http:// or https://"); return; }
+
+  if (!https && !insecure) {
+    out("plain HTTP refused - pass --insecure to allow");
+    return;
+  }
+
+  char        host[128];
+  const char* slash   = strchr(p, '/');
+  const char* hostEnd = slash ? slash : p + strlen(p);
+  size_t      hostLen = hostEnd - p;
+  if (hostLen == 0 || hostLen >= sizeof(host)) { out("bad host"); return; }
+  memcpy(host, p, hostLen);
+  host[hostLen] = '\0';
+  char* colon = strchr(host, ':');
+  if (colon) { *colon = '\0'; port = atoi(colon + 1); }
+  const char* path = slash ? slash : "/";
+
+  char msg[224];
+  snprintf(msg, sizeof(msg), "GET %s://%s:%u%s",
+           https ? "https" : "http", host, port, path);
+  out(msg);
+
+  HttpFetchJob* job = static_cast<HttpFetchJob*>(calloc(1, sizeof(HttpFetchJob)));
+  if (!job) { out("net.http: out of memory"); return; }
+  strncpy(job->url, url, sizeof(job->url) - 1);
+  job->https    = https;
+  job->insecure = insecure;
+
+  const char* via = "?";
+
+  if (WiFiManager::connected()) {
+    via = "WiFi";
+    // The WiFi HTTPS path runs on a dedicated deep-stack task (see
+    // httpFetchTask); cmd_http blocks here feeding the main-task
+    // watchdog and pumping the console while it waits.
+    if (xTaskCreate(httpFetchTask, "net.http", 12288, job,
+                    tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
+      out("net.http: failed to spawn fetch task");
+      free(job);
+      return;
+    }
+    // The task's own bounds are ~8 s connect + 8 s handshake + 20 s read;
+    // 60 s is a comfortable ceiling. job is freed only after done is
+    // observed, so the task cannot write into freed memory on this path.
+    uint32_t deadline = millis() + 60000UL;
+    while (!job->done && millis() < deadline) {
+      esp_task_wdt_reset();
+      Shell::pumpConsole();
+      delay(20);
+    }
+    if (!job->done) {
+      // Unreachable given the task's internal bounds. Leak the job rather
+      // than free it - the task may still hold the pointer.
+      out("net.http: fetch task overran - leaking job buffer");
+      return;
+    }
+  } else {
+    const Net::CellularProvider* cell = Net::cellular();
+    if (cell && cell->linkUp && cell->linkUp() && cell->httpsGet) {
+      if (!https) { out("cellular path is HTTPS only"); free(job); return; }
+      via = "cellular";
+      // No ESP-side mbedtls on the cellular path (the modem does TLS), so
+      // this runs inline on the main-loop task without the stack hit.
+      auto sink = [&](const uint8_t* buf, size_t len) -> bool {
+        job->totalLen += len;
+        if (job->previewLen < HTTP_PREVIEW_CAP) {
+          size_t copy = std::min(len, HTTP_PREVIEW_CAP - job->previewLen);
+          memcpy(job->preview + job->previewLen, buf, copy);
+          job->previewLen += copy;
+        }
+        return true;
+      };
+      job->ok = cell->httpsGet(host, path, port, sink, &job->status);
+    } else {
+      out("no transport up");
+      free(job);
+      return;
+    }
+  }
+
+  if (job->err) {
+    out(job->err);
+    free(job);
+    return;
+  }
+
+  snprintf(msg, sizeof(msg),
+           "status=%d ok=%d body=%u bytes (preview <=%u, via %s)",
+           job->status, (int)job->ok, (unsigned)job->totalLen,
+           (unsigned)job->previewLen, via);
+  out(msg);
+
+  // Emit the preview line by line so shell output stays clean.
+  size_t start = 0;
+  for (size_t i = 0; i < job->previewLen; ++i) {
+    if (job->preview[i] == '\n' || job->preview[i] == '\r') {
+      if (i > start) {
+        char l[256];
+        size_t n = std::min(i - start, sizeof(l) - 1);
+        memcpy(l, job->preview + start, n);
+        l[n] = '\0';
+        out(l);
+      }
+      start = i + 1;
+    }
+  }
+  if (start < job->previewLen) {
+    char l[256];
+    size_t n = std::min(job->previewLen - start, sizeof(l) - 1);
+    memcpy(l, job->preview + start, n);
+    l[n] = '\0';
+    out(l);
+  }
+  out("--- done ---");
+  free(job);
 }
 
 // ---------------------------------------------------------------------------
@@ -1669,6 +2004,7 @@ void Shell::registerBuiltins() {
   registerCommand("net.ping",      "DNS resolve test",              cmd_ping);
   registerCommand("net.ntp",       "NTP status / net.ntp set <epoch|ISO8601>", cmd_ntp);
   registerCommand("net.mqtt",      "MQTT connection + subscription dump", cmd_mqtt);
+  registerCommand("net.http",      "HTTPS GET via active transport (net.http [--insecure] <url>)", cmd_http);
   registerCommand("ota.check",     "Trigger OTA check (ota.check [--force] [url])", cmd_ota_check);
   registerCommand("ota.status",    "Partition + rollback state",    cmd_ota_status);
 

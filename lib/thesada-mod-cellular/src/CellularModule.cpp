@@ -30,7 +30,9 @@
 #include <ArduinoJson.h>
 #include <ModuleRegistry.h>
 #include <Shell.h>
-#include <algorithm>
+#include <Net.h>
+#include <ctime>
+#include <cstring>
 #include <esp_task_wdt.h>
 #include <MQTTClient.h>
 
@@ -97,6 +99,11 @@ void CellularModule::begin() {
       out(ok ? "Modem back after hardware reset" : "Modem hardware-reset timeout");
     });
 
+  // cell.cert.test / cell.cert.dump / cell.smconn.test expose modem-internal
+  // cert state and raw handshake probes through the shell. Useful on the
+  // bench when chasing mTLS / modem-cert upload bugs, pure noise and extra
+  // attack surface on a deployed OWB - gated to debug builds only.
+#ifdef THESADA_CELL_DEBUG
   // cell.cert.test: read back the size of the modem-side client.crt
   // (filled by mqttConnect's writeClientCert) and try CSSLCFG CONVERT
   // with several ssltype slots. Lets us pin down whether mTLS failures
@@ -166,97 +173,34 @@ void CellularModule::begin() {
       Cellular::atPassthrough("+SMSTATE?", 3000, out);
       out("--- done ---");
     });
+#endif // THESADA_CELL_DEBUG
 
-  // cell.http: HTTPS GET via the modem-native SSL socket layer
-  // (TinyGsmClientSecure -> AT+CAOPEN / AT+CASEND / AT+CARECV).
-  //
-  // Why not the SH HTTP service: SIM7080G fw 1951B17 rejects every
-  // executive SH command (SHSSL, SHCONN, ...) with "CME ERROR:
-  // operation not allowed". The lilygo SIM7080G HTTP/HTTPS reference
-  // example uses TinyGsmClientSecure for the same reason; CAOPEN is
-  // the supported HTTPS path on this fw rev.
-  //
-  // Standalone validation tool for the cellular OTA path. Prints body
-  // length + first <=512 bytes of payload so an operator can verify
-  // the manifest fetch end-to-end before the C++ wrapper is wired into
-  // OTAUpdate.
-  Shell::registerCommand("cell.http",
-    "HTTPS GET via modem-native SSL socket (cell.http <url>)",
-    [](int argc, char** argv, ShellOutput out) {
-      if (argc < 2) { out("usage: cell.http <https-url>"); return; }
-      const char* url = argv[1];
+  // No standalone cell.http command - the modem HTTPS path is reached
+  // through net.http, which auto-routes WiFi-vs-cellular. Cellular::httpsGet
+  // stays as the implementation (used by the net.http cellular branch via
+  // the Net provider hook below, and by the OTA cellular fallback).
 
-      // Parse host + path + port from URL.
-      const char* p = url;
-      uint16_t port = 443;
-      if (strncmp(p, "https://", 8) == 0) { p += 8; port = 443; }
-      else if (strncmp(p, "http://", 7) == 0) { p += 7; port = 80; }
-      char host[128];
-      const char* slash = strchr(p, '/');
-      const char* hostEnd = slash ? slash : p + strlen(p);
-      size_t hostLen = hostEnd - p;
-      if (hostLen >= sizeof(host)) { out("host too long"); return; }
-      memcpy(host, p, hostLen);
-      host[hostLen] = '\0';
-      // Port override "host:443/path".
-      char* colon = strchr(host, ':');
-      if (colon) { *colon = '\0'; port = atoi(colon + 1); }
-      const char* path = slash ? slash : "/";
-
-      char msg[200];
-      snprintf(msg, sizeof(msg), "GET https://%s:%u%s", host, port, path);
-      out(msg);
-
-      // Accumulate body into a 1 KB preview buffer; total length comes
-      // from the callback's running sum (works whether server sent a
-      // Content-Length header or used chunked encoding).
-      char     preview[1024];
-      size_t   previewLen = 0;
-      size_t   totalLen   = 0;
-      auto cb = [&](const uint8_t* buf, size_t len) -> bool {
-        totalLen += len;
-        size_t copy = (previewLen < sizeof(preview))
-                        ? std::min(len, sizeof(preview) - previewLen)
-                        : 0;
-        if (copy > 0) {
-          memcpy(preview + previewLen, buf, copy);
-          previewLen += copy;
-        }
-        return true;
-      };
-
-      int status = 0;
-      bool ok = Cellular::httpsGet(host, path, port, cb, &status);
-
-      snprintf(msg, sizeof(msg), "status=%d ok=%d body=%u bytes (preview <=%u)",
-               status, (int)ok, (unsigned)totalLen, (unsigned)previewLen);
-      out(msg);
-
-      if (previewLen > 0) {
-        // Emit preview line-by-line so the shell output stays clean.
-        size_t start = 0;
-        for (size_t i = 0; i < previewLen; ++i) {
-          if (preview[i] == '\n' || preview[i] == '\r') {
-            if (i > start) {
-              char line[256];
-              size_t n = std::min(i - start, sizeof(line) - 1);
-              memcpy(line, preview + start, n);
-              line[n] = '\0';
-              out(line);
-            }
-            start = i + 1;
-          }
-        }
-        if (start < previewLen) {
-          char line[256];
-          size_t n = std::min(previewLen - start, sizeof(line) - 1);
-          memcpy(line, preview + start, n);
-          line[n] = '\0';
-          out(line);
-        }
-      }
-      out("--- done ---");
-    });
+  // Wire the Net transport-abstraction hook so thesada-core's net.* shell
+  // commands (net.ip / net.ping / net.ntp / net.http) keep working on the
+  // cellular leg when WiFi is down. Captureless lambdas decay to plain
+  // function pointers - the provider table stays trivially copyable.
+  Net::CellularProvider provider = {};
+  provider.linkUp   = []() { return Cellular::dataLinkUp(); };
+  provider.linkInfo = [](std::function<void(const char*)> emit) {
+    Cellular::netInfo(emit);
+  };
+  provider.resolve  = [](const char* host, char* out, size_t outLen) {
+    return Cellular::resolveHost(host, out, outLen);
+  };
+  provider.ntpSync  = [](const char* server, uint32_t timeoutMs) {
+    return Cellular::ntpSync(server, timeoutMs);
+  };
+  provider.httpsGet = [](const char* host, const char* path, uint16_t port,
+                         std::function<bool(const uint8_t*, size_t)> onBody,
+                         int* httpStatus) {
+    return Cellular::httpsGet(host, path, port, onBody, httpStatus);
+  };
+  Net::setCellularProvider(provider);
 
   Log::info(TAG, "Cellular module ready (standby)");
 }
@@ -307,6 +251,23 @@ void CellularModule::loop() {
         // Session-flag inside publishRetainedSet guards against repeats on
         // STANDBY -> ACTIVE bouncing within one fallback window.
         MQTTClient::publishRetainedSet();
+
+        // Clock recovery: when WiFi never associated, the SNTP client in
+        // WiFiManager never ran and the system clock is stuck pre-2023.
+        // Sync it off the modem now that the data context is up, so log
+        // timestamps and TLS validity windows are correct on a
+        // cellular-only boot.
+        if (time(nullptr) < 1700000000L) {
+          JsonObject  ncfg = Config::get();
+          const char* nsrv = ncfg["ntp"]["server"]         | "pool.ntp.org";
+          uint32_t    nto  = (ncfg["ntp"]["cell_timeout_s"] | 60) * 1000UL;
+          if (Cellular::ntpSync(nsrv, nto)) {
+            Log::info(TAG, "Clock synced via cellular NTP");
+          } else {
+            Log::warn(TAG, "Cellular NTP sync failed - clock still unset");
+          }
+        }
+
         emitActive(1);
       } else {
         // begin() did not bring MQTT up. Drop back to STANDBY and reset
@@ -343,6 +304,15 @@ void CellularModule::loop() {
           // the gate (Cellular::begin() is idempotent).
           Cellular::setPublishGate(false);
           MQTTClient::setFallbackPublishing(false);
+          // link_mode "fallback" (default): tear down the data context
+          // now WiFi is back so an idle PDP context does not burn
+          // metered data/battery. "standby" leaves it warm for instant
+          // re-takeover. Modem stays network-registered either way.
+          {
+            JsonObject  cfg      = Config::get();
+            const char* linkMode = cfg["cellular"]["link_mode"] | "fallback";
+            if (strcmp(linkMode, "standby") != 0) Cellular::dataLinkDown();
+          }
           _state         = State::STANDBY;
           _wifiDownSince = 0;
           _wifiUpSince   = 0;
