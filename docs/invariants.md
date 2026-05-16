@@ -4,7 +4,7 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-05-14. Bump the date on every edit.
+Dated 2026-05-15. Bump the date on every edit.
 
 ---
 
@@ -67,11 +67,33 @@ cannot bypass the boot-time refusal. SHA256 verification of the
 binary against the manifest is NOT a substitute for cert verification:
 a MITM controls both manifest and binary.
 
+The `/ca.crt`-missing path itself is not silent: when LittleFS lacks
+`/ca.crt`, both `OTAUpdate::loadCaCert` and `MQTTClient::begin` fall
+back to the baked-in `OTA_CA_PROGMEM` bundle (ISRG X1+X2, DigiCert
+RSA+G2+G3, USERTrust ECC). The refusal above only fires when both the
+LittleFS file AND the PROGMEM bundle are empty (build misconfig).
+This is a pure fallback - `/ca.crt` in LittleFS always overrides, so
+the rotation path stays flash-based.
+
 How enforced: any change to `OTAUpdate::configureSecureClient` must
 keep both guards. Reviewers grep for new `setInsecure()` calls.
 
 Source: `lib/thesada-core/src/OTAUpdate.cpp` `begin()`, `check()`,
-`configureSecureClient()`.
+`configureSecureClient()`, `loadCaCert()`; `lib/thesada-core/src/MQTTClient.cpp`
+CA-load block; `lib/thesada-core/src/ota_ca_progmem.h`.
+
+### Every `OTAUpdate::check()` exit emits exactly one `<prefix>/status/ota` record
+
+`refused` (with `reason` = `no-transport` | `no-manifest-url` | `no-ca` |
+`heap-low` | `manifest-fetch-failed`), `up-to-date`, `updating`, or
+`failed`. Operators see the result of every check without needing serial.
+Silent returns are a regression - any new bailout path in `check()` must
+add a matching `publishOtaRefusal` (or other state) call.
+
+How enforced: code review checks new early-return branches in `check()`.
+Bench test: drive each path via `cli/ota.check` and watch `status/ota`.
+
+Source: `lib/thesada-core/src/OTAUpdate.cpp` `check()` + `publishOtaRefusal()`.
 
 ### OTA downloaded binary integrity verified by SHA256 streamed during download
 

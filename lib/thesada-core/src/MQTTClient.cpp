@@ -8,6 +8,7 @@
 #include "Log.h"
 #include "Shell.h"
 #include "OTAUpdate.h"
+#include "ota_ca_progmem.h"
 #include <WiFi.h>
 #include <LittleFS.h>
 #include <Preferences.h>
@@ -270,7 +271,33 @@ void MQTTClient::begin() {
     }
   }
   if (!_caCert || _caCertLen == 0) {
-    Log::warn(TAG, "No /ca.crt - TLS without cert verification");
+    // Fallback to baked PROGMEM bundle. Same shared roots used by OTA -
+    // a stripped LittleFS should not silently drop broker TLS validation
+    // to insecure. setInsecure only fires if even the PROGMEM bundle is
+    // empty (build misconfig).
+    size_t pmLen = strlen_P(OTA_CA_PROGMEM);
+    if (pmLen > 0) {
+#if defined(BOARD_HAS_PSRAM)
+      _caCert = (char*)heap_caps_malloc(pmLen + 1, MALLOC_CAP_SPIRAM);
+      const char* heapTag = "PSRAM";
+#else
+      _caCert = (char*)malloc(pmLen + 1);
+      const char* heapTag = "heap";
+#endif
+      if (_caCert) {
+        memcpy_P(_caCert, OTA_CA_PROGMEM, pmLen);
+        _caCert[pmLen] = '\0';
+        _caCertLen = pmLen;
+        char msg[96];
+        snprintf(msg, sizeof(msg),
+                 "No /ca.crt - using baked PROGMEM CA bundle (%u B in %s)",
+                 (unsigned)pmLen, heapTag);
+        Log::warn(TAG, msg);
+      }
+    }
+  }
+  if (!_caCert || _caCertLen == 0) {
+    Log::warn(TAG, "No /ca.crt AND PROGMEM bundle empty - TLS without cert verification");
     _wifiClient.setInsecure();
   } else {
     _wifiClient.setCACert(_caCert);

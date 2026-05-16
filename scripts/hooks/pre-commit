@@ -1,53 +1,16 @@
 #!/bin/sh
 # thesada-fw pre-commit guard: invariant ledger discipline.
 #
-# Refuses the commit when staged files touch load-bearing source paths
-# but docs/invariants.md is NOT also staged. The reviewer flagged two
-# commits (96947fb, cfd6e72) that landed new invariants without ledger
-# entries; if the ledger drifts behind the code, it stops being load-
-# bearing. The documentation and the fix are the same deliverable.
+# Thin wrapper around scripts/check-invariant-ledger.sh so the local hook
+# and the CI job share one matching rule. Refuses the commit when staged
+# files touch load-bearing source paths without docs/invariants.md.
 #
-# Bypass when the commit genuinely does not establish or rely on a new
-# invariant:
-#
+# Bypass:
 #     INVARIANT_OK=1 git commit ...
-#
-# Bypasses leave a trace: grep for `INVARIANT_OK` in the parent shell
-# history, or add the trailer to the commit message manually.
-#
-# Sensitive paths are the source files named in docs/invariants.md
-# today. When a new load-bearing file gets added, add its path here.
 
 set -eu
 
-SENSITIVE_REGEX='^(lib/thesada-core/src/(OTAUpdate|MQTTClient|Shell|Config)\.cpp|lib/thesada-mod-httpserver/src/[^/]+\.cpp|lib/thesada-mod-cellular/src/Cellular\.cpp)$'
+repo_root="$(git rev-parse --show-toplevel)"
 
-staged="$(git diff --cached --name-only --diff-filter=ACMR)"
-
-touched_sensitive="$(printf '%s\n' "$staged" | grep -E "$SENSITIVE_REGEX" || true)"
-touched_ledger="$(printf '%s\n' "$staged" | grep -E '^docs/invariants\.md$' || true)"
-
-if [ -n "$touched_sensitive" ] && [ -z "$touched_ledger" ]; then
-  if [ "${INVARIANT_OK:-}" = "1" ]; then
-    echo "pre-commit: INVARIANT_OK=1 set, skipping ledger guard." >&2
-    exit 0
-  fi
-  cat >&2 <<EOF
-pre-commit: load-bearing source touched without docs/invariants.md update.
-
-Staged sensitive files:
-$touched_sensitive
-
-If this commit establishes or relies on a new invariant, update
-docs/invariants.md (bump the Dated line) and stage it.
-
-If it does not, re-run with:
-
-    INVARIANT_OK=1 git commit ...
-
-(The bypass is explicit on purpose - it leaves an audit trail.)
-EOF
-  exit 1
-fi
-
-exit 0
+git diff --cached --name-only --diff-filter=ACMR \
+  | "$repo_root/scripts/check-invariant-ledger.sh"

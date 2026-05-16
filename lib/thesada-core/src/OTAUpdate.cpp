@@ -26,6 +26,7 @@
 #include "SleepManager.h"
 #include "Log.h"
 #include "Shell.h"
+#include "ota_ca_progmem.h"
 #include <thesada_config.h>
 
 #include <HTTPClient.h>
@@ -66,8 +67,37 @@ static void loadCaCert() {
     }
   }
   if (_otaCaCert.isEmpty()) {
-    Log::warn(TAG, "No /ca.crt - HTTPS will use insecure mode");
+    // Fallback to baked PROGMEM bundle. Prevents silent OTA disable when
+    // LittleFS is fresh/wiped (firmware-only reflash without uploadfs).
+    // FPSTR + assignment copies flash->RAM as a one-shot at boot; OK
+    // because _otaCaCert is then reused for every subsequent fetch.
+    _otaCaCert = String(FPSTR(OTA_CA_PROGMEM));
+    if (!_otaCaCert.isEmpty()) {
+      Log::warn(TAG, "No /ca.crt in LittleFS - using baked PROGMEM CA bundle");
+    } else {
+      Log::error(TAG, "No /ca.crt AND PROGMEM bundle empty - HTTPS will use insecure mode");
+    }
   }
+}
+
+// Publish a status/ota refusal record so operators see WHY a check did
+// not proceed without needing serial. Without this, every silent
+// bailout in check() / begin() looks identical to "device offline" or
+// "manifest unreachable" from the broker side. Best-effort: a publish
+// failure is itself silently dropped (we are already in a failure path).
+// in:  reason (short kebab-case identifier, e.g. "no-ca", "heap-low").
+// out: none.
+static void publishOtaRefusal(const char* reason) {
+  if (!MQTTClient::connected()) return;
+  JsonObject  cfg    = Config::get();
+  const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+  char topic[96];
+  snprintf(topic, sizeof(topic), "%s/status/ota", prefix);
+  char payload[160];
+  snprintf(payload, sizeof(payload),
+           "{\"state\":\"refused\",\"reason\":\"%s\",\"version\":\"%s\"}",
+           reason, FIRMWARE_VERSION);
+  MQTTClient::publish(topic, payload);
 }
 
 // Apply CA cert or insecure mode to a WiFiClientSecure instance.
@@ -96,8 +126,9 @@ static void configureSecureClient(WiFiClientSecure& client) {
 // underlying paths are very different (Arduino HTTPClient/WiFiClientSecure
 // over WiFi vs SIM7080G modem-native SSL socket via TinyGsmClientSecure),
 // so we wrap both behind a single byte-stream callback API. Same /ca.crt
-// validates ota.thesada.app on either path (Let's Encrypt -> ISRG roots
-// already in the cert file the modem also uses for MQTT TLS).
+// validates the manifest origin on either path (public TLS roots covering
+// the common backends - GitHub Releases, Let's Encrypt fronted origins,
+// Sectigo, etc - are baked into the firmware via ota_ca_progmem.h).
 // ---------------------------------------------------------------------------
 
 // HTTP GET via WiFi using Arduino HTTPClient. Streams the response body
@@ -488,6 +519,7 @@ void OTAUpdate::loop() {
 void OTAUpdate::check(const char* manifestOverride, bool force) {
   if (!anyTransportUp()) {
     Log::warn(TAG, "No transport - skipping OTA check");
+    publishOtaRefusal("no-transport");
     return;
   }
 
@@ -498,6 +530,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
 
   if (strlen(url) == 0) {
     Log::error(TAG, "No manifest URL");
+    publishOtaRefusal("no-manifest-url");
     return;
   }
 
@@ -507,10 +540,15 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
   // operator-driven retries; without this gate, an attacker who can publish
   // to the OTA cmd_topic could still force an insecure HTTPS fetch even
   // though begin() refused at boot.
+  //
+  // With the PROGMEM CA fallback in loadCaCert this gate effectively only
+  // fires when the PROGMEM bundle itself is empty (build misconfig). Kept
+  // anyway so a future allow_insecure code path stays consistent.
   loadCaCert();
   bool allowInsecure = cfg["ota"]["allow_insecure"] | false;
   if (_otaCaCert.isEmpty() && !allowInsecure) {
     Log::error(TAG, "OTA check refused - no /ca.crt and ota.allow_insecure not set");
+    publishOtaRefusal("no-ca");
     return;
   }
 
@@ -531,6 +569,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
       MQTTClient::connected() && ESP.getMaxAllocHeap() < 40000) {
     if (!force) {
       Log::info(TAG, "Skipping OTA check - heap too low for second TLS session");
+      publishOtaRefusal("heap-low");
       return;
     }
     Log::warn(TAG, "Heap low - disconnecting MQTT to free TLS buffers for forced OTA");
@@ -543,6 +582,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
   size_t binSize = 0;
   if (!fetchManifest(url, remoteVersion, binUrl, sha256, binSize)) {
     Log::error(TAG, "Manifest fetch failed");
+    publishOtaRefusal("manifest-fetch-failed");
     return;
   }
 
@@ -553,6 +593,17 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
 
   if (!force && !isNewer(remoteVersion.c_str(), FIRMWARE_VERSION)) {
     Log::info(TAG, "Already up to date");
+    // Publish so operators see the check completed and the device is on
+    // the latest. Without this an up-to-date check looks identical to
+    // "device offline" or "silent refusal" from the broker side.
+    const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+    char topic[96];
+    snprintf(topic, sizeof(topic), "%s/status/ota", prefix);
+    char payload[160];
+    snprintf(payload, sizeof(payload),
+             "{\"state\":\"up-to-date\",\"version\":\"%s\",\"remote\":\"%s\"}",
+             FIRMWARE_VERSION, remoteVersion.c_str());
+    MQTTClient::publish(topic, payload);
     return;
   }
   if (force && !isNewer(remoteVersion.c_str(), FIRMWARE_VERSION)) {

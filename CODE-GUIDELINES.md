@@ -316,15 +316,20 @@ drifts behind the code, it stops being load-bearing: a reviewer six
 months from now cannot tell which rules the code currently depends on
 versus which ones got quietly removed.
 
-How enforced:
+How enforced (layered):
 
 - Pre-commit hook (`scripts/hooks/pre-commit`) refuses commits that
   touch load-bearing source paths (OTA, MQTT, Shell, Config, HTTP
   server, Cellular) unless `docs/invariants.md` is also staged. Bypass
   is explicit: `INVARIANT_OK=1 git commit ...` (audit-traceable).
-- Install via `./scripts/hooks/install.sh` after clone.
-- When a new file becomes load-bearing, add its path to the
-  `SENSITIVE_REGEX` in `scripts/hooks/pre-commit`.
+  Install via `./scripts/hooks/install.sh` after clone.
+- CI workflow (`.github/workflows/ci.yml` job `invariant-ledger`) runs
+  the same check against the push or PR commit range, so a contributor
+  who has not installed the local hook still hits the guard. Bypass
+  trailer: include `INVARIANT_OK: 1` in any commit message in the range.
+- Both call into `scripts/check-invariant-ledger.sh` so the matching
+  rule lives in one place. When a new file becomes load-bearing, add
+  its path to the `SENSITIVE_REGEX` in that shared script.
 
 What counts as "establishes a new invariant":
 
