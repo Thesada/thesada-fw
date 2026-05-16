@@ -171,6 +171,33 @@ Each `thesada-mod-*` directory is a standalone PlatformIO library with its own `
 
 ---
 
+## Development
+
+Install the local git hooks once after clone:
+
+```bash
+./scripts/hooks/install.sh
+```
+
+This symlinks `scripts/hooks/pre-commit` into `.git/hooks/`. The hook
+refuses a commit that touches load-bearing source files (OTA, MQTT,
+Shell, Config, HttpServer, Cellular) without an update to
+[docs/invariants.md](docs/invariants.md). The same check runs server
+side in CI (`.github/workflows/ci.yml` job `invariant-ledger`).
+
+Bypass when the touch genuinely does not establish or rely on an
+invariant:
+
+```bash
+INVARIANT_OK=1 git commit ...                     # env-set, no audit trail
+git commit -m "... \n\nINVARIANT_OK: 1"           # trailer, greppable in git log
+```
+
+See [CODE-GUIDELINES.md](CODE-GUIDELINES.md) "Ledger discipline" for
+what counts as establishing an invariant.
+
+---
+
 ## Licence
 
 SPDX-License-Identifier: GPL-3.0-only

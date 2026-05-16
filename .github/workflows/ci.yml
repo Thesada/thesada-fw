@@ -96,8 +96,64 @@ jobs:
       - name: Run Lua test suite
         run: lua5.3 tests/lua/run_all.lua
 
+  invariant-ledger:
+    # Server-side mirror of scripts/hooks/pre-commit: refuses a push or PR
+    # that touches load-bearing source without updating docs/invariants.md.
+    # Pre-commit guards a local commit; this job guards anything that
+    # arrives via a direct push or a contributor who has not installed
+    # the hooks. Bypass with `INVARIANT_OK: 1` trailer in any commit in
+    # the range.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need the merge base for PRs; full history for pushes so we can
+          # walk back to the previous commit on the branch.
+          fetch-depth: 0
+
+      - name: Resolve change range
+        id: range
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            # push event: before is the prior tip on the branch
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+          fi
+          # First push to a new branch has all-zero `before`; fall back to
+          # parent of HEAD so the check still runs against a real diff.
+          if [ "$base" = "0000000000000000000000000000000000000000" ] || [ -z "$base" ]; then
+            base="$(git rev-parse "$head^" 2>/dev/null || echo "$head")"
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+
+      - name: Check for INVARIANT_OK bypass trailer in range
+        id: bypass
+        run: |
+          if git log --format=%B "${{ steps.range.outputs.base }}..${{ steps.range.outputs.head }}" \
+              | grep -qE '^INVARIANT_OK:[[:space:]]*1[[:space:]]*$'; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run ledger check
+        if: steps.bypass.outputs.found != 'true'
+        run: |
+          git diff --name-only "${{ steps.range.outputs.base }}..${{ steps.range.outputs.head }}" \
+            | ./scripts/check-invariant-ledger.sh
+
+      - name: Note bypass
+        if: steps.bypass.outputs.found == 'true'
+        run: echo "INVARIANT_OK trailer found in commit range - skipping ledger check."
+
   release:
-    needs: [build, lua-tests]
+    needs: [build, lua-tests, invariant-ledger]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
