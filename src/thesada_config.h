@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
-#define FIRMWARE_VERSION "1.4.8"  // bump on each release
+#define FIRMWARE_VERSION "1.4.9"  // bump on each release
 
 // ── Memory tuning defaults ──────────────────────────────────────────────────
 #define LOG_RING_SIZE       50    // log replay lines for WS terminal

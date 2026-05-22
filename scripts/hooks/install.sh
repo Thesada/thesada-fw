@@ -17,7 +17,7 @@ if [ ! -d "$hooks_dst" ]; then
   exit 1
 fi
 
-for hook in pre-commit; do
+for hook in pre-commit commit-msg; do
   src="$hooks_src/$hook"
   dst="$hooks_dst/$hook"
   if [ ! -x "$src" ]; then

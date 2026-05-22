@@ -36,3 +36,4 @@ tests/__pycache__
 
 # Deploy script (contains server details)
 scripts/deploy-ota.sh
+scripts/owb.sh

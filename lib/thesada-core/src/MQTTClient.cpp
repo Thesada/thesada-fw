@@ -61,33 +61,48 @@ static char      _brokerHost[96] = {0};
 
 // Validate a PEM cert + key pair via mbedtls. Prevents feeding a bad
 // buffer into WiFiClientSecure::setCertificate which would stick in the
-// TLS stack and break every future reconnect until restart.
+// TLS stack and break every future reconnect until restart. Also rejects
+// a mismatched pair (cert A + key B): each parses fine on its own, so
+// without the explicit pair check the mismatch only surfaces later as an
+// opaque "TLS handshake failed" instead of an immediate cert.set error.
 // in: cert (PEM string), key (PEM string).
-// out: true if both parse as valid X.509 cert + compatible private key.
+// out: true if both parse AND the key is the private half of the cert's
+//      public key.
 static bool validateClientCertKey(const char* cert, const char* key) {
   if (!cert || !key || !*cert || !*key) return false;
 
   mbedtls_x509_crt crt;
-  mbedtls_x509_crt_init(&crt);
-  int rc = mbedtls_x509_crt_parse(&crt, (const unsigned char*)cert, strlen(cert) + 1);
-  mbedtls_x509_crt_free(&crt);
-  if (rc != 0) return false;
-
   mbedtls_pk_context pk;
+  mbedtls_x509_crt_init(&crt);
   mbedtls_pk_init(&pk);
-  // mbedtls 3.x (pioarduino / IDF 5.x) added RNG callback args; 2.x has 5-arg form.
+
+  // crt must stay live until after the pair check - it owns the public
+  // key that mbedtls_pk_check_pair compares the private key against.
+  bool ok = false;
+  do {
+    if (mbedtls_x509_crt_parse(&crt, (const unsigned char*)cert, strlen(cert) + 1) != 0)
+      break;
+    // mbedtls 3.x (pioarduino / IDF 5.x) added RNG callback args to both
+    // pk_parse_key and pk_check_pair; 2.x has the shorter forms.
 #if MBEDTLS_VERSION_MAJOR >= 3
-  rc = mbedtls_pk_parse_key(&pk,
-                            (const unsigned char*)key, strlen(key) + 1,
-                            nullptr, 0,
-                            nullptr, nullptr);
+    if (mbedtls_pk_parse_key(&pk, (const unsigned char*)key, strlen(key) + 1,
+                             nullptr, 0, nullptr, nullptr) != 0)
+      break;
+    if (mbedtls_pk_check_pair(&crt.pk, &pk, nullptr, nullptr) != 0)
+      break;
 #else
-  rc = mbedtls_pk_parse_key(&pk,
-                            (const unsigned char*)key, strlen(key) + 1,
-                            nullptr, 0);
+    if (mbedtls_pk_parse_key(&pk, (const unsigned char*)key, strlen(key) + 1,
+                             nullptr, 0) != 0)
+      break;
+    if (mbedtls_pk_check_pair(&crt.pk, &pk) != 0)
+      break;
 #endif
+    ok = true;
+  } while (0);
+
   mbedtls_pk_free(&pk);
-  return rc == 0;
+  mbedtls_x509_crt_free(&crt);
+  return ok;
 }
 
 // CA cert buffer - routed to PSRAM when BOARD_HAS_PSRAM is defined, falling
