@@ -4,7 +4,7 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-05-15. Bump the date on every edit.
+Dated 2026-05-21. Bump the date on every edit.
 
 ---
 
@@ -142,12 +142,22 @@ short-term use must zero+free. Add `#include <mbedtls/platform_util.h>`.
 Source: `lib/thesada-mod-cellular/src/Cellular.cpp::writeClientCert`,
 `lib/thesada-core/src/MQTTClient.cpp` cert.set handler.
 
-### Cert+key pair are validated together at cert.set (WIP)
+### Cert+key pair are validated together at cert.set
 
-Target state. Currently cert and key are parsed independently; a
-mismatched pair is caught later at TLS handshake. Aspirational
-invariant: `mbedtls_pk_check_pair(&crt.pk, &pk)` runs before any
-cert.set returns ok.
+A client cert + key only reach NVS / the TLS stack if they are a
+matching pair. `validateClientCertKey` parses both, then runs
+`mbedtls_pk_check_pair(&crt.pk, &pk, ...)` against the cert's public
+key before returning ok - the `crt` context is kept live through the
+check for exactly that. A mismatched pair (cert A + key B) is rejected
+at cert.set instead of surfacing later as an opaque TLS handshake
+failure.
+
+How enforced: every path that installs client mTLS material calls
+`validateClientCertKey` first. The check is version-guarded -
+`mbedtls_pk_check_pair` and `mbedtls_pk_parse_key` take RNG callback
+args on mbedtls 3.x (pioarduino / IDF 5.x), the shorter forms on 2.x.
+
+Source: `lib/thesada-core/src/MQTTClient.cpp::validateClientCertKey`.
 
 ### mTLS context reset between connect attempts
 
