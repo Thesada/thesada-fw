@@ -19,6 +19,8 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <LittleFS.h>
+#include "telegram_ca_progmem.h"
 #ifdef ENABLE_SCRIPTENGINE
 #include <ScriptEngine.h>
 extern "C" {
@@ -33,6 +35,8 @@ static const char* TAG = "Telegram";
 
 bool TelegramModule::_ready = false;
 WiFiClientSecure TelegramModule::_secClient;
+String TelegramModule::_caCert;
+WiFiClientSecure TelegramModule::_webhookClient;
 
 // ---------------------------------------------------------------------------
 
@@ -48,10 +52,42 @@ void TelegramModule::begin() {
   else if (chatIds.is<JsonObject>()) nChats = (int)chatIds.as<JsonObject>().size();
   bool hasToken = strlen(token) > 0;
 
-  // Configure the persistent TLS client once. This instance is never
-  // deleted - avoids the heap fragmentation that kills Telegram after 3 alerts.
-  _secClient.setInsecure();
+  // Configure the persistent TLS clients once. Both are never deleted -
+  // avoids the heap fragmentation that kills Telegram after 3 alerts.
+  //
+  // Bot API client: CA-verified. Load the Telegram API root - LittleFS
+  // /telegram-ca.crt wins (rotation without a reflash), else the baked
+  // PROGMEM Go Daddy Root G2. Verified TLS replaces the old setInsecure()
+  // call - that left every request open to a MITM lifting the bot token
+  // out of the request URL.
+  _caCert = "";
+  if (LittleFS.exists("/telegram-ca.crt")) {
+    File cf = LittleFS.open("/telegram-ca.crt", "r");
+    if (cf) {
+      _caCert = cf.readString();
+      cf.close();
+      Log::info(TAG, "CA loaded from /telegram-ca.crt");
+    }
+  }
+  if (_caCert.isEmpty()) {
+    _caCert = String(FPSTR(TELEGRAM_CA_PROGMEM));
+    if (!_caCert.isEmpty()) {
+      Log::warn(TAG, "No /telegram-ca.crt - using baked PROGMEM CA");
+    }
+  }
+  if (!_caCert.isEmpty()) {
+    _secClient.setCACert(_caCert.c_str());
+  } else {
+    // No CA at all: leave the client unconfigured so the handshake
+    // fails closed. Refusing to send beats leaking the token insecurely.
+    Log::error(TAG, "No Telegram CA - sends will fail (refusing insecure)");
+  }
   _secClient.setTimeout(10);
+
+  // Webhook client: optional operator-chosen endpoint, kept unverified
+  // (it may be self-signed or internal - not in scope for CA pinning).
+  _webhookClient.setInsecure();
+  _webhookClient.setTimeout(10);
 
   char msg[64];
   snprintf(msg, sizeof(msg), "Ready - token=%s, %d chat(s)", hasToken ? "yes" : "no", nChats);
@@ -193,8 +229,8 @@ bool TelegramModule::send(const char* message) {
       bool isHttps = String(url).startsWith("https");
       WiFiClient pc;
       if (isHttps) {
-        _secClient.stop();
-        http.begin(_secClient, url);
+        _webhookClient.stop();
+        http.begin(_webhookClient, url);
       } else {
         pc.setTimeout(10);
         http.begin(pc, url);
