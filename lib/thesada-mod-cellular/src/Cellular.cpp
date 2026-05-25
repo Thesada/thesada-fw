@@ -73,9 +73,9 @@ Cellular::ATGuard::~ATGuard() {
 
 // Temporarily release the bus, chunked-sleep with shell + WDT pumps,
 // then re-acquire before returning. Used by mqttBackoffWait so a long
-// MQTT retry backoff inside Cellular::begin does not starve the main
-// loop (Shell, console, cell.at debug commands, URC pump). See header
-// for caller contract: no AT commands while paused.
+// MQTT retry backoff inside the Cellular::loop() recovery path does not
+// starve the main loop (Shell, console, cell.at debug commands, URC
+// pump). See header for caller contract: no AT commands while paused.
 void Cellular::ATGuard::pause(uint32_t pauseMs) {
   bool wasHeld = _held;
   if (wasHeld) {
@@ -162,8 +162,10 @@ static uint32_t           s_mqttRetryMs      = MQTT_RETRY_INIT_MS;
 //
 // If `guard` is non-null, it is paused for the backoff so the AT bus
 // is released and the shell console pumps for cell.at / cell.cert.*
-// debug commands. begin()'s retry loop passes its own guard; older
-// callers without a guard get a plain delay loop (no console pump).
+// debug commands. The Cellular::loop() recovery path passes its own
+// guard; callers without a guard get a plain delay loop (no console
+// pump). The incremental tickActivation() path does not use this -
+// it schedules a non-blocking retry timestamp instead.
 //
 // in:  guard  optional ATGuard to pause during the sleep, or nullptr
 // out: none (uses module-static s_mqttRetryMs)
@@ -516,12 +518,18 @@ bool Cellular::writeClientCert() {
 
 // ---------------------------------------------------------------------------
 
-// Configure radio, register on LTE-M network, and activate data bearer
-bool Cellular::networkConnect() {
-  JsonObject cfg = Config::get();
-  const char* apn         = cfg["cellular"]["apn"]            | "OSC";
-  uint32_t    rfSettleMs  = cfg["cellular"]["rf_settle_ms"]   | 15000;
-  uint32_t    regTimeout  = cfg["cellular"]["reg_timeout_ms"] | 180000;
+// Radio configuration block of the network bring-up: CFUN power-cycle,
+// network/preferred-mode select, APN (CGDCONT/CNCFG), CEREG/CGREG URC
+// enable, then a configurable RF-settle delay before registration is
+// polled. Caller owns the AT bus. Shared by the synchronous
+// networkConnect() and the incremental tickActivation() RADIO_CFG phase.
+//
+// The CFUN waits + RF settle are chunked so the task watchdog stays fed;
+// the whole sequence is one ~40 s burst that otherwise blocks > TWDT.
+void Cellular::radioConfigure() {
+  JsonObject  cfg        = Config::get();
+  const char* apn        = cfg["cellular"]["apn"]          | "OSC";
+  uint32_t    rfSettleMs = cfg["cellular"]["rf_settle_ms"] | 15000;
 
   Log::info(TAG, "Configuring radio...");
   modem.sendAT("+CFUN=0");
@@ -545,68 +553,69 @@ bool Cellular::networkConnect() {
   waitChunked(20000UL);
 
   // Critical: let LTE-M radio settle before polling registration.
-  // Chunk the delay so the task watchdog stays fed; whole sequence runs
-  // inside a single loop() tick that otherwise blocks > TWDT timeout.
   char msg[64];
-  snprintf(msg, sizeof(msg), "RF settle %lu ms...", rfSettleMs);
+  snprintf(msg, sizeof(msg), "RF settle %lu ms...", (unsigned long)rfSettleMs);
   Log::info(TAG, msg);
-  {
-    uint32_t remaining = rfSettleMs;
-    while (remaining) {
-      uint32_t step = remaining > 500UL ? 500UL : remaining;
-      delay(step);
-      esp_task_wdt_reset();
-      remaining -= step;
-    }
-  }
-
-  Log::info(TAG, "Waiting for registration...");
-  SIM70xxRegStatus s;
-  uint32_t start = millis();
-#ifdef THESADA_CELL_DEBUG
-  uint32_t lastDiag = 0;
-#endif
-  do {
+  uint32_t remaining = rfSettleMs;
+  while (remaining) {
+    uint32_t step = remaining > 500UL ? 500UL : remaining;
+    delay(step);
     esp_task_wdt_reset();
-    Shell::pumpConsole();
-    s = modem.getRegistrationStatus();
-    if (s == REG_OK_HOME)    { Log::info(TAG, "Registered - HOME");    break; }
-    if (s == REG_OK_ROAMING) { Log::info(TAG, "Registered - ROAMING"); break; }
-    if (s == REG_DENIED)     { Log::error(TAG, "Registration DENIED"); return false; }
-#ifdef THESADA_CELL_DEBUG
-    if (millis() - lastDiag > 5000UL) {
-      lastDiag = millis();
-      char dbg[160];
-      int csq = modem.getSignalQuality();
-      snprintf(dbg, sizeof(dbg), "diag: regStatus=%d CSQ=%d", (int)s, csq);
-      Log::info(TAG, dbg);
-      auto dumpAT = [](const char* cmd) {
-        Serial1.printf("AT%s\r\n", cmd);
-        uint32_t t0 = millis();
-        String buf;
-        while (millis() - t0 < 1500UL) {
-          while (Serial1.available()) buf += (char)Serial1.read();
-          delay(20);
-        }
-        buf.replace("\r", " ");
-        buf.replace("\n", " | ");
-        char line[256];
-        snprintf(line, sizeof(line), "AT%s -> %s", cmd, buf.c_str());
-        Log::info(TAG, line);
-      };
-      dumpAT("+CPSI?");
-      dumpAT("+CEREG?");
-      dumpAT("+CGREG?");
-    }
-#endif
-    delay(1000);
-    if (millis() - start > regTimeout) {
-      Log::error(TAG, "Registration timeout");
-      return false;
-    }
-  } while (true);
+    remaining -= step;
+  }
+}
 
-  // Activate bearer.
+// ---------------------------------------------------------------------------
+
+// One network-registration status read for the bring-up paths. Returns
+// 1 on HOME/ROAMING, 0 while still searching, -1 on REG_DENIED. The
+// caller owns the registration timeout. THESADA_CELL_DEBUG builds also
+// dump CPSI/CEREG/CGREG at most every 5 s while still searching.
+int Cellular::pollRegistration() {
+  esp_task_wdt_reset();
+  SIM70xxRegStatus s = modem.getRegistrationStatus();
+  if (s == REG_OK_HOME)    { Log::info(TAG, "Registered - HOME");    return 1; }
+  if (s == REG_OK_ROAMING) { Log::info(TAG, "Registered - ROAMING"); return 1; }
+  if (s == REG_DENIED)     { Log::error(TAG, "Registration DENIED"); return -1; }
+#ifdef THESADA_CELL_DEBUG
+  static uint32_t lastDiag = 0;
+  if (millis() - lastDiag > 5000UL) {
+    lastDiag = millis();
+    char dbg[160];
+    snprintf(dbg, sizeof(dbg), "diag: regStatus=%d CSQ=%d",
+             (int)s, modem.getSignalQuality());
+    Log::info(TAG, dbg);
+    auto dumpAT = [](const char* cmd) {
+      Serial1.printf("AT%s\r\n", cmd);
+      uint32_t t0 = millis();
+      String buf;
+      while (millis() - t0 < 1500UL) {
+        while (Serial1.available()) buf += (char)Serial1.read();
+        delay(20);
+      }
+      buf.replace("\r", " ");
+      buf.replace("\n", " | ");
+      char line[256];
+      snprintf(line, sizeof(line), "AT%s -> %s", cmd, buf.c_str());
+      Log::info(TAG, line);
+    };
+    dumpAT("+CPSI?");
+    dumpAT("+CEREG?");
+    dumpAT("+CGREG?");
+  }
+#endif
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+
+// Activate the PDP data context (CNACT slot 0) after registration.
+// Falls back to TinyGSM gprsConnect() if the direct CNACT does not
+// confirm. Caller owns the AT bus. Returns true once isGprsConnected().
+bool Cellular::activateBearer() {
+  JsonObject  cfg = Config::get();
+  const char* apn = cfg["cellular"]["apn"] | "OSC";
+
   Log::info(TAG, "Activating bearer...");
   if (!modem.isGprsConnected()) {
     modem.sendAT("+CNACT=0,1");
@@ -624,6 +633,36 @@ bool Cellular::networkConnect() {
   snprintf(ipMsg, sizeof(ipMsg), "IP: %s", modem.localIP().toString().c_str());
   Log::info(TAG, ipMsg);
   return true;
+}
+
+// ---------------------------------------------------------------------------
+
+// Configure radio, register on LTE-M network, and activate data bearer.
+// Synchronous (blocking registration poll) - used by the steady-state
+// recovery path in Cellular::loop() and the modem-wedge path in
+// mqttConnect(). The incremental CellularModule activation walks
+// radioConfigure() / pollRegistration() / activateBearer() through
+// tickActivation() instead, so it can yield between phases.
+bool Cellular::networkConnect() {
+  radioConfigure();
+
+  Log::info(TAG, "Waiting for registration...");
+  JsonObject cfg        = Config::get();
+  uint32_t   regTimeout = cfg["cellular"]["reg_timeout_ms"] | 180000;
+  uint32_t   start      = millis();
+  for (;;) {
+    Shell::pumpConsole();
+    int r = pollRegistration();
+    if (r > 0) break;
+    if (r < 0) return false;  // REG_DENIED
+    delay(1000);
+    if (millis() - start > regTimeout) {
+      Log::error(TAG, "Registration timeout");
+      return false;
+    }
+  }
+
+  return activateBearer();
 }
 
 // ---------------------------------------------------------------------------
@@ -1128,79 +1167,192 @@ bool Cellular::powerOn() {
   return true;
 }
 
-// Initialize PMU, modem, SIM, CA cert, network, and MQTT connection.
-// Calls powerOn() first; if the modem is already alive (e.g. GNSS
-// warmed it earlier), powerOn is a no-op. Returns immediately if the
-// full path has already completed.
-void Cellular::begin() {
-  if (_started) return;  // already fully initialised
-  Log::info(TAG, "Starting cellular path...");
+// --- Incremental activation state machine ----------------------------------
+// begin() used to run power-on through MQTT-connect in one blocking call,
+// freezing every other module loop for 30-120 s (Forgejo FW M1). The
+// tickActivation() state machine below walks the same bring-up one phase
+// per call instead; CellularModule polls it every loop while ACTIVATING.
+// State is module-static - only one activation runs at a time and
+// CellularModule is its sole driver.
+enum class ActPhase : uint8_t {
+  INIT,       // install hooks, stamp the deadline
+  POWER_ON,   // PMU rails + PWRKEY + AT probe
+  SIM,        // PIN unlock, SIM_READY check, CA cert upload
+  RADIO_CFG,  // CFUN cycle, band/APN config, RF settle
+  REGISTER,   // poll network registration, one read per tick
+  BEARER,     // activate the PDP data context
+  MQTT,       // modem-native MQTT connect (non-blocking backoff on fail)
+};
+static ActPhase s_actPhase     = ActPhase::INIT;
+static uint32_t s_actDeadline  = 0;  // millis() hard stop for the cycle
+static uint32_t s_regPollStart = 0;  // millis() the REGISTER phase began
+static uint32_t s_lastRegPoll  = 0;  // millis() of the last registration read
+static uint32_t s_nextRetryMs  = 0;  // millis() before which a failed MQTT
+                                     // connect will not be retried
 
-  // Wire the MQTTClient cert-cleared hook so cert.clear from any path
-  // (Shell, MQTT CLI, WS) drops our modem-side cache + active session
-  // and triggers a reconnect under the new auth mode. Idempotent -
-  // begin() is gated by _started so this fires once per boot.
-  MQTTClient::setOnClientCertCleared([]() {
-    Cellular::invalidateClientCert();
-  });
+// Advance the cellular bring-up by one phase. See Cellular.h for the
+// caller contract. Each phase takes its own short-lived ATGuard so the
+// AT bus is free between phases and other module loops keep ticking.
+Cellular::ActStatus Cellular::tickActivation() {
+  // Already fully up (re-entry after a WiFi-recovery yield): nothing to do.
+  if (_started) { s_actPhase = ActPhase::INIT; return ActStatus::DONE; }
 
-  if (!powerOn()) {
-    Log::error(TAG, "Modem powerOn failed - aborting cellular bring-up");
-    return;
+  uint32_t now = millis();
+
+  // Overall deadline guard. A wedged modem or bad broker config must not
+  // pin the device in ACTIVATING forever - after the timeout we hardware-
+  // reset the modem and report FAILED so CellularModule drops to STANDBY
+  // (device stays responsive, keeps watching WiFi, retries later).
+  if (s_actPhase != ActPhase::INIT && s_actDeadline != 0 &&
+      (int32_t)(now - s_actDeadline) >= 0) {
+    Log::error(TAG, "Cellular activation timed out - hard-resetting modem");
+    hardReset();
+    s_actPhase = ActPhase::INIT;
+    return ActStatus::FAILED;
   }
 
-  // Take the AT bus for the rest of the bring-up. Long: registration
-  // alone can take 60-180 s on first SIM-card touch, plus CA upload +
-  // SMCONN. Any cross-task caller that hits Cellular::publish during
-  // boot will wait its turn rather than racing the registration AT
-  // chatter.
-  ATGuard g(300000UL);
-  if (!g.ok()) {
-    Log::error(TAG, "Cellular begin: AT bus stuck - aborting");
-    return;
-  }
+  switch (s_actPhase) {
+    case ActPhase::INIT: {
+      Log::info(TAG, "Starting cellular path...");
+      // Wire the MQTTClient cert-cleared hook so cert.clear from any path
+      // (Shell, MQTT CLI, WS) drops the modem-side cache + active session
+      // and triggers a reconnect under the new auth mode. Idempotent.
+      MQTTClient::setOnClientCertCleared([]() {
+        Cellular::invalidateClientCert();
+      });
+      JsonObject cfg     = Config::get();
+      uint32_t   timeout = cfg["cellular"]["activation_timeout_ms"] | 1800000UL;
+      s_actDeadline = now + timeout;
+      s_nextRetryMs = 0;
+      mqttBackoffReset();  // fresh cycle starts at the short backoff window
+      s_actPhase    = ActPhase::POWER_ON;
+      return ActStatus::PENDING;
+    }
 
-  // Unlock SIM with PIN if configured.
-  {
-    JsonObject  cfg = Config::get();
-    const char* pin = cfg["cellular"]["sim_pin"] | "";
-    if (strlen(pin) > 0) {
-      if (modem.getSimStatus() == SIM_LOCKED) {
+    case ActPhase::POWER_ON: {
+      // powerOn() takes its own (long) ATGuard internally; idempotent if
+      // the modem is already alive (e.g. GNSS warmed it earlier).
+      if (!powerOn()) {
+        Log::error(TAG, "Modem powerOn failed - aborting cellular bring-up");
+        s_actPhase = ActPhase::INIT;
+        return ActStatus::FAILED;
+      }
+      s_actPhase = ActPhase::SIM;
+      return ActStatus::PENDING;
+    }
+
+    case ActPhase::SIM: {
+      ATGuard g(120000UL);
+      if (!g.ok()) {
+        Log::error(TAG, "Cellular SIM phase: AT bus stuck - aborting");
+        s_actPhase = ActPhase::INIT;
+        return ActStatus::FAILED;
+      }
+      JsonObject  cfg = Config::get();
+      const char* pin = cfg["cellular"]["sim_pin"] | "";
+      if (strlen(pin) > 0 && modem.getSimStatus() == SIM_LOCKED) {
         if (!modem.simUnlock(pin)) {
           Log::error(TAG, "SIM unlock failed");
-          return;
+          s_actPhase = ActPhase::INIT;
+          return ActStatus::FAILED;
         }
         Log::info(TAG, "SIM unlocked");
       }
+      if (modem.getSimStatus() != SIM_READY) {
+        Log::error(TAG, "SIM not ready - cellular unavailable");
+        s_actPhase = ActPhase::INIT;
+        return ActStatus::FAILED;
+      }
+      Log::info(TAG, "SIM ready");
+      writeCACert();
+      s_actPhase = ActPhase::RADIO_CFG;
+      return ActStatus::PENDING;
+    }
+
+    case ActPhase::RADIO_CFG: {
+      ATGuard g(120000UL);
+      if (!g.ok()) {
+        Log::warn(TAG, "Cellular radio config: AT bus busy - retrying");
+        return ActStatus::PENDING;
+      }
+      radioConfigure();
+      s_regPollStart = millis();
+      s_lastRegPoll  = 0;
+      s_actPhase     = ActPhase::REGISTER;
+      return ActStatus::PENDING;
+    }
+
+    case ActPhase::REGISTER: {
+      // Poll registration at ~1 Hz so the bring-up does not hammer the
+      // AT bus every main-loop iteration.
+      if (s_lastRegPoll != 0 && (now - s_lastRegPoll) < 1000UL) {
+        return ActStatus::PENDING;
+      }
+      s_lastRegPoll = now;
+      ATGuard g(10000UL);
+      if (!g.ok()) return ActStatus::PENDING;  // bus busy - retry next tick
+
+      int r = pollRegistration();
+      if (r > 0) {
+        s_actPhase = ActPhase::BEARER;
+        return ActStatus::PENDING;
+      }
+      // Not registered. On denial or the per-attempt registration
+      // timeout, re-walk the radio config (the cycle deadline still
+      // bounds the total).
+      JsonObject cfg        = Config::get();
+      uint32_t   regTimeout = cfg["cellular"]["reg_timeout_ms"] | 180000;
+      if (r < 0 || (millis() - s_regPollStart) > regTimeout) {
+        Log::warn(TAG, "Registration failed - re-walking radio config");
+        s_actPhase = ActPhase::RADIO_CFG;
+      }
+      return ActStatus::PENDING;
+    }
+
+    case ActPhase::BEARER: {
+      ATGuard g(60000UL);
+      if (!g.ok()) return ActStatus::PENDING;
+      if (!activateBearer()) {
+        Log::warn(TAG, "Bearer activation failed - re-walking radio config");
+        s_actPhase = ActPhase::RADIO_CFG;
+        return ActStatus::PENDING;
+      }
+      s_actPhase = ActPhase::MQTT;
+      return ActStatus::PENDING;
+    }
+
+    case ActPhase::MQTT: {
+      // Non-blocking backoff: after a failed connect, just wait out
+      // s_nextRetryMs without holding the bus so other modules tick.
+      if (s_nextRetryMs != 0 && (int32_t)(now - s_nextRetryMs) < 0) {
+        return ActStatus::PENDING;
+      }
+      ATGuard g(120000UL);
+      if (!g.ok()) return ActStatus::PENDING;
+
+      if (mqttConnect()) {
+        mqttBackoffReset();
+        _started          = true;
+        _mqttConnected    = true;
+        _publishGate      = true;
+        _lastSignalSample = 0;
+        sampleSignalQuality();
+        s_actPhase = ActPhase::INIT;
+        return ActStatus::DONE;
+      }
+
+      // Failed - schedule the next attempt and grow the backoff window.
+      s_nextRetryMs = millis() + s_mqttRetryMs;
+      uint32_t next = s_mqttRetryMs * 2UL;
+      s_mqttRetryMs = (next > MQTT_RETRY_MAX_MS) ? MQTT_RETRY_MAX_MS : next;
+      char msg[64];
+      snprintf(msg, sizeof(msg), "MQTT connect failed - retry in %lu s",
+               (unsigned long)((s_nextRetryMs - millis()) / 1000UL));
+      Log::warn(TAG, msg);
+      return ActStatus::PENDING;
     }
   }
-
-  if (modem.getSimStatus() != SIM_READY) {
-    Log::error(TAG, "SIM not ready - cellular unavailable");
-    return;
-  }
-  Log::info(TAG, "SIM ready");
-
-  writeCACert();
-
-  // Retry network + MQTT until both succeed. Both loops yield the AT
-  // bus + pump shell during the sleep so a stuck retry phase does not
-  // freeze the main loop (otherwise cell.at / cell.cert.* / restart
-  // commands cannot be entered while we hammer the broker).
-  while (!networkConnect()) {
-    Log::warn(TAG, "Network connect failed, retry in 10s");
-    g.pause(10000UL);
-  }
-  while (!mqttConnect()) {
-    mqttBackoffWait(&g);
-  }
-  mqttBackoffReset();
-
-  _started          = true;
-  _mqttConnected    = true;
-  _publishGate      = true;
-  _lastSignalSample = 0;
-  sampleSignalQuality();
+  return ActStatus::PENDING;  // unreachable - keeps the compiler happy
 }
 
 // ---------------------------------------------------------------------------

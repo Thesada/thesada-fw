@@ -231,50 +231,59 @@ void CellularModule::loop() {
     }
 
     case State::ACTIVATING: {
-      // Cellular::begin() is idempotent. If the modem is already started
-      // (re-entry after a yield), it returns immediately and we just need
-      // to re-open the publish gate.
-      Cellular::begin();
-      Cellular::setPublishGate(true);
+      // tickActivation() advances one bring-up phase per call and returns
+      // fast, so every other module loop keeps ticking while the modem
+      // registers. Stay in ACTIVATING until it reaches DONE or FAILED.
+      switch (Cellular::tickActivation()) {
+        case Cellular::ActStatus::PENDING:
+          // Bring-up still walking its phases - re-poll next loop.
+          break;
 
-      if (Cellular::connected()) {
-        Log::info(TAG, "Cellular ACTIVE");
-        _state           = State::ACTIVE;
-        _wifiUpSince     = 0;
-        _lastTelemetryMs = 0;
-        // Tell MQTTClient to stop enqueueing during the WiFi outage; cellular
-        // is now shipping the same data via EventBus.
-        MQTTClient::setFallbackPublishing(true);
-        // Republish retained state (availability "online", HA discovery,
-        // /info, retained manifest) over the cellular leg so cellular-only
-        // sessions converge to the same broker-side state as WiFi sessions.
-        // Session-flag inside publishRetainedSet guards against repeats on
-        // STANDBY -> ACTIVE bouncing within one fallback window.
-        MQTTClient::publishRetainedSet();
+        case Cellular::ActStatus::DONE: {
+          Cellular::setPublishGate(true);
+          Log::info(TAG, "Cellular ACTIVE");
+          _state           = State::ACTIVE;
+          _wifiUpSince     = 0;
+          _lastTelemetryMs = 0;
+          // Tell MQTTClient to stop enqueueing during the WiFi outage;
+          // cellular is now shipping the same data via EventBus.
+          MQTTClient::setFallbackPublishing(true);
+          // Republish retained state (availability "online", HA discovery,
+          // /info, retained manifest) over the cellular leg so cellular-
+          // only sessions converge to the same broker-side state as WiFi
+          // sessions. Session-flag inside publishRetainedSet guards
+          // against repeats on STANDBY -> ACTIVE bouncing within one
+          // fallback window.
+          MQTTClient::publishRetainedSet();
 
-        // Clock recovery: when WiFi never associated, the SNTP client in
-        // WiFiManager never ran and the system clock is stuck pre-2023.
-        // Sync it off the modem now that the data context is up, so log
-        // timestamps and TLS validity windows are correct on a
-        // cellular-only boot.
-        if (time(nullptr) < 1700000000L) {
-          JsonObject  ncfg = Config::get();
-          const char* nsrv = ncfg["ntp"]["server"]         | "pool.ntp.org";
-          uint32_t    nto  = (ncfg["ntp"]["cell_timeout_s"] | 60) * 1000UL;
-          if (Cellular::ntpSync(nsrv, nto)) {
-            Log::info(TAG, "Clock synced via cellular NTP");
-          } else {
-            Log::warn(TAG, "Cellular NTP sync failed - clock still unset");
+          // Clock recovery: when WiFi never associated, the SNTP client
+          // in WiFiManager never ran and the system clock is stuck
+          // pre-2023. Sync it off the modem now that the data context is
+          // up, so log timestamps and TLS validity windows are correct
+          // on a cellular-only boot.
+          if (time(nullptr) < 1700000000L) {
+            JsonObject  ncfg = Config::get();
+            const char* nsrv = ncfg["ntp"]["server"]         | "pool.ntp.org";
+            uint32_t    nto  = (ncfg["ntp"]["cell_timeout_s"] | 60) * 1000UL;
+            if (Cellular::ntpSync(nsrv, nto)) {
+              Log::info(TAG, "Clock synced via cellular NTP");
+            } else {
+              Log::warn(TAG, "Cellular NTP sync failed - clock still unset");
+            }
           }
+
+          emitActive(1);
+          break;
         }
 
-        emitActive(1);
-      } else {
-        // begin() did not bring MQTT up. Drop back to STANDBY and reset
-        // the down-hold so we do not retry on every loop tick.
-        Log::warn(TAG, "Cellular activation failed - back to standby");
-        _wifiDownSince = now;
-        _state         = State::STANDBY;
+        case Cellular::ActStatus::FAILED:
+          // Hard failure or the activation deadline expired. Drop back to
+          // STANDBY and reset the down-hold so we do not retry on every
+          // loop tick - the next 60 s WiFi-down hold re-arms activation.
+          Log::warn(TAG, "Cellular activation failed - back to standby");
+          _wifiDownSince = now;
+          _state         = State::STANDBY;
+          break;
       }
       break;
     }
@@ -301,7 +310,8 @@ void CellularModule::loop() {
           emitActive(0);
           // Close the publish gate but leave the modem registered.
           // Re-takeover from a future WiFi drop only needs to re-open
-          // the gate (Cellular::begin() is idempotent).
+          // the gate (tickActivation() returns DONE immediately while
+          // _started is still set).
           Cellular::setPublishGate(false);
           MQTTClient::setFallbackPublishing(false);
           // link_mode "fallback" (default): tear down the data context
