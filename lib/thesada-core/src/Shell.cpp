@@ -696,10 +696,17 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
   if (lastDot) {
     *lastDot = '\0';
     const char* finalKey = lastDot + 1;
+    String parentPath(key);  // parent path with dots intact, for error messages
 
     JsonVariant parent = doc.as<JsonVariant>();
-    char* token = strtok(key, ".");
+    String walked;           // dotted path resolved so far
+    char* saveptr = nullptr;
+    char* token = strtok_r(key, ".", &saveptr);
     while (token) {
+      // Peek the next segment so an auto-created intermediate knows
+      // whether the user actually wants an array at this level.
+      char* nextToken = strtok_r(nullptr, ".", &saveptr);
+
       size_t idx;
       if (parent.is<JsonArray>() && parseArrayIndex(token, idx)) {
         JsonArray arr = parent.as<JsonArray>();
@@ -708,9 +715,21 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
       } else if (parent.is<JsonObject>()) {
         // Auto-create missing intermediate objects so config.set can land
         // a value into a section that does not exist yet (e.g. enabling a
-        // brand-new optional module like gnss). Does not auto-create
-        // arrays - explicit `config.set foo.bar []` does that.
+        // brand-new optional module like gnss). Never auto-creates arrays:
+        // if the next segment is a numeric index the user wants an array
+        // here, so refuse with a clear instruction rather than silently
+        // creating an object the index cannot address.
         if (parent[token].isNull()) {
+          size_t dummy;
+          if (nextToken && parseArrayIndex(nextToken, dummy)) {
+            String path = walked.length() ? walked + "." + token : String(token);
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "Parent path '%s' doesn't exist. Run config.set %s [] first.",
+                     path.c_str(), path.c_str());
+            out(msg);
+            return;
+          }
           parent[token].to<JsonObject>();
         }
         parent = parent[token];
@@ -718,7 +737,8 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
         out("Parent key not found");
         return;
       }
-      token = strtok(nullptr, ".");
+      walked = walked.length() ? walked + "." + token : String(token);
+      token = nextToken;
     }
 
     // Resolve a writable target for the final key. JsonObject member
@@ -731,8 +751,19 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
     // numeric-suffix config.set paths naturally extend an array. Strict
     // idx > size rejection still prevents a sparse array from ever
     // forming.
+    // A numeric final segment only addresses an array. If the parent
+    // resolved to an object the array does not exist yet - refuse rather
+    // than creating a string-keyed member that merely looks like an index.
     JsonVariant target;
     size_t finalIdx;
+    if (parseArrayIndex(finalKey, finalIdx) && !parent.is<JsonArray>()) {
+      char msg[160];
+      snprintf(msg, sizeof(msg),
+               "Parent path '%s' is not an array. Run config.set %s [] first.",
+               parentPath.c_str(), parentPath.c_str());
+      out(msg);
+      return;
+    }
     if (parent.is<JsonArray>() && parseArrayIndex(finalKey, finalIdx)) {
       JsonArray arr = parent.as<JsonArray>();
       if (finalIdx > arr.size()) {
@@ -745,6 +776,17 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
         target = arr[finalIdx];
       }
     } else if (parent.is<JsonObject>()) {
+      // ArduinoJson's operator[] yields an *unbound* variant for a key
+      // that does not exist yet; capturing that into `target` and
+      // calling target.set() later writes into nothing. That is why
+      // config.set could update an existing key but silently failed to
+      // create a new one. Materialise the member first (mirrors the
+      // intermediate-object auto-create above) so the captured handle
+      // binds to a real document slot. The placeholder object is
+      // overwritten by the value assignment below.
+      if (parent[finalKey].isNull()) {
+        parent[finalKey].to<JsonObject>();
+      }
       target = parent[finalKey];
     } else {
       out("Parent is not an object or array");

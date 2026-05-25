@@ -190,6 +190,11 @@ public:
   static uint32_t      _lastAttempt;
   static uint32_t      _retryInterval;
   static uint8_t       _retryCount;
+  // True once the broker-exhaustion reboot loop has been halted this
+  // boot: the NVS reboot counter reached mqtt.max_exhaust_reboots, so
+  // the device stays alive and keeps retrying MQTT without rebooting
+  // again. Cleared by a successful connect. See issue FW M2.
+  static bool          _rebootHalted;
   static uint32_t      _lastPublishMs;
   static uint32_t      _minIntervalMs;
   static time_t        _lastPublishTime;
