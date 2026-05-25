@@ -6,9 +6,9 @@
 # private references must never land in one. This scans a single commit
 # message for the recurring offenders:
 #
-#   - Forgejo issue refs    #<digits>      (private tracker numbering)
-#   - private hostnames     *.thesada.app  (use example.com in public text)
-#   - RFC1918 IP addresses  10/172.16-31/192.168
+#   - internal issue-tracker refs    #<digits>
+#   - internal hostnames             (use example.com in public text)
+#   - RFC1918 IP addresses           10/172.16-31/192.168
 #
 # Merge commits are skipped - their `#<n>` is a GitHub PR number, which is
 # public and legitimate.
@@ -34,7 +34,7 @@ case "$first_line" in
 esac
 
 # Drop comment lines (the git template's `#` block) so they cannot
-# false-positive as Forgejo refs. Real refs appear inline, not at col 0.
+# false-positive as tracker refs. Real refs appear inline, not at col 0.
 body=$(grep -v '^#' "$msg_file" || true)
 
 fail=0
@@ -46,10 +46,10 @@ report() {
   fail=1
 }
 
-report "Forgejo issue ref (#NN) - drop it or describe the change instead" \
+report "internal issue-tracker ref (#NN) - drop it or describe the change instead" \
   "$(printf '%s\n' "$body" | grep -nE '#[0-9]+' || true)"
 
-report "private hostname (*.thesada.app) - use example.com in public text" \
+report "internal hostname - use example.com in public text" \
   "$(printf '%s\n' "$body" | grep -nE '[A-Za-z0-9-]+\.thesada\.app' || true)"
 
 report "private IP address (RFC1918) - redact it" \

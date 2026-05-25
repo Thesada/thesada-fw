@@ -2,7 +2,7 @@
 # thesada-fw commit-msg guard: keep private refs out of public commits.
 #
 # Thin wrapper around scripts/check-commit-msg.sh. Refuses the commit when
-# the message contains Forgejo issue refs, *.thesada.app hostnames, or
+# the message contains internal issue-tracker refs, internal hostnames, or
 # RFC1918 IPs - all of which would be mirrored verbatim to the public
 # GitHub repo and its release notes.
 #
