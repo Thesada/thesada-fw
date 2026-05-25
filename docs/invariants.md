@@ -284,6 +284,34 @@ Source: `lib/thesada-mod-cellular/src/Cellular.cpp::ATGuard`.
 
 ---
 
+### Cellular activation is incremental - one phase per loop tick
+
+Cellular bring-up must not run as a single blocking call. `Cellular::
+tickActivation()` advances at most one phase (`POWER_ON`, `SIM`,
+`RADIO_CFG`, `REGISTER`, `BEARER`, `MQTT`) per call and returns
+`PENDING`; `CellularModule` polls it each loop while ACTIVATING so
+every other module loop keeps ticking between phases. Registration is
+polled ~1 Hz, never as one 30-180 s blocking wait.
+
+The whole cycle is bounded by `cellular.activation_timeout_ms`
+(default 30 min): on expiry the modem is hardware-reset and
+`tickActivation()` returns `FAILED`, dropping the module to STANDBY -
+a wedged modem or bad broker can never pin the device in ACTIVATING.
+
+Why: the old blocking `Cellular::begin()` froze MQTT keepalive,
+sensors, Telegram and the shell for 30-120 s during a WiFi-to-cellular
+failover, exactly when remote intervention matters most.
+
+How enforced: `CellularModule` ACTIVATING calls only
+`tickActivation()` - never a blocking bring-up. The synchronous
+`networkConnect()` survives for the steady-state `loop()` recovery
+path only.
+
+Source: `lib/thesada-mod-cellular/src/Cellular.cpp::tickActivation`,
+`lib/thesada-mod-cellular/src/CellularModule.cpp::loop`.
+
+---
+
 ## Lua sandbox
 
 ### `os` library is explicitly minimal
@@ -379,6 +407,31 @@ to escape any user-influenced string before it lands in HTML. Avoids
 hand-rolling escape tables.
 
 Source: `data/dashboard.html` `_esc` helper.
+
+---
+
+### Broker-exhaustion reboots are bounded - no perpetual reboot loop
+
+A persistently failing broker (bad host/port/credentials) must not
+reboot the device forever. After `mqtt.reboot_after_fails` failed
+reconnects (default 30) `connect()` reboots, but only while an NVS
+counter (`thesada-boot` namespace) is below `mqtt.max_exhaust_reboots`
+(default 3). Once the budget is spent
+the device sets `_rebootHalted`, stops rebooting, and stays alive -
+locally reachable via serial/web - while still retrying MQTT at the
+capped backoff. The counter clears on the first successful connect; a
+streak older than 6 h ages out so unrelated outages never accumulate.
+
+Why: a reboot loop leaves the device reachable only briefly each
+~30 min cycle, making remote recovery from a config mistake nearly
+impossible. The TLS-OOM fast-reboot (`MaxAllocHeap` low) is a separate
+path and is intentionally not counted - it genuinely defragments.
+
+How enforced: the `_retryCount >= 30` branch in `connect()` is gated by
+`!_rebootHalted` and the `mqttRebootCount()` budget check. Any new
+reboot trigger in this file must justify why it cannot loop.
+
+Source: `lib/thesada-core/src/MQTTClient.cpp::connect`.
 
 ---
 

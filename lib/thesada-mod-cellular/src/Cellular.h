@@ -62,11 +62,29 @@ public:
   // out: true if modem AT-OK after the call.
   static bool powerOn();
 
-  // Initialise PMU, wake modem, check SIM, write CA cert, register, MQTT connect.
-  // Calls powerOn() first; powerOn is idempotent if the modem is already up
-  // (e.g. GNSS warmed it earlier). Returns immediately if MQTT is already
-  // connected. Side-effect: leaves the publish gate open on success.
-  static void begin();
+  // Result of one Cellular::tickActivation() call.
+  enum class ActStatus {
+    PENDING,  // bring-up still walking its phases - poll again next tick
+    DONE,     // modem registered + MQTT connected; publish gate openable
+    FAILED,   // hard failure (modem dead / SIM absent / activation timeout)
+  };
+
+  // Incremental cellular bring-up. Replaces the old blocking begin():
+  // each call advances at most one phase of the modem activation state
+  // machine (power-on -> SIM -> radio config -> registration -> bearer
+  // -> MQTT) and returns fast, so every other module loop keeps ticking
+  // between phases. CellularModule polls this each loop while ACTIVATING.
+  //
+  // Registration is polled one status read per call (~1 Hz). A
+  // configurable deadline (cellular.activation_timeout_ms, default
+  // 30 min) bounds the whole cycle: on expiry the modem is hardware-
+  // reset and FAILED returned, so the device drops back to WiFi-watching
+  // standby instead of looping a wedged modem or bad broker forever.
+  //
+  // Idempotent: returns DONE immediately if cellular is already up
+  // (re-entry after a yield). Resets the internal phase to the top on
+  // DONE or FAILED so the next ACTIVATING cycle walks from scratch.
+  static ActStatus tickActivation();
 
   // Cellular-only recovery loop: re-register on network drop, reconnect MQTT
   // if dropped while network is up. Does NOT touch WiFi; CellularModule owns
@@ -214,7 +232,7 @@ public:
 
   // Close the data context (CNACT slot 0) and modem MQTT session while
   // leaving the modem powered and network-registered. Drops _started so
-  // a future re-takeover re-walks begin(). Used on WiFi return when
+  // a future re-takeover re-walks tickActivation(). Used on WiFi return when
   // link_mode is "fallback" so an idle PDP context does not burn data.
   static void dataLinkDown();
 
@@ -243,7 +261,24 @@ private:
   // or any AT step fails - caller falls back to non-mTLS path. Safe to
   // call only when an ATGuard is held by an outer scope.
   static bool writeClientCert();
+  // Synchronous network bring-up (radio config + blocking registration
+  // poll + bearer). Retained for the steady-state recovery path in
+  // Cellular::loop() and the modem-wedge path in mqttConnect(). The
+  // incremental tickActivation() uses the three helpers below directly
+  // so it can yield between phases instead of blocking.
   static bool networkConnect();
+  // Radio configuration block: CFUN power-cycle, network/preferred mode,
+  // APN (CGDCONT/CNCFG), CEREG/CGREG URC enable, RF-settle delay. Caller
+  // owns the AT bus.
+  static void radioConfigure();
+  // One network-registration status read. Returns 1 on HOME/ROAMING,
+  // 0 while still searching, -1 on REG_DENIED. Caller owns the overall
+  // registration timeout. Caller owns the AT bus.
+  static int  pollRegistration();
+  // Activate the PDP data context (CNACT slot 0), falling back to
+  // TinyGSM gprsConnect(). Caller owns the AT bus. Returns true once
+  // the bearer reports connected.
+  static bool activateBearer();
   static bool mqttConnect();
   static bool isRegistered();
   static bool mqttIsConnected();
@@ -293,7 +328,7 @@ private:
   static bool isGprsConnectedRaw();
 
   static bool     _modemAlive;     // PMU + wakeModem ok (powerOn complete)
-  static bool     _started;        // begin() fully completed (MQTT up)
+  static bool     _started;        // tickActivation() reached DONE (MQTT up)
   static bool     _mqttConnected;
   static bool     _publishGate;
   static bool     _hasCACert;

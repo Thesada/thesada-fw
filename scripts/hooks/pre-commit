@@ -1,16 +1,21 @@
 #!/bin/sh
-# thesada-fw pre-commit guard: invariant ledger discipline.
+# thesada-fw pre-commit guard: invariant ledger + doc-drift discipline.
 #
-# Thin wrapper around scripts/check-invariant-ledger.sh so the local hook
-# and the CI job share one matching rule. Refuses the commit when staged
-# files touch load-bearing source paths without docs/invariants.md.
+# Two checks, both fed the same staged-file list:
+#   1. check-invariant-ledger.sh - BLOCKS when load-bearing source is
+#      touched without docs/invariants.md. Shared with the CI job.
+#   2. check-doc-drift.sh        - REMINDS to mirror firmware changes
+#      into the separate thesada-doc repo. Never blocks (cross-repo,
+#      cannot be verified locally).
 #
-# Bypass:
+# Bypass the ledger gate:
 #     INVARIANT_OK=1 git commit ...
 
 set -eu
 
 repo_root="$(git rev-parse --show-toplevel)"
 
-git diff --cached --name-only --diff-filter=ACMR \
-  | "$repo_root/scripts/check-invariant-ledger.sh"
+staged="$(git diff --cached --name-only --diff-filter=ACMR)"
+
+printf '%s\n' "$staged" | "$repo_root/scripts/check-invariant-ledger.sh"
+printf '%s\n' "$staged" | "$repo_root/scripts/check-doc-drift.sh"

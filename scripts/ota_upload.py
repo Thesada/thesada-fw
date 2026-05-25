@@ -3,9 +3,9 @@
 ota_upload.py - Push firmware binary to a Thesada node via HTTP OTA.
 
 Usage:
-    python3 scripts/ota_upload.py [host] [--user USER] [--bin PATH]
+    python3 scripts/ota_upload.py <host> [--user USER] [--bin PATH]
 
-    host     Device IP or hostname (default: 172.16.1.212)
+    host     Device IP or hostname (required)
     --user   Web admin username (default: admin)
     --bin    Path to firmware binary (default: build/firmware.bin)
 
@@ -83,7 +83,7 @@ def upload_firmware(host: str, user: str, password: str, bin_path: str) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(description="Push OTA firmware to a Thesada node")
-    parser.add_argument("host", nargs="?", default="172.16.1.212", help="Device IP or hostname")
+    parser.add_argument("host", help="Device IP or hostname")
     parser.add_argument("--user", default="admin", help="Web admin username")
     parser.add_argument("--bin", default="build/firmware.bin", help="Path to firmware .bin")
     args = parser.parse_args()

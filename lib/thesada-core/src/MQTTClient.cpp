@@ -28,6 +28,20 @@
 static const char* CERT_NS        = "thesada-tls";
 static const char* CERT_KEY_CERT  = "client_cert";
 static const char* CERT_KEY_KEY   = "client_key";
+
+// NVS namespace + keys for the broker-exhaustion reboot counter (issue
+// FW M2). Separate from the cert namespace so a cert wipe does not also
+// reset the reboot guard, and vice versa.
+static const char* BOOT_NS        = "thesada-boot";
+static const char* RB_KEY_COUNT   = "mqtt_reboots";  // uint8: consecutive
+                                                     //   exhaustion reboots
+static const char* RB_KEY_EPOCH   = "mqtt_rb_at";    // uint32: epoch (s)
+                                                     //   of the last one
+
+// Consecutive exhaustion reboots older than this age out: a one-off
+// outage weeks apart never accumulates toward a halt. Only applied when
+// the system clock is set.
+static constexpr uint32_t RB_STALE_WINDOW_S = 6UL * 3600UL;
 // CERT_MAX_LEN is now MQTTClient::CERT_MAX_LEN (header) so transports
 // that load via loadClientCert can size buffers without copy-pasting
 // the constant. ESP32 NVS string blob limit drives the value.
@@ -124,6 +138,7 @@ uint8_t          MQTTClient::_queueCount    = 0;
 uint32_t         MQTTClient::_lastAttempt   = 0;
 uint32_t         MQTTClient::_retryInterval = RETRY_MIN_MS;
 uint8_t          MQTTClient::_retryCount    = 0;
+bool             MQTTClient::_rebootHalted  = false;
 uint32_t         MQTTClient::_lastPublishMs   = 0;
 uint32_t         MQTTClient::_minIntervalMs   = 0;
 time_t           MQTTClient::_lastPublishTime = 0;
@@ -387,6 +402,52 @@ void MQTTClient::begin() {
 
 // ---------------------------------------------------------------------------
 
+// Read the persisted broker-exhaustion reboot count, applying the
+// stale-window reset: if the last exhaustion reboot was more than
+// RB_STALE_WINDOW_S ago (and the clock is set), the old streak has aged
+// out and no longer counts.
+//
+// out: effective consecutive exhaustion-reboot count (0 if none/stale)
+static uint8_t mqttRebootCount() {
+  Preferences prefs;
+  if (!prefs.begin(BOOT_NS, true)) return 0;
+  uint8_t  count = prefs.getUChar(RB_KEY_COUNT, 0);
+  uint32_t epoch = prefs.getUInt(RB_KEY_EPOCH, 0);
+  prefs.end();
+
+  time_t now = time(nullptr);
+  if (count > 0 && now > 1700000000L && epoch > 0 &&
+      (uint32_t)now - epoch > RB_STALE_WINDOW_S) {
+    return 0;  // streak aged out
+  }
+  return count;
+}
+
+// Persist an incremented exhaustion-reboot count plus the current epoch
+// (0 if the clock is unset - the stale check then simply skips).
+static void mqttRebootCountBump(uint8_t newCount) {
+  Preferences prefs;
+  if (!prefs.begin(BOOT_NS, false)) return;
+  prefs.putUChar(RB_KEY_COUNT, newCount);
+  time_t now = time(nullptr);
+  prefs.putUInt(RB_KEY_EPOCH, (now > 1700000000L) ? (uint32_t)now : 0);
+  prefs.end();
+}
+
+// Clear the exhaustion-reboot counter after a successful connect. Reads
+// first so a clean steady-state connect does not rewrite NVS every cycle.
+static void mqttRebootCountClear() {
+  Preferences prefs;
+  if (!prefs.begin(BOOT_NS, false)) return;
+  if (prefs.getUChar(RB_KEY_COUNT, 0) != 0) {
+    prefs.remove(RB_KEY_COUNT);
+    prefs.remove(RB_KEY_EPOCH);
+  }
+  prefs.end();
+}
+
+// ---------------------------------------------------------------------------
+
 // Attempt to connect to the MQTT broker with LWT
 void MQTTClient::connect() {
   if (!WiFiManager::connected()) return;
@@ -500,6 +561,11 @@ void MQTTClient::connect() {
   if (ok) {
     _retryInterval = RETRY_MIN_MS;
     _retryCount    = 0;
+    // A successful connect clears the broker-exhaustion reboot guard:
+    // whatever was wrong is fixed, so a future failure starts a fresh
+    // streak rather than inheriting a stale count.
+    _rebootHalted  = false;
+    mqttRebootCountClear();
     _lastSuccessMs    = millis();
     _connectedSinceMs = millis();
     Log::info(TAG, "Connected");
@@ -548,11 +614,40 @@ void MQTTClient::connect() {
       ESP.restart();
     }
 
-    // General safety net for other failure modes (broker down, auth wrong, etc.)
-    if (_retryCount >= 30) {
-      Log::error(TAG, "MQTT reconnect failed 30 times - rebooting");
-      delay(1000);
-      ESP.restart();
+    // Broker-misconfiguration safety net (issue FW M2). A persistently
+    // failing broker (bad host/port/creds) used to reboot every ~30 min
+    // forever - a perpetual slow reboot loop, the device reachable only
+    // briefly each cycle. Now: after mqtt.reboot_after_fails failed
+    // reconnects (default 30) reboot at most mqtt.max_exhaust_reboots
+    // times (a reboot can clear a wedged TLS stack), then stop rebooting
+    // and stay alive - locally reachable via serial/web, still retrying
+    // MQTT at the capped backoff. The NVS counter clears on the first
+    // successful connect; an old streak ages out after RB_STALE_WINDOW_S.
+    uint8_t rebootAfter = Config::get()["mqtt"]["reboot_after_fails"] | 30;
+    if (_retryCount >= rebootAfter && !_rebootHalted) {
+      uint8_t maxReboots = Config::get()["mqtt"]["max_exhaust_reboots"] | 3;
+      uint8_t count      = mqttRebootCount();
+      if (count < maxReboots) {
+        char m[96];
+        snprintf(m, sizeof(m),
+                 "MQTT failed %ux - reboot %u/%u to recover",
+                 (unsigned)rebootAfter, (unsigned)(count + 1),
+                 (unsigned)maxReboots);
+        Log::error(TAG, m);
+        mqttRebootCountBump(count + 1);
+        delay(1000);
+        ESP.restart();
+      } else {
+        // Reboot budget spent - the broker config is almost certainly
+        // wrong. Stop the loop: keep retrying, never reboot again.
+        _rebootHalted = true;
+        char m[128];
+        snprintf(m, sizeof(m),
+                 "MQTT failed %ux after %u reboots - staying alive, "
+                 "retrying without reboot (check broker config)",
+                 (unsigned)rebootAfter, (unsigned)maxReboots);
+        Log::error(TAG, m);
+      }
     }
   }
 }
