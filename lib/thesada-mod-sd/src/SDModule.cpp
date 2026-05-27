@@ -62,6 +62,37 @@ bool SDModule::_openNextLog() {
   return false;
 }
 
+// Pick the active log file on boot.
+//
+// Walk log999 -> log001 looking for the highest-numbered existing file.
+// If found and under _maxBytes, resume appending to it: _logPath = path,
+// _logBytes = on-disk size. Avoids the per-boot empty-file pile-up
+// (Forgejo #312). If the highest file is at/over the limit, or none
+// exist, fall back to _openNextLog() to claim a fresh slot.
+//
+// Returns true on success (either resumed or new slot opened).
+bool SDModule::_resumeOrOpen() {
+  fs::FS* sdfs = fs();
+  for (int i = 999; i >= 1; i--) {
+    char path[20];
+    snprintf(path, sizeof(path), "/log%03d.csv", i);
+    if (!sdfs->exists(path)) continue;
+
+    File f = sdfs->open(path, FILE_READ);
+    if (!f) return _openNextLog();
+    uint32_t sz = (uint32_t)f.size();
+    f.close();
+
+    if (_maxBytes == 0 || sz < _maxBytes) {
+      _logPath  = path;
+      _logBytes = sz;
+      return true;
+    }
+    return _openNextLog();
+  }
+  return _openNextLog();
+}
+
 // Rotate to a new log file when the current one exceeds the size limit
 void SDModule::_rotate() {
   char msg[48];
@@ -140,17 +171,18 @@ void SDModule::begin() {
     Shell::registerFS("/sd", &SD_MMC, _dfUsed, _dfTotal);
   }
 
-  if (!_openNextLog()) {
+  if (!_resumeOrOpen()) {
     Log::error(TAG, "Could not find free log slot (log001-log999 all exist?)");
     return;
   }
 
-  char info[80];
+  char info[96];
   if (_maxBytes > 0)
-    snprintf(info, sizeof(info), "Logging to %s  (max %lu KB per file)",
-             _logPath.c_str(), (unsigned long)maxKb);
+    snprintf(info, sizeof(info), "Logging to %s  (%lu B, max %lu KB per file)",
+             _logPath.c_str(), (unsigned long)_logBytes, (unsigned long)maxKb);
   else
-    snprintf(info, sizeof(info), "Logging to %s  (no size limit)", _logPath.c_str());
+    snprintf(info, sizeof(info), "Logging to %s  (%lu B, no size limit)",
+             _logPath.c_str(), (unsigned long)_logBytes);
   Log::info(TAG, info);
 
   subscribeEvents();
@@ -192,7 +224,7 @@ void SDModule::logEvent(const char* sensor, const char* json) {
   _logBytes += rowSize;
 }
 
-// Subscribe to temperature and current EventBus events for SD logging
+// Subscribe to temperature, current, and battery EventBus events for SD logging
 void SDModule::subscribeEvents() {
   EventBus::subscribe("temperature", [](JsonObject data) {
     String out;
@@ -204,6 +236,12 @@ void SDModule::subscribeEvents() {
     String out;
     serializeJson(data, out);
     SDModule::logEvent("current", out.c_str());
+  });
+
+  EventBus::subscribe("battery", [](JsonObject data) {
+    String out;
+    serializeJson(data, out);
+    SDModule::logEvent("battery", out.c_str());
   });
 }
 
