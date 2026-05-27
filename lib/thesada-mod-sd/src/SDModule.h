@@ -2,8 +2,9 @@
 // SD card data logger. Supports both SD_MMC (LILYGO) and SPI (CYD) modes.
 // Mode is selected via sd.mode in config.json: "sdmmc" (default) or "spi".
 // Subscribes to EventBus events and appends CSV rows to the current log file.
-// Log files are named /log001.csv, /log002.csv, ... (new file each boot).
-// Rotates to the next file when sd.max_file_kb is exceeded (0 = unlimited).
+// Log files are named /log001.csv, /log002.csv, ... On boot, resume the
+// highest-numbered existing file if it is under sd.max_file_kb; otherwise
+// open a fresh slot. Rotation is size-triggered only (not per-boot).
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
@@ -34,6 +35,7 @@ private:
   static uint32_t _maxBytes;
 
   static bool _openNextLog();
+  static bool _resumeOrOpen();
   static void _rotate();
 
   // fs.df probes registered with Shell::registerFS. Static so they match

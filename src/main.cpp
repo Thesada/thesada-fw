@@ -7,6 +7,10 @@
 #include <Arduino.h>
 #include <esp_task_wdt.h>
 #include <esp_log.h>
+#include <esp_system.h>
+#include <Preferences.h>
+#include <rom/rtc.h>
+#include <soc/soc_caps.h>
 #include "thesada_config.h"
 #include <Config.h>
 #include <ModuleRegistry.h>
@@ -19,6 +23,54 @@
 #ifdef ENABLE_CELLULAR
 #include <Cellular.h>
 #endif
+
+// Emit a single line at cold boot summarising why the chip restarted.
+// Helps debrief outages (see Forgejo #353): pairs esp_reset_reason() with
+// per-core rtc_get_reset_reason() (legacy ROM API; covers panic faults
+// that the unified API maps to ESP_RST_PANIC) and a persistent brownout
+// counter in NVS namespace "boot" key "brownout_n". The counter only
+// ever increments, never resets - rolling baseline for field units.
+static void logBootCause() {
+  esp_reset_reason_t reason = esp_reset_reason();
+  const char* reasonStr;
+  switch (reason) {
+    case ESP_RST_POWERON:   reasonStr = "power_on"; break;
+    case ESP_RST_EXT:       reasonStr = "external_pin"; break;
+    case ESP_RST_SW:        reasonStr = "sw"; break;
+    case ESP_RST_PANIC:     reasonStr = "panic"; break;
+    case ESP_RST_INT_WDT:   reasonStr = "int_wdt"; break;
+    case ESP_RST_TASK_WDT:  reasonStr = "task_wdt"; break;
+    case ESP_RST_WDT:       reasonStr = "wdt"; break;
+    case ESP_RST_DEEPSLEEP: reasonStr = "deep_sleep_wake"; break;
+    case ESP_RST_BROWNOUT:  reasonStr = "brownout"; break;
+    case ESP_RST_SDIO:      reasonStr = "sdio"; break;
+    default:                reasonStr = "unknown"; break;
+  }
+
+  Preferences p;
+  uint32_t brownouts = 0;
+  if (p.begin("boot", false)) {
+    brownouts = p.getUInt("brownout_n", 0);
+    if (reason == ESP_RST_BROWNOUT) {
+      brownouts++;
+      p.putUInt("brownout_n", brownouts);
+    }
+    p.end();
+  }
+
+  int rtc0 = (int)rtc_get_reset_reason(0);
+#if SOC_CPU_CORES_NUM > 1
+  int rtc1 = (int)rtc_get_reset_reason(1);
+#else
+  int rtc1 = -1;
+#endif
+
+  char line[160];
+  snprintf(line, sizeof(line),
+    "[INF][Boot] reset=%s (%d) rtc_core0=%d rtc_core1=%d brownout_total=%lu",
+    reasonStr, (int)reason, rtc0, rtc1, (unsigned long)brownouts);
+  Serial.println(line);
+}
 
 // Return true if WiFi (or the AP fallback) reports a usable link
 static bool networkConnected() {
@@ -57,6 +109,7 @@ void setup() {
   esp_task_wdt_add(NULL);
 
   Serial.println("[INF][Boot] thesada-fw v" FIRMWARE_VERSION " (" __DATE__ " " __TIME__ ")");
+  logBootCause();
 
   // Quiet the IDF VFS layer's "file does not exist" ERROR logs. Every
   // LittleFS.exists("/foo") for a missing file emits one, even when our
