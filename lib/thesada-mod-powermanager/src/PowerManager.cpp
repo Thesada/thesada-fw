@@ -215,6 +215,8 @@ public:
   void loop() override { PowerManager::loop(); }
   // Return module name
   const char* name() override { return "PowerManager"; }
+  const char* configKey() override { return "power"; }
+  bool coreModule() override { return true; }
   // Report PMU and battery status
   void status(ShellOutput out) override {
     char line[96];

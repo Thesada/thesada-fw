@@ -50,6 +50,27 @@ ADAPTER_VIDS = (0x10C4, 0x1A86, 0x0403)
 BAUD         = 115200
 CMD_WAIT     = 1.5   # default seconds to wait per command
 
+# ── Module activation gate ─────────────────────────────────────────────
+# Maps a module.status display name to its (config.json subtree key, is_core).
+# Core modules default ENABLED when the key is absent; optional modules default
+# DISABLED. Mirror of the firmware configKey()/coreModule() overrides - keep in
+# sync when adding a module.
+MODULE_GATES = {
+    "TemperatureModule": ("temperature", False),
+    "ADS1115":           ("ads1115",     False),
+    "PWMModule":         ("pwm",         False),
+    "SDModule":          ("sd",          False),
+    "CellularModule":    ("cellular",    True),
+    "BatteryModule":     ("battery",     False),
+    "GNSS":              ("gnss",        False),
+    "SHT31":             ("sht31",       False),
+    "TelegramModule":    ("telegram",    False),
+    "HttpServer":        ("web",         False),
+    "LiteServer":        ("web",         False),
+    "ScriptEngine":      ("lua",         False),
+    "PowerManager":      ("power",       True),
+}
+
 
 # ── Port discovery ────────────────────────────────────────────────────────────
 
@@ -816,6 +837,60 @@ def test_shell(r):
         r.fail("module.list", f"output: {lines[:2]}")
 
 
+def _config_enabled(sh, key):
+    """Return True/False for <key>.enabled, or None when the key is absent."""
+    lines = sh.cmd(f"config.get {key}.enabled")
+    val   = lines[0].strip().strip('"').lower() if lines else ""
+    if val in ("true", "1"):
+        return True
+    if val in ("false", "0"):
+        return False
+    return None   # null / Key not found
+
+
+def test_module_gating(r):
+    """Runtime enabled-gate invariant.
+
+    For every module reported by `module.status`, its runtime activation
+    (active vs 'disabled') must agree with config[<key>].enabled, defaulting
+    to the module's tier (core = on, optional = off) when the key is absent.
+    Read-only - no reflash; validates whatever config is on the device now.
+    """
+    r.group("5b · Module gating")
+    if r.is_skipped("gating"):
+        r.skip("module gating")
+        return
+    sh = r.sh
+
+    lines = sh.cmd("module.status")
+    rows  = [l for l in lines if l.startswith("  ") and l.strip()
+             and not _LOG_RE.match(l.strip())]
+    if not rows:
+        r.fail("module.status", f"no module rows: {lines[:2]}")
+        return
+
+    for l in rows:
+        name      = l.strip().split()[0]
+        remainder = l.strip()[len(name):].strip()
+        disabled  = (remainder == "disabled")   # exact match - registry text
+        gate      = MODULE_GATES.get(name)
+        if gate is None:
+            r.warn(name, "unknown module - add to MODULE_GATES")
+            continue
+        key, is_core = gate
+        cfg = _config_enabled(sh, key)
+        # Absent key -> tier default: core on (not disabled), optional off.
+        expected_disabled = (cfg is False) if cfg is not None else (not is_core)
+        cfgstr = {True: "true", False: "false", None: "absent"}[cfg]
+        if disabled == expected_disabled:
+            state = "disabled" if disabled else "active"
+            r.ok(name, f"{state} ({key}.enabled={cfgstr})")
+        else:
+            want = "disabled" if expected_disabled else "active"
+            r.fail(name, f"runtime {'disabled' if disabled else 'active'} but "
+                         f"config implies {want} ({key}.enabled={cfgstr}, core={is_core})")
+
+
 def _get_device_ip(sh):
     """Parse device IP from ifconfig output."""
     lines = sh.cmd("net.ip")
@@ -904,9 +979,25 @@ def test_api_cmd(r, ip, web_user, web_pass):
         r.warn("api/cmd bad body", str(e))
 
 
+def _module_disabled(sh, display_name):
+    """True if `module.status` reports the named module as gated off."""
+    for l in sh.cmd("module.status"):
+        s = l.strip()
+        if s.startswith(display_name):
+            return s[len(display_name):].strip() == "disabled"
+    return False   # not registered (not compiled in) - treat as not-disabled
+
+
 def test_lua(r):
     r.group("6 · Lua")
     sh = r.sh
+
+    # Lua commands only exist when ScriptEngine is active. If the module is
+    # gated off (lua.enabled absent/false), skip rather than fail - the gate
+    # working is not a Lua regression.
+    if _module_disabled(sh, "ScriptEngine"):
+        r.skip("lua (ScriptEngine disabled - set lua.enabled:true to test)")
+        return
 
     # return value
     lines = sh.cmd("lua.exec return 42")
@@ -1279,6 +1370,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Skippable groups (--skip a,b,c):
+  gating       Module enabled-gate invariant (automated)
   sensors      Manual sensor reading confirmation
   ads1115      Load test (requires physical load + 70 s wait)
   mqtt         MQTT publish test (requires broker access to verify)
@@ -1371,6 +1463,7 @@ Examples:
         test_config(r)
         test_network(r)
         test_shell(r)
+        test_module_gating(r)
         test_lua(r)
         if device_ip is None:
             device_ip = _get_device_ip(sh)

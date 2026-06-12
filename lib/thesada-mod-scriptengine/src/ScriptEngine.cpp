@@ -695,6 +695,7 @@ public:
   void loop() override { ScriptEngine::loop(); }
   // Return module name
   const char* name() override { return "ScriptEngine"; }
+  const char* configKey() override { return "lua"; }
   // Check Lua state health
   void selftest(ShellOutput out) override {
     extern lua_State* gL;

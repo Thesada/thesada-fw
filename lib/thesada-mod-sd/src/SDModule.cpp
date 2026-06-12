@@ -111,11 +111,6 @@ void SDModule::_rotate() {
 void SDModule::begin() {
   JsonObject cfg = Config::get();
 
-  if (!(cfg["sd"]["enabled"] | true)) {
-    Log::info(TAG, "Disabled in config");
-    return;
-  }
-
   const char* mode = cfg["sd"]["mode"] | "sdmmc";
   _spiMode = (strcmp(mode, "spi") == 0);
 

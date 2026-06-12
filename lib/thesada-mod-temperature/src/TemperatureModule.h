@@ -23,6 +23,7 @@ public:
   void begin() override;
   void loop() override;
   const char* name() override { return "TemperatureModule"; }
+  const char* configKey() override { return "temperature"; }
   void status(ShellOutput out) override;
 
   // One-shot read for the SensorRegistry callback. Writes one line per

@@ -33,6 +33,7 @@ public:
   void        begin() override;
   void        loop()  override;
   const char* name()  override { return "ADS1115"; }
+  const char* configKey() override { return "ads1115"; }
   void        status(ShellOutput out) override;
 
   // One-shot read for the SensorRegistry callback. Prints one line per

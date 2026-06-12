@@ -15,6 +15,7 @@ public:
   void begin() override;
   void loop() override;
   const char* name() override { return "TelegramModule"; }
+  const char* configKey() override { return "telegram"; }
   void status(ShellOutput out) override;
 
   static bool send(const char* message);

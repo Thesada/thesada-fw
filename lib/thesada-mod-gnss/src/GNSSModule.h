@@ -30,10 +30,10 @@ public:
   void begin() override;
   void loop() override;
   const char* name() override { return "GNSS"; }
+  const char* configKey() override { return "gnss"; }
   void status(ShellOutput out) override;
 
 private:
-  bool     _enabled       = false;  // config gnss.enabled
   uint32_t _intervalMs    = 30000;
   uint32_t _lastReadMs    = 0;
   uint32_t _coldFixMs     = 60000;  // upper bound for first fix

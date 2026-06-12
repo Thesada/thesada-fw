@@ -11,6 +11,8 @@ public:
   void begin() override;
   void loop() override;
   const char* name() override { return "CellularModule"; }
+  const char* configKey() override { return "cellular"; }
+  bool coreModule() override { return true; }  // fallback transport
   void status(ShellOutput out) override;
 
 private:
