@@ -17,6 +17,7 @@ public:
   void begin() override;
   void loop() override;
   const char* name() override { return "SDModule"; }
+  const char* configKey() override { return "sd"; }
   void status(ShellOutput out) override;
   void selftest(ShellOutput out) override;
 

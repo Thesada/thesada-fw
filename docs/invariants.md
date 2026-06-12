@@ -4,7 +4,7 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-05-21. Bump the date on every edit.
+Dated 2026-06-11. Bump the date on every edit.
 
 ---
 
@@ -470,6 +470,63 @@ Format: `Log::kv("subsystem.state_change", "from", old, "to", new,
 
 Today the cellular state machine (STANDBY / ACTIVATING / ACTIVE)
 emits per-transition lines but they are free text, not structured.
+
+---
+
+## Module activation
+
+### A compiled-in module stays dark unless its config gate allows it
+
+Compile-time presence (`ENABLE_*`) only puts a module in the binary. It does
+NOT run. `ModuleRegistry::beginAll()` is the single gate: before calling a
+module's `begin()`, it reads `config[module->configKey()]["enabled"]`,
+defaulting to `module->coreModule()`. A module that resolves to disabled never
+has `begin()` or `loop()` called - it must not probe hardware, register
+handlers, spawn tasks, or log.
+
+Two tiers, differing only in the default applied when the key is absent:
+- **Core** (`coreModule() == true`: CellularModule, PowerManager) default ON -
+  an absent key means run. Only an explicit `enabled: false` disables.
+- **Optional** (everything else) default OFF - an absent or `false` key means
+  the module never inits. `enabled: true` is the only path to activation.
+
+`configKey()` is the module's `/config.json` subtree (e.g. `SDModule` ->
+`"sd"`), not `name()`. The gate is the ONLY place activation is decided:
+modules must not re-check `enabled` inside their own `begin()` (that would
+fork the default and reintroduce the scattered, inconsistent gating this
+replaced).
+
+How enforced: new modules inherit optional-OFF for free (the base
+`coreModule()` returns false). A module that needs to default on overrides
+`coreModule()`. `module.status` reports `disabled` for gated-off modules so
+the runtime decision is observable. The test suite asserts the invariant
+(`module.status` vs `config[key].enabled`) for every module.
+
+Source: `lib/thesada-core/src/Module.h` (`configKey`, `coreModule`),
+`lib/thesada-core/src/ModuleRegistry.cpp::beginAll`/`loopAll`/`enabled`,
+`lib/thesada-core/src/Shell.cpp::cmd_module_status`.
+
+### Core statics honour the same `<key>.enabled` gate from `main.cpp`
+
+The always-compiled core statics (WiFiManager, MQTTClient, OTAUpdate,
+HeartbeatLED) are not `ModuleRegistry` modules, so `setup()` applies the same
+scheme directly: it reads `wifi`/`mqtt`/`ota`/`heartbeat` `.enabled` once after
+`Config::load()`, all defaulting ON, and gates both the `begin()` and the
+per-tick `loop()` call. The headline lever is `wifi.enabled: false`, which
+skips WiFi bring-up so CellularModule becomes the active transport without
+removing WiFi credentials.
+
+Source: `src/main.cpp` (`_wifiEnabled`/`_mqttEnabled`/`_otaEnabled`/
+`_heartbeatEnabled`, set in `setup()`, gating `setup()` and `loop()`).
+
+### Shell is never gateable
+
+The on-device recovery CLI (`Shell`) has no `enabled` gate at any tier. It is
+hard-mandatory so a bad config can never lock out the serial/MQTT recovery
+path. Reduced/headless command surface is a separate concern (`shell.mode`),
+not an on/off switch.
+
+Source: `src/main.cpp` (`Shell::begin()` called unconditionally).
 
 ---
 

@@ -803,6 +803,7 @@ public:
   void loop() override { HttpServer::loop(); }
   // Return module name
   const char* name() override { return "HttpServer"; }
+  const char* configKey() override { return "web"; }
 };
 
 MODULE_REGISTER(HttpServerModule, PRIORITY_SERVICE)

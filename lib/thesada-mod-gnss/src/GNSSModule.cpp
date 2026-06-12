@@ -18,16 +18,10 @@ static const char* TAG = "GNSS";
 // see loop() for the time-share rationale.
 void GNSSModule::begin() {
   JsonObject cfg = Config::get();
-  _enabled            = cfg["gnss"]["enabled"] | false;
   _intervalMs         = (uint32_t)(cfg["gnss"]["interval_s"]      | 30) * 1000UL;
   _coldFixMs          = (uint32_t)(cfg["gnss"]["cold_fix_s"]      | 60) * 1000UL;
   _warmFixMs          = (uint32_t)(cfg["gnss"]["warm_fix_s"]      | 10) * 1000UL;
   _publishWithoutFix  = cfg["gnss"]["publish_without_fix"] | false;
-
-  if (!_enabled) {
-    Log::info(TAG, "Disabled via config (gnss.enabled=false)");
-    return;
-  }
 
   char msg[96];
   snprintf(msg, sizeof(msg), "Ready - interval %lus, cold fix <=%lus, warm fix <=%lus",
@@ -41,8 +35,6 @@ void GNSSModule::begin() {
 // cycle in Cellular. Receiver is OFF between calls so the LTE data path
 // stays free for MQTT.
 void GNSSModule::loop() {
-  if (!_enabled) return;
-
   uint32_t now = millis();
   if (_lastReadMs != 0 && now - _lastReadMs < _intervalMs) return;
   _lastReadMs = now;
@@ -148,7 +140,6 @@ void GNSSModule::readAndPublish() {
 
 // Shell: module.status gnss
 void GNSSModule::status(ShellOutput out) {
-  if (!_enabled) { out("  disabled"); return; }
   char line[96];
   snprintf(line, sizeof(line), "  receiver:  %s",
            Cellular::isModemAlive() ? "time-share (off between reads)"

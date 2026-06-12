@@ -13,6 +13,7 @@ public:
   void begin() override;
   void loop() override;
   const char* name() override { return "SHT31"; }
+  const char* configKey() override { return "sht31"; }
   void status(ShellOutput out) override;
   void selftest(ShellOutput out) override;
 

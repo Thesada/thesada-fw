@@ -11,6 +11,7 @@ public:
   void begin() override;
   void loop() override;
   const char* name() override { return "PWMModule"; }
+  const char* configKey() override { return "pwm"; }
   void status(ShellOutput out) override;
 
   static void setLevel(float level); // 0.0 - 1.0

@@ -13,6 +13,7 @@ public:
   void begin() override;
   void loop() override;
   const char* name() override { return "BatteryModule"; }
+  const char* configKey() override { return "battery"; }
   void status(ShellOutput out) override;
   void selftest(ShellOutput out) override;
 
@@ -23,5 +24,4 @@ private:
   uint32_t _intervalMs = 60000;
   int      _lowPct     = 20;
   bool     _alertFired = false;  // hysteresis - only fire once per dip
-  bool     _disabled   = false;
 };

@@ -22,12 +22,6 @@ void BatteryModule::begin() {
   }
 
   JsonObject cfg = Config::get();
-  bool enabled   = cfg["battery"]["enabled"] | true;
-  if (!enabled) {
-    Log::info(TAG, "Disabled via config");
-    _disabled = true;
-    return;
-  }
   _intervalMs    = (uint32_t)(cfg["battery"]["interval_s"] | 60) * 1000;
   _lowPct        = cfg["battery"]["low_pct"] | 20;
 
@@ -57,7 +51,7 @@ void BatteryModule::begin() {
 
 // Periodically read and publish battery status at the configured interval
 void BatteryModule::loop() {
-  if (_disabled || !PowerManager::isPmuOk()) return;
+  if (!PowerManager::isPmuOk()) return;
 
   uint32_t now = millis();
   if (now - _lastRead >= _intervalMs) {

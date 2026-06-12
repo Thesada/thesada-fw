@@ -1772,9 +1772,14 @@ static void cmd_module_status(int argc, char** argv, ShellOutput out) {
   for (uint8_t i = 0; i < ModuleRegistry::count(); i++) {
     Module* m = ModuleRegistry::get(i);
     if (!m) continue;
-    // Module name + status on one line
+    // Disabled modules never ran begin(); don't call status() on uninit state.
     char buf[160] = {};
     size_t off = snprintf(buf, sizeof(buf), "  %-14s ", m->name());
+    if (!ModuleRegistry::enabled(i)) {
+      snprintf(buf + off, sizeof(buf) - off, "disabled");
+      out(buf);
+      continue;
+    }
     m->status([&buf, &off](const char* s) {
       snprintf(buf + off, sizeof(buf) - off, "%s", s);
     });
@@ -1979,10 +1984,10 @@ static void cmd_selftest(int argc, char** argv, ShellOutput out) {
     out("[WARN] /ca.crt not found (MQTT TLS using insecure mode)");
   }
 
-  // 8. Module self-tests
+  // 8. Module self-tests. Skip disabled modules - begin() never ran.
   for (uint8_t i = 0; i < ModuleRegistry::count(); i++) {
     Module* m = ModuleRegistry::get(i);
-    if (!m) continue;
+    if (!m || !ModuleRegistry::enabled(i)) continue;
     m->selftest([&out, &pass, &fail](const char* line) {
       out(line);
       if (strncmp(line, "[PASS]", 6) == 0) pass++;

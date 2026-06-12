@@ -238,6 +238,7 @@ public:
   void begin() override { LiteServer::begin(); }
   void loop() override { LiteServer::loop(); }
   const char* name() override { return "LiteServer"; }
+  const char* configKey() override { return "web"; }
   void status(ShellOutput out) override { out("listening on :80"); }
 };
 

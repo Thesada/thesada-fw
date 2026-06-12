@@ -46,13 +46,6 @@ static bool sht31Read(uint8_t addr, float& temp, float& humid) {
 // Initialize I2C and verify sensor is present
 void SHT31Module::begin() {
   JsonObject cfg = Config::get();
-  // Runtime gate: nodes without the sensor soldered can set
-  // sht31.enabled=false to skip the probe and silence the "no device" log.
-  bool enabled = cfg["sht31"]["enabled"] | true;
-  if (!enabled) {
-    Log::info(TAG, "disabled via config (sht31.enabled=false)");
-    return;
-  }
   int sda  = cfg["sht31"]["sda"]        | 11;
   int scl  = cfg["sht31"]["scl"]        | 12;
   _addr    = cfg["sht31"]["address"]    | 0x44;

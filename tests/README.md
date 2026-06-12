@@ -33,6 +33,7 @@ python tests/test_firmware.py --skip sensors,ads1115,mqtt,ota,websocket,sd,cellu
 | 3 | Config | auto | config.get, config.dump |
 | 4 | Network | auto | ifconfig, ping (DNS), ntp, mqtt |
 | 5 | Shell | auto | help, module.list |
+| 5b | Module gating | auto | module.status activation vs config[key].enabled |
 | 6 | Lua | auto | return value, OK, error handling, reload |
 | 7 | Sensors | manual | confirm temp + ADS1115 readings on MQTT/dashboard |
 | 8 | ADS1115 load | manual | connect physical load, wait 70 s, confirm non-zero |

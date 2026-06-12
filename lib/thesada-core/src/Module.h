@@ -14,6 +14,13 @@ public:
   virtual const char* name() = 0;
   virtual void status(ShellOutput out) { out("ok"); }
   virtual void selftest(ShellOutput out) {}
+
+  // Activation gate: ModuleRegistry runs a module only when
+  // config[configKey()].enabled resolves true, defaulting to coreModule().
+  // configKey() overrides name() - name() is "SHT31", the subtree is "sht31".
+  virtual const char* configKey() { return name(); }
+  virtual bool coreModule() { return false; }  // true: on unless disabled
+
   virtual ~Module() {}
 };
 

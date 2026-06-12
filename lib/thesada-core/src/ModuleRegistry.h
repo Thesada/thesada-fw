@@ -10,6 +10,8 @@ public:
   static void loopAll();
   static uint8_t count();
   static Module* get(uint8_t index);
+  // False for modules gated off at boot (see Module.h).
+  static bool enabled(uint8_t index);
 
   static constexpr uint8_t MAX_MODULES = 24;
 };

@@ -88,6 +88,13 @@ static bool otaTransportUp() {
   return false;
 }
 
+// Core statics aren't ModuleRegistry modules, so they carry their own
+// <key>.enabled gate here (default on). wifi.enabled:false forces cellular.
+static bool _wifiEnabled      = true;
+static bool _mqttEnabled      = true;
+static bool _otaEnabled       = true;
+static bool _heartbeatEnabled = true;
+
 void setup() {
   Serial.begin(115200);
   // Don't block waiting for serial - CDC boards hang here without USB host
@@ -120,13 +127,22 @@ void setup() {
 
   Config::load();
 
+  {
+    JsonObject cfg    = Config::get();
+    _wifiEnabled      = cfg["wifi"]["enabled"]      | true;
+    _mqttEnabled      = cfg["mqtt"]["enabled"]      | true;
+    _otaEnabled       = cfg["ota"]["enabled"]       | true;
+    _heartbeatEnabled = cfg["heartbeat"]["enabled"] | true;
+    if (!_wifiEnabled) Serial.println("[INF][Boot] wifi.enabled=false - WiFi skipped, cellular is primary transport");
+  }
+
   // Bring WiFi up. CellularModule registers later via PRIORITY_NETWORK
   // and handles the fallback path if WiFi never associates.
-  if (!networkConnected()) {
+  if (_wifiEnabled && !networkConnected()) {
     WiFiManager::begin();
   }
 
-  if (networkConnected()) {
+  if (_otaEnabled && networkConnected()) {
     // OTA check BEFORE MQTT - heap is still contiguous here (~80KB max alloc).
     // After MQTT + modules load, heap fragments and a second TLS session
     // for the OTA manifest fetch can't allocate on WROOM-32 boards.
@@ -134,17 +150,12 @@ void setup() {
     OTAUpdate::begin();
     OTAUpdate::checkNow();  // immediate check while heap is clean
   }
-  // MQTTClient::begin runs unconditionally. It registers the subscription
-  // set (cli/#, cmd/lua/reload, etc) and starts the subscription registry
-  // that Cellular::smsubAll mirrors onto the cellular MQTT session when
-  // the failover path activates. With this gated on WiFi, a WiFi-down boot
-  // would leave the subscription list empty and cellular MQTT inbound
-  // would have nothing to dispatch.
-  // connect() is a no-op if WiFi is down; loop() retries.
-  MQTTClient::begin();
+  // Registers the subscription set that Cellular::smsubAll mirrors onto the
+  // cellular MQTT session on failover. connect() is a no-op if WiFi is down.
+  if (_mqttEnabled) MQTTClient::begin();
 
   Shell::begin();
-  HeartbeatLED::begin();
+  if (_heartbeatEnabled) HeartbeatLED::begin();
 
   // All modules self-registered via MODULE_REGISTER. beginAll() sorts by priority.
   ModuleRegistry::beginAll();
@@ -163,15 +174,15 @@ void loop() {
   Shell::pumpConsole();
 
   // WiFi management runs even with Ethernet - keeps fallback ready
-  WiFiManager::loop();
+  if (_wifiEnabled) WiFiManager::loop();
 
   // MQTTClient::loop runs on every tick regardless of WiFi/Eth state.
   // The heap-stats trigger and other transport-agnostic work inside it
   // need to fire when cellular fallback is active even though
   // networkConnected() (WiFi/Eth-only) is false. The WiFi-specific
   // reconnect path inside loop() is no-op when WiFi is down.
-  MQTTClient::loop();
-  if (otaTransportUp()) {
+  if (_mqttEnabled) MQTTClient::loop();
+  if (_otaEnabled && otaTransportUp()) {
     OTAUpdate::loop();
   }
 
@@ -180,7 +191,7 @@ void loop() {
   // full main-loop stack instead of inside an AsyncTCP / mbedtls callback.
   Shell::loop();
 
-  HeartbeatLED::loop();
+  if (_heartbeatEnabled) HeartbeatLED::loop();
   ModuleRegistry::loopAll();
   SleepManager::loop();
 }
