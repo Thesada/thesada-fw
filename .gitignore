@@ -1,7 +1,5 @@
 .DS_Store
 *.patch
-CLAUDE.md
-AGENTS.md
 
 # PlatformIO
 .pio
