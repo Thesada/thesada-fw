@@ -1368,10 +1368,26 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
     // the envelope is purely for correlation, not arguments. Without
     // this the envelope JSON would be passed verbatim as a literal arg
     // and Shell command parsers would see it as garbage.
+    int lineN;
     if (payload && plen > 0 && !isEmptyJson && !reqIdOnlyPayload) {
-      snprintf(line, sizeof(line), "%s %s", cmd, payload);
+      lineN = snprintf(line, sizeof(line), "%s %s", cmd, payload);
     } else {
-      snprintf(line, sizeof(line), "%s", cmd);
+      lineN = snprintf(line, sizeof(line), "%s", cmd);
+    }
+    if (lineN < 0 || (size_t)lineN >= sizeof(line)) {
+      // cmd + payload exceeds the 1024-byte shell line buffer; report and
+      // bail out rather than silently truncating the command string.
+      JsonDocument resp;
+      resp["cmd"] = cmd;
+      if (hasReqId) resp["req_id"] = reqId;
+      resp["ok"] = false;
+      resp["output"][0] = "Command line too long for shell - use chunked variant";
+      char respTopic[64];
+      snprintf(respTopic, sizeof(respTopic), "%s/cli/response", prefix);
+      size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
+      char* rp = (char*)malloc(bufSz);
+      if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
+      goto cleanup;
     }
 
     // Execute through Shell and collect output, paginating the response so

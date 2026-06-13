@@ -4,7 +4,7 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-06-11. Bump the date on every edit.
+Dated 2026-06-13. Bump the date on every edit.
 
 ---
 
@@ -397,6 +397,27 @@ sink (`startPage` / `publishPage` lambdas in `runCli`). The
 special-case handlers (`fs.write`, `fs.cat` chunked, `cert.set`)
 publish single fixed-shape responses and are exempt - their output
 is bounded by construction.
+
+Source: `lib/thesada-core/src/MQTTClient.cpp::runCli`.
+
+### The shell command line in `runCli` is never silently truncated
+
+The general path builds the shell input as
+`snprintf(line, sizeof(line), "%s %s", cmd, payload)` into a fixed
+`line[1024]`. The `snprintf` return is captured in `lineN`; if it is
+negative or `>= sizeof(line)` the line would be clipped, so `runCli`
+publishes an error response (`ok: false`, `"Command line too long for
+shell - use chunked variant"`) and bails via `cleanup` instead of
+dispatching a truncated command string to the shell.
+
+Without this, an oversized cmd+payload is silently cut to malformed
+shell input and executed. Today's binary handlers (`fs.write`,
+`cert.set`) intercept before this path, but any future CLI command
+carrying large JSON args would be bitten. This is the input-side
+counterpart to the output-side pagination invariant above.
+
+How enforced: both `snprintf` branches store into `lineN`; the length
+guard runs before the command reaches `Shell::enqueueDeferred`.
 
 Source: `lib/thesada-core/src/MQTTClient.cpp::runCli`.
 
