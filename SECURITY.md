@@ -2,7 +2,11 @@
 
 ## Reporting a Vulnerability
 
-Email **daniel@hit-con.ca** with a description of the issue, steps to reproduce, and any relevant version or board information. Please do not open a public issue for security reports.
+Report security issues privately - please do not open a public issue.
+
+**Preferred:** GitHub private vulnerability reporting. Open the **Security** tab of this repository and click **"Report a vulnerability"** (Security -> Advisories -> Report a vulnerability). The report stays private and threaded with the maintainer.
+
+**Alternative:** email **info@hit-con.ca** with a description, steps to reproduce, and relevant version or board information.
 
 Response target: acknowledgement within 5 business days.
 
