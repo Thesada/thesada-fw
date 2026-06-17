@@ -1,6 +1,7 @@
 // thesada-fw - Log.cpp
 // SPDX-License-Identifier: GPL-3.0-only
 #include "Log.h"
+#include "Console.h"
 
 void (*Log::_remoteHandler)(const char* line) = nullptr;
 char    Log::_ring[RING_SIZE][LOG_LINE_LEN] = {};
@@ -43,7 +44,7 @@ void Log::write(LogLevel level, const char* tag, const char* msg) {
   _ringHead = (_ringHead + 1) % RING_SIZE;
   if (_ringUsed < RING_SIZE) _ringUsed++;
 
-  Serial.println(line);
+  Console::log(line);
   if (_remoteHandler) _remoteHandler(line);
 }
 

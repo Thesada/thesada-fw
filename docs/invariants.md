@@ -4,7 +4,7 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-06-13. Bump the date on every edit.
+Dated 2026-06-16. Bump the date on every edit.
 
 ---
 
@@ -247,6 +247,36 @@ contract.
 
 Source: `lib/thesada-core/src/Shell.cpp::pumpConsole` and call sites
 in `WiFiManager.cpp`, `OTAUpdate.cpp`, `Cellular.cpp`, `main.cpp`.
+
+---
+
+## Serial console output
+
+### All serial console writes go through `Console` under one mutex
+
+Both `Log::write` and the `Shell` serial sink (`pumpConsole`) emit
+through `Console`, which holds a single output mutex. Concurrent writes
+from different tasks (an async log vs a command response) can no longer
+byte-interleave into one mangled line. Boot prints in `main.cpp` use
+`Log::` for the same path.
+
+How enforced: no raw `Serial.print*` for console output - logs go
+through `Log::`, command responses through `Console::reply`.
+
+Source: `lib/thesada-core/src/Console.cpp`, `Console.h`, `Log.cpp`,
+`Shell.cpp::pumpConsole`, `src/main.cpp`.
+
+### Command mode frames each response with a sequence marker
+
+`console.mode command` keeps async logs off the serial console (the ring
+buffer + remote/WS handler still receive them) and ends every command
+response with `\x04CMD-DONE <seq>`. Automated readers rely on the marker
+plus the monotonic seq to delimit responses and discard a late one from a
+timed-out command. Mode resets to normal on reboot and never gates the
+recovery CLI.
+
+Source: `lib/thesada-core/src/Console.cpp::endReply`,
+`Shell.cpp::pumpConsole` / `cmd_console_mode`.
 
 ---
 

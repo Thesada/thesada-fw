@@ -5,6 +5,7 @@
 
 #include "Shell.h"
 #include "Config.h"
+#include "Console.h"
 #include "Log.h"
 #include "WiFiManager.h"
 #include "MQTTClient.h"
@@ -202,7 +203,8 @@ void Shell::pumpConsole() {
     if (c == '\n' || c == '\r') {
       buf[pos] = '\0';
       if (pos > 0) {
-        Shell::execute(buf, [](const char* line) { Serial.println(line); });
+        Shell::execute(buf, [](const char* line) { Console::reply(line); });
+        Console::endReply();
       }
       pos = 0;
     } else if (pos < (int)sizeof(buf) - 1) {
@@ -2018,11 +2020,27 @@ static void cmd_selftest(int argc, char** argv, ShellOutput out) {
 // Registration
 // ---------------------------------------------------------------------------
 
+// Get/set the serial console mode. Resets to normal on reboot.
+static void cmd_console_mode(int argc, char** argv, ShellOutput out) {
+  if (argc >= 2) {
+    if (strcmp(argv[1], "command") == 0) {
+      Console::setMode(Console::Mode::Command);
+    } else if (strcmp(argv[1], "normal") == 0) {
+      Console::setMode(Console::Mode::Normal);
+    } else {
+      out("Usage: console.mode [normal|command]");
+      return;
+    }
+  }
+  out(Console::mode() == Console::Mode::Command ? "mode: command" : "mode: normal");
+}
+
 // Register all built-in shell commands
 void Shell::registerBuiltins() {
   // System
   registerCommand("help",          "Show categories or expand one (help <cat>)", cmd_help);
   registerCommand("version",       "Firmware version and build",    cmd_version);
+  registerCommand("console.mode",  "Get/set console mode (normal|command)", cmd_console_mode);
   registerCommand("restart",       "Reboot device",                 cmd_restart);
   registerCommand("heap",          "Free heap memory",              cmd_heap);
   registerCommand("uptime",        "Device uptime",                 cmd_uptime);

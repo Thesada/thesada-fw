@@ -1,0 +1,29 @@
+#!/bin/sh
+# thesada-fw pre-push reminder: HIL bench smoke before main.
+#
+# Board dev happens on the bench host where the USB rack lives; the HIL
+# orchestrator and board map live in the private infra repo. This hook only
+# REMINDS to run the bench smoke when pushing main - it never blocks the push.
+# (When the team grows, promote this to a real CI gate.)
+#
+# Override the suggested command:  THESADA_HIL_CMD="..." git push
+# Silence:                         THESADA_HIL_SKIP=1 git push
+
+set -eu
+
+[ -n "${THESADA_HIL_SKIP:-}" ] && exit 0
+
+push_main=0
+while read -r _local _localsha remoteref _remotesha; do
+  case "$remoteref" in
+    refs/heads/main) push_main=1 ;;
+  esac
+done
+
+if [ "$push_main" -eq 1 ]; then
+  cmd="${THESADA_HIL_CMD:-hil-flash-and-smoke all}"
+  printf '\n[hil] pushing main - run the HIL bench smoke on the rack first:\n' >&2
+  printf '      %s\n' "$cmd" >&2
+  printf '      (reminder only; THESADA_HIL_SKIP=1 to silence)\n\n' >&2
+fi
+exit 0

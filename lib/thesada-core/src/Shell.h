@@ -166,7 +166,7 @@ public:
   static void pumpConsole();
 
   // Max commands
-  static constexpr int MAX_COMMANDS = 56;
+  static constexpr int MAX_COMMANDS = 60;
 
   // Deferred-execution ring depth. 4 slots covers concurrent serial + WS +
   // MQTT CLI bursts without runaway memory. Bump if "shell busy" starts

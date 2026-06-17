@@ -179,11 +179,17 @@ Install the local git hooks once after clone:
 ./scripts/hooks/install.sh
 ```
 
-This symlinks `scripts/hooks/pre-commit` into `.git/hooks/`. The hook
-refuses a commit that touches load-bearing source files (OTA, MQTT,
-Shell, Config, HttpServer, Cellular) without an update to
-[docs/invariants.md](docs/invariants.md). The same check runs server
-side in CI (`.github/workflows/ci.yml` job `invariant-ledger`).
+This symlinks `scripts/hooks/pre-commit`, `commit-msg`, and `pre-push`
+into `.git/hooks/`. The pre-commit hook refuses a commit that touches
+load-bearing source files (OTA, MQTT, Shell, Config, HttpServer,
+Cellular) without an update to [docs/invariants.md](docs/invariants.md).
+The same check runs server side in CI (`.github/workflows/ci.yml` job
+`invariant-ledger`).
+
+The `pre-push` hook is a reminder only (never blocks): when pushing
+`main` it prompts to run the HIL bench smoke on the board rack first.
+Set `THESADA_HIL_CMD` to your orchestrator command, or `THESADA_HIL_SKIP=1`
+to silence it.
 
 Bypass when the touch genuinely does not establish or rely on an
 invariant:

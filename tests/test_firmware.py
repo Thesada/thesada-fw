@@ -71,6 +71,20 @@ MODULE_GATES = {
     "PowerManager":      ("power",       True),
 }
 
+# ── Per-board HIL profile ──────────────────────────────────────────────
+# Keyed by device_id. flash_mb matches chip.info's "(N MB)" string.
+# require_status lists module.status names that must be present + active for the
+# board (module.status reports running modules with live state, e.g.
+# "SHT31 addr=0x44 23.2C"; module.list is a separate, narrower view).
+BOARD_PROFILES = {
+    "node":      {"flash_mb": "8.00",  "require_status": []},
+    "sht31":     {"flash_mb": "8.00",  "require_status": ["SHT31"]},
+    "owb-debug": {"flash_mb": "16.00", "require_status": ["CellularModule"]},
+}
+
+# Reset reasons that mean a crash/instability rather than a clean start.
+BAD_RESET_REASONS = ("panic", "int_wdt", "task_wdt", "wdt", "brownout")
+
 
 # ── Port discovery ────────────────────────────────────────────────────────────
 
@@ -129,19 +143,108 @@ def pick_port_interactive():
 _LOG_RE = re.compile(r'^\[(INF|WRN|ERR|DBG)\]\[')
 
 
+# Firmware frame marker after each command response in console command-mode.
+# First byte is EOT (0x04).
+DONE_MARKER = "\x04CMD-DONE"
+
+
 class DeviceShell:
-    def __init__(self, port, baud=BAUD):
+    # command_mode drives the firmware's `console.mode command`: async logs are
+    # suppressed on serial and each response ends with DONE_MARKER, so reads
+    # frame deterministically instead of racing interleaved log output. The HIL
+    # harness uses it; interactive/manual runs leave it False.
+    def __init__(self, port, baud=BAUD, command_mode=False):
         print(f"{DIM}Connecting to {port} at {baud} baud...{RESET}")
         self.ser = serial.Serial(port, baud, timeout=0.1)
+        self.command_mode = command_mode
+        self._last_seq = -1   # last frame sequence consumed in command mode
         time.sleep(1.0)   # let device settle after DTR toggle
         self._flush()
+        if command_mode:
+            self._sync()
         print(f"{DIM}Connected.{RESET}\n")
 
     def _flush(self):
         self.ser.read_all()
 
+    # Read one framed block. Returns (lines, seq): seq is the marker's sequence
+    # number, or None on timeout without a marker. In command mode async logs
+    # are off serial, so there is nothing to filter here.
+    def _read_block(self, timeout):
+        end = time.time() + timeout
+        buf = b""
+        lines = []
+        while time.time() < end:
+            chunk = self.ser.read(4096)
+            if chunk:
+                buf += chunk
+                while b"\n" in buf:
+                    raw, buf = buf.split(b"\n", 1)
+                    line = raw.rstrip(b"\r").decode(errors="replace")
+                    if DONE_MARKER in line:
+                        tail = line.split(DONE_MARKER, 1)[1].strip()
+                        try:
+                            return lines, int(tail)
+                        except ValueError:
+                            return lines, -1   # marker without parseable seq
+                    if line:
+                        lines.append(line)
+            else:
+                time.sleep(0.03)
+        return lines, None
+
+    # Read framed blocks until the marker seq == target, discarding earlier
+    # blocks (a late response from a timed-out prior command). Returns
+    # (lines, ok). ok=False means the target marker never arrived.
+    def _read_response(self, target, timeout):
+        end = time.time() + timeout
+        while time.time() < end:
+            lines, seq = self._read_block(end - time.time())
+            if seq is None:
+                return [], False                  # timed out, no marker
+            if seq >= 0 and seq < target:
+                continue                          # stale late block - discard
+            self._last_seq = seq
+            return lines, True
+        return [], False
+
+    # Re-assert command mode and prime with `version`, syncing _last_seq to the
+    # device's frame counter. A freshly booted board may still be in early setup
+    # (WiFi/MQTT) when the first command lands, so retry until clean.
+    def _sync(self, tries=6):
+        for _ in range(tries):
+            self.ser.reset_input_buffer()
+            self.ser.write(b"console.mode command\n")
+            self.ser.flush()
+            _, seq = self._read_block(8.0)
+            if seq is not None:
+                self._last_seq = seq
+                self._flush()
+                self.ser.write(b"version\n")
+                self.ser.flush()
+                vlines, vseq = self._read_block(6.0)
+                if vseq is not None and any("thesada-fw" in l for l in vlines):
+                    self._last_seq = vseq
+                    return True
+            time.sleep(1.0)
+        return False
+
     def send_raw(self, cmd, wait=CMD_WAIT):
-        """Send a command and return ALL received lines (including log lines)."""
+        """Send a command and return its output lines."""
+        if self.command_mode:
+            timeout = max(wait * 4, 8.0)
+            # One retry: a transient slow response times out, but seq-discard
+            # keeps the channel synced, so the resend reads cleanly. A real hang
+            # fails both attempts (fail-closed).
+            for attempt in range(2):
+                self._flush()
+                target = self._last_seq + 1
+                self.ser.write((cmd + "\n").encode())
+                lines, ok = self._read_response(target, timeout)
+                if ok:
+                    return lines
+                self._last_seq = target   # device will emit this seq late; skip it
+            return lines
         self._flush()
         self.ser.write((cmd + "\n").encode())
         time.sleep(wait)
@@ -155,6 +258,13 @@ class DeviceShell:
         return [l for l in self.send_raw(command, wait) if not _LOG_RE.match(l)]
 
     def close(self):
+        if self.command_mode:
+            try:
+                self.ser.write(b"console.mode normal\n")
+                self.ser.flush()
+                time.sleep(0.3)
+            except Exception:
+                pass
         self.ser.close()
 
 
@@ -494,6 +604,57 @@ class Runner:
 
 
 # ── Test groups ───────────────────────────────────────────────────────────────
+
+def test_board_profile(r, board):
+    """Per-board HIL asserts: identity, flash size, PSRAM, reset reason, and any
+    board-specific modules. selftest + heap are covered by test_system."""
+    r.group(f"0 · Board profile ({board})")
+    prof = BOARD_PROFILES.get(board)
+    if prof is None:
+        r.fail("board profile", f"unknown board '{board}' (add to BOARD_PROFILES)")
+        return
+    sh = r.sh
+
+    # identity: `version` reports "device: thesada-<id>  topic: ..."
+    lines  = sh.cmd("version")
+    idline = next((l for l in lines if "device:" in l), "")
+    if f"thesada-{board}" in idline:
+        r.ok("identity", idline.strip())
+    else:
+        r.fail("identity", f"expected thesada-{board}, got: {idline or lines}")
+
+    # chip.info: flash size + PSRAM present
+    lines = sh.cmd("chip.info")
+    blob  = " ".join(lines)
+    if f"({prof['flash_mb']} MB)" in blob:
+        r.ok("flash size", f"{prof['flash_mb']} MB")
+    else:
+        r.fail("flash size", f"expected {prof['flash_mb']} MB: {lines}")
+    psram = next((l for l in lines if l.strip().startswith("psram:")), "")
+    if psram and "0 bytes total" not in psram:
+        r.ok("PSRAM", psram.strip())
+    else:
+        r.fail("PSRAM", f"not present: {psram or lines}")
+
+    # reset reason must not indicate a crash
+    lines = sh.cmd("boot.info")
+    rr    = next((l for l in lines if "reset reason:" in l), "")
+    if rr and not any(b in rr for b in BAD_RESET_REASONS):
+        r.ok("reset reason", rr.split("reset reason:")[1].strip())
+    else:
+        r.fail("reset reason", f"crash/unstable or missing: {rr or lines}")
+
+    # board-specific modules must be active (module.status reports running
+    # modules with live state, e.g. "SHT31 addr=0x44 23.2C")
+    if prof["require_status"]:
+        lines = sh.cmd("module.status")
+        for mod in prof["require_status"]:
+            row = next((l for l in lines if l.strip().startswith(mod)), None)
+            if row:
+                r.ok(f"module {mod}", row.strip())
+            else:
+                r.fail(f"module {mod}", "not active in module.status")
+
 
 def test_system(r):
     r.group("1 · System")
@@ -992,10 +1153,15 @@ def test_lua(r):
     r.group("6 · Lua")
     sh = r.sh
 
-    # Lua commands only exist when ScriptEngine is active. If the module is
-    # gated off (lua.enabled absent/false), skip rather than fail - the gate
-    # working is not a Lua regression.
-    if _module_disabled(sh, "ScriptEngine"):
+    # Lua commands only exist when ScriptEngine is compiled AND active. Skip
+    # (not fail) when the module is absent from this build or gated off - a
+    # build/gate choice is not a Lua regression.
+    statuses = sh.cmd("module.status")
+    se = next((l for l in statuses if l.strip().startswith("ScriptEngine")), None)
+    if se is None:
+        r.skip("lua (ScriptEngine not compiled in this build)")
+        return
+    if se.strip()[len("ScriptEngine"):].strip() == "disabled":
         r.skip("lua (ScriptEngine disabled - set lua.enabled:true to test)")
         return
 
@@ -1393,6 +1559,12 @@ Examples:
     parser.add_argument("--port",      help="Serial port (auto-detected if omitted)")
     parser.add_argument("--baud",      type=int, default=BAUD,
                         help=f"Baud rate (default: {BAUD})")
+    parser.add_argument("--command-mode", action="store_true",
+                        help="Drive the device console in command mode (HIL): logs "
+                             "off serial, framed responses. Serial only.")
+    parser.add_argument("--board",
+                        help="Board device_id for per-board HIL profile asserts "
+                             "(node|sht31|owb-debug)")
     parser.add_argument("--http",      metavar="HOST",
                         help="Use HTTP shell instead of serial (e.g. 172.16.1.212). "
                              "Requires --web-pass.")
@@ -1448,7 +1620,7 @@ Examples:
             print(f"Skipping: {', '.join(skips)}")
         print()
         try:
-            sh = DeviceShell(port, args.baud)
+            sh = DeviceShell(port, args.baud, command_mode=args.command_mode)
         except serial.SerialException as e:
             print(f"{RED}Failed to open {port}: {e}{RESET}")
             sys.exit(1)
@@ -1457,6 +1629,8 @@ Examples:
     r = Runner(sh, skips)
 
     try:
+        if args.board:
+            test_board_profile(r, args.board)
         test_system(r)
         test_filesystem(r)
         test_chunked_io(r)
