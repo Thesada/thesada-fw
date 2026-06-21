@@ -1,5 +1,4 @@
 // thesada-fw - OTAUpdate.cpp
-// HTTP(S) pull-based OTA. Manifest -> version check -> download -> SHA256 -> flash.
 //
 // Manifest format (JSON at a known URL):
 //   {
@@ -7,12 +6,6 @@
 //     "url": "https://example.com/firmware.bin",
 //     "sha256": "e3b0c44298fc1c149afbf4c8996fb924..."
 //   }
-//
-// Config keys (in config.json):
-//   ota.manifest_url     - URL to the manifest JSON
-//   ota.check_interval_s - seconds between periodic checks (default 21600 = 6h)
-//   ota.enabled          - master enable (default true)
-//   ota.cmd_topic        - MQTT topic to trigger check (empty = <prefix>/cmd/ota)
 //
 // TLS: uses /ca.crt from LittleFS (same file as MQTTClient and Cellular).
 // If /ca.crt is not present, falls back to setInsecure().
@@ -51,7 +44,6 @@ bool     OTAUpdate::_checkRequested  = false;
 bool     OTAUpdate::_forceRequested  = false;
 String   OTAUpdate::_pendingManifestUrl;
 
-// Load CA cert from LittleFS, matching MQTTClient pattern.
 static String _otaCaCert;
 static bool   _otaCaCertLoaded = false;
 
@@ -80,11 +72,9 @@ static void loadCaCert() {
   }
 }
 
-// Publish a status/ota refusal record so operators see WHY a check did
-// not proceed without needing serial. Without this, every silent
-// bailout in check() / begin() looks identical to "device offline" or
-// "manifest unreachable" from the broker side. Best-effort: a publish
-// failure is itself silently dropped (we are already in a failure path).
+// Without this, every silent bailout looks identical to "device offline"
+// from the broker side. Best-effort: publish failure silently dropped
+// (we are already in a failure path).
 // in:  reason (short kebab-case identifier, e.g. "no-ca", "heap-low").
 // out: none.
 static void publishOtaRefusal(const char* reason) {
@@ -100,7 +90,6 @@ static void publishOtaRefusal(const char* reason) {
   MQTTClient::publish(topic, payload);
 }
 
-// Apply CA cert or insecure mode to a WiFiClientSecure instance.
 // Short socket + handshake timeouts so a flaky upstream cannot block
 // readBytes() long enough to trip the task watchdog. WiFiClientSecure
 // defaults to ~60s read timeout, far past the ~5s TWDT window.
@@ -131,10 +120,6 @@ static void configureSecureClient(WiFiClientSecure& client) {
 // Sectigo, etc - are baked into the firmware via ota_ca_progmem.h).
 // ---------------------------------------------------------------------------
 
-// HTTP GET via WiFi using Arduino HTTPClient. Streams the response body
-// through writeCallback; if the callback returns false the transfer is
-// aborted. Returns true if the HTTP transport completed (any status
-// code); the caller checks *outStatus.
 // in:  url, writeCallback. out: outStatus (200/404/...), outLen (bytes).
 static bool otaHttpGetWiFi(const char* url,
                            std::function<bool(const uint8_t*, size_t)> writeCallback,
@@ -189,10 +174,6 @@ static bool otaHttpGetWiFi(const char* url,
 }
 
 #ifdef ENABLE_CELLULAR
-// HTTP GET via SIM7080G modem-native SSL socket (Cellular::httpsGet ->
-// TinyGsmClientSecure -> CAOPEN/CASEND/CARECV). Parses URL into host/
-// path/port; the lower-level helper handles status-line + headers + body
-// chunking. Same writeCallback signature as the WiFi path.
 // in:  url, writeCallback. out: outStatus, outLen.
 static bool otaHttpGetCellular(const char* url,
                                std::function<bool(const uint8_t*, size_t)> writeCallback,
@@ -224,8 +205,6 @@ static bool otaHttpGetCellular(const char* url,
 #endif
 
 #ifdef ENABLE_CELLULAR
-// Parse `host`, `path`, `port` out of an absolute http(s) URL. Returns
-// false on malformed input or oversized host string.
 static bool parseUrl(const char* url, char* host, size_t hostCap,
                      const char** pathOut, uint16_t* portOut) {
   const char* p = url;
@@ -335,7 +314,6 @@ static bool downloadBinaryChunkedCellular(
       }
     }
 
-    // Inter-chunk pacing while feeding the watchdog.
     uint32_t paceUntil = millis() + CHUNK_GAP_MS;
     while (millis() < paceUntil) {
       Shell::pumpConsole();
@@ -347,10 +325,7 @@ static bool downloadBinaryChunkedCellular(
 }
 #endif // ENABLE_CELLULAR
 
-// Pick whichever transport is currently up. WiFi wins when both are up
-// (cheaper than waking + holding the cellular TX). Caller MUST already
-// have ensured at least one transport is connected (the OTAUpdate loop
-// gates on this).
+// WiFi wins when both are up (cheaper than waking + holding cellular TX).
 // in:  url, writeCallback. out: outStatus, outLen.
 static bool otaHttpGet(const char* url,
                       std::function<bool(const uint8_t*, size_t)> writeCallback,
@@ -369,7 +344,6 @@ static bool otaHttpGet(const char* url,
   return false;
 }
 
-// True when any OTA-capable transport is up.
 static bool anyTransportUp() {
   if (WiFiManager::connected()) return true;
 #ifdef ENABLE_CELLULAR
@@ -380,7 +354,6 @@ static bool anyTransportUp() {
 
 // ---------------------------------------------------------------------------
 
-// Initialize OTA from config and subscribe to MQTT trigger topic
 void OTAUpdate::begin() {
   JsonObject cfg = Config::get();
 
@@ -417,10 +390,8 @@ void OTAUpdate::begin() {
     Log::info(TAG, msg);
   }
 
-  // Subscribe to MQTT OTA trigger (optional dedicated topic).
   // There is NO `cli/ota.check` shell command - the only on-demand trigger
   // is publishing to the topic defined by ota.cmd_topic in config.
-  // If ota.cmd_topic is set, subscribe to it.
   const char* customTopic = cfg["ota"]["cmd_topic"] | "";
   if (strlen(customTopic) == 0) goto skip_ota_sub;
   {
@@ -446,21 +417,14 @@ void OTAUpdate::begin() {
 
 // ---------------------------------------------------------------------------
 
-// Immediate boot-time OTA check. Runs before MQTT/modules to use clean heap.
-// If an update is found, the device flashes and reboots (never returns).
 void OTAUpdate::checkNow() {
   if (!_enabled) return;
   if (!anyTransportUp()) return;
   Log::info(TAG, "Boot-time OTA check (clean heap)");
   check();
-  // If we get here, no update was found. Disable the 30s delayed check
-  // since we just checked.
   _lastCheck = millis();
 }
 
-// Non-blocking OTA trigger used by the Shell `ota.check` command and the
-// MQTT cmd_topic callback. Setting state here lets the caller return
-// immediately so CLI responses can publish before the device reboots.
 void OTAUpdate::triggerCheck(const char* manifestOverride, bool force) {
   if (manifestOverride && strlen(manifestOverride) > 0) {
     _pendingManifestUrl = manifestOverride;
@@ -471,9 +435,8 @@ void OTAUpdate::triggerCheck(const char* manifestOverride, bool force) {
   _checkRequested = true;
 }
 
-// Periodically check for updates or handle MQTT-triggered checks
 void OTAUpdate::loop() {
-  // Handle deferred MQTT-triggered check (runs outside MQTT callback context).
+  // Deferred MQTT-triggered check: runs outside MQTT callback context.
   if (_checkRequested) {
     _checkRequested = false;
     bool force = _forceRequested;
@@ -511,11 +474,6 @@ void OTAUpdate::loop() {
 
 // ---------------------------------------------------------------------------
 
-// Fetch manifest, compare versions, and apply update if newer.
-// `force=true` bypasses the isNewer() check so the device re-flashes whatever
-// the manifest points at even if the remote version equals the local one.
-// Intended for dev iteration (avoids bumping FIRMWARE_VERSION every cycle)
-// and for recovering from a stuck state without a version bump.
 void OTAUpdate::check(const char* manifestOverride, bool force) {
   if (!anyTransportUp()) {
     Log::warn(TAG, "No transport - skipping OTA check");
@@ -614,7 +572,6 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
            remoteVersion.c_str(), binUrl.c_str());
   Log::info(TAG, msg);
 
-  // Publish status via MQTT before starting.
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
   char statusTopic[96];
   snprintf(statusTopic, sizeof(statusTopic), "%s/status/ota", prefix);
@@ -639,8 +596,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
 
 // ---------------------------------------------------------------------------
 
-// Download and parse the OTA manifest JSON from a URL
-// Fetch the manifest JSON. Belt-and-braces watchdog feeding + tight timeouts
+// Belt-and-braces watchdog feeding + tight timeouts
 // so a stall here (TLS handshake, hung socket read on a flaky upstream)
 // cannot block this task long enough to trip TWDT. Goes through the
 // unified otaHttpGet helper so the same call site works over WiFi or
@@ -800,7 +756,6 @@ bool OTAUpdate::applyUpdate(const String& binUrl, const String& expectedSha256,
     return false;
   }
 
-  // Finalize SHA256.
   uint8_t hash[32];
   mbedtls_sha256_finish(&sha_ctx, hash);
   mbedtls_sha256_free(&sha_ctx);
@@ -833,7 +788,6 @@ bool OTAUpdate::applyUpdate(const String& binUrl, const String& expectedSha256,
 
 // ---------------------------------------------------------------------------
 
-// Compare semver strings to determine if remote is newer
 bool OTAUpdate::isNewer(const char* remote, const char* local) {
   int rMajor = 0, rMinor = 0, rPatch = 0;
   int lMajor = 0, lMinor = 0, lPatch = 0;

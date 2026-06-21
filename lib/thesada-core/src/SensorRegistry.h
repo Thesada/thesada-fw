@@ -13,16 +13,15 @@
 using SensorReadFn = void (*)(ShellOutput out, void* ctx);
 
 struct SensorEntry {
-  const char* name;          // short token, e.g. "sht31", "battery"
-  const char* desc;          // one-line human description
-  SensorReadFn read;          // callback
+  const char* name;
+  const char* desc;
+  SensorReadFn read;
   void*        ctx;           // module instance ptr or nullptr
-  bool         enabled;       // runtime-gated; false = (disabled) in listing
+  bool         enabled;       // false = listed as (disabled)
 };
 
 class SensorRegistry {
 public:
-  // Max sensor slots. Bump if a board grows beyond this.
   static constexpr int MAX_SENSORS = 16;
 
   // Register a sensor read callback. Safe to call from module begin().
@@ -32,11 +31,10 @@ public:
   static bool add(const char* name, const char* desc,
                   SensorReadFn read, void* ctx, bool enabled = true);
 
-  // Mark an already-registered sensor as disabled/enabled at runtime.
-  // No-op if name not found.
+  // in: name, enabled flag. out: none. No-op if name not found.
   static void setEnabled(const char* name, bool enabled);
 
-  // Lookup by name. Returns nullptr if not found.
+  // in: name. out: pointer to entry, or nullptr if not found.
   static const SensorEntry* find(const char* name);
 
   // Iterate all registered entries in registration order.

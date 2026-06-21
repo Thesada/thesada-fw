@@ -62,6 +62,13 @@ responsibilities is not.
   these rot as the codebase evolves and belong in the commit body.
 - TODOs without an owner.
 
+### Density is a smell test, not a quota
+
+No hard ratio. But a core file whose comments restate the code or run
+multi-paragraph has drifted. Implementation `.cpp` files trend low
+(~10-15% comment lines); headers run higher only because the in/out
+contracts dominate, not because of prose.
+
 ---
 
 ## Logging
