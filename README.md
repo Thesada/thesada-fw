@@ -204,6 +204,6 @@ what counts as establishing an invariant.
 
 ---
 
-## Licence
+## License
 
 SPDX-License-Identifier: GPL-3.0-only
