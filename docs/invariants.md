@@ -4,7 +4,7 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-06-16. Bump the date on every edit.
+Dated 2026-06-21. Bump the date on every edit.
 
 ---
 
@@ -275,6 +275,14 @@ plus the monotonic seq to delimit responses and discard a late one from a
 timed-out command. Mode resets to normal on reboot and never gates the
 recovery CLI.
 
+`_mode` and `_seq` are read and written only under the Console output
+mutex (`log`, `endReply`, `setMode`, `mode`). A mode flip on the
+main-loop task cannot race a concurrent `Log::write` from another task:
+the gate decision (suppress-in-command-mode) and the frame marker emit
+are atomic with the write they guard, so a log line can never splice
+into a command frame. `endReply` takes the mutex directly rather than
+calling `writeLocked` - the mutex is non-recursive.
+
 Source: `lib/thesada-core/src/Console.cpp::endReply`,
 `Shell.cpp::pumpConsole` / `cmd_console_mode`.
 
@@ -450,6 +458,21 @@ How enforced: both `snprintf` branches store into `lineN`; the length
 guard runs before the command reaches `Shell::enqueueDeferred`.
 
 Source: `lib/thesada-core/src/MQTTClient.cpp::runCli`.
+
+### `Config::set` rejects a dot-path it cannot store, never truncates it
+
+`config.set` (serial and MQTT cli) copies the dot-path into a fixed
+`buf[128]`. An empty or over-long path is rejected up front
+(`return false`) instead of being truncated: a silent truncation would
+resolve to a *different* key than the operator named and write the
+value there, corrupting config from a remote command. Config-write
+counterpart to the runCli line-length and pagination guards above.
+
+How enforced: the `!path || !*path || strlen(path) >= sizeof(buf)`
+guard runs before the `strncpy` into `buf`. Any new fixed-buffer copy
+of an operator-supplied key adds the same length check.
+
+Source: `lib/thesada-core/src/Config.cpp::set`.
 
 ### Dashboard / shell HTML output is escaped via the browser's serializer
 
