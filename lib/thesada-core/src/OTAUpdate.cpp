@@ -73,12 +73,13 @@ static void loadCaCert() {
 }
 
 // Without this, every silent bailout looks identical to "device offline"
-// from the broker side. Best-effort: publish failure silently dropped
-// (we are already in a failure path).
+// from the broker side. publish() queues on the WiFi ring (or routes to
+// the cellular forwarder) when the broker is down, so a refusal raised
+// while disconnected still reaches the operator on reconnect - do not
+// pre-empt that with a connected() guard here.
 // in:  reason (short kebab-case identifier, e.g. "no-ca", "heap-low").
 // out: none.
 static void publishOtaRefusal(const char* reason) {
-  if (!MQTTClient::connected()) return;
   JsonObject  cfg    = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
   char topic[96];
@@ -390,8 +391,9 @@ void OTAUpdate::begin() {
     Log::info(TAG, msg);
   }
 
-  // There is NO `cli/ota.check` shell command - the only on-demand trigger
-  // is publishing to the topic defined by ota.cmd_topic in config.
+  // On-demand checks come from the `ota.check` shell command (serial or
+  // the cli/ MQTT path, both via triggerCheck) and from publishing to
+  // ota.cmd_topic. This block wires up the optional ota.cmd_topic sub.
   const char* customTopic = cfg["ota"]["cmd_topic"] | "";
   if (strlen(customTopic) == 0) goto skip_ota_sub;
   {
@@ -411,8 +413,13 @@ void OTAUpdate::begin() {
   }
   skip_ota_sub:
 
-  // Run first check shortly after boot (30s delay to let everything settle).
-  _lastCheck = millis() - _checkIntervalMs + 30000;
+  // Run first check ~30s after boot to let things settle. Guard the
+  // unsigned subtraction: a sub-30s interval would set _lastCheck in the
+  // future, underflowing the first elapsed compare and firing at once.
+  const uint32_t settleMs = 30000;
+  _lastCheck = (_checkIntervalMs > settleMs)
+                 ? millis() - (_checkIntervalMs - settleMs)
+                 : millis();
 }
 
 // ---------------------------------------------------------------------------

@@ -16,14 +16,26 @@ void Config::load() {
   f.close();
 }
 
-void Config::save() {
+// Persist the in-memory doc to /config.json. out: true on success;
+// false if the file cannot be opened or the write came up short (e.g.
+// LittleFS full) so callers never report a save that did not happen.
+bool Config::save() {
   File f = LittleFS.open("/config.json", "w");
-  if (!f) { Log::error(TAG, "Failed to open config.json for writing"); return; }
-  size_t written = serializeJson(_doc, f);
+  if (!f) { Log::error(TAG, "Failed to open config.json for writing"); return false; }
+  size_t written  = serializeJson(_doc, f);
+  size_t expected = measureJson(_doc);
   f.close();
+  if (written < expected) {
+    char msg[64];
+    snprintf(msg, sizeof(msg), "Short write to config.json: %u/%u bytes",
+             (unsigned)written, (unsigned)expected);
+    Log::error(TAG, msg);
+    return false;
+  }
   char msg[48];
   snprintf(msg, sizeof(msg), "Saved %u bytes to /config.json", (unsigned)written);
   Log::info(TAG, msg);
+  return true;
 }
 
 // Replace whole config with new JSON. On parse failure the cleared doc
@@ -39,7 +51,10 @@ void Config::replace(const char* json) {
     load();  // rollback to file on disk
     return;
   }
-  save();
+  if (!save()) {
+    Log::error(TAG, "Config replace parsed but failed to persist");
+    return;
+  }
   Log::info(TAG, "Config replaced via MQTT");
 }
 
@@ -81,7 +96,7 @@ bool Config::set(const char* path, const char* value) {
     }
   }
 
-  save();
+  if (!save()) return false;   // persist failed - do not report success
   char msg[128];
   snprintf(msg, sizeof(msg), "Set %s = %s", path, value);
   Log::info(TAG, msg);

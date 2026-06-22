@@ -90,6 +90,12 @@ CA-load block; `lib/thesada-core/src/ota_ca_progmem.h`.
 Silent returns are a regression - any new bailout path in `check()` must
 add a matching `publishOtaRefusal` (or other state) call.
 
+`publishOtaRefusal` must NOT short-circuit on `!connected()`:
+`MQTTClient::publish` queues on the WiFi ring (or routes to the cellular
+forwarder) while the broker is down, so a refusal raised mid-outage is
+still delivered on reconnect. A `connected()` guard there silently drops
+exactly the diagnostic an offline operator needs.
+
 How enforced: code review checks new early-return branches in `check()`.
 Bench test: drive each path via `cli/ota.check` and watch `status/ota`.
 
@@ -470,9 +476,28 @@ counterpart to the runCli line-length and pagination guards above.
 
 How enforced: the `!path || !*path || strlen(path) >= sizeof(buf)`
 guard runs before the `strncpy` into `buf`. Any new fixed-buffer copy
-of an operator-supplied key adds the same length check.
+of an operator-supplied key adds the same length check. The MQTT binary
+handlers apply the same rule: `fs.write` rejects a path that would not
+fit `path[64]` and `fs.cat` rejects args longer than `pbuf[256]`,
+publishing an error rather than acting on a clipped path/range.
 
-Source: `lib/thesada-core/src/Config.cpp::set`.
+Source: `lib/thesada-core/src/Config.cpp::set`,
+`lib/thesada-core/src/MQTTClient.cpp::runCli` (`fs.write`, `fs.cat`).
+
+### `Config::set` / `replace` never report success on a failed persist
+
+`Config::save()` returns `false` when `/config.json` cannot be opened
+or the serialize comes up short of `measureJson` (LittleFS full,
+truncated write). `set()` returns `false` and skips its success log;
+`replace()` logs an error instead of "replaced". A config write that
+did not hit flash must never surface to the operator as applied -
+otherwise a full filesystem silently discards every change while the
+device reports success.
+
+How enforced: every caller that persists config checks the `save()`
+return before logging or returning success.
+
+Source: `lib/thesada-core/src/Config.cpp::save`, `set`, `replace`.
 
 ### Dashboard / shell HTML output is escaped via the browser's serializer
 

@@ -1028,12 +1028,17 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
       JsonDocument resp;
       resp["cmd"] = cmd;
       if (hasReqId) resp["req_id"] = reqId;
+      const size_t kPathCap = 64;
       if (!nl) {
         resp["ok"] = false;
         resp["output"][0] = "Usage: payload = <path>\\n<content>";
+      } else if ((size_t)(nl - payload) >= kPathCap) {
+        // Reject rather than truncate - a clipped path writes the wrong file.
+        resp["ok"] = false;
+        resp["output"][0] = "Path too long";
       } else {
-        char path[64];
-        size_t pathLen = min((size_t)(nl - payload), sizeof(path) - 1);
+        char path[kPathCap];
+        size_t pathLen = (size_t)(nl - payload);
         memcpy(path, payload, pathLen);
         path[pathLen] = '\0';
         const char* content = nl + 1;
@@ -1080,6 +1085,21 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
     // Without offset+length, falls through to Shell::execute (line-by-line).
     if (strcmp(cmd, "fs.cat") == 0 && payload && plen > 0) {
       char pbuf[256];
+      if (plen >= sizeof(pbuf)) {
+        // Reject rather than truncate - a clipped "path off len" would
+        // read the wrong file or byte range.
+        JsonDocument resp;
+        resp["cmd"] = cmd;
+        if (hasReqId) resp["req_id"] = reqId;
+        resp["ok"] = false;
+        resp["output"][0] = "Args too long";
+        char respTopic[64];
+        snprintf(respTopic, sizeof(respTopic), "%s/cli/response", prefix);
+        size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
+        char* rp = (char*)malloc(bufSz);
+        if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
+        goto cleanup;
+      }
       strncpy(pbuf, payload, min(plen, sizeof(pbuf) - 1));
       pbuf[min(plen, sizeof(pbuf) - 1)] = '\0';
 
