@@ -12,8 +12,16 @@ void Config::load() {
   if (!LittleFS.begin()) return;
   File f = LittleFS.open("/config.json", "r");
   if (!f) return;
-  deserializeJson(_doc, f);
+  DeserializationError err = deserializeJson(_doc, f);
   f.close();
+  // A malformed file would otherwise leave _doc half-parsed; clear to a
+  // clean empty doc so get() returns defaults, not garbage.
+  if (err) {
+    _doc.clear();
+    char msg[64];
+    snprintf(msg, sizeof(msg), "config.json parse failed (%s) - using defaults", err.c_str());
+    Log::error(TAG, msg);
+  }
 }
 
 // Persist the in-memory doc to /config.json. out: true on success;
@@ -63,9 +71,9 @@ void Config::replace(const char* json) {
 // out: false if a parent key on the path is missing.
 bool Config::set(const char* path, const char* value) {
   char buf[128];
-  // Reject empty or over-long paths; truncation would rewrite a
-  // different key than the caller asked for.
-  if (!path || !*path || strlen(path) >= sizeof(buf)) return false;
+  // Reject empty/over-long paths (truncation would rewrite a different
+  // key) and a null value (the strcmp/strtod below would deref it).
+  if (!path || !*path || !value || strlen(path) >= sizeof(buf)) return false;
   JsonVariant node = _doc.as<JsonVariant>();
   strncpy(buf, path, sizeof(buf) - 1);
   buf[sizeof(buf) - 1] = '\0';
