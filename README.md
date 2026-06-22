@@ -207,3 +207,8 @@ what counts as establishing an invariant.
 ## License
 
 SPDX-License-Identifier: GPL-3.0-only
+
+## Related
+
+- [thesada-doc](https://github.com/Thesada/thesada-doc) - documentation site source
+- [thesada.io](https://thesada.io) - project site and docs
