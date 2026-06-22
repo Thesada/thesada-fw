@@ -8,7 +8,6 @@ static const char* TAG = "Config";
 
 JsonDocument Config::_doc;
 
-// Load config from LittleFS into memory
 void Config::load() {
   if (!LittleFS.begin()) return;
   File f = LittleFS.open("/config.json", "r");
@@ -17,7 +16,6 @@ void Config::load() {
   f.close();
 }
 
-// Persist in-memory config to LittleFS
 void Config::save() {
   File f = LittleFS.open("/config.json", "w");
   if (!f) { Log::error(TAG, "Failed to open config.json for writing"); return; }
@@ -28,7 +26,9 @@ void Config::save() {
   Log::info(TAG, msg);
 }
 
-// Replace entire config with new JSON, rolling back on parse failure
+// Replace whole config with new JSON. On parse failure the cleared doc
+// is rolled back to the on-disk file so a bad MQTT payload cannot wipe
+// live config. in: JSON string.
 void Config::replace(const char* json) {
   _doc.clear();
   DeserializationError err = deserializeJson(_doc, json);
@@ -43,21 +43,20 @@ void Config::replace(const char* json) {
   Log::info(TAG, "Config replaced via MQTT");
 }
 
-// Set a single config value by dot-separated path and save to flash
+// Set one value by dot-path (e.g. "telegram.cooldown_s"), preserving
+// JSON type (bool/int/double/string). in: dot-path, value string.
+// out: false if a parent key on the path is missing.
 bool Config::set(const char* path, const char* value) {
-  // Walk dot-separated path (e.g. "telegram.cooldown_s").
   JsonVariant node = _doc.as<JsonVariant>();
   char buf[128];
   strncpy(buf, path, sizeof(buf) - 1);
   buf[sizeof(buf) - 1] = '\0';
 
-  // Find parent and final key.
   char* lastDot = strrchr(buf, '.');
   const char* finalKey = buf;
   if (lastDot) {
     *lastDot = '\0';
     finalKey = lastDot + 1;
-    // Navigate to parent.
     char* tok = strtok(buf, ".");
     while (tok) {
       if (node[tok].isNull()) return false;
@@ -66,7 +65,6 @@ bool Config::set(const char* path, const char* value) {
     }
   }
 
-  // Try to preserve type: number, bool, or string.
   if (strcmp(value, "true") == 0)       node[finalKey] = true;
   else if (strcmp(value, "false") == 0) node[finalKey] = false;
   else {
@@ -87,7 +85,6 @@ bool Config::set(const char* path, const char* value) {
   return true;
 }
 
-// Return the in-memory config as a JsonObject
 JsonObject Config::get() {
   return _doc.as<JsonObject>();
 }
