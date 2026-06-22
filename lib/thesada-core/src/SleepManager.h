@@ -9,29 +9,33 @@
 
 // Stored in RTC slow memory - survives deep sleep but not power cycle.
 struct RtcData {
-  uint32_t magic;          // 0xDEADBEEF = valid
+  uint32_t magic;          // 0xDEADBEEF = valid; anything else = uninitialised
   uint32_t bootCount;
-  time_t   lastOtaCheck;   // UTC epoch of last OTA check
+  time_t   lastOtaCheck;
 };
 
 class SleepManager {
 public:
-  // Call once at end of setup(). Reads config, sets wake deadline.
+  // Read config and set wake deadline.
+  // in: none. out: none. Call once at end of setup().
   static void begin();
 
-  // Call every loop(). When wake time expires, triggers graceful shutdown + sleep.
+  // When wake time expires, trigger graceful shutdown and sleep.
+  // in: none. out: none. Call every loop().
   static void loop();
 
-  // True if sleep is enabled in config.
+  // in: none. out: true if sleep is enabled in config.
   static bool enabled();
 
-  // Boot count from RTC memory (survives sleep, resets on power cycle).
+  // Boot count from RTC memory - resets on power cycle, survives sleep.
+  // in: none. out: boot count.
   static uint32_t bootCount();
 
-  // Last OTA check epoch from RTC memory.
+  // in: none. out: UTC epoch of last OTA check from RTC memory.
   static time_t lastOtaCheck();
 
-  // Update the OTA check time in RTC memory (called by OTAUpdate after a check).
+  // Update the OTA check time in RTC memory.
+  // in: UTC epoch. out: none.
   static void setLastOtaCheck(time_t t);
 
 private:

@@ -22,16 +22,14 @@
 #include <lwip/netdb.h>
 #include <esp_chip_info.h>
 
-// NVS namespace + keys for per-device mTLS client certificate.
-// Kept separate from Config so cert survives factory reset of config.json
-// and is never exposed via /api/config or config.dump.
+// NVS namespace separate from Config: cert survives factory reset and never
+// appears in /api/config or config.dump.
 static const char* CERT_NS        = "thesada-tls";
 static const char* CERT_KEY_CERT  = "client_cert";
 static const char* CERT_KEY_KEY   = "client_key";
 
-// NVS namespace + keys for the broker-exhaustion reboot counter (issue
-// FW M2). Separate from the cert namespace so a cert wipe does not also
-// reset the reboot guard, and vice versa.
+// Separate namespace from cert: a cert wipe must not reset the reboot guard,
+// and vice versa.
 static const char* BOOT_NS        = "thesada-boot";
 static const char* RB_KEY_COUNT   = "mqtt_reboots";  // uint8: consecutive
                                                      //   exhaustion reboots
@@ -42,27 +40,21 @@ static const char* RB_KEY_EPOCH   = "mqtt_rb_at";    // uint32: epoch (s)
 // outage weeks apart never accumulates toward a halt. Only applied when
 // the system clock is set.
 static constexpr uint32_t RB_STALE_WINDOW_S = 6UL * 3600UL;
-// CERT_MAX_LEN is now MQTTClient::CERT_MAX_LEN (header) so transports
-// that load via loadClientCert can size buffers without copy-pasting
-// the constant. ESP32 NVS string blob limit drives the value.
 
-// Optional hook fired after a successful clearClientCert. Cellular
-// installs one at bring-up so the modem-side cert cache invalidates
-// and any live SMCONN session drops. nullptr when no transport
-// registered an interest.
+// Cellular installs a hook so its cert cache and any live SMCONN session
+// drop when the cert is cleared. nullptr when unused.
 static std::function<void()> _onCertClearedHook = nullptr;
 
 static const char* TAG = "MQTT";
 
 #ifdef MQTT_TLS
 WiFiClientSecure MQTTClient::_wifiClient;
-// Client cert + key buffers for mTLS. Loaded from NVS on connect(), held
-// live while the WiFiClientSecure session is open (the TLS stack holds
-// the pointer, must outlive the handshake). Freed/NULL when no cert set.
+// Buffers held live across the TLS session; WiFiClientSecure stores the
+// raw pointer and dereferences it during the handshake.
 static char*     _clientCert    = nullptr;
 static char*     _clientKey     = nullptr;
 static bool      _mtlsActive    = false;
-static bool      _mtlsWasActive = false;  // last connect() used mTLS - need to clear WiFiClientSecure on fallback
+static bool      _mtlsWasActive = false;  // tracks whether last connect() used mTLS; need to clear WiFiClientSecure on fallback
 
 // Persistent broker hostname buffer. PubSubClient::setServer(const char*,
 // uint16_t) stores the pointer, not the contents, so we cannot hand it
@@ -119,11 +111,8 @@ static bool validateClientCertKey(const char* cert, const char* key) {
   return ok;
 }
 
-// CA cert buffer - routed to PSRAM when BOARD_HAS_PSRAM is defined, falling
-// back to internal heap otherwise. Raw char* + length instead of Arduino
-// String so we can use heap_caps_malloc(MALLOC_CAP_SPIRAM) directly and
-// avoid paying ~2 KB of internal SRAM for a cert that only matters during
-// TLS handshake.
+// Raw char* (not Arduino String) so heap_caps_malloc(MALLOC_CAP_SPIRAM)
+// can route it to PSRAM, keeping ~2 KB off the internal heap.
 static char*     _caCert    = nullptr;
 static size_t    _caCertLen = 0;
 #else
@@ -168,26 +157,19 @@ bool     MQTTClient::_manifestDirty        = false;
 uint32_t MQTTClient::_manifestDirtySinceMs = 0;
 bool     MQTTClient::_retainedPublishedThisSession = false;
 
-// Cellular fallback hint - see header. When true, publish() drops on a
-// WiFi disconnect instead of enqueueing.
+// When true, publish() routes to the cellular forwarder on WiFi disconnect
+// instead of enqueueing. See header.
 static bool s_fallbackPublishing = false;
 
-// Cellular subscribe forwarder. When installed, MQTTClient::subscribe
-// also calls this so the cellular MQTT session mirrors the WiFi-side
-// subscription set as new entries are added at runtime.
+// Mirrors new subscriptions onto the cellular MQTT session when installed.
 static std::function<void(const char*)> s_subForwarder;
 
-// Cellular publish forwarder. When installed and fallback publishing
-// is active, MQTTClient::publish routes here instead of enqueueing on a
-// WiFi-side disconnect. Returns true on successful hand-off to cellular,
-// false if the cellular transport is not ready (publish then drops).
+// Routes publishes to cellular when fallback is active. Returns false if
+// cellular is not ready (message drops).
 static std::function<bool(const char*, const char*, bool)> s_pubForwarder;
 
-// Tracks the millis() at which fallback publishing became active, so the
-// heap-stats trigger can defer its first firing until 30 s after the
-// cellular handoff completes. Initial post-ACTIVE burst (battery + rssi
-// + retained manifest re-emit) crowds the modem AT bus; deferring heap
-// keeps that window quiet.
+// Timestamp of cellular handoff; heap-stats firing defers 30 s to avoid
+// crowding the modem AT bus during the initial post-ACTIVE burst.
 static uint32_t s_fallbackStartMs = 0;
 
 void MQTTClient::setFallbackPublishing(bool active) {
@@ -225,11 +207,12 @@ void MQTTClient::setFallbackPublishing(bool active) {
 
 // ---------------------------------------------------------------------------
 
-// Initialize MQTT client, load TLS cert, and set up subscriptions
+// Initialize MQTT: load config, TLS certs, set up subscriptions, connect.
+// in: none (reads Config, LittleFS /ca.crt, NVS cert namespace).
+// out: none.
 void MQTTClient::begin() {
-  // Bootstrap the TLS NVS namespace so readonly begin() calls from
-  // hasClientCert() / loadClientCert() / getCertInfo() don't spam
-  // "nvs_open failed: NOT_FOUND" to serial on first-boot devices.
+  // Open the NVS namespace rw once so first-boot devices don't get
+  // "nvs_open failed: NOT_FOUND" spam from the subsequent read-only calls.
   {
     Preferences prefs;
     if (prefs.begin(CERT_NS, false)) prefs.end();
@@ -253,7 +236,7 @@ void MQTTClient::begin() {
   if (_bufferOut < 512)  _bufferOut = 512;
   if (_bufferOut > 8192) _bufferOut = 8192;
 
-  // Copy broker into persistent buffer - see _brokerHost comment.
+  // Copy into persistent buffer - see _brokerHost comment above.
   strncpy(_brokerHost, host, sizeof(_brokerHost) - 1);
   _brokerHost[sizeof(_brokerHost) - 1] = '\0';
   _client.setServer(_brokerHost, port);
@@ -262,17 +245,14 @@ void MQTTClient::begin() {
   _client.setCallback(onMessage);
 
 #ifdef MQTT_TLS
-  // Keep socket timeout well under the 30s hardware watchdog.
-  // arduino-esp32 v2.x: setTimeout takes seconds (current platform).
-  // arduino-esp32 v3.x: setTimeout takes milliseconds (future-proof).
-  // Setting both ensures correct behavior across versions.
+  // Keep well under the 30 s hardware watchdog.
+  // v2.x setTimeout takes seconds; v3.x takes milliseconds. Setting both
+  // handles the difference. setHandshakeTimeout is always in seconds.
   _wifiClient.setTimeout(10);
   _wifiClient.setHandshakeTimeout(10);  // ssl handshake, always seconds
 
-  // CA cert must be present as /ca.crt on LittleFS.
-  // Allocate the cert buffer in PSRAM when available (keeps ~2 KB off the
-  // internal heap, where it matters more under MQTT+Telegram fragmentation).
-  // Falls back to internal heap via plain malloc on non-PSRAM targets.
+  // Load CA cert from LittleFS; fall back to baked PROGMEM bundle; last
+  // resort setInsecure. Prefer PSRAM when available (see _caCert comment).
   if (LittleFS.exists("/ca.crt")) {
     File cf = LittleFS.open("/ca.crt", "r");
     if (cf) {
@@ -301,10 +281,8 @@ void MQTTClient::begin() {
     }
   }
   if (!_caCert || _caCertLen == 0) {
-    // Fallback to baked PROGMEM bundle. Same shared roots used by OTA -
-    // a stripped LittleFS should not silently drop broker TLS validation
-    // to insecure. setInsecure only fires if even the PROGMEM bundle is
-    // empty (build misconfig).
+    // Same roots as OTA; a stripped LittleFS must not silently go insecure.
+    // setInsecure below is a last resort for a misbuilt PROGMEM bundle.
     size_t pmLen = strlen_P(OTA_CA_PROGMEM);
     if (pmLen > 0) {
 #if defined(BOARD_HAS_PSRAM)
@@ -334,12 +312,10 @@ void MQTTClient::begin() {
   }
 #endif
 
-  // Initialize subscription storage.
   for (int i = 0; i < MQTT_MAX_SUBS; i++) {
     _subs[i].active = false;
   }
 
-  // Publish alert events to MQTT alert topic.
   EventBus::subscribe("alert", [](JsonObject data) {
     JsonObject  cfg    = Config::get();
     const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
@@ -350,8 +326,6 @@ void MQTTClient::begin() {
     MQTTClient::publish(topic, payload);
   });
 
-  // MQTT CLI: subscribe to <prefix>/cli/#, extract command from topic, payload = args.
-  // Response published to <prefix>/cli/response as JSON.
   {
     JsonObject  cfg    = Config::get();
     const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
@@ -394,20 +368,15 @@ void MQTTClient::begin() {
     });
   }
 
-  // cmd/config/set and cmd/config/push removed in v1.2.3.
-  // Use cli/config.set, cli/file.write + cli/config.reload instead.
 
   connect();
 }
 
 // ---------------------------------------------------------------------------
 
-// Read the persisted broker-exhaustion reboot count, applying the
-// stale-window reset: if the last exhaustion reboot was more than
-// RB_STALE_WINDOW_S ago (and the clock is set), the old streak has aged
-// out and no longer counts.
-//
-// out: effective consecutive exhaustion-reboot count (0 if none/stale)
+// Read persisted broker-exhaustion reboot count. A streak older than
+// RB_STALE_WINDOW_S (clock must be set) ages out and returns 0.
+// out: effective consecutive count (0 if none or stale).
 static uint8_t mqttRebootCount() {
   Preferences prefs;
   if (!prefs.begin(BOOT_NS, true)) return 0;
@@ -423,8 +392,7 @@ static uint8_t mqttRebootCount() {
   return count;
 }
 
-// Persist an incremented exhaustion-reboot count plus the current epoch
-// (0 if the clock is unset - the stale check then simply skips).
+// Persist newCount and current epoch (0 if clock unset; stale check skips).
 static void mqttRebootCountBump(uint8_t newCount) {
   Preferences prefs;
   if (!prefs.begin(BOOT_NS, false)) return;
@@ -434,8 +402,8 @@ static void mqttRebootCountBump(uint8_t newCount) {
   prefs.end();
 }
 
-// Clear the exhaustion-reboot counter after a successful connect. Reads
-// first so a clean steady-state connect does not rewrite NVS every cycle.
+// Clear the exhaustion-reboot counter. Reads before writing so a steady-
+// state connect does not rewrite NVS every cycle.
 static void mqttRebootCountClear() {
   Preferences prefs;
   if (!prefs.begin(BOOT_NS, false)) return;
@@ -448,7 +416,9 @@ static void mqttRebootCountClear() {
 
 // ---------------------------------------------------------------------------
 
-// Attempt to connect to the MQTT broker with LWT
+// Connect to the MQTT broker. Applies mTLS when a client cert is present.
+// Sets LWT so the broker publishes "offline" on disconnect.
+// in: none (reads Config + NVS cert namespace). out: none.
 void MQTTClient::connect() {
   if (!WiFiManager::connected()) return;
 
@@ -458,7 +428,6 @@ void MQTTClient::connect() {
   const char* password = cfg["mqtt"]["password"]  | "";
   const char* prefix   = cfg["mqtt"]["topic_prefix"] | "thesada/node";
 
-  // Availability topic - LWT publishes "offline" when connection drops
   char availTopic[64];
   snprintf(availTopic, sizeof(availTopic), "%s/status", prefix);
 
@@ -504,14 +473,11 @@ void MQTTClient::connect() {
     }
   }
 
-  // Client certificate (per-device mTLS). Loaded from NVS once and kept
-  // in module-level buffers because WiFiClientSecure holds the raw char*
-  // pointer for the life of the TLS session. Re-load if cert was cleared
-  // externally (cert.clear via CLI) - hasClientCert() drives enable.
-  //
-  // Validation: parse PEM via mbedtls BEFORE setCertificate. Arduino-esp32
-  // WiFiClientSecure has no clear-cert API; once a bad pointer is set, every
-  // reconnect fails until restart. Catch bad PEM here and skip mTLS.
+  // Load client cert from NVS into module-level buffers. WiFiClientSecure
+  // holds the raw pointer for the TLS session lifetime, so buffers must
+  // stay live across handshake. Validate via mbedtls before setCertificate:
+  // there is no clear-cert API, so a bad pointer breaks every future
+  // reconnect until restart.
   _mtlsActive = false;
   if (!_insecureFallback && hasClientCert()) {
     if (!_clientCert) _clientCert = (char*)malloc(CERT_MAX_LEN);
@@ -527,18 +493,15 @@ void MQTTClient::connect() {
         Log::warn(TAG, "mTLS: stored cert/key failed mbedtls validation - password fallback");
       }
     } else {
-      // Partial malloc (one buffer allocated, the other failed) or NVS
-      // load failure: free whatever was allocated and null both. Holding
-      // a stranded 4 KB buffer only starves the next attempt's malloc -
-      // free(nullptr) is safe so this covers every failure shape.
+      // Free both on any failure (malloc partial or NVS miss) - a stranded
+      // 4 KB buffer starves the next connect attempt. free(nullptr) is safe.
       free(_clientCert); _clientCert = nullptr;
       free(_clientKey);  _clientKey  = nullptr;
       Log::warn(TAG, "mTLS: NVS load failed, falling back to password auth");
     }
   }
-  // If previous attempt used mTLS but this one won't, clear stale pointer
-  // inside WiFiClientSecure by passing nullptr. Without this, the old
-  // setCertificate pointer lingers and sabotages every future connect().
+  // When dropping from mTLS to password auth, pass nullptr to evict the
+  // stale setCertificate pointer - it lingers and breaks future connect()s.
   if (_mtlsWasActive && !_mtlsActive) {
     _wifiClient.setCertificate(nullptr);
     _wifiClient.setPrivateKey(nullptr);
@@ -547,8 +510,8 @@ void MQTTClient::connect() {
   _mtlsWasActive = _mtlsActive;
 #endif
 
-  // With mTLS active, broker uses CN as username (use_identity_as_username).
-  // Skip sending user/pass - cleaner auth path, avoids mixed-mode confusion.
+  // Broker uses CN as username (use_identity_as_username) when mTLS is
+  // active - sending user/pass alongside is redundant and confusing.
   bool ok;
   if (_mtlsActive) {
     ok = _client.connect(clientId, nullptr, nullptr, availTopic, 0, true, "offline");
@@ -561,16 +524,14 @@ void MQTTClient::connect() {
   if (ok) {
     _retryInterval = RETRY_MIN_MS;
     _retryCount    = 0;
-    // A successful connect clears the broker-exhaustion reboot guard:
-    // whatever was wrong is fixed, so a future failure starts a fresh
-    // streak rather than inheriting a stale count.
+    // Clear the reboot guard: a future failure starts a fresh streak.
     _rebootHalted  = false;
     mqttRebootCountClear();
     _lastSuccessMs    = millis();
     _connectedSinceMs = millis();
     Log::info(TAG, "Connected");
 
-    // Enable TCP keepalive to detect dead connections faster than MQTT keepalive
+    // TCP keepalive catches dead connections faster than MQTT-level keepalive.
     int fd = _wifiClient.fd();
     if (fd >= 0) {
       int keepAlive    = 1;
@@ -584,17 +545,14 @@ void MQTTClient::connect() {
       Log::info(TAG, "TCP keepalive enabled (30s/10s/3)");
     }
 
-    // Reset the retained-topics manifest before we start re-publishing this
-    // session's retained state. publishDiscovery / publishDeviceInfo / SHT31
-    // and friends will repopulate it; publishRetainedManifest() ships it.
+    // Reset manifest; modules repopulate it during this session.
     _retainedTopics.clear();
     _manifestPublished    = false;
     _manifestDirty        = false;
     _manifestDirtySinceMs = 0;
 
     resubscribeAll();
-    // WiFi reconnect always republishes the retained set (force=true) so
-    // a stale cellular-side flag does not block the WiFi-side refresh.
+    // force=true: WiFi reconnect must not be blocked by a stale cellular flag.
     publishRetainedSet(true);
     flushQueue();
   } else {
@@ -605,24 +563,20 @@ void MQTTClient::connect() {
     _retryCount++;
     _retryInterval = min(_retryInterval * 2, (uint32_t)RETRY_MAX_MS);
 
-    // Fast restart on TLS OOM: if max contiguous block is below the ~30KB
-    // mbedtls needs, retrying is pointless - only a fresh boot defragments.
-    // Give 3 attempts for transient failures, then reboot.
+    // mbedtls needs ~30 KB contiguous; retrying without a reboot just
+    // fails again. Allow 3 attempts for transient failures first.
     if (_retryCount >= 3 && ESP.getMaxAllocHeap() < 40000) {
       Log::error(TAG, "TLS alloc failed 3x with low heap - rebooting to defrag");
       delay(1000);
       ESP.restart();
     }
 
-    // Broker-misconfiguration safety net (issue FW M2). A persistently
-    // failing broker (bad host/port/creds) used to reboot every ~30 min
-    // forever - a perpetual slow reboot loop, the device reachable only
-    // briefly each cycle. Now: after mqtt.reboot_after_fails failed
-    // reconnects (default 30) reboot at most mqtt.max_exhaust_reboots
-    // times (a reboot can clear a wedged TLS stack), then stop rebooting
-    // and stay alive - locally reachable via serial/web, still retrying
-    // MQTT at the capped backoff. The NVS counter clears on the first
-    // successful connect; an old streak ages out after RB_STALE_WINDOW_S.
+    // Broker-misconfiguration safety net. A bad host/port/creds used to
+    // reboot every ~30 min forever, leaving the device reachable only
+    // briefly each cycle. Instead: after reboot_after_fails attempts,
+    // reboot at most max_exhaust_reboots times (a reboot can clear a
+    // wedged TLS stack), then stop rebooting and stay alive - serial/web
+    // still reachable, MQTT still retrying at capped backoff.
     uint8_t rebootAfter = Config::get()["mqtt"]["reboot_after_fails"] | 30;
     if (_retryCount >= rebootAfter && !_rebootHalted) {
       uint8_t maxReboots = Config::get()["mqtt"]["max_exhaust_reboots"] | 3;
@@ -638,8 +592,7 @@ void MQTTClient::connect() {
         delay(1000);
         ESP.restart();
       } else {
-        // Reboot budget spent - the broker config is almost certainly
-        // wrong. Stop the loop: keep retrying, never reboot again.
+        // Budget spent. Keep retrying, never reboot again.
         _rebootHalted = true;
         char m[128];
         snprintf(m, sizeof(m),
@@ -654,9 +607,9 @@ void MQTTClient::connect() {
 
 // ---------------------------------------------------------------------------
 
-// Lightweight keepalive - just run PubSubClient::loop() to send/receive
-// PINGREQ/PINGRESP. Safe to call during beginAll() between module inits
-// so the MQTT connection survives long init sequences.
+// Run PubSubClient::loop() to service keepalive. Safe to call from
+// beginAll() between module inits so long init sequences don't drop
+// the broker connection.
 void MQTTClient::tick() {
   if (_client.connected()) {
     _client.loop();
@@ -665,14 +618,10 @@ void MQTTClient::tick() {
 
 // ---------------------------------------------------------------------------
 
-// Process MQTT messages and handle reconnection with backoff
 void MQTTClient::loop() {
-  // Preventive reboot if free heap stays below HEAP_REBOOT_FLOOR_BYTES for
-  // longer than HEAP_REBOOT_HOLD_MS. Prevents the bad path where an
-  // mbedtls allocation inside the TLS stack fails mid-handshake and
-  // wedges the connection without a clean recovery. A reboot here lands
-  // the device on a fresh, defragmented heap. Disable by defining
-  // HEAP_REBOOT_FLOOR_BYTES = 0 in thesada_config.h.
+  // Reboot if heap stays below floor for HEAP_REBOOT_HOLD_MS: mbedtls OOM
+  // mid-handshake wedges the connection with no clean recovery; a fresh
+  // boot defragments. Set HEAP_REBOOT_FLOOR_BYTES=0 to disable.
   if (HEAP_REBOOT_FLOOR_BYTES > 0) {
     uint32_t freeHeap = ESP.getFreeHeap();
     uint32_t now = millis();
@@ -699,14 +648,9 @@ void MQTTClient::loop() {
     }
   }
 
-  // CLI commands are now drained from the Shell ring -
-  // see Shell::loop() drained from the main app loop. No poll needed here.
 
-  // Periodic heap telemetry. Transport-agnostic: fires whenever any
-  // transport (WiFi MQTT or cellular fallback) is publishing. Defers
-  // 30 s after a fresh cellular handoff so the post-ACTIVE burst
-  // (battery + rssi + retained manifest re-emit) clears first. 5 min
-  // interval -> <= 288 publishes/day per metric.
+  // Transport-agnostic heap telemetry. Defers 30 s after cellular handoff
+  // (see s_fallbackStartMs) so the post-ACTIVE AT burst clears first.
   {
     uint32_t hpNow = millis();
     bool eligible = _client.connected() ||
@@ -718,36 +662,31 @@ void MQTTClient::loop() {
     }
   }
 
-  // Late-arriving retained topics (e.g. SHT31 discovery published after the
-  // initial connect()-time manifest) re-emit after a 5 s debounce so we do
-  // not thrash the broker during burst-publishes from module begin().
+  // 5 s debounce: late-arriving retained topics (module begin() burst)
+  // re-emit without thrashing the broker.
   if (_manifestDirty && _client.connected() &&
       (millis() - _manifestDirtySinceMs) >= 5000) {
     publishRetainedManifest();
   }
 
-  // Deferred reboot after cert.apply. The shell handler publishes its
-  // response, schedules the reboot for a few seconds later, then returns.
-  // This main-loop tick performs the actual restart - only reliable way to
-  // clear sticky WiFiClientSecure / mbedtls state across a cert swap on
-  // classic-platform boards. Remote devices have no USB
-  // fallback, so cert.apply must self-recover.
+  // cert.apply deferred reboot: shell handler publishes its response, then
+  // this tick fires the restart. Only reliable way to clear sticky
+  // WiFiClientSecure / mbedtls state on a cert swap; remote devices have
+  // no USB fallback so cert.apply must self-recover.
   if (_certApplyRebootPending && (int32_t)(millis() - _certApplyRebootAtMs) >= 0) {
     Log::warn(TAG, "cert.apply deferred reboot firing");
     delay(100);
     ESP.restart();
   }
 
-  // Deferred reconnect after reinitSubscriptions() - runs on a clean stack
-  // so TLS handshake has enough room (~10KB for mbedtls).
+  // Deferred reconnect after reinitSubscriptions(): clean stack gives
+  // mbedtls enough room (~10 KB) for the TLS handshake.
   if (_reinitPending) {
     _reinitPending = false;
     JsonObject  cfgR = Config::get();
     const char* host = cfgR["mqtt"]["broker"] | "";
     uint16_t    port = cfgR["mqtt"]["port"]   | 8883;
-    // Refresh the persistent buffer so the re-parsed pool cannot dangle
-    // the pointer PubSubClient holds across future reconnects. See
-    // _brokerHost comment at the top of the file.
+    // Refresh persistent buffer; re-parsed pool invalidates prior pointer.
     strncpy(_brokerHost, host, sizeof(_brokerHost) - 1);
     _brokerHost[sizeof(_brokerHost) - 1] = '\0';
     _client.setServer(_brokerHost, port);
@@ -756,19 +695,17 @@ void MQTTClient::loop() {
   }
 
   if (_client.connected()) {
-    // NTP upgrade: if we connected insecure and NTP has since synced,
-    // disconnect and reconnect with proper cert validation.
-    // Skip if largest contiguous block is below 40KB (TLS handshake needs ~30KB).
+    // NTP has synced since the insecure connect - reconnect with cert
+    // validation. Skip if contiguous heap < 40 KB (TLS needs ~30 KB).
     if (_insecureFallback && time(nullptr) > 1700000000 && ESP.getMaxAllocHeap() > 40000) {
       Log::info(TAG, "NTP synced - upgrading to cert-validated connection");
-      _connectedSinceMs = 0;  // suppress "lost after 0 seconds" log
+      _connectedSinceMs = 0;  // suppress spurious "lost after 0 seconds" log
       _client.disconnect();
       _wifiClient.stop();
       _retryInterval = RETRY_MIN_MS;
       return;
     }
 
-    // Watchdog: force reconnect if no successful activity in WATCHDOG_MS
     uint32_t now = millis();
     if (_lastSuccessMs > 0 && (now - _lastSuccessMs > WATCHDOG_MS)) {
       uint32_t uptime = (now - _connectedSinceMs) / 1000;
@@ -783,9 +720,8 @@ void MQTTClient::loop() {
     }
 
     _client.loop();
-    _lastSuccessMs = millis();  // MQTT loop succeeded (keepalive worked)
+    _lastSuccessMs = millis();
 
-    // Drain queued messages, respecting minimum send interval.
     if (_queueCount > 0) {
       if (_minIntervalMs == 0 || now - _lastPublishMs >= _minIntervalMs) {
         MQTTMessage& msg = _queue[_queueHead];
@@ -804,7 +740,6 @@ void MQTTClient::loop() {
     return;
   }
 
-  // Connection lost - log uptime
   if (_connectedSinceMs > 0) {
     uint32_t uptime = (millis() - _connectedSinceMs) / 1000;
     char dmsg[64];
@@ -824,7 +759,6 @@ void MQTTClient::loop() {
 
 // ---------------------------------------------------------------------------
 
-// Publish a message, queuing it if disconnected or rate-limited
 void MQTTClient::publish(const char* topic, const char* payload) {
   if (_client.connected()) {
     if (_minIntervalMs > 0) {
@@ -840,12 +774,9 @@ void MQTTClient::publish(const char* topic, const char* payload) {
     _lastPublishTime = time(nullptr);
     return;
   }
-  // WiFi MQTT is down. If cellular has taken over, route through the
-  // installed publish forwarder so the broker still gets the message
-  // via the modem-native MQTT session. The WiFi ring is reserved for
-  // WiFi - we do NOT enqueue under fallback or it fills 8/8 forever
-  // and every new publish triggers "Queue full - dropping oldest"
-  // eviction.
+  // WiFi MQTT is down. Route to cellular forwarder when active - do NOT
+  // enqueue on the WiFi ring or it fills 8/8 and every publish triggers
+  // "Queue full - dropping oldest".
   if (s_fallbackPublishing) {
     if (s_pubForwarder) s_pubForwarder(topic, payload, false);
     return;
@@ -853,11 +784,8 @@ void MQTTClient::publish(const char* topic, const char* payload) {
   enqueue(topic, payload);
 }
 
-// Publish a retained message (for HA discovery configs).
-// Records the topic in the retained-topics manifest so the platform can
-// clear it on device delete. Routes through the cellular forwarder when
-// WiFi MQTT is down and cellular fallback is publishing, so HA discovery
-// configs / availability / device info still land on the broker.
+// Publish retained. Records the topic in the manifest so a device-delete
+// sweep can clear it. Routes to the cellular forwarder when WiFi is down.
 void MQTTClient::publishRetained(const char* topic, const char* payload) {
   if (_client.connected()) {
     _client.publish(topic, (const uint8_t*)payload, strlen(payload), true);
@@ -871,11 +799,9 @@ void MQTTClient::publishRetained(const char* topic, const char* payload) {
   }
 }
 
-// Append a topic to the retained-topics manifest, deduping case-sensitively.
-// Caller is responsible for invoking this only when a retained publish was
-// actually issued. Manifest is reset at the start of each connect() so it
-// always reflects the current session's footprint.
-// in: topic. out: appended to _retainedTopics if not already present.
+// Dedupe-append topic to the retained manifest. Manifest resets each
+// connect() so it always reflects the current session.
+// in: topic. out: none.
 void MQTTClient::recordRetainedTopic(const char* topic) {
   if (!topic || !*topic) return;
   for (const auto& t : _retainedTopics) {
@@ -888,13 +814,11 @@ void MQTTClient::recordRetainedTopic(const char* topic) {
   }
 }
 
-// Publish a retained JSON array of every retained topic this device owns to
-// <prefix>/info/retained_topics. Called after publishDiscovery + module
-// discovery have run so the list is complete. Lets a controller enumerate
-// + clean up retained state when a device is unprovisioned.
-// in: none (reads _retainedTopics + topic_prefix from Config).
-// out: publishes one retained MQTT message; topic itself is added to the
-// manifest list pre-publish so the device can also clean its own info.
+// Publish retained JSON array of all retained topics to
+// <prefix>/info/retained_topics so a controller can enumerate and clean
+// them on device removal. The manifest topic itself is included so a
+// sweep also clears this entry.
+// in: none. out: none.
 void MQTTClient::publishRetainedManifest() {
   if (!_client.connected() && !s_fallbackPublishing) return;
 
@@ -904,14 +828,12 @@ void MQTTClient::publishRetainedManifest() {
   char topic[96];
   snprintf(topic, sizeof(topic), "%s/info/retained_topics", prefix);
 
-  // Include the manifest topic itself so a delete sweep also clears it.
   recordRetainedTopic(topic);
 
   JsonDocument doc;
   JsonArray arr = doc.to<JsonArray>();
   for (const auto& t : _retainedTopics) arr.add(t);
 
-  // Conservative budget: ~30-50 short topics * ~80 B = ~4 KB. Keep on heap.
   String payload;
   serializeJson(doc, payload);
 
@@ -930,18 +852,10 @@ void MQTTClient::publishRetainedManifest() {
 
 // ---------------------------------------------------------------------------
 
-// Republish the device's full retained-state set: availability "online", HA
-// discovery configs, /info, retained-topics manifest. Routes through
-// publishRetained so the cellular forwarder picks it up when WiFi MQTT is
-// down.
-//
-// Called from connect() (WiFi reconnect, force=true) and from
-// CellularModule on the STANDBY -> ACTIVE transition (force=false).
-// The session flag prevents republishing on every cellular STANDBY -> ACTIVE
-// bounce within a single fallback window; setFallbackPublishing(false)
-// clears it so a fresh fallback window republishes.
-//
-// in:  force - skip the session-flag check.
+// Republish retained state: availability, discovery, /info, manifest.
+// Session flag prevents repeat on cellular STANDBY->ACTIVE bounces within
+// one fallback window; setFallbackPublishing(false) resets it.
+// in: force - bypass the session flag.
 // out: none.
 void MQTTClient::publishRetainedSet(bool force) {
   if (!_client.connected() && !s_fallbackPublishing) return;
@@ -963,7 +877,6 @@ void MQTTClient::publishRetainedSet(bool force) {
 
 // ---------------------------------------------------------------------------
 
-// Register a topic subscription with a callback
 void MQTTClient::subscribe(const char* topic, MQTTCallback callback) {
   if (_subCount >= MQTT_MAX_SUBS) {
     Log::error(TAG, "Max subscriptions reached");
@@ -981,25 +894,21 @@ void MQTTClient::subscribe(const char* topic, MQTTCallback callback) {
   snprintf(msg, sizeof(msg), "Registered sub: %s (%d/%d)", topic, _subCount, MQTT_MAX_SUBS);
   Log::info(TAG, msg);
 
-  // If already connected, subscribe immediately and feed keepalive.
-  // Bulk subscription during Lua init can take >10s total - without
-  // tick() the broker or HAProxy drops the idle TCP connection.
+  // Feed keepalive during bulk Lua subscription (>10 s): without this the
+  // broker or HAProxy drops the idle TCP connection.
   if (_client.connected()) {
     _client.subscribe(topic);
     _client.loop();
   }
 
-  // If cellular has installed a forwarder, mirror this subscription onto
-  // the cellular MQTT session too.
   if (s_subForwarder) s_subForwarder(topic);
 }
 
 // ---------------------------------------------------------------------------
 
-// Capture topic in the rxRing and fire every active subscription whose
-// topic matches by exact string OR trailing /# OR trailing /+. Shared
-// between WiFi (onMessage) and cellular (dispatchInbound) so the two
-// transports never drift on wildcard semantics.
+// Match and fire subscriptions: exact, /#, /+ wildcard. Shared between
+// WiFi (onMessage) and cellular (dispatchInbound) to keep semantics identical.
+// in: topic, payload. out: none.
 void MQTTClient::matchAndDispatch(const char* topic, const char* payload) {
   strncpy(_rxRing[_rxRingHead], topic, sizeof(_rxRing[0]) - 1);
   _rxRing[_rxRingHead][sizeof(_rxRing[0]) - 1] = '\0';
@@ -1010,14 +919,12 @@ void MQTTClient::matchAndDispatch(const char* topic, const char* payload) {
   for (uint8_t i = 0; i < _subCount; i++) {
     if (!_subs[i].active) continue;
     size_t slen = strlen(_subs[i].topic);
-    // Trailing /# = multi-level wildcard.
-    if (slen >= 2 && _subs[i].topic[slen - 1] == '#' && _subs[i].topic[slen - 2] == '/') {
+    if (slen >= 2 && _subs[i].topic[slen - 1] == '#' && _subs[i].topic[slen - 2] == '/') {  // trailing /#
       if (strncmp(_subs[i].topic, topic, slen - 1) == 0) {
         _subs[i].callback(topic, payload);
       }
     }
-    // Trailing /+ = single-level wildcard. Match if the prefix up to /+
-    // matches and the remainder of the topic has no further '/'.
+    // /+ matches only one level (no further '/').
     else if (slen >= 2 && _subs[i].topic[slen - 1] == '+' && _subs[i].topic[slen - 2] == '/') {
       if (strncmp(_subs[i].topic, topic, slen - 1) == 0) {
         const char* rest = topic + (slen - 1);
@@ -1032,17 +939,14 @@ void MQTTClient::matchAndDispatch(const char* topic, const char* payload) {
   }
 }
 
-// Route incoming messages to matching subscription callbacks.
-// Public dispatcher used by Cellular::pumpInbound to route +SMSUB: URCs
-// through the same subscription callbacks as the WiFi onMessage path.
+// Public entry for Cellular::pumpInbound: routes +SMSUB URCs through the
+// same callbacks as the WiFi path.
 void MQTTClient::dispatchInbound(const char* topic, const char* payload, size_t length) {
   matchAndDispatch(topic, payload);
   (void)length;  // payload is null-terminated by caller
 }
 
-// Iterate every active subscription topic. Cellular bring-up uses this
-// to issue AT+SMSUB on every entry so the cellular transport carries the
-// same subscription set as the WiFi transport.
+// Cellular bring-up uses this to replay AT+SMSUB for every WiFi-side entry.
 void MQTTClient::forEachSubscription(std::function<void(const char*)> fn) {
   for (uint8_t i = 0; i < _subCount; i++) {
     if (_subs[i].active) fn(_subs[i].topic);
@@ -1058,7 +962,7 @@ void MQTTClient::setPublishForwarder(std::function<bool(const char*, const char*
 }
 
 void MQTTClient::onMessage(char* topic, uint8_t* payload, unsigned int length) {
-  // Null-terminate the payload - heap-allocated to avoid stack overflow on WROOM-32.
+  // Heap-allocate: stack overflow on WROOM-32 with large payloads.
   size_t bufSize = length + 1;
   char* payloadBuf = (char*)malloc(bufSize);
   if (!payloadBuf) return;
@@ -1071,31 +975,24 @@ void MQTTClient::onMessage(char* topic, uint8_t* payload, unsigned int length) {
 
 // ---------------------------------------------------------------------------
 
-// Run a CLI command on the main loop (Shell::enqueueDeferred drain).
-// The PubSubClient callback already extracted cmd from the topic and
-// copied payload onto the heap (owned by the std::function capture);
-// this just dispatches by command name + binary-protocol special case.
+// Dispatch a CLI command from the Shell deferred ring. cmd was extracted
+// from the topic; payload is heap-owned by the std::function capture.
+// Binary-protocol commands (fs.write, fs.cat chunked, cert.set) are
+// handled as special cases before the Shell::execute fallthrough.
+// in: cmd, payload (may be null), plen. out: none.
 void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
   if (!cmd || strlen(cmd) == 0) return;
 
-  // Caller already filtered out empty cmd + the response topic itself,
-  // but the special-case branches still expect the locals to exist for
-  // the response-publish path so resolve prefix here.
   JsonObject cfg = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
 
-  // CLI correlation envelope: `{"req_id":<id>, "args":<string>}` where both
-  // fields are optional. req_id is echoed back on every cli/response so the
-  // app can match requests against responses on the shared cli/response
-  // topic. args, when present as a string, is unwrapped and used as the
-  // command payload for every downstream handler (binary fs.write /
-  // fs.append / cert.set + chunked fs.cat + Shell::execute fall-through).
-  // Non-envelope callers (raw plain-text args, raw binary path\ncontent)
-  // keep working - the envelope is recognised by payload[0]=='{' + valid
-  // JSON object shape; anything else falls through untouched.
-  //
-  // reqDoc stays in scope for the whole function so reqId and the args
-  // string view remain valid at every publish + dispatch site.
+  // Optional envelope: {"req_id":<id>, "args":<string>}. req_id is echoed
+  // on every cli/response for request/response matching on the shared topic.
+  // args is unwrapped and replaces payload for all downstream handlers so
+  // binary-protocol special cases (fs.write, cert.set) and Shell::execute
+  // all see the inner string. Non-envelope payloads fall through untouched.
+  // reqDoc stays in scope so reqId and the args view stay valid at every
+  // publish site.
   JsonDocument reqDoc;
   JsonVariantConst reqId;
   bool hasReqId = false;
@@ -1108,18 +1005,13 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
         reqId = obj["req_id"];
         hasReqId = true;
       }
-      // Unwrap args: every downstream handler sees the inner string
-      // instead of the JSON envelope. Binary handlers still get raw bytes
-      // (the path\ncontent / type\nPEM format lives inside the args
-      // string). fs.cat chunked still gets "path offset length".
       const char* argsStr = obj["args"];
       if (argsStr) {
         payload = argsStr;
         plen    = strlen(argsStr);
       }
-      // {"req_id":...} with no other keys (or {"req_id":..., "args":""}
-      // after unwrap) = no-arg command. Falls through to the Shell path
-      // bare instead of carrying the envelope as a literal arg.
+      // req_id-only envelope = no-arg command; don't pass the JSON as a
+      // literal arg to Shell parsers.
       reqIdOnlyPayload = hasReqId && (obj.size() == 1 ||
                                       (argsStr && plen == 0));
     }
@@ -1127,9 +1019,8 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
 
   {
 
-    // Special case: fs.write / fs.append / file.write (legacy alias)
-    // First line of payload is the path, rest is content.
-    // fs.write truncates (mode "w"), fs.append appends (mode "a").
+    // fs.write / fs.append / file.write (legacy alias).
+    // Payload: first line = path, remainder = content.
     if ((strcmp(cmd, "fs.write") == 0 || strcmp(cmd, "file.write") == 0 ||
          strcmp(cmd, "fs.append") == 0) && payload && plen > 0) {
       const char* mode = (strcmp(cmd, "fs.append") == 0) ? "a" : "w";
@@ -1137,20 +1028,23 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
       JsonDocument resp;
       resp["cmd"] = cmd;
       if (hasReqId) resp["req_id"] = reqId;
+      const size_t kPathCap = 64;
       if (!nl) {
         resp["ok"] = false;
         resp["output"][0] = "Usage: payload = <path>\\n<content>";
+      } else if ((size_t)(nl - payload) >= kPathCap) {
+        // Reject rather than truncate - a clipped path writes the wrong file.
+        resp["ok"] = false;
+        resp["output"][0] = "Path too long";
       } else {
-        char path[64];
-        size_t pathLen = min((size_t)(nl - payload), sizeof(path) - 1);
+        char path[kPathCap];
+        size_t pathLen = (size_t)(nl - payload);
         memcpy(path, payload, pathLen);
         path[pathLen] = '\0';
         const char* content = nl + 1;
         size_t contentLen = plen - pathLen - 1;
 
-        // Reject path traversal before any LittleFS call - the cli/<cmd>
-        // topic is the device's remote attack surface (broker ACL is the
-        // only thing between an external publisher and this handler).
+        // Broker ACL is the only external gate; reject traversal here.
         if (!Shell::pathSafe(path)) {
           resp["ok"] = false;
           resp["output"][0] = "Invalid path";
@@ -1187,13 +1081,25 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
       goto cleanup;
     }
 
-    // Special case: fs.cat with offset/length for chunked reads.
-    // Payload: "<path> <offset> <length>" - reads a byte range and returns
-    // JSON with offset, length, total, done, and data (JSON-escaped text).
-    // Without offset/length, falls through to Shell::execute (line-by-line).
+    // fs.cat chunked: "<path> <offset> <length>" returns a JSON byte range.
+    // Without offset+length, falls through to Shell::execute (line-by-line).
     if (strcmp(cmd, "fs.cat") == 0 && payload && plen > 0) {
-      // Parse: path offset length (space-separated)
       char pbuf[256];
+      if (plen >= sizeof(pbuf)) {
+        // Reject rather than truncate - a clipped "path off len" would
+        // read the wrong file or byte range.
+        JsonDocument resp;
+        resp["cmd"] = cmd;
+        if (hasReqId) resp["req_id"] = reqId;
+        resp["ok"] = false;
+        resp["output"][0] = "Args too long";
+        char respTopic[64];
+        snprintf(respTopic, sizeof(respTopic), "%s/cli/response", prefix);
+        size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
+        char* rp = (char*)malloc(bufSz);
+        if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
+        goto cleanup;
+      }
       strncpy(pbuf, payload, min(plen, sizeof(pbuf) - 1));
       pbuf[min(plen, sizeof(pbuf) - 1)] = '\0';
 
@@ -1201,11 +1107,10 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
       char* offStr = strtok(nullptr, " ");
       char* lenStr = strtok(nullptr, " ");
 
-      // Only handle chunked mode (with offset + length)
       if (path && offStr && lenStr) {
         size_t offset = (size_t)atol(offStr);
         size_t chunkLen = (size_t)atol(lenStr);
-        // Cap chunk to half of output buffer (response JSON has overhead)
+        // Half of output buffer; response JSON has significant overhead.
         size_t maxChunk = _bufferOut > 512 ? _bufferOut / 2 : 512;
         if (chunkLen == 0) chunkLen = maxChunk;
         if (chunkLen > maxChunk) chunkLen = maxChunk;
@@ -1214,9 +1119,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
         resp["cmd"] = cmd;
         if (hasReqId) resp["req_id"] = reqId;
 
-        // Reject path traversal before LittleFS - same surface as fs.write
-        // above, same broker-ACL-only mitigation pre-pathSafe.
-        if (!Shell::pathSafe(path)) {
+        if (!Shell::pathSafe(path)) {  // same attack surface as fs.write
           resp["ok"] = false;
           resp["output"][0] = "Invalid path";
           char respTopic[64];
@@ -1253,8 +1156,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
               buf[got] = '\0';
               resp["length"] = (int)got;
               resp["done"] = (offset + got >= total);
-              // ArduinoJson escapes the string for JSON automatically
-              resp["data"] = buf;
+              resp["data"] = buf;  // ArduinoJson escapes on serialise
               free(buf);
             } else {
               resp["ok"] = false;
@@ -1271,14 +1173,11 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
         if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
         goto cleanup;
       }
-      // No offset/length - fall through to Shell::execute for line-by-line
+      // No offset/length: fall through to Shell::execute.
     }
 
-    // Special case: cert.set - per-device mTLS client cert/key push.
-    // Payload: "<type>\n<PEM content>" where type is "client_cert" or
-    // "client_key". Writes to NVS (survives factory reset of config.json).
-    // cert.apply (non-binary command) disconnects MQTT and reconnects with
-    // mTLS once both halves are present.
+    // cert.set: payload = "<type>\n<PEM>" (type: client_cert|client_key).
+    // Stored in NVS; survives factory reset. cert.apply reconnects with mTLS.
     if (strcmp(cmd, "cert.set") == 0 && payload && plen > 0) {
       JsonDocument resp;
       resp["cmd"] = cmd;
@@ -1300,7 +1199,6 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
           resp["ok"] = false;
           resp["output"][0] = "PEM too large (>4000 B)";
         } else if (strcmp(type, "client_cert") == 0) {
-          // Null-terminate a copy; NVS putString needs a C string.
           char* buf = (char*)malloc(pemLen + 1);
           if (!buf) {
             resp["ok"] = false;
@@ -1322,11 +1220,9 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
             memcpy(buf, pem, pemLen);
             buf[pemLen] = '\0';
             bool ok = storeClientCert(nullptr, buf);
-            // Zero the heap copy of the private key before free - leaving
-            // it lingering in heap means any future feature that dumps /
-            // inspects heap (debug command, crash uploader, remote heap
-            // inspector) leaks the key. mbedtls_platform_zeroize is not
-            // optimised away by the compiler.
+            // Zeroize before free: a lingering key in heap can surface via
+            // debug commands or crash dumps. mbedtls_platform_zeroize is
+            // not optimised away by the compiler.
             mbedtls_platform_zeroize(buf, pemLen + 1);
             free(buf);
             resp["ok"] = ok;
@@ -1346,21 +1242,10 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
       goto cleanup;
     }
 
-    // Build command line: "<cmd> <payload>". An empty JSON object payload
-    // is treated as no-arg - the platform side substitutes "{}" for empty
-    // payloads as a SIM7080G workaround (empty SMSUB URCs get silently
-    // dropped on cellular), and Shell command handlers should not see
-    // that substitution as a literal argument.
-    //
-    // Contract for new MQTT CLI commands: a command reached here goes
-    // through Shell::execute as a flat "<cmd> <payload>" string. It must
-    // therefore either (a) take its payload as plain space-delimited
-    // args, or (b) accept "{}" / a req_id-only envelope as a valid
-    // no-arg invocation. A command that needs a STRUCTURED JSON payload
-    // cannot use this path - "{}" would be swallowed as no-arg and any
-    // other JSON passed verbatim as a single garbage arg. Such commands
-    // must be added as a special-case binary-payload handler ABOVE this
-    // point (see cert.set / the offset/length file-read block).
+    // Build "<cmd> <payload>" for Shell::execute. "{}" is a no-arg sentinel
+    // (SIM7080G drops empty SMSUB URCs; platform substitutes "{}") and
+    // req_id-only envelopes are also no-arg. Commands needing structured
+    // JSON cannot use this path - add them as special cases above.
     char line[1024];
     bool isEmptyJson =
       payload && plen == 2 && payload[0] == '{' && payload[1] == '}';
@@ -1368,24 +1253,34 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
     // the envelope is purely for correlation, not arguments. Without
     // this the envelope JSON would be passed verbatim as a literal arg
     // and Shell command parsers would see it as garbage.
+    int lineN;
     if (payload && plen > 0 && !isEmptyJson && !reqIdOnlyPayload) {
-      snprintf(line, sizeof(line), "%s %s", cmd, payload);
+      lineN = snprintf(line, sizeof(line), "%s %s", cmd, payload);
     } else {
-      snprintf(line, sizeof(line), "%s", cmd);
+      lineN = snprintf(line, sizeof(line), "%s", cmd);
+    }
+    if (lineN < 0 || (size_t)lineN >= sizeof(line)) {
+      // cmd + payload exceeds the 1024-byte shell line buffer; report and
+      // bail out rather than silently truncating the command string.
+      JsonDocument resp;
+      resp["cmd"] = cmd;
+      if (hasReqId) resp["req_id"] = reqId;
+      resp["ok"] = false;
+      resp["output"][0] = "Command line too long for shell - use chunked variant";
+      char respTopic[64];
+      snprintf(respTopic, sizeof(respTopic), "%s/cli/response", prefix);
+      size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
+      char* rp = (char*)malloc(bufSz);
+      if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
+      goto cleanup;
     }
 
-    // Execute through Shell and collect output, paginating the response so
-    // a command that produces more output than fits in one cli/response
-    // payload (fs.ls on a large SD dir, help, module dumps) is not silently
-    // truncated by serializeJson. The output sink measures the running JSON
-    // size; when the next line would overflow the publish buffer it ships
-    // the current page with more=true and starts a fresh one. The final
-    // page carries more=false. Single-page output - the common case - is
-    // page 0 / more=false, the same shape any consumer that ignores the
-    // new fields already sees.
+    // Paginate: when the next output line would overflow the publish buffer,
+    // ship with more=true and start a fresh page. Final page is more=false.
+    // Single-page (common case) is page 0/more=false, same shape old
+    // consumers already handle.
     size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
-    // Headroom for the envelope serializeJson writes around the output
-    // array (cmd, req_id, ok, page, more keys) plus the trailing NUL.
+    // Headroom for envelope keys (cmd, req_id, ok, page, more) + NUL.
     const size_t PAGE_MARGIN = 160;
     size_t pageLimit = bufSz > PAGE_MARGIN ? bufSz - PAGE_MARGIN : bufSz / 2;
 
@@ -1403,8 +1298,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
 
     auto publishPage = [&](bool more) {
       resp["more"] = more;
-      // Re-read prefix every publish - config.reload mid-command may have
-      // invalidated it, and a multi-page command spans more wall time.
+      // Re-read prefix: config.reload mid-command invalidates the old pool.
       JsonObject cfgAfter = Config::get();
       const char* pfxAfter = cfgAfter["mqtt"]["topic_prefix"] | "thesada/node";
       char respTopic[64];
@@ -1420,9 +1314,8 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
     JsonArray output = startPage();
 
     Shell::execute(line, [&](const char* outLine) {
-      // strlen + slack covers ASCII shell output (the common path); a
-      // pathological line full of escaped bytes still publishes, it just
-      // risks one truncated page rather than dropping silently.
+      // +8 slack covers ASCII output; pathological escape-heavy lines may
+      // truncate one page rather than drop silently.
       size_t lineCost = strlen(outLine) + 8;
       if (output.size() > 0 && measureJson(resp) + lineCost > pageLimit) {
         publishPage(true);
@@ -1436,16 +1329,14 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
   }
 
 cleanup:
-  // Payload is owned by the std::function capture in the Shell ring slot;
-  // it gets released when the slot is reset on drain. Nothing to free here.
   return;
 }
 
 // ---------------------------------------------------------------------------
 
-// Clear subscriptions and re-register core MQTT topics (cli/#, cmd/ota)
-// with the current config prefix. Called after config.reload when network
-// keys changed. Does NOT re-register EventBus handlers or reload TLS certs.
+// Re-register core subscriptions (cli/#, OTA) under the current prefix.
+// Called after config.reload when mqtt.topic_prefix changed. Does not
+// re-register EventBus handlers or reload TLS certs.
 void MQTTClient::reinitSubscriptions() {
   for (int i = 0; i < MQTT_MAX_SUBS; i++) _subs[i].active = false;
   _subCount = 0;
@@ -1455,8 +1346,6 @@ void MQTTClient::reinitSubscriptions() {
   char cliTopic[64];
   snprintf(cliTopic, sizeof(cliTopic), "%s/cli/#", prefix);
 
-  // Same Shell::enqueueDeferred path as begin()'s subscribe so config.reload
-  // does not split CLI dispatch between two mechanisms.
   MQTTClient::subscribe(cliTopic, [](const char* topic, const char* payload) {
     JsonObject  cfgInner    = Config::get();
     const char* prefixInner = cfgInner["mqtt"]["topic_prefix"] | "thesada/node";
@@ -1489,7 +1378,6 @@ void MQTTClient::reinitSubscriptions() {
   _reinitPending = true;
 }
 
-// Re-subscribe all active topics after reconnect
 void MQTTClient::resubscribeAll() {
   for (uint8_t i = 0; i < _subCount; i++) {
     if (!_subs[i].active) continue;
@@ -1502,7 +1390,6 @@ void MQTTClient::resubscribeAll() {
 
 // ---------------------------------------------------------------------------
 
-// Publish Home Assistant MQTT discovery configs for all sensors
 void MQTTClient::publishDiscovery() {
   JsonObject cfg = Config::get();
   bool enabled = cfg["mqtt"]["ha_discovery"] | true;
@@ -1515,19 +1402,15 @@ void MQTTClient::publishDiscovery() {
   const char* devName = cfg["device"]["friendly_name"] | cfg["device"]["name"] | "Thesada Node";
   const char* devId = cfg["device"]["name"] | "thesada_node";
 
-  // Availability topic
   char availTopic[64];
   snprintf(availTopic, sizeof(availTopic), "%s/status", prefix);
 
-  // Helper: build slug from name (lowercase, underscores)
   auto makeSlug = [](const char* name, char* slug, size_t sz) {
     strncpy(slug, name, sz - 1);
     slug[sz - 1] = '\0';
     for (char* p = slug; *p; p++) { if (*p == ' ') *p = '_'; *p = tolower(*p); }
   };
 
-  // Helper: publish a single discovery config (retained).
-  // Uses per-sensor state topics with simple {{value}} template.
   auto disc = [&](const char* component, const char* uid, const char* name,
                   const char* stateTopic,
                   const char* unit, const char* devClass, const char* stateClass,
@@ -1555,17 +1438,14 @@ void MQTTClient::publishDiscovery() {
     char payload[640];
     serializeJson(doc, payload, sizeof(payload));
     publishRetained(topic, payload);
-    // Drain TCP buffer between retained publishes. Without this, small
-    // MQTT buffers (CYD 1024B) overflow and spam EAGAIN socket errors.
-    // Cellular forwarder serializes via ATGuard so the loop()/yield is a
-    // no-op on that path but harmless.
+    // Drain TCP between retained publishes; CYD 1024 B buffers overflow
+    // without this and spam EAGAIN. No-op but harmless on cellular path.
     if (_client.connected()) _client.loop();
     yield();
   };
 
   char slug[32], uid[48], stBuf[96];
 
-  // -- Temperature sensors --
   JsonArray sensors = cfg["temperature"]["sensors"].as<JsonArray>();
   if (sensors) {
     const char* tunit = cfg["temperature"]["unit"] | "C";
@@ -1579,19 +1459,16 @@ void MQTTClient::publishDiscovery() {
     }
   }
 
-  // -- ADS1115 channels --
   JsonArray channels = cfg["ads1115"]["channels"].as<JsonArray>();
   if (channels) {
     for (JsonObject ch : channels) {
       const char* cname = ch["name"] | "unknown";
       makeSlug(cname, slug, sizeof(slug));
 
-      // Current (A)
       snprintf(uid, sizeof(uid), "%s_%s_current", devId, slug);
       snprintf(stBuf, sizeof(stBuf), "%s/sensor/current/%s", prefix, slug);
       disc("sensor", uid, cname, stBuf, "A", "current", "measurement");
 
-      // Power (W)
       char pname[64];
       snprintf(pname, sizeof(pname), "%s Power", cname);
       snprintf(uid, sizeof(uid), "%s_%s_power", devId, slug);
@@ -1600,7 +1477,6 @@ void MQTTClient::publishDiscovery() {
     }
   }
 
-  // -- Battery --
   bool battEnabled = cfg["battery"]["enabled"] | true;
   if (battEnabled) {
     snprintf(uid, sizeof(uid), "%s_battery_percent", devId);
@@ -1616,7 +1492,6 @@ void MQTTClient::publishDiscovery() {
     disc("sensor", uid, "Battery Charge State", stBuf, "", "", "");
   }
 
-  // -- WiFi diagnostics (disabled by default in HA) --
   snprintf(uid, sizeof(uid), "%s_wifi_rssi", devId);
   snprintf(stBuf, sizeof(stBuf), "%s/sensor/wifi/rssi", prefix);
   disc("sensor", uid, "WiFi RSSI", stBuf, "dBm", "signal_strength", "measurement", "diagnostic");
@@ -1629,7 +1504,6 @@ void MQTTClient::publishDiscovery() {
   snprintf(stBuf, sizeof(stBuf), "%s/sensor/wifi/ip", prefix);
   disc("sensor", uid, "WiFi IP", stBuf, "", "", "", "diagnostic");
 
-  // Publish WiFi stats now
   {
     char t[96], v[32];
     snprintf(t, sizeof(t), "%s/sensor/wifi/rssi", prefix);
@@ -1644,7 +1518,6 @@ void MQTTClient::publishDiscovery() {
   }
 
 
-  // -- Heap + PSRAM diagnostics --
   snprintf(uid, sizeof(uid), "%s_heap_free", devId);
   snprintf(stBuf, sizeof(stBuf), "%s/sensor/heap/free", prefix);
   disc("sensor", uid, "Free Heap", stBuf, "B", "", "measurement", "diagnostic");
@@ -1665,7 +1538,6 @@ void MQTTClient::publishDiscovery() {
   snprintf(stBuf, sizeof(stBuf), "%s/sensor/uptime", prefix);
   disc("sensor", uid, "Uptime", stBuf, "s", "duration", "total_increasing", "diagnostic");
 
-  // Publish first heap sample immediately so HA has values on discovery.
   publishHeapStats();
 
   Log::info(TAG, "HA discovery published");
@@ -1673,13 +1545,10 @@ void MQTTClient::publishDiscovery() {
 
 // ---------------------------------------------------------------------------
 
-// Publish free heap, min free heap, max alloc block, free PSRAM, and
-// uptime to <prefix>/sensor/{heap,uptime}/*. Called on a 5 min timer
-// from loop() and once from publishDiscovery() for immediate HA
-// visibility. Last sampled free heap is cached in _lastHeapFree for
-// alert tagging via currentFreeHeap(). Routes through the static
-// publish() bus so cellular-only deployments get the same telemetry
-// (publish() picks WiFi or cellular forwarder based on s_fallbackPublishing).
+// Publish heap/PSRAM/uptime telemetry. Called on a 5 min timer and once
+// from publishDiscovery(). Caches free heap in _lastHeapFree for alert
+// tagging. Routes through publish() so cellular deployments get the same
+// telemetry.
 void MQTTClient::publishHeapStats() {
   if (!_client.connected() && !s_fallbackPublishing) return;
 
@@ -1717,10 +1586,8 @@ void MQTTClient::publishHeapStats() {
   snprintf(value, sizeof(value), "%lu", (unsigned long)(millis() / 1000));
   publish(topic, value);
 
-  // WiFi diagnostics. Only meaningful when WiFi is the active transport;
-  // cellular-only deployments skip these. publishDiscovery seeds them once
-  // at MQTT connect, but with a stable session there is no further refresh,
-  // so dashboards drift stale. Re-publish on the same 5 min trigger as heap.
+  // WiFi diagnostics only. publishDiscovery seeds them on connect; without
+  // this refresh they drift stale during long stable sessions.
   if (WiFi.status() == WL_CONNECTED) {
     snprintf(topic, sizeof(topic), "%s/sensor/wifi/rssi", prefix);
     snprintf(value, sizeof(value), "%d", (int)WiFi.RSSI());
@@ -1738,13 +1605,8 @@ void MQTTClient::publishHeapStats() {
 
 // ---------------------------------------------------------------------------
 
-// Publish a retained JSON blob to <prefix>/info describing the firmware and
-// hardware: version, chip model/rev, board flag, MAC, PSRAM presence, build
-// timestamp. Called once per successful reconnect from connect(). Retained
-// so a fresh MQTT subscriber gets the device metadata immediately without
-// waiting for the next boot.
-// Compute SHA256 hex digest of a string. Output buffer must be >= 65 bytes.
-// in: data, length, output buffer. out: none (writes hex string to out).
+// SHA256 hex digest of a buffer.
+// in: data, len, out (>= 65 bytes). out: none.
 static void sha256Hex(const char* data, size_t len, char* out) {
   uint8_t hash[32];
   mbedtls_sha256_context ctx;
@@ -1757,8 +1619,8 @@ static void sha256Hex(const char* data, size_t len, char* out) {
   out[64] = '\0';
 }
 
-// Compute SHA256 hex digest of a LittleFS file. Returns empty hash if missing.
-// in: file path, output buffer (>= 65 bytes). out: none.
+// SHA256 hex digest of a LittleFS file. Returns empty-string hash if missing.
+// in: path, out (>= 65 bytes). out: none.
 static void sha256File(const char* path, char* out) {
   File f = LittleFS.open(path, "r");
   if (!f) {
@@ -1782,8 +1644,6 @@ static void sha256File(const char* path, char* out) {
 }
 
 void MQTTClient::publishDeviceInfo() {
-  // No transport gate here - publishRetained handles WiFi-vs-cellular
-  // routing. Drops only if neither transport is available.
   if (!_client.connected() && !s_fallbackPublishing) return;
 
   JsonObject cfg = Config::get();
@@ -1820,14 +1680,9 @@ void MQTTClient::publishDeviceInfo() {
   psram = psramFound();
 #endif
 
-  // Compute config + script hashes for drift detection. config_hash MUST
-  // match what an external consumer gets when it sha256s /config.json
-  // raw bytes via /api/config (or any other channel that reads the file).
-  // Re-serialising Config::get() produced the compact-canonical form
-  // (no whitespace, ArduinoJson default order) which never matched the
-  // raw-file hash - drift detection sat broken regardless of when this
-  // payload was republished. Hash the file directly so on-disk content
-  // is the single source of truth.
+  // Hash the raw files, not a re-serialised Config::get(). ArduinoJson
+  // compact form never matched the on-disk bytes, making drift detection
+  // permanently broken. File hash = single source of truth.
   char configHash[65], mainHash[65], rulesHash[65];
   sha256File("/config.json", configHash);
   sha256File("/scripts/main.lua", mainHash);
@@ -1867,8 +1722,7 @@ void MQTTClient::publishDeviceInfo() {
 
 // ---------------------------------------------------------------------------
 
-// Returns the most recently sampled free heap (from the 5 min publish), or
-// a live read if the sampler has not run yet. Used by alert tagging.
+// Most-recently-sampled free heap, or live read if sampler has not run yet.
 uint32_t MQTTClient::currentFreeHeap() {
   if (_lastHeapFree > 0) return _lastHeapFree;
   return ESP.getFreeHeap();
@@ -1876,7 +1730,6 @@ uint32_t MQTTClient::currentFreeHeap() {
 
 // ---------------------------------------------------------------------------
 
-// Add a message to the offline queue, dropping oldest if full
 void MQTTClient::enqueue(const char* topic, const char* payload) {
   if (_queueCount == MQTT_QUEUE_SIZE) {
     Log::warn(TAG, "Queue full - dropping oldest message");
@@ -1901,7 +1754,6 @@ void MQTTClient::enqueue(const char* topic, const char* payload) {
 
 // ---------------------------------------------------------------------------
 
-// Send all queued messages after reconnecting
 void MQTTClient::flushQueue() {
   while (_queueCount > 0) {
     MQTTMessage& msg = _queue[_queueHead];
@@ -1919,15 +1771,12 @@ void MQTTClient::flushQueue() {
 
 // ---------------------------------------------------------------------------
 
-// Return whether the MQTT client is currently connected
 bool MQTTClient::connected() {
-  // _client is the WiFi-path PubSubClient only. On cellular fallback the
-  // MQTT session runs through the forwarder, so s_fallbackPublishing is
-  // the connected signal there - same pattern the publish guards use.
+  // _client is WiFi only. s_fallbackPublishing is the connected signal when
+  // cellular has taken over (same pattern as the publish guards).
   return _client.connected() || s_fallbackPublishing;
 }
 
-// Return the wall-clock time of the last successful publish
 time_t MQTTClient::lastPublishTime() {
   return _lastPublishTime;
 }
@@ -1936,12 +1785,9 @@ time_t MQTTClient::lastPublishTime() {
 // Per-device mTLS client certificate - NVS storage
 // ---------------------------------------------------------------------------
 
-// Store PEM-encoded client cert and/or key in NVS.
-// Pass nullptr or empty string to skip a half (lets cert + key arrive in
-// separate cli/cert.set messages). Returns false on size violation or
-// NVS write failure.
-// in:  certPEM, keyPEM (PEM strings or nullptr/empty to skip)
-// out: true on success
+// Store cert and/or key in NVS. Pass nullptr/empty to skip a half so cert
+// and key can arrive in separate cert.set messages.
+// in: certPEM, keyPEM (or nullptr/empty to skip). out: true on success.
 bool MQTTClient::storeClientCert(const char* certPEM, const char* keyPEM) {
   Preferences prefs;
   if (!prefs.begin(CERT_NS, false)) {
@@ -1973,10 +1819,8 @@ bool MQTTClient::storeClientCert(const char* certPEM, const char* keyPEM) {
   return ok;
 }
 
-// Load client cert + key from NVS into caller-provided buffers.
-// Both buffers must be at least CERT_MAX_LEN bytes.
-// in:  cert, key buffers (>= maxLen bytes each), maxLen
-// out: true only if BOTH cert and key are present and fit in buffers
+// Load cert + key from NVS.
+// in: cert, key (>= maxLen each), maxLen. out: true only if both are present.
 bool MQTTClient::loadClientCert(char* cert, char* key, size_t maxLen) {
   if (!cert || !key || maxLen < CERT_MAX_LEN) return false;
   Preferences prefs;
@@ -1987,10 +1831,9 @@ bool MQTTClient::loadClientCert(char* cert, char* key, size_t maxLen) {
   return certLen > 0 && keyLen > 0;
 }
 
-// Erase client cert + key from NVS. Safe to call when absent.
-// Fires the cert-cleared hook after the rows are gone so cellular (or
-// any other transport) can drop its cached upload + active session.
-// out: true if both keys were cleared (or were already absent)
+// Erase cert + key from NVS. Fires the cleared hook so cellular drops its
+// cached cert and active session. Safe to call when absent.
+// out: true (or already absent).
 bool MQTTClient::clearClientCert() {
   Preferences prefs;
   if (!prefs.begin(CERT_NS, false)) return false;
@@ -2001,28 +1844,23 @@ bool MQTTClient::clearClientCert() {
   return true;
 }
 
-// Register a callback fired from clearClientCert. Idempotent; pass
-// nullptr to drop the hook. See header for full contract.
 void MQTTClient::setOnClientCertCleared(std::function<void()> fn) {
   _onCertClearedHook = fn;
 }
 
-// True if both cert and key are present in NVS (non-zero length).
 bool MQTTClient::hasClientCert() {
   Preferences prefs;
   if (!prefs.begin(CERT_NS, true)) return false;
-  // Stored as strings via putString - isKey is enough. getBytesLength
-  // is for NVS_TYPE_BLOB and logs an error when queried on a string key.
+  // isKey is correct for NVS_TYPE_STR. getBytesLength targets NVS_TYPE_BLOB
+  // and logs an error when called on a string key.
   bool ok = prefs.isKey(CERT_KEY_CERT) && prefs.isKey(CERT_KEY_KEY);
   prefs.end();
   return ok;
 }
 
-// Parse stored cert PEM and fill caller-allocated buffers with metadata.
-// Never touches the private key. Uses mbedtls directly (already linked
-// for TLS), no extra deps.
-// in:  cn, serial, notBefore, notAfter buffers (>= maxLen each), maxLen >= 128
-// out: true if cert loaded and parsed, false if missing or malformed
+// Parse stored cert PEM and extract metadata. Never touches the private key.
+// in: cn, serial, notBefore, notAfter (>= maxLen each), maxLen >= 64.
+// out: true if parsed, false if missing or malformed.
 bool MQTTClient::getCertInfo(char* cn, char* serial, char* notBefore, char* notAfter, size_t maxLen) {
   if (!cn || !serial || !notBefore || !notAfter || maxLen < 64) return false;
 
@@ -2047,7 +1885,6 @@ bool MQTTClient::getCertInfo(char* cn, char* serial, char* notBefore, char* notA
     return false;
   }
 
-  // Subject DN - mbedtls returns "CN=foo, O=bar, ..." - extract CN
   char subj[256];
   mbedtls_x509_dn_gets(subj, sizeof(subj), &crt.subject);
   const char* cnp = strstr(subj, "CN=");
@@ -2060,7 +1897,6 @@ bool MQTTClient::getCertInfo(char* cn, char* serial, char* notBefore, char* notA
     snprintf(cn, maxLen, "(no CN)");
   }
 
-  // Serial - hex bytes joined
   char* sp = serial;
   char* se = serial + maxLen - 1;
   for (size_t i = 0; i < crt.serial.len && sp + 2 < se; i++) {
@@ -2068,7 +1904,6 @@ bool MQTTClient::getCertInfo(char* cn, char* serial, char* notBefore, char* notA
   }
   *sp = '\0';
 
-  // Validity - YYYY-MM-DDTHH:MM:SSZ
   snprintf(notBefore, maxLen, "%04d-%02d-%02dT%02d:%02d:%02dZ",
            crt.valid_from.year, crt.valid_from.mon, crt.valid_from.day,
            crt.valid_from.hour, crt.valid_from.min, crt.valid_from.sec);

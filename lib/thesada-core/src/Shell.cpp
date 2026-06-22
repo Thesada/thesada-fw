@@ -1,10 +1,9 @@
 // thesada-fw - Shell.cpp
-// Interactive CLI shell. All commands output through a callback so the
-// same implementation works for serial and WebSocket transports.
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "Shell.h"
 #include "Config.h"
+#include "Console.h"
 #include "Log.h"
 #include "WiFiManager.h"
 #include "MQTTClient.h"
@@ -51,7 +50,6 @@ static portMUX_TYPE _shellRingMux = portMUX_INITIALIZER_UNLOCKED;
 // Parser
 // ---------------------------------------------------------------------------
 
-// Tokenize a command line into argv-style arguments
 int Shell::parse(const char* line, char** argv, int maxArgs) {
   strncpy(_parseBuf, line, sizeof(_parseBuf) - 1);
   _parseBuf[sizeof(_parseBuf) - 1] = '\0';
@@ -69,14 +67,12 @@ int Shell::parse(const char* line, char** argv, int maxArgs) {
 // Command registry
 // ---------------------------------------------------------------------------
 
-// Register a named command with help text and handler
 void Shell::registerCommand(const char* name, const char* help, ShellCommand handler) {
   if (_commandCount >= MAX_COMMANDS) return;
   _commands[_commandCount] = {name, help, handler};
   _commandCount++;
 }
 
-// Parse and dispatch a command line to the matching handler
 void Shell::execute(const char* line, ShellOutput out) {
   if (!line || strlen(line) == 0) return;
 
@@ -190,10 +186,8 @@ void Shell::loop() {
   }
 }
 
-// Drain Serial (USB-CDC on debug envs, UART0 on production) one line at
-// a time and dispatch via execute(). Single console - safe to share buffer
-// state across callers because there is only one host typing at the
-// other end.
+// Single console - safe to share static buffer state because there is only
+// one host typing at the other end.
 void Shell::pumpConsole() {
   static char  buf[Shell::DEFERRED_LINE_LEN];
   static int   pos = 0;
@@ -202,7 +196,8 @@ void Shell::pumpConsole() {
     if (c == '\n' || c == '\r') {
       buf[pos] = '\0';
       if (pos > 0) {
-        Shell::execute(buf, [](const char* line) { Serial.println(line); });
+        Shell::execute(buf, [](const char* line) { Console::reply(line); });
+        Console::endReply();
       }
       pos = 0;
     } else if (pos < (int)sizeof(buf) - 1) {
@@ -211,7 +206,6 @@ void Shell::pumpConsole() {
   }
 }
 
-// Print all registered commands with their help text
 void Shell::listCommands(ShellOutput out) {
   for (int i = 0; i < _commandCount; i++) {
     char line[128];
@@ -316,8 +310,6 @@ void Shell::printHelp(const char* filter, ShellOutput out) {
 // Filesystem commands
 // ---------------------------------------------------------------------------
 
-// File-scope forwarders so the existing cmd_* call sites keep working
-// without qualifying every line as `Shell::resolveFS(...)`.
 static FS* resolveFS(const char* path) { return Shell::resolveFS(path); }
 static const char* stripPrefix(const char* path) {
   return Shell::stripPrefix(path);
@@ -379,7 +371,6 @@ bool Shell::registerFS(const char* prefix, fs::FS* fs, FSDfFn dfUsed, FSDfFn dfT
   return true;
 }
 
-// Print one line per registered FS mount prefix. See Shell.h.
 void Shell::listMounts(ShellOutput out) {
   char line[64];
   for (int i = 0; i < _fsMountCount; i++) {
@@ -388,9 +379,8 @@ void Shell::listMounts(ShellOutput out) {
   }
 }
 
-// Print a df line for every registered mount that advertises disk-usage
-// support. Member function so it can reach the private FSMount registry;
-// cmd_df (a free function) handles LittleFS inline then calls this.
+// Member function so it can reach the private FSMount registry;
+// cmd_df handles LittleFS inline then calls this.
 void Shell::printRegisteredDf(ShellOutput out) {
   char line[128];
   for (int i = 0; i < _fsMountCount; i++) {
@@ -410,9 +400,8 @@ void Shell::printRegisteredDf(ShellOutput out) {
   }
 }
 
-// Validate a filesystem path before any LittleFS call. Centralised so every
-// transport (Shell-over-serial/WS, HTTP /api/file, MQTT CLI binary handlers)
-// shares one policy. See Shell::pathSafe doc in Shell.h.
+// Centralised so every transport (Shell-over-serial/WS, HTTP /api/file,
+// MQTT CLI binary handlers) shares one policy. See Shell::pathSafe in Shell.h.
 // in:  null-terminated path. out: true if safe.
 bool Shell::pathSafe(const char* path) {
   if (!path || !*path) return false;
@@ -422,7 +411,6 @@ bool Shell::pathSafe(const char* path) {
   return true;
 }
 
-// List files in a directory
 static void cmd_ls(int argc, char** argv, ShellOutput out) {
   const char* path = (argc > 1) ? argv[1] : "/";
   if (!Shell::pathSafe(path)) { out("Invalid path"); return; }
@@ -470,7 +458,6 @@ static void cmd_ls(int argc, char** argv, ShellOutput out) {
   }
 }
 
-// Print file contents line by line
 static void cmd_cat(int argc, char** argv, ShellOutput out) {
   if (argc < 2) { out("Usage: cat <path>"); return; }
   if (!Shell::pathSafe(argv[1])) { out("Invalid path"); return; }
@@ -488,7 +475,6 @@ static void cmd_cat(int argc, char** argv, ShellOutput out) {
   f.close();
 }
 
-// Remove a file from the filesystem
 static void cmd_rm(int argc, char** argv, ShellOutput out) {
   if (argc < 2) { out("Usage: rm <path>"); return; }
   if (!Shell::pathSafe(argv[1])) { out("Invalid path"); return; }
@@ -517,7 +503,6 @@ static void cmd_write(int argc, char** argv, ShellOutput out) {
 
   bool append = (strcasecmp(argv[0], "fs.append") == 0);
 
-  // Reconstruct content from remaining args.
   String content;
   for (int i = 2; i < argc; i++) {
     if (i > 2) content += " ";
@@ -658,13 +643,9 @@ static void cmd_config_get(int argc, char** argv, ShellOutput out) {
   }
 }
 
-// Set a config value by dot-notation key and save to flash
 static void cmd_config_set(int argc, char** argv, ShellOutput out) {
-  // config.set <key> <value>
-  // This modifies the in-memory config. Use config.save to persist.
   if (argc < 3) { out("Usage: config.set <key> <value>  (then config.save to persist)"); return; }
 
-  // Reconstruct value from remaining args, strip surrounding quotes.
   String value;
   for (int i = 2; i < argc; i++) {
     if (i > 2) value += " ";
@@ -675,7 +656,6 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
     value = value.substring(1, value.length() - 1);
   }
 
-  // Read current config file, parse, modify, and update in-memory.
   if (!LittleFS.exists("/config.json")) { out("config.json not found"); return; }
   File f = LittleFS.open("/config.json", "r");
   if (!f) { out("Failed to read config.json"); return; }
@@ -686,12 +666,10 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
   DeserializationError err = deserializeJson(doc, json);
   if (err) { out("JSON parse error in config.json"); return; }
 
-  // Walk the dot path and set the value.
   char key[128];
   strncpy(key, argv[1], sizeof(key) - 1);
   key[sizeof(key) - 1] = '\0';
 
-  // Split into parent path + final key.
   char* lastDot = strrchr(key, '.');
   if (lastDot) {
     *lastDot = '\0';
@@ -793,7 +771,6 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
       return;
     }
 
-    // Delete key if value is "--delete"
     if (value == "--delete") {
       if (parent.is<JsonObject>()) {
         parent[finalKey].clear();
@@ -806,9 +783,8 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
       goto save;
     }
 
-    // JSON literal? Parse and assign as a Variant so config.set
-    // wifi.networks [{"ssid":"..."}] stores a real JsonArray, not a
-    // stringified blob (the prior fallthrough behaviour).
+    // Assign as a Variant so config.set wifi.networks [{"ssid":"..."}] stores
+    // a real JsonArray, not a stringified blob (prior fallthrough behaviour).
     {
       String trimmed = value;
       trimmed.trim();
@@ -825,7 +801,6 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
       }
     }
 
-    // Try to detect type: number, boolean, or string.
     if (value == "true") target.set(true);
     else if (value == "false") target.set(false);
     else {
@@ -849,14 +824,12 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
   }
 
   save:
-  // Write back to LittleFS.
   File wf = LittleFS.open("/config.json", "w");
   if (!wf) { out("Failed to write config.json"); return; }
   serializeJsonPretty(doc, wf);
   wf.close();
 
-  // Refresh in-memory config from flash so config.dump shows the new value.
-  // This does NOT trigger MQTT reconnect - that requires config.reload.
+  // Does NOT trigger MQTT reconnect - that requires config.reload.
   Config::load();
 
   char msg[128];
@@ -868,10 +841,8 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
   out(msg);
 }
 
-// Save the in-memory config to flash
+// For programmatic changes to Config::get() that bypass config.set.
 static void cmd_config_save(int argc, char** argv, ShellOutput out) {
-  // Config is already saved by config.set. This is for manual save after
-  // programmatic changes to Config::get() that bypass config.set.
   JsonObject cfg = Config::get();
   File f = LittleFS.open("/config.json", "w");
   if (!f) { out("Failed to write config.json"); return; }
@@ -926,7 +897,6 @@ static void cmd_config_reload(int argc, char** argv, ShellOutput out) {
   out(msg);
 }
 
-// Print the full config as pretty-printed JSON
 static void cmd_config_dump(int argc, char** argv, ShellOutput out) {
   JsonObject cfg = Config::get();
   String json;
@@ -938,7 +908,6 @@ static void cmd_config_dump(int argc, char** argv, ShellOutput out) {
 // Network commands
 // ---------------------------------------------------------------------------
 
-// Show WiFi connection details and network info
 static void cmd_ifconfig(int argc, char** argv, ShellOutput out) {
   char line[128];
 
@@ -1019,14 +988,11 @@ static void cmd_ping(int argc, char** argv, ShellOutput out) {
   out("No transport up - cannot resolve");
 }
 
-// Show NTP status or manually set system time
 static void cmd_ntp(int argc, char** argv, ShellOutput out) {
   char line[128];
 
-  // ntp set <epoch> or ntp set <ISO8601>
   if (argc >= 3 && strcmp(argv[1], "set") == 0) {
     time_t epoch = 0;
-    // Try epoch first (all digits).
     bool isEpoch = true;
     for (const char* p = argv[2]; *p; p++) {
       if (*p < '0' || *p > '9') { isEpoch = false; break; }
@@ -1105,10 +1071,8 @@ static void cmd_ntp(int argc, char** argv, ShellOutput out) {
   out(now > 1700000000UL ? "  log timestamps: active" : "  log timestamps: pending sync");
 }
 
-// Show MQTT connection status and broker info
-// Print MQTT connection state, broker, prefix, and the full subscription table
-// (slot index, topic, active flag). Used to diagnose subscription dispatch
-// issues - e.g. a cmd_topic that silently stopped firing after reconnect.
+// Prints full subscription table (slot, topic, active) to diagnose
+// dispatch issues - e.g. a cmd_topic that silently stopped firing after reconnect.
 static void cmd_mqtt(int argc, char** argv, ShellOutput out) {
   char line[160];
   snprintf(line, sizeof(line), "MQTT: %s", MQTTClient::connected() ? "connected" : "disconnected");
@@ -1276,7 +1240,6 @@ static void cmd_http(int argc, char** argv, ShellOutput out) {
   if (!url) { out("usage: net.http [--insecure] <url>"); return; }
   if (strlen(url) >= HTTP_URL_MAX) { out("url too long"); return; }
 
-  // Parse scheme / host / port / path.
   const char* p     = url;
   uint16_t    port  = 443;
   bool        https = true;
@@ -1375,7 +1338,6 @@ static void cmd_http(int argc, char** argv, ShellOutput out) {
            (unsigned)job->previewLen, via);
   out(msg);
 
-  // Emit the preview line by line so shell output stays clean.
   size_t start = 0;
   for (size_t i = 0; i < job->previewLen; ++i) {
     if (job->preview[i] == '\n' || job->preview[i] == '\r') {
@@ -1513,10 +1475,8 @@ static void cmd_cert_clear(int argc, char** argv, ShellOutput out) {
   }
 }
 
-// Print running + boot + next-update partition info and OTA state. Uses the
-// ESP-IDF esp_ota API directly so it works regardless of whether the Arduino
-// Update wrapper has been touched this boot. Useful for diagnosing rollback
-// state and confirming a freshly-flashed partition is marked valid.
+// Uses the ESP-IDF esp_ota API directly so it works regardless of whether
+// the Arduino Update wrapper has been touched this boot.
 static void cmd_ota_status(int argc, char** argv, ShellOutput out) {
   const esp_partition_t* running = esp_ota_get_running_partition();
   const esp_partition_t* boot    = esp_ota_get_boot_partition();
@@ -1563,9 +1523,7 @@ static void cmd_ota_status(int argc, char** argv, ShellOutput out) {
   out(line);
 }
 
-// Boot count (from RTC-memory survival across deep sleep via SleepManager)
-// plus the last reset reason as a human-readable string. Cheap, no flash
-// reads, safe to call in any state.
+// No flash reads; safe to call in any state.
 static void cmd_boot_info(int argc, char** argv, ShellOutput out) {
   esp_reset_reason_t reason = esp_reset_reason();
   const char* reasonStr = "unknown";
@@ -1594,7 +1552,6 @@ static void cmd_boot_info(int argc, char** argv, ShellOutput out) {
   out(line);
 }
 
-// List all partitions (app + data) with label, type, subtype, offset, size.
 // Uses esp_partition_next iterator - no hardcoded layout assumptions.
 static void cmd_partitions(int argc, char** argv, ShellOutput out) {
   char line[160];
@@ -1617,10 +1574,8 @@ static void cmd_partitions(int argc, char** argv, ShellOutput out) {
   esp_partition_iterator_release(it);
 }
 
-// Dump selected CONFIG_* values from sdkconfig.h that affect OTA + partition
-// + rollback behavior. Used to confirm the device's runtime config matches
-// what the firmware was built against. No hidden state - all macros are
-// evaluated at compile time.
+// All macros evaluated at compile time - confirms runtime build config
+// matches what the firmware was compiled against.
 static void cmd_sdkconfig(int argc, char** argv, ShellOutput out) {
   char line[160];
 
@@ -1677,8 +1632,6 @@ static void cmd_sdkconfig(int argc, char** argv, ShellOutput out) {
 #endif
 }
 
-// Chip revision, cores, flash size, PSRAM size. No hidden state - pure
-// hardware facts, read from esp_chip_info + esp_flash + heap_caps.
 static void cmd_chip_info(int argc, char** argv, ShellOutput out) {
   esp_chip_info_t info;
   esp_chip_info(&info);
@@ -1720,7 +1673,6 @@ static void cmd_chip_info(int argc, char** argv, ShellOutput out) {
 // Module commands
 // ---------------------------------------------------------------------------
 
-// List all modules and their compile-time enabled state
 static void cmd_module_list(int argc, char** argv, ShellOutput out) {
   out("Compiled modules:");
 
@@ -1767,7 +1719,6 @@ static void cmd_module_list(int argc, char** argv, ShellOutput out) {
   #endif
 }
 
-// Show runtime status of each registered module
 static void cmd_module_status(int argc, char** argv, ShellOutput out) {
   for (uint8_t i = 0; i < ModuleRegistry::count(); i++) {
     Module* m = ModuleRegistry::get(i);
@@ -1791,15 +1742,12 @@ static void cmd_module_status(int argc, char** argv, ShellOutput out) {
 // System commands
 // ---------------------------------------------------------------------------
 
-// Reboot the device
 static void cmd_restart(int argc, char** argv, ShellOutput out) {
   out("Restarting...");
   delay(100);
   ESP.restart();
 }
 
-// Show free heap, minimum watermark, and largest allocatable block.
-// Also shows PSRAM stats if PSRAM is present and enabled.
 static void cmd_heap(int argc, char** argv, ShellOutput out) {
   char line[128];
   snprintf(line, sizeof(line), "Free: %lu B  Min: %lu B  Max alloc: %lu B",
@@ -1824,7 +1772,6 @@ static void cmd_heap(int argc, char** argv, ShellOutput out) {
 #endif
 }
 
-// Show device uptime in days, hours, minutes, seconds
 static void cmd_uptime(int argc, char** argv, ShellOutput out) {
   unsigned long s = millis() / 1000;
   char line[48];
@@ -1833,10 +1780,8 @@ static void cmd_uptime(int argc, char** argv, ShellOutput out) {
   out(line);
 }
 
-// Show firmware version, build timestamp, and configured device name.
-// Device name prints on a second line so the identify-dev-ports helper
-// (and any other scripts that only grep the `thesada-fw v...` line) keep
-// working unchanged.
+// Device name prints on a second line so scripts that grep `thesada-fw v...`
+// keep working unchanged.
 static void cmd_version(int argc, char** argv, ShellOutput out) {
   char line[96];
   snprintf(line, sizeof(line), "thesada-fw v%s (%s %s)", FIRMWARE_VERSION, __DATE__, __TIME__);
@@ -1851,25 +1796,14 @@ static void cmd_version(int argc, char** argv, ShellOutput out) {
   out(line);
 }
 
-// Show shell commands. With no arg: collapse dotted commands into
-// category buckets (cell.*, fs.*, etc) and list each bucket once with
-// a count, plus all top-level (no-dot) commands inline. With an arg:
-// expand that bucket only (so `help cell` shows every cell.* command
-// with its description). Avoids the multi-screen wall the flat list
-// became as command count grew.
+// Collapses dotted commands into category buckets to avoid the multi-screen
+// wall the flat list became as command count grew.
 static void cmd_help(int argc, char** argv, ShellOutput out) {
   Shell::printHelp(argc > 1 ? argv[1] : nullptr, out);
 }
 
-// Unified sensors command backed by SensorRegistry. Modules self-register
-// a read callback in their begin(); this handler dispatches by name or
-// iterates all registered entries.
-//
-//   sensors            list registered sensors (name, desc, (disabled))
-//   sensors <name>     run the one-shot read for that sensor
-//   sensors all        run every registered sensor in turn
-//
-// Uniform sensor-read interface for the unified `sensors` CLI.
+// Modules self-register a read callback in begin(); dispatches by name
+// or iterates all. `sensors all` runs every registered sensor in turn.
 static void cmd_sensors(int argc, char** argv, ShellOutput out) {
   if (argc <= 1) {
     char line[96];
@@ -1916,7 +1850,6 @@ static void cmd_sensors(int argc, char** argv, ShellOutput out) {
 // Self-test command
 // ---------------------------------------------------------------------------
 
-// Run diagnostic checks on all core subsystems
 static void cmd_selftest(int argc, char** argv, ShellOutput out) {
   out("=== thesada-fw self-test ===");
   out("");
@@ -2018,11 +1951,27 @@ static void cmd_selftest(int argc, char** argv, ShellOutput out) {
 // Registration
 // ---------------------------------------------------------------------------
 
+// Get/set the serial console mode. Resets to normal on reboot.
+static void cmd_console_mode(int argc, char** argv, ShellOutput out) {
+  if (argc >= 2) {
+    if (strcmp(argv[1], "command") == 0) {
+      Console::setMode(Console::Mode::Command);
+    } else if (strcmp(argv[1], "normal") == 0) {
+      Console::setMode(Console::Mode::Normal);
+    } else {
+      out("Usage: console.mode [normal|command]");
+      return;
+    }
+  }
+  out(Console::mode() == Console::Mode::Command ? "mode: command" : "mode: normal");
+}
+
 // Register all built-in shell commands
 void Shell::registerBuiltins() {
   // System
   registerCommand("help",          "Show categories or expand one (help <cat>)", cmd_help);
   registerCommand("version",       "Firmware version and build",    cmd_version);
+  registerCommand("console.mode",  "Get/set console mode (normal|command)", cmd_console_mode);
   registerCommand("restart",       "Reboot device",                 cmd_restart);
   registerCommand("heap",          "Free heap memory",              cmd_heap);
   registerCommand("uptime",        "Device uptime",                 cmd_uptime);
@@ -2069,7 +2018,6 @@ void Shell::registerBuiltins() {
   registerCommand("module.status", "Module status overview",        cmd_module_status);
 }
 
-// Initialize the shell and register built-in commands
 void Shell::begin() {
   registerBuiltins();
 

@@ -7,7 +7,7 @@
 class Config {
 public:
   static void load();
-  static void save();
+  static bool save();   // false if the on-disk write failed (open or short write)
   static void replace(const char* json);
   static bool set(const char* path, const char* value);
   static JsonObject get();

@@ -4,7 +4,7 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-06-11. Bump the date on every edit.
+Dated 2026-06-21. Bump the date on every edit.
 
 ---
 
@@ -89,6 +89,12 @@ CA-load block; `lib/thesada-core/src/ota_ca_progmem.h`.
 `failed`. Operators see the result of every check without needing serial.
 Silent returns are a regression - any new bailout path in `check()` must
 add a matching `publishOtaRefusal` (or other state) call.
+
+`publishOtaRefusal` must NOT short-circuit on `!connected()`:
+`MQTTClient::publish` queues on the WiFi ring (or routes to the cellular
+forwarder) while the broker is down, so a refusal raised mid-outage is
+still delivered on reconnect. A `connected()` guard there silently drops
+exactly the diagnostic an offline operator needs.
 
 How enforced: code review checks new early-return branches in `check()`.
 Bench test: drive each path via `cli/ota.check` and watch `status/ota`.
@@ -250,6 +256,44 @@ in `WiFiManager.cpp`, `OTAUpdate.cpp`, `Cellular.cpp`, `main.cpp`.
 
 ---
 
+## Serial console output
+
+### All serial console writes go through `Console` under one mutex
+
+Both `Log::write` and the `Shell` serial sink (`pumpConsole`) emit
+through `Console`, which holds a single output mutex. Concurrent writes
+from different tasks (an async log vs a command response) can no longer
+byte-interleave into one mangled line. Boot prints in `main.cpp` use
+`Log::` for the same path.
+
+How enforced: no raw `Serial.print*` for console output - logs go
+through `Log::`, command responses through `Console::reply`.
+
+Source: `lib/thesada-core/src/Console.cpp`, `Console.h`, `Log.cpp`,
+`Shell.cpp::pumpConsole`, `src/main.cpp`.
+
+### Command mode frames each response with a sequence marker
+
+`console.mode command` keeps async logs off the serial console (the ring
+buffer + remote/WS handler still receive them) and ends every command
+response with `\x04CMD-DONE <seq>`. Automated readers rely on the marker
+plus the monotonic seq to delimit responses and discard a late one from a
+timed-out command. Mode resets to normal on reboot and never gates the
+recovery CLI.
+
+`_mode` and `_seq` are read and written only under the Console output
+mutex (`log`, `endReply`, `setMode`, `mode`). A mode flip on the
+main-loop task cannot race a concurrent `Log::write` from another task:
+the gate decision (suppress-in-command-mode) and the frame marker emit
+are atomic with the write they guard, so a log line can never splice
+into a command frame. `endReply` takes the mutex directly rather than
+calling `writeLocked` - the mutex is non-recursive.
+
+Source: `lib/thesada-core/src/Console.cpp::endReply`,
+`Shell.cpp::pumpConsole` / `cmd_console_mode`.
+
+---
+
 ## Concurrency
 
 ### Config and EventBus are single-task only
@@ -399,6 +443,79 @@ publish single fixed-shape responses and are exempt - their output
 is bounded by construction.
 
 Source: `lib/thesada-core/src/MQTTClient.cpp::runCli`.
+
+### The shell command line in `runCli` is never silently truncated
+
+The general path builds the shell input as
+`snprintf(line, sizeof(line), "%s %s", cmd, payload)` into a fixed
+`line[1024]`. The `snprintf` return is captured in `lineN`; if it is
+negative or `>= sizeof(line)` the line would be clipped, so `runCli`
+publishes an error response (`ok: false`, `"Command line too long for
+shell - use chunked variant"`) and bails via `cleanup` instead of
+dispatching a truncated command string to the shell.
+
+Without this, an oversized cmd+payload is silently cut to malformed
+shell input and executed. Today's binary handlers (`fs.write`,
+`cert.set`) intercept before this path, but any future CLI command
+carrying large JSON args would be bitten. This is the input-side
+counterpart to the output-side pagination invariant above.
+
+How enforced: both `snprintf` branches store into `lineN`; the length
+guard runs before the command reaches `Shell::enqueueDeferred`.
+
+Source: `lib/thesada-core/src/MQTTClient.cpp::runCli`.
+
+### `Config::set` rejects a dot-path it cannot store, never truncates it
+
+`config.set` (serial and MQTT cli) copies the dot-path into a fixed
+`buf[128]`. An empty or over-long path is rejected up front
+(`return false`) instead of being truncated: a silent truncation would
+resolve to a *different* key than the operator named and write the
+value there, corrupting config from a remote command. Config-write
+counterpart to the runCli line-length and pagination guards above.
+
+How enforced: the `!path || !*path || !value || strlen(path) >=
+sizeof(buf)` guard runs before the `strncpy` into `buf` (a null `value`
+would also deref in the `strcmp`/`strtod` coercion below). Any new
+fixed-buffer copy of an operator-supplied key adds the same length
+check. The MQTT binary handlers apply the same rule: `fs.write` rejects
+a path that would not fit `path[64]` and `fs.cat` rejects args longer
+than `pbuf[256]`, publishing an error rather than acting on a clipped
+path/range.
+
+Source: `lib/thesada-core/src/Config.cpp::set`,
+`lib/thesada-core/src/MQTTClient.cpp::runCli` (`fs.write`, `fs.cat`).
+
+### `Config::load` leaves a clean doc on a malformed `/config.json`
+
+A deserialize failure clears `_doc` and logs, rather than leaving it
+half-parsed. `Config::get()` then returns an empty object and every
+`cfg[...] | default` read falls back to its default - a corrupt config
+file degrades to defaults, never to garbage values read out of a
+partially-populated document.
+
+Source: `lib/thesada-core/src/Config.cpp::load`.
+
+### `Config::set` / `replace` never report success on a failed persist
+
+`Config::save()` returns `false` when `/config.json` cannot be opened
+or the serialize comes up short of `measureJson` (LittleFS full,
+truncated write). `set()` returns `false` and skips its success log;
+`replace()` logs an error instead of "replaced". A config write that
+did not hit flash must never surface to the operator as applied -
+otherwise a full filesystem silently discards every change while the
+device reports success.
+
+`set()` also rolls the in-memory `_doc` back (via `load()`) when
+`save()` fails, so the mutation it applied before persisting cannot
+linger: a rejected set leaves both flash and `_doc` at the last
+persisted state, never a value that was never written.
+
+How enforced: every caller that persists config checks the `save()`
+return before logging or returning success; a failed persist in a
+mutate-then-save path reloads the persisted state.
+
+Source: `lib/thesada-core/src/Config.cpp::save`, `set`, `replace`.
 
 ### Dashboard / shell HTML output is escaped via the browser's serializer
 

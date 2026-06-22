@@ -18,6 +18,8 @@
 #include <MQTTClient.h>
 #include <OTAUpdate.h>
 #include <Shell.h>
+#include <Log.h>
+#include <Console.h>
 #include <SleepManager.h>
 #include <HeartbeatLED.h>
 #ifdef ENABLE_CELLULAR
@@ -67,9 +69,9 @@ static void logBootCause() {
 
   char line[160];
   snprintf(line, sizeof(line),
-    "[INF][Boot] reset=%s (%d) rtc_core0=%d rtc_core1=%d brownout_total=%lu",
+    "reset=%s (%d) rtc_core0=%d rtc_core1=%d brownout_total=%lu",
     reasonStr, (int)reason, rtc0, rtc1, (unsigned long)brownouts);
-  Serial.println(line);
+  Log::info("Boot", line);
 }
 
 // Return true if WiFi (or the AP fallback) reports a usable link
@@ -100,6 +102,7 @@ void setup() {
   // Don't block waiting for serial - CDC boards hang here without USB host
   uint32_t serialWait = millis();
   while (!Serial && millis() - serialWait < 3000) delay(10);
+  Console::begin();
 
   // Hardware watchdog: reboot if loop() doesn't feed within 30s.
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
@@ -115,7 +118,7 @@ void setup() {
 #endif
   esp_task_wdt_add(NULL);
 
-  Serial.println("[INF][Boot] thesada-fw v" FIRMWARE_VERSION " (" __DATE__ " " __TIME__ ")");
+  Log::info("Boot", "thesada-fw v" FIRMWARE_VERSION " (" __DATE__ " " __TIME__ ")");
   logBootCause();
 
   // Quiet the IDF VFS layer's "file does not exist" ERROR logs. Every
@@ -133,7 +136,7 @@ void setup() {
     _mqttEnabled      = cfg["mqtt"]["enabled"]      | true;
     _otaEnabled       = cfg["ota"]["enabled"]       | true;
     _heartbeatEnabled = cfg["heartbeat"]["enabled"] | true;
-    if (!_wifiEnabled) Serial.println("[INF][Boot] wifi.enabled=false - WiFi skipped, cellular is primary transport");
+    if (!_wifiEnabled) Log::info("Boot", "wifi.enabled=false - WiFi skipped, cellular is primary transport");
   }
 
   // Bring WiFi up. CellularModule registers later via PRIORITY_NETWORK
@@ -162,7 +165,7 @@ void setup() {
 
   SleepManager::begin();
 
-  Serial.println("[INF][Boot] Ready. Type 'help' for commands.");
+  Log::info("Boot", "Ready. Type 'help' for commands.");
 }
 
 void loop() {

@@ -1,8 +1,4 @@
 // thesada-fw - OTAUpdate.h
-// HTTP(S) pull-based OTA with manifest + SHA256 integrity check.
-// Fetches a JSON manifest from a configured URL, compares version,
-// downloads and verifies the binary, then flashes via Update.h.
-// Triggers: periodic interval (configurable) + MQTT command.
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
@@ -10,34 +6,42 @@
 
 class OTAUpdate {
 public:
-  // Call once after WiFi + MQTT are up.
+  // in:  none
+  // out: none
   static void begin();
 
-  // Call every loop(). Handles periodic check timing.
+  // in:  none
+  // out: none
   static void loop();
 
-  // Trigger an immediate OTA check. Called by MQTT handler or manual trigger.
-  // `force=true` bypasses isNewer() so the device re-flashes whatever the
-  // manifest points at even when the remote version equals the local one.
-  // Intended for dev iteration (no version-bump-every-test-cycle) and for
-  // recovering a stuck device without having to bump FIRMWARE_VERSION.
+  // Fetch manifest, compare version, download, verify SHA256, flash, reboot.
+  // force=true bypasses isNewer() - re-flashes even when remote == local.
+  // Useful for dev iteration without bumping FIRMWARE_VERSION each cycle.
   //
-  // WARNING: this is synchronous - it blocks on manifest fetch + download +
-  // flash + ESP.restart(). Callers running inside the MQTT loop (e.g. the
-  // Shell `ota.check` command) must use `triggerCheck()` below instead,
-  // otherwise the CLI response never publishes because the device reboots
-  // before Shell::execute can return.
+  // WARNING: synchronous - blocks on fetch + download + flash + ESP.restart().
+  // Callers inside the MQTT/Shell loop must use triggerCheck() instead;
+  // calling check() directly means the CLI response never publishes because
+  // the device reboots before Shell::execute() can return.
+  //
+  // in:  manifestOverride - alternate manifest URL, or nullptr for configured URL
+  //      force            - re-flash even when versions match
+  // out: does not return on success (reboots); returns on no-update or error
   static void check(const char* manifestOverride = nullptr, bool force = false);
 
-  // Non-blocking trigger. Sets the deferred state so the next OTAUpdate::loop()
-  // tick picks up the request and runs check() synchronously from the main
-  // loop context. Safe to call from Shell command handlers (lets the CLI
-  // response publish before the device reboots).
+  // Deferred check: safe to call from Shell command handlers.
+  // Schedules check() to run from the main loop context, so the CLI response
+  // publishes before the device reboots.
+  //
+  // in:  manifestOverride - alternate manifest URL, or nullptr for configured URL
+  //      force            - re-flash even when versions match
+  // out: none
   static void triggerCheck(const char* manifestOverride = nullptr, bool force = false);
 
-  // Immediate boot-time check. Called from setup() before MQTT/modules load,
-  // while heap is still contiguous. If update found, flashes and reboots.
-  // If no update or OTA disabled, returns immediately.
+  // Boot-time check before MQTT/modules load, while heap is still contiguous.
+  // If update found, flashes and reboots; otherwise returns immediately.
+  //
+  // in:  none
+  // out: does not return on success (reboots); returns on no-update, error, or OTA disabled
   static void checkNow();
 
 private:

@@ -15,26 +15,26 @@ enum class WiFiStatus {
 
 class WiFiManager {
 public:
-  // Call once in setup(). Scans, ranks by RSSI, tries each configured SSID.
+  // Scan, rank by RSSI, and try each configured SSID.
+  // in: none. out: none. Call once in setup().
   static void       begin();
 
-  // Call every loop(). Detects drops and re-scans while on WiFi.
-  // When in AP mode, runs DNS server for captive portal.
+  // Detect drops and re-scan while on WiFi; run DNS server when in AP mode.
   // AP times out after wifi.ap_timeout_s and retries WiFi scan.
+  // in: none. out: none. Call every loop().
   static void       loop();
 
-  // True only when associated and IP is assigned.
+  // in: none. out: true only when associated and IP is assigned.
   static bool       connected();
 
-  // True when fallback AP is active.
+  // in: none. out: true when fallback AP is active.
   static bool       isAPActive();
 
-  // Current state - Cellular polls this to decide whether to activate.
+  // in: none. out: current WiFi path state.
   static WiFiStatus status();
 
-  // Called by the cellular path on its periodic schedule (default 15 min).
-  // Triggers a fresh scan/connect attempt. Returns true if WiFi came back up,
-  // meaning cellular should yield.
+  // Trigger a fresh scan/connect attempt.
+  // in: none. out: true if WiFi came back up (cellular should yield).
   static bool       recheckWiFi();
 
 private:
