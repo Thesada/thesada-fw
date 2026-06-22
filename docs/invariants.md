@@ -474,15 +474,27 @@ resolve to a *different* key than the operator named and write the
 value there, corrupting config from a remote command. Config-write
 counterpart to the runCli line-length and pagination guards above.
 
-How enforced: the `!path || !*path || strlen(path) >= sizeof(buf)`
-guard runs before the `strncpy` into `buf`. Any new fixed-buffer copy
-of an operator-supplied key adds the same length check. The MQTT binary
-handlers apply the same rule: `fs.write` rejects a path that would not
-fit `path[64]` and `fs.cat` rejects args longer than `pbuf[256]`,
-publishing an error rather than acting on a clipped path/range.
+How enforced: the `!path || !*path || !value || strlen(path) >=
+sizeof(buf)` guard runs before the `strncpy` into `buf` (a null `value`
+would also deref in the `strcmp`/`strtod` coercion below). Any new
+fixed-buffer copy of an operator-supplied key adds the same length
+check. The MQTT binary handlers apply the same rule: `fs.write` rejects
+a path that would not fit `path[64]` and `fs.cat` rejects args longer
+than `pbuf[256]`, publishing an error rather than acting on a clipped
+path/range.
 
 Source: `lib/thesada-core/src/Config.cpp::set`,
 `lib/thesada-core/src/MQTTClient.cpp::runCli` (`fs.write`, `fs.cat`).
+
+### `Config::load` leaves a clean doc on a malformed `/config.json`
+
+A deserialize failure clears `_doc` and logs, rather than leaving it
+half-parsed. `Config::get()` then returns an empty object and every
+`cfg[...] | default` read falls back to its default - a corrupt config
+file degrades to defaults, never to garbage values read out of a
+partially-populated document.
+
+Source: `lib/thesada-core/src/Config.cpp::load`.
 
 ### `Config::set` / `replace` never report success on a failed persist
 
