@@ -172,19 +172,20 @@ jobs:
         run: |
           VERSION=$(grep -oP '(?<=")\d+\.\d+\.\d+(?=")' src/thesada_config.h)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+          # CalVer tags carry no v-prefix (26.06.1), aligned with the app.
+          echo "tag=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Check if release already exists
         id: check_tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+          if gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
             echo "exists=true" >> $GITHUB_OUTPUT
-            echo "Release v${{ steps.version.outputs.version }} already exists - skipping"
+            echo "Release ${{ steps.version.outputs.tag }} already exists - skipping"
           else
             echo "exists=false" >> $GITHUB_OUTPUT
-            echo "New version v${{ steps.version.outputs.version }} - will create release"
+            echo "New version ${{ steps.version.outputs.tag }} - will create release"
           fi
 
       - name: Download build artifacts
