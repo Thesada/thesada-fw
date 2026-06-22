@@ -104,7 +104,8 @@ public:
 
   // Fallback transport hint. When true, publish() routes to the registered
   // publish-forwarder instead of enqueueing on a WiFi-side disconnect;
-  // the WiFi-side ring is preserved until WiFi MQTT recovers.
+  // the stale WiFi-side ring is dropped on handoff (level-triggered
+  // sensors refire) rather than replayed through the cellular forwarder.
   // in:  active  true = cellular is publishing on this device's behalf
   static void setFallbackPublishing(bool active);
 

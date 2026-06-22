@@ -47,8 +47,11 @@ void Config::replace(const char* json) {
 // JSON type (bool/int/double/string). in: dot-path, value string.
 // out: false if a parent key on the path is missing.
 bool Config::set(const char* path, const char* value) {
-  JsonVariant node = _doc.as<JsonVariant>();
   char buf[128];
+  // Reject empty or over-long paths; truncation would rewrite a
+  // different key than the caller asked for.
+  if (!path || !*path || strlen(path) >= sizeof(buf)) return false;
+  JsonVariant node = _doc.as<JsonVariant>();
   strncpy(buf, path, sizeof(buf) - 1);
   buf[sizeof(buf) - 1] = '\0';
 

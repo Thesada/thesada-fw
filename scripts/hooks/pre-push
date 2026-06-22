@@ -22,7 +22,7 @@ done
 
 if [ "$push_main" -eq 1 ]; then
   cmd="${THESADA_HIL_CMD:-hil-flash-and-smoke all}"
-  printf '\n[hil] pushing main - run the HIL bench smoke on the rack first:\n' >&2
+  printf '\n[HIL] pushing main - run the HIL bench smoke on the rack first:\n' >&2
   printf '      %s\n' "$cmd" >&2
   printf '      (reminder only; THESADA_HIL_SKIP=1 to silence)\n\n' >&2
 fi
