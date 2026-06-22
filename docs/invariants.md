@@ -506,8 +506,14 @@ did not hit flash must never surface to the operator as applied -
 otherwise a full filesystem silently discards every change while the
 device reports success.
 
+`set()` also rolls the in-memory `_doc` back (via `load()`) when
+`save()` fails, so the mutation it applied before persisting cannot
+linger: a rejected set leaves both flash and `_doc` at the last
+persisted state, never a value that was never written.
+
 How enforced: every caller that persists config checks the `save()`
-return before logging or returning success.
+return before logging or returning success; a failed persist in a
+mutate-then-save path reloads the persisted state.
 
 Source: `lib/thesada-core/src/Config.cpp::save`, `set`, `replace`.
 

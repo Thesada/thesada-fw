@@ -3,6 +3,8 @@
 #include "Config.h"
 #include "Log.h"
 #include <LittleFS.h>
+#include <cmath>
+#include <climits>
 
 static const char* TAG = "Config";
 
@@ -68,7 +70,8 @@ void Config::replace(const char* json) {
 
 // Set one value by dot-path (e.g. "telegram.cooldown_s"), preserving
 // JSON type (bool/int/double/string). in: dot-path, value string.
-// out: false if a parent key on the path is missing.
+// out: false if a parent key is missing or not an object, value is
+// null, or the persist fails (in which case _doc is rolled back).
 bool Config::set(const char* path, const char* value) {
   char buf[128];
   // Reject empty/over-long paths (truncation would rewrite a different
@@ -85,7 +88,9 @@ bool Config::set(const char* path, const char* value) {
     finalKey = lastDot + 1;
     char* tok = strtok(buf, ".");
     while (tok) {
-      if (node[tok].isNull()) return false;
+      // Parent must exist AND be an object - traversing into a scalar
+      // (or absent) key would silently write nowhere.
+      if (!node[tok].is<JsonObject>()) return false;
       node = node[tok];
       tok = strtok(nullptr, ".");
     }
@@ -96,15 +101,26 @@ bool Config::set(const char* path, const char* value) {
   else {
     char* end;
     double num = strtod(value, &end);
-    if (*end == '\0' && end != value) {
-      if (num == (int)num && !strchr(value, '.')) node[finalKey] = (int)num;
-      else node[finalKey] = num;
+    // Whole string parsed as a finite number stores numerically; the int
+    // cast is gated by an explicit range check so inf/nan/overflow (where
+    // (int)num is UB) fall through to string storage instead.
+    if (*end == '\0' && end != value && isfinite(num)) {
+      if (!strchr(value, '.') &&
+          num >= (double)INT_MIN && num <= (double)INT_MAX && num == (int)num)
+        node[finalKey] = (int)num;
+      else
+        node[finalKey] = num;
     } else {
       node[finalKey] = value;
     }
   }
 
-  if (!save()) return false;   // persist failed - do not report success
+  if (!save()) {
+    // Persist failed - roll _doc back to the on-disk state so get()
+    // never returns a value that was never written.
+    load();
+    return false;
+  }
   char msg[128];
   snprintf(msg, sizeof(msg), "Set %s = %s", path, value);
   Log::info(TAG, msg);
