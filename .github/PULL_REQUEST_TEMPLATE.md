@@ -9,6 +9,13 @@
 - [ ] Built clean on the relevant board envs (`pio run -e ...`)
 - [ ] Manual flow exercised on hardware where applicable
 
+## Security
+
+- [ ] Security review checklist run
+- [ ] Threat model updated if this PR introduces a new attack surface
+- [ ] Tests added for the new contract (not just a bug repro)
+- [ ] Structured logging at new state transitions
+
 ## Invariant ledger
 
 - [ ] Touches load-bearing source (OTA, MQTT, Shell, Config, HttpServer, Cellular)
