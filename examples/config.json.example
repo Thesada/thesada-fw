@@ -109,8 +109,8 @@
     "address":      72,
     "interval_s":   60,
     "channels": [
-      { "name": "house_pump", "mux": "A0_A1", "gain": 0.256 },
-      { "name": "barn_pump",  "mux": "A2_A3", "gain": 0.256 }
+      { "name": "house_pump", "mux": "A0_A1", "gain": 0.256, "clamp_a_per_v": 30 },
+      { "name": "barn_pump",  "mux": "A2_A3", "gain": 0.256, "clamp_a_per_v": 30 }
     ]
   },
 

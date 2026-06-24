@@ -26,6 +26,7 @@ struct ADS1115Channel {
   ADS1115Mux  mux;         // resolved mux mode
   float       gain;        // PGA full-scale in V (e.g. 1.024)
   adsGain_t   gainEnum;    // resolved Adafruit gain constant
+  float       clampAPerV;  // CT clamp ratio, amps per 1 V output (default 30)
 };
 
 class ADS1115Module : public Module {
