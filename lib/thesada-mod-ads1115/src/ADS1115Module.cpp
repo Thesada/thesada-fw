@@ -68,6 +68,10 @@ void ADS1115Module::loadChannels() {
     const char* muxS  = ch["mux"]  | "A0_A1";
     float       gain  = ch["gain"] | 1.024f;
     float       clamp = ch["clamp_a_per_v"] | 30.0f;  // SCT-013-030 default
+    if (clamp <= 0.0f) {                              // bad config -> default
+      Log::warn(TAG, "  clamp_a_per_v <= 0; using 30");
+      clamp = 30.0f;
+    }
 
     ADS1115Channel c;
     strncpy(c.name, cname, sizeof(c.name) - 1);
@@ -79,7 +83,7 @@ void ADS1115Module::loadChannels() {
     _channels.push_back(c);
 
     char msg[80];
-    snprintf(msg, sizeof(msg), "  '%s'  mux=%s  gain=%.3fV  clamp=%.0fA/V",
+    snprintf(msg, sizeof(msg), "  '%s'  mux=%s  gain=%.3fV  clamp=%gA/V",
              cname, muxS, gain, clamp);
     Log::info(TAG, msg);
   }
