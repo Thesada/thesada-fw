@@ -11,9 +11,9 @@
 
 ## Security
 
-- [ ] Security review checklist run
+- [ ] Security review completed
 - [ ] Threat model updated if this PR introduces a new attack surface
-- [ ] Tests added for the new contract (not just a bug repro)
+- [ ] Tests cover the new behavior (not just a bug repro)
 - [ ] Structured logging at new state transitions
 
 ## Invariant ledger
