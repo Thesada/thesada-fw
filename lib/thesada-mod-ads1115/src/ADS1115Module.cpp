@@ -1,7 +1,8 @@
 // thesada-fw - ADS1115Module.cpp
 // Reads the channel list from config.json at boot. Each channel specifies a
-// mux pair (e.g. "A0_A1" for differential, "A0_GND" for single-ended) and a
-// PGA gain value in volts (e.g. 1.024). Readings are published as a JSON array:
+// mux pair (e.g. "A0_A1" for differential, "A0_GND" for single-ended), a PGA
+// gain in volts (e.g. 1.024), and a CT clamp ratio "clamp_a_per_v" (amps per
+// 1 V, default 30). Readings are published as a JSON array:
 //   <topic_prefix>/sensor/current
 // and as individual "current" EventBus events per channel for Lua rules.
 // SPDX-License-Identifier: GPL-3.0-only
@@ -66,17 +67,20 @@ void ADS1115Module::loadChannels() {
     const char* cname = ch["name"] | "";
     const char* muxS  = ch["mux"]  | "A0_A1";
     float       gain  = ch["gain"] | 1.024f;
+    float       clamp = ch["clamp_a_per_v"] | 30.0f;  // SCT-013-030 default
 
     ADS1115Channel c;
     strncpy(c.name, cname, sizeof(c.name) - 1);
     c.name[sizeof(c.name) - 1] = '\0';
-    c.mux      = muxFromString(muxS);
-    c.gain     = gain;
-    c.gainEnum = gainFromFloat(gain);
+    c.mux        = muxFromString(muxS);
+    c.gain       = gain;
+    c.gainEnum   = gainFromFloat(gain);
+    c.clampAPerV = clamp;
     _channels.push_back(c);
 
-    char msg[64];
-    snprintf(msg, sizeof(msg), "  '%s'  mux=%s  gain=%.3fV", cname, muxS, gain);
+    char msg[80];
+    snprintf(msg, sizeof(msg), "  '%s'  mux=%s  gain=%.3fV  clamp=%.0fA/V",
+             cname, muxS, gain, clamp);
     Log::info(TAG, msg);
   }
 }
@@ -101,7 +105,7 @@ void ADS1115Module::sensorRead(ShellOutput out) {
   char line[128];
   for (auto& ch : _channels) {
     float rmsV    = readRmsVoltage(ch, 30);
-    float current = rmsV * 30.0f;
+    float current = rmsV * ch.clampAPerV;
     float power   = current * _lineVoltage;
     snprintf(line, sizeof(line),
              "  %-12s: %.4f V rms  %.2f A  %.1f W",
@@ -121,8 +125,8 @@ void ADS1115Module::readAndPublish() {
 
   for (auto& ch : _channels) {
     float rmsV    = readRmsVoltage(ch, 30);
-    // SCT-013-030: 30A input produces 1V output, so current_A = voltage_rms * 30
-    float current = rmsV * 30.0f;
+    // Clamp ratio is amps per 1 V output (e.g. SCT-013-030 = 30, SCT-013-005 = 5).
+    float current = rmsV * ch.clampAPerV;
     float power   = current * _lineVoltage;
     int16_t raw   = _ads.getLastConversionResults();
 
