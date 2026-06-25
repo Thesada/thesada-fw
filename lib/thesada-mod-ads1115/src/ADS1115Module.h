@@ -1,8 +1,8 @@
 // thesada-fw - ADS1115Module.h
 // ADS1115 16-bit ADC module. Reads configurable differential (or single-ended)
-// channels, publishes readings to MQTT and the EventBus on a configurable
-// interval. Channel list is defined at runtime in config.json - add or remove
-// entries without recompiling.
+// channels across one or more ADS1115 devices, publishing readings to MQTT and
+// the EventBus on a configurable interval. Device and channel lists are defined
+// at runtime in config.json - add or remove entries without recompiling.
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
@@ -12,6 +12,7 @@
 
 #include <Module.h>
 #include <Adafruit_ADS1X15.h>
+#include <ArduinoJson.h>
 #include <vector>
 
 // Mux mode resolved from the config.json "mux" string.
@@ -29,6 +30,14 @@ struct ADS1115Channel {
   float       clampAPerV;  // CT clamp ratio, amps per 1 V output (default 30)
 };
 
+// One physical ADS1115 chip at a fixed I2C address with its own channel list.
+struct ADS1115Device {
+  uint8_t                     address;
+  Adafruit_ADS1115*           ads = nullptr;  // heap, lives until reboot
+  std::vector<ADS1115Channel> channels;
+  bool                        ok  = false;     // begin() succeeded
+};
+
 class ADS1115Module : public Module {
 public:
   void        begin() override;
@@ -42,18 +51,19 @@ public:
   void        sensorRead(ShellOutput out);
 
 private:
-  void        loadChannels();
+  void        addDevice(uint8_t address, JsonArray channels);
+  void        loadChannels(JsonArray src, std::vector<ADS1115Channel>& dst, uint8_t address);
   void        readAndPublish();
-  int16_t     readChannel(const ADS1115Channel& ch);
-  float       readRmsVoltage(ADS1115Channel& ch, int samples = 30);
+  int16_t     readChannel(Adafruit_ADS1115& ads, const ADS1115Channel& ch);
+  float       readRmsVoltage(Adafruit_ADS1115& ads, ADS1115Channel& ch, int samples = 30);
   adsGain_t   gainFromFloat(float g);
   ADS1115Mux  muxFromString(const char* s);
+  size_t      channelCount() const;
 
-  Adafruit_ADS1115            _ads;
-  std::vector<ADS1115Channel> _channels;
-  uint32_t                    _intervalMs   = 60000;
-  uint32_t                    _lastRead     = 0;
-  float                       _lineVoltage  = 120.0f;
+  std::vector<ADS1115Device> _devices;
+  uint32_t                   _intervalMs   = 60000;
+  uint32_t                   _lastRead     = 0;
+  float                      _lineVoltage  = 120.0f;
 };
 
 #endif // ENABLE_ADS1115
