@@ -5,7 +5,7 @@
 // 1 V, default 30). Multiple ADS1115 chips on the shared I2C bus are supported
 // via ads1115.devices[]; the scalar ads1115.address form is one device.
 // Readings are published as a JSON array <topic_prefix>/sensor/current and as
-// individual "current" EventBus events per channel for Lua rules.
+// one combined "current" EventBus event for Lua rules.
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "ADS1115Module.h"
@@ -172,6 +172,7 @@ void ADS1115Module::readAndPublish() {
 
       JsonObject obj    = arr.add<JsonObject>();
       obj["name"]       = ch.name;
+      obj["address"]    = dev.address;  // disambiguate same-named channels across chips
       obj["raw"]        = raw;
       obj["voltage_v"]  = roundf(rmsV * 10000.0f) / 10000.0f;
       obj["current_a"]  = roundf(current * 100.0f) / 100.0f;
