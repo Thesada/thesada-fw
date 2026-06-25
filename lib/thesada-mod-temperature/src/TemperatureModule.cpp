@@ -37,10 +37,10 @@ void TemperatureModule::begin() {
 
   loadConfigSensors();
 
-  if (_autoDiscover) {
-    discoverSensors();
-    saveDiscovered();
-  }
+  // Always retag configured probes to their real bus; only auto-discover adds
+  // and persists previously unknown probes.
+  discoverSensors(_autoDiscover);
+  if (_autoDiscover) saveDiscovered();
 
   char msg[64];
   snprintf(msg, sizeof(msg), "temp.ready sensors=%d buses=%d",
@@ -108,9 +108,10 @@ void TemperatureModule::addBus(uint8_t pin) {
   _buses.push_back(bus);
 }
 
-// Scan every bus; add new probes, and re-tag a known probe's busIdx if it
-// has moved buses. ROM addresses are globally unique so they merge cleanly.
-void TemperatureModule::discoverSensors() {
+// Scan every bus and re-tag each known probe's busIdx (handles a probe that
+// moved buses). New probes are appended only when addNew is set. ROM addresses
+// are globally unique so they merge cleanly.
+void TemperatureModule::discoverSensors(bool addNew) {
   for (size_t b = 0; b < _buses.size(); b++) {
     DallasTemperature* dt = _buses[b].sensors;
     int found = dt->getDeviceCount();
@@ -136,6 +137,7 @@ void TemperatureModule::discoverSensors() {
         }
       }
       if (exists) continue;
+      if (!addNew) continue;
 
       TempSensor sensor;
       memcpy(sensor.address, addr, sizeof(DeviceAddress));
@@ -214,8 +216,12 @@ void TemperatureModule::saveDiscovered() {
   // ── Write updated config.json back ─────────────────────────────────────────
   File out = LittleFS.open("/config.json", "w");
   if (!out) { Log::error(TAG, "temp.config_write_failed op=save file=config.json"); return; }
-  serializeJson(cfgDoc, out);
+  size_t written = serializeJson(cfgDoc, out);
   out.close();
+  if (written < measureJson(cfgDoc)) {
+    Log::error(TAG, "temp.config_write_failed op=save reason=short_write");
+    return;
+  }
   Log::info(TAG, "temp.config_saved file=config.json");
 }
 
@@ -231,7 +237,7 @@ void TemperatureModule::discoverCmd(int argc, char** argv, ShellOutput out) {
 
   size_t before = _sensorList.size();
   for (auto& b : _buses) b.sensors->begin();  // re-walk every bus
-  discoverSensors();
+  discoverSensors(true);
   size_t added   = _sensorList.size() - before;
   size_t removed = prune ? pruneSensors() : 0;
   saveDiscovered();
@@ -297,8 +303,11 @@ void TemperatureModule::removeSensorsFromConfig(const std::vector<std::string>& 
 
   File w = LittleFS.open("/config.json", "w");
   if (!w) { Log::error(TAG, "temp.config_write_failed op=prune file=config.json"); return; }
-  serializeJson(cfgDoc, w);
+  size_t written = serializeJson(cfgDoc, w);
   w.close();
+  if (written < measureJson(cfgDoc)) {
+    Log::error(TAG, "temp.config_write_failed op=prune reason=short_write");
+  }
 }
 
 // Read one probe with library retries (CRC-validated) plus a plausibility
@@ -389,12 +398,15 @@ void TemperatureModule::readAndPublish() {
     MQTTClient::publish(perTopic, val);
   }
 
-  // Combined JSON topic (for Lua EventBus, SD logging, backwards compat)
+  // Combined JSON topic (for Lua EventBus, SD logging, backwards compat).
+  // Dynamic buffer - multi-bus probe counts can outgrow any fixed size and a
+  // truncated payload would publish malformed JSON.
   char topic[64];
   snprintf(topic, sizeof(topic), "%s/sensor/temperature", prefix);
-  char payload[768];
-  serializeJson(doc, payload, sizeof(payload));
-  MQTTClient::publish(topic, payload);
+  String payload;
+  payload.reserve(measureJson(doc) + 1);
+  serializeJson(doc, payload);
+  MQTTClient::publish(topic, payload.c_str());
 
   EventBus::publish("temperature", doc.as<JsonObject>());
 }

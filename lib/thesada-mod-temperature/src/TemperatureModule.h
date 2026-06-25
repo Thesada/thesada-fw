@@ -40,7 +40,7 @@ public:
 
 private:
   void        addBus(uint8_t pin);
-  void        discoverSensors();
+  void        discoverSensors(bool addNew);
   void        loadConfigSensors();
   void        saveDiscovered();
   void        readAndPublish();
