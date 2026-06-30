@@ -9,17 +9,18 @@
 #include <stdio.h>
 
 // NVS key for a wifi network password: wifi_pw_<6 hex of FNV-1a(ssid)>, so the
-// key fits the 15-char NVS limit regardless of SSID length.
-inline void secretWifiKey(const char* ssid, char* out, size_t maxLen) {
+// key fits the 15-char NVS limit. out: snprintf length (>= maxLen = truncated).
+inline int secretWifiKey(const char* ssid, char* out, size_t maxLen) {
   uint32_t h = 2166136261u;
   for (const char* p = ssid; p && *p; ++p) { h ^= (uint8_t)*p; h *= 16777619u; }
-  snprintf(out, maxLen, "wifi_pw_%06x", (unsigned)(h & 0xFFFFFFu));
+  return snprintf(out, maxLen, "wifi_pw_%06x", (unsigned)(h & 0xFFFFFFu));
 }
 
 // Logical field -> 15-char-safe NVS key. Scalars plus "wifi.password:<ssid>".
-// out: true if field is known (key written to keyOut), false otherwise.
+// out: true only if the field is known AND the key fit keyOut - false on
+// truncation, so a too-small buffer is a clean failure, not a silent remap.
 inline bool secretNvsKeyFor(const char* field, char* keyOut, size_t maxLen) {
-  if (!field || !keyOut) return false;
+  if (!field || !keyOut || maxLen == 0) return false;
   static const struct { const char* field; const char* key; } kMap[] = {
     { "mqtt.password",      "mqtt_password"  },
     { "telegram.bot_token", "telegram_token" },
@@ -27,13 +28,16 @@ inline bool secretNvsKeyFor(const char* field, char* keyOut, size_t maxLen) {
     { "wifi.ap_password",   "ap_password"    },
   };
   for (const auto& m : kMap) {
-    if (strcmp(field, m.field) == 0) { snprintf(keyOut, maxLen, "%s", m.key); return true; }
+    if (strcmp(field, m.field) == 0) {
+      int n = snprintf(keyOut, maxLen, "%s", m.key);
+      return n > 0 && (size_t)n < maxLen;
+    }
   }
   static const char* kWifiPrefix = "wifi.password:";
   size_t plen = strlen(kWifiPrefix);
   if (strncmp(field, kWifiPrefix, plen) == 0 && field[plen]) {
-    secretWifiKey(field + plen, keyOut, maxLen);
-    return true;
+    int n = secretWifiKey(field + plen, keyOut, maxLen);
+    return n > 0 && (size_t)n < maxLen;
   }
   return false;
 }

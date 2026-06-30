@@ -53,6 +53,12 @@ void test_wifi_key_deterministic_and_ssid_distinct(void) {
   TEST_ASSERT_TRUE(strcmp(a, c) != 0);     // different ssid -> different key
 }
 
+void test_truncating_buffer_rejected(void) {
+  char tiny[5];   // too small for any key -> clean failure, not a silent remap
+  TEST_ASSERT_FALSE(secretNvsKeyFor("mqtt.password", tiny, sizeof(tiny)));
+  TEST_ASSERT_FALSE(secretNvsKeyFor("wifi.password:RebelIOT", tiny, sizeof(tiny)));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_scalar_fields_map_to_short_keys);
@@ -60,5 +66,6 @@ int main(int, char**) {
   RUN_TEST(test_unknown_field_rejected);
   RUN_TEST(test_wifi_password_keyed_by_ssid);
   RUN_TEST(test_wifi_key_deterministic_and_ssid_distinct);
+  RUN_TEST(test_truncating_buffer_rejected);
   return UNITY_END();
 }
