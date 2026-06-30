@@ -4,7 +4,7 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-06-21. Bump the date on every edit.
+Dated 2026-06-29. Bump the date on every edit.
 
 ---
 
@@ -135,7 +135,8 @@ Use `mbedtls_platform_zeroize(buf, len)` (not `memset` - the compiler
 is allowed to elide a memset on a buffer about to be freed; the
 mbedtls helper is explicitly volatile-pointer to defeat that). Applies
 to every transient cert/key buffer: cellular cert upload to modem FS,
-the cert.set MQTT CLI handler that writes per-device material to NVS.
+the cert.set MQTT CLI handler that writes per-device material to NVS,
+the secret.set MQTT CLI handler that writes per-device secrets to NVS.
 
 Persistent buffers held for the life of the TLS session
 (`_clientCert`, `_clientKey`) are NOT freed during normal operation;
@@ -549,6 +550,47 @@ How enforced: the `_retryCount >= 30` branch in `connect()` is gated by
 reboot trigger in this file must justify why it cannot loop.
 
 Source: `lib/thesada-core/src/MQTTClient.cpp::connect`.
+
+---
+
+## Device secrets
+
+### Secret fields resolve NVS -> config.json -> empty, and NVS never reaches the cli bus
+
+The secret fields (each `wifi.networks[].password`, `mqtt.password`,
+`telegram.bot_token`, `web.password`, `wifi.ap_password`) resolve through
+`Secret::resolve` at every read site: the `thesada-secrets` NVS namespace
+first, the config.json plaintext second, empty last. NVS is not reachable
+via `config.dump` or `fs.cat` (both LittleFS-only), so a platform-managed
+device provisions the value into NVS and blanks the config.json field -
+`config.dump` then leaks nothing on `cli/response`. A standalone firmware
+user with no platform keeps the config.json plaintext path; that fallback
+is permanent, not a deprecation.
+
+Provisioned via the `secret.set` MQTT cli handler (binary payload
+`<field>\n<value>`, mirrors cert.set) and the serial `secret.set` /
+`secret.clear`. `secret.info` reports presence only and never echoes a
+stored value (write-only contract). Per-network wifi passwords key off a
+short SSID hash so the NVS key fits the 15-char limit.
+
+`Secret` uses the raw IDF `nvs` API, not Arduino `Preferences`: a read-only
+open of an absent namespace, or a get of an absent key, is the normal
+standalone path and must not ERROR-log on every connect/scan/auth.
+`Preferences` logs those under the un-maskable `ARDUINO` tag; the raw nvs
+calls return `ESP_ERR_NVS_NOT_FOUND` silently.
+
+How enforced: any new plaintext-secret read site routes through
+`Secret::resolve`; any new provisioning path zeroes the transient value
+buffer (see the mTLS-zeroize invariant). `secret.info` must never print a
+value.
+
+Source: `lib/thesada-core/src/Secret.h`, `Secret.cpp`;
+`lib/thesada-core/src/MQTTClient.cpp` (connect read site + secret.set
+handler); `lib/thesada-core/src/Shell.cpp` (`secret.*`);
+`lib/thesada-core/src/WiFiManager.cpp`,
+`lib/thesada-mod-telegram/src/TelegramModule.cpp`,
+`lib/thesada-mod-httpserver/src/HttpServer.cpp`,
+`lib/thesada-mod-liteserver/src/LiteServer.cpp`.
 
 ---
 

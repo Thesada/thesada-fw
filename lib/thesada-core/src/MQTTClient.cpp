@@ -3,6 +3,7 @@
 #include "MQTTClient.h"
 #include <thesada_config.h>
 #include "Config.h"
+#include "Secret.h"
 #include "EventBus.h"
 #include "WiFiManager.h"
 #include "Log.h"
@@ -425,7 +426,9 @@ void MQTTClient::connect() {
   JsonObject  cfg      = Config::get();
   const char* clientId = cfg["device"]["name"]   | "thesada-node";
   const char* user     = cfg["mqtt"]["user"]      | "";
-  const char* password = cfg["mqtt"]["password"]  | "";
+  char        passwordBuf[128];
+  const char* password = Secret::resolve("mqtt_password", cfg["mqtt"]["password"] | "",
+                                         passwordBuf, sizeof(passwordBuf));
   const char* prefix   = cfg["mqtt"]["topic_prefix"] | "thesada/node";
 
   char availTopic[64];
@@ -1231,6 +1234,54 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
         } else {
           resp["ok"] = false;
           resp["output"][0] = "Unknown type - expected client_cert or client_key";
+        }
+      }
+
+      char respTopic[64];
+      snprintf(respTopic, sizeof(respTopic), "%s/cli/response", prefix);
+      size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
+      char* rp = (char*)malloc(bufSz);
+      if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
+      goto cleanup;
+    }
+
+    // secret.set: payload = "<field>\n<value>". Provisions a per-device secret
+    // into NVS so config.json can stay blank. Mirrors cert.set; value zeroized.
+    if (strcmp(cmd, "secret.set") == 0 && payload && plen > 0) {
+      JsonDocument resp;
+      resp["cmd"] = cmd;
+      if (hasReqId) resp["req_id"] = reqId;
+
+      const char* nl = strchr(payload, '\n');
+      if (!nl) {
+        resp["ok"] = false;
+        resp["output"][0] = "Usage: payload = <field>\\n<value>";
+      } else {
+        char field[48];
+        size_t fieldLen = min((size_t)(nl - payload), sizeof(field) - 1);
+        memcpy(field, payload, fieldLen);
+        field[fieldLen] = '\0';
+        const char* value = nl + 1;
+        size_t valueLen = plen - fieldLen - 1;
+
+        if (valueLen >= 256) {
+          resp["ok"] = false;
+          resp["output"][0] = "value too large (>256 B)";
+        } else {
+          char* buf = (char*)malloc(valueLen + 1);
+          if (!buf) {
+            resp["ok"] = false;
+            resp["output"][0] = "malloc failed";
+          } else {
+            memcpy(buf, value, valueLen);
+            buf[valueLen] = '\0';
+            bool ok = Secret::set(field, buf);
+            mbedtls_platform_zeroize(buf, valueLen + 1);
+            free(buf);
+            resp["ok"] = ok;
+            resp["output"][0] = ok ? "secret stored in NVS"
+                                   : "unknown field or NVS write failed";
+          }
         }
       }
 

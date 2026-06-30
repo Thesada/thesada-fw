@@ -11,6 +11,7 @@
 
 #include "HttpServer.h"
 #include <Config.h>
+#include <Secret.h>
 #include <EventBus.h>
 #include <Log.h>
 #include <ScriptEngine.h>
@@ -278,7 +279,9 @@ void HttpServer::subscribeToEvents() {
 void HttpServer::setupRoutes() {
   JsonObject cfg = Config::get();
   String webUser = cfg["web"]["user"]     | "admin";
-  String webPass = cfg["web"]["password"] | "changeme";
+  char webPassBuf[128];
+  String webPass = Secret::resolve("web_password", cfg["web"]["password"] | "changeme",
+                                   webPassBuf, sizeof(webPassBuf));
 
   if (webPass == "changeme") {
     Log::warn(TAG, "Default password in use - change web.password in config.json");
