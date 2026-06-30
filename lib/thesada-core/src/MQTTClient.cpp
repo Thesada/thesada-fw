@@ -5,6 +5,7 @@
 #include "Config.h"
 #include "Secret.h"
 #include "cli_payload.h"
+#include "mqtt_rollback_policy.h"
 #include "EventBus.h"
 #include "WiFiManager.h"
 #include "Log.h"
@@ -443,17 +444,10 @@ static void mqttClearRbCfg() {
   prefs.end();
 }
 
-// Pure rollback decision (no NVS / Config) so it is unit-testable. Roll back
-// iff a snapshot exists, the current config is the exact one that rebooted
-// without connecting (rbCfg), and it differs from last-good.
+// Thin wrapper over the pure, host-tested predicate (mqtt_rollback_policy.h).
 bool MQTTClient::rollbackDecision(const char* lg, bool haveLg,
                                   const char* rbCfg, const char* cur) {
-  if (!haveLg || !lg || !*lg) return false;      // nothing to fall back to
-  if (!rbCfg || !*rbCfg) return false;           // no failing candidate recorded
-  if (!cur) return false;
-  if (strcmp(cur, rbCfg) != 0) return false;     // current != the config that failed
-  if (strcmp(cur, lg) == 0) return false;        // current == last-good
-  return true;
+  return mqttRollbackShould(lg, haveLg, rbCfg, cur);
 }
 
 // Serialize the connection-critical mqtt keys in a fixed order so two identical
