@@ -571,12 +571,13 @@ unrelated offline streak (config differs from the recorded candidate).
 `mqtt_rb_cfg` is cleared on the next successful connect and after a
 rollback. Boot-time only, mirrors OTA commit / pending-verify.
 
-How enforced: the decision lives in the pure `rollbackDecision()` predicate
-(unit-tested); `rollbackIfUncommitted()` only does the NVS I/O around it and
-runs before the first `connect()` in `main.cpp`.
+How enforced: the decision lives in the pure `mqttRollbackShould()` predicate
+(host-unit-tested in `test/test_rollback`); `rollbackIfUncommitted()` only does
+the NVS I/O around it and runs before the first `connect()` in `main.cpp`.
 
-Source: `lib/thesada-core/src/MQTTClient.cpp::rollbackDecision`,
-`snapshotGoodConfig`, `rollbackIfUncommitted`; `src/main.cpp` boot call.
+Source: `lib/thesada-core/src/mqtt_rollback_policy.h::mqttRollbackShould`,
+`MQTTClient.cpp::snapshotGoodConfig`, `rollbackIfUncommitted`;
+`src/main.cpp` boot call.
 
 ---
 
