@@ -135,7 +135,8 @@ Use `mbedtls_platform_zeroize(buf, len)` (not `memset` - the compiler
 is allowed to elide a memset on a buffer about to be freed; the
 mbedtls helper is explicitly volatile-pointer to defeat that). Applies
 to every transient cert/key buffer: cellular cert upload to modem FS,
-the cert.set MQTT CLI handler that writes per-device material to NVS.
+the cert.set MQTT CLI handler that writes per-device material to NVS,
+the secret.set MQTT CLI handler that writes per-device secrets to NVS.
 
 Persistent buffers held for the life of the TLS session
 (`_clientCert`, `_clientKey`) are NOT freed during normal operation;
@@ -481,10 +482,15 @@ fixed-buffer copy of an operator-supplied key adds the same length
 check. The MQTT binary handlers apply the same rule: `fs.write` rejects
 a path that would not fit `path[64]` and `fs.cat` rejects args longer
 than `pbuf[256]`, publishing an error rather than acting on a clipped
-path/range.
+path/range. `secret.set` and `cert.set` likewise reject an over-long
+`<field>` / `<type>` before the `\n` rather than clipping it - a clipped
+length makes the value/PEM length too large and reads past the payload
+end.
 
 Source: `lib/thesada-core/src/Config.cpp::set`,
-`lib/thesada-core/src/MQTTClient.cpp::runCli` (`fs.write`, `fs.cat`).
+`lib/thesada-core/src/MQTTClient.cpp::runCli` (`fs.write`, `fs.cat`),
+`lib/thesada-core/src/cli_payload.h::cliSplitFieldValue` (`secret.set`,
+`cert.set`, host-unit-tested in `test/test_cli_payload`).
 
 ### `Config::load` leaves a clean doc on a malformed `/config.json`
 
@@ -571,6 +577,54 @@ runs before the first `connect()` in `main.cpp`.
 
 Source: `lib/thesada-core/src/MQTTClient.cpp::rollbackDecision`,
 `snapshotGoodConfig`, `rollbackIfUncommitted`; `src/main.cpp` boot call.
+
+---
+
+## Device secrets
+
+### Secret fields resolve NVS -> config.json -> empty, and NVS never reaches the cli bus
+
+The secret fields (each `wifi.networks[].password`, `mqtt.password`,
+`telegram.bot_token`, `web.password`, `wifi.ap_password`) resolve through
+`Secret::resolve` at every read site: the `thesada-secrets` NVS namespace
+first, the config.json plaintext second, empty last. NVS is not reachable
+via `config.dump` or `fs.cat` (both LittleFS-only), so a platform-managed
+device provisions the value into NVS and blanks the config.json field -
+`config.dump` then leaks nothing on `cli/response`. A standalone firmware
+user with no platform keeps the config.json plaintext path; that fallback
+is permanent, not a deprecation.
+
+Provisioned via the `secret.set` MQTT cli handler (binary payload
+`<field>\n<value>`, mirrors cert.set) and the serial `secret.set` /
+`secret.clear`. `secret.info` reports presence only and never echoes a
+stored value (write-only contract). Per-network wifi passwords key off a
+short SSID hash so the NVS key fits the 15-char limit.
+
+`Secret` uses the raw IDF `nvs` API, not Arduino `Preferences`: a read-only
+open of an absent namespace, or a get of an absent key, is the normal
+standalone path and must not ERROR-log on every connect/scan/auth.
+`Preferences` logs those under the un-maskable `ARDUINO` tag; the raw nvs
+calls return `ESP_ERR_NVS_NOT_FOUND` silently.
+
+`Secret::set` rejects a value `>= Secret::MAX_LEN` and every read-site
+buffer is sized to `MAX_LEN`, so any value `set()` accepts fits `resolve()`.
+An undersized read buffer would make `nvs_get_str` fail and `resolve()`
+silently fall back to config.json, breaking NVS-wins. `web.password` is
+resolved per request in `HttpServer::_checkAuth`, not captured at route
+registration, so `secret.set web.password` takes effect without a restart.
+
+How enforced: any new plaintext-secret read site routes through
+`Secret::resolve` with a `MAX_LEN` buffer; any new provisioning path zeroes
+the transient value buffer (see the mTLS-zeroize invariant). `secret.info`
+must never print a value.
+
+Source: `lib/thesada-core/src/Secret.h`, `Secret.cpp`;
+`lib/thesada-core/src/MQTTClient.cpp` (connect read site + secret.set
+handler); `lib/thesada-core/src/Shell.cpp` (`secret.*`);
+`lib/thesada-core/src/WiFiManager.cpp`,
+`lib/thesada-mod-telegram/src/TelegramModule.cpp`,
+`lib/thesada-mod-httpserver/src/HttpServer.cpp`,
+`lib/thesada-mod-liteserver/src/LiteServer.cpp`.
 
 ---
 

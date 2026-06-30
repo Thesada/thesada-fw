@@ -9,6 +9,7 @@
 
 #include "WiFiManager.h"
 #include "Config.h"
+#include "Secret.h"
 #include "Log.h"
 #include "Shell.h"
 #include <WiFi.h>
@@ -62,8 +63,9 @@ void WiFiManager::scanAndConnect() {
   }
 
   // Match configured networks against scan results; record best RSSI per SSID.
-  // Stack-allocated; supports up to 8 configured networks.
-  struct Candidate { const char* ssid; const char* password; int32_t rssi; };
+  // Stack-allocated; supports up to 8 configured networks. password is a buffer
+  // (not a pointer) so a per-network NVS secret resolves into stable storage.
+  struct Candidate { const char* ssid; char password[Secret::MAX_LEN]; int32_t rssi; };
   Candidate candidates[8];
   uint8_t   count = 0;
 
@@ -84,7 +86,14 @@ void WiFiManager::scanAndConnect() {
       continue;
     }
 
-    candidates[count++] = { ssid, net["password"] | "", bestRssi };
+    // Resolve the per-network password: NVS (app-provisioned) -> config.json.
+    Candidate& c = candidates[count];
+    c.ssid = ssid;
+    c.rssi = bestRssi;
+    char nvsKey[16];
+    Secret::wifiKey(ssid, nvsKey, sizeof(nvsKey));
+    Secret::resolve(nvsKey, net["password"] | "", c.password, sizeof(c.password));
+    count++;
   }
 
   WiFi.scanDelete();
@@ -194,7 +203,9 @@ void WiFiManager::startFallbackAP() {
 
   JsonObject  cfg      = Config::get();
   const char* name     = cfg["device"]["name"]        | "thesada-node";
-  const char* apPass   = cfg["wifi"]["ap_password"]    | "";
+  char        apPassBuf[Secret::MAX_LEN];
+  const char* apPass   = Secret::resolve("ap_password", cfg["wifi"]["ap_password"] | "",
+                                         apPassBuf, sizeof(apPassBuf));
   _apTimeoutMs         = (uint32_t)(cfg["wifi"]["ap_timeout_s"] | 300) * 1000UL;
 
   char apSSID[32];

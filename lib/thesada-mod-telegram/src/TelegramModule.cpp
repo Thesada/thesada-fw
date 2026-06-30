@@ -12,6 +12,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "TelegramModule.h"
 #include <Config.h>
+#include <Secret.h>
 #include <EventBus.h>
 #include <WiFiManager.h>
 #include <MQTTClient.h>
@@ -45,7 +46,9 @@ void TelegramModule::begin() {
   _ready = true;
 
   JsonObject cfg    = Config::get();
-  const char* token = cfg["telegram"]["bot_token"] | "";
+  char tokenBuf[Secret::MAX_LEN];
+  const char* token = Secret::resolve("telegram_token", cfg["telegram"]["bot_token"] | "",
+                                      tokenBuf, sizeof(tokenBuf));
   JsonVariant chatIds = cfg["telegram"]["chat_ids"];
   int nChats = 0;
   if (chatIds.is<JsonArray>()) nChats = (int)chatIds.as<JsonArray>().size();
@@ -143,7 +146,9 @@ bool TelegramModule::sendTo(const char* chatId, const char* message) {
   }
 
   JsonObject cfg    = Config::get();
-  const char* token = cfg["telegram"]["bot_token"] | "";
+  char tokenBuf[Secret::MAX_LEN];
+  const char* token = Secret::resolve("telegram_token", cfg["telegram"]["bot_token"] | "",
+                                      tokenBuf, sizeof(tokenBuf));
   if (strlen(token) == 0) { Log::warn(TAG, "No bot_token"); return false; }
 
   char url[128];
@@ -255,7 +260,9 @@ bool TelegramModule::send(const char* message) {
 // Report Telegram module status
 void TelegramModule::status(ShellOutput out) {
   JsonObject cfg = Config::get();
-  const char* token = cfg["telegram"]["bot_token"] | "";
+  char tokenBuf[Secret::MAX_LEN];
+  const char* token = Secret::resolve("telegram_token", cfg["telegram"]["bot_token"] | "",
+                                      tokenBuf, sizeof(tokenBuf));
   JsonArray chatIds = cfg["telegram"]["chat_ids"].as<JsonArray>();
   int nChats = chatIds.isNull() ? 0 : (int)chatIds.size();
   char line[96];

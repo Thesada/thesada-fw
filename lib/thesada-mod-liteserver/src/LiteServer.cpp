@@ -8,6 +8,7 @@
 
 #include "LiteServer.h"
 #include <Config.h>
+#include <Secret.h>
 #include <Log.h>
 #include <WiFiManager.h>
 #include <ModuleRegistry.h>
@@ -28,7 +29,9 @@ static bool checkAuth() {
   if (WiFiManager::isAPActive()) return true;
   JsonObject cfg = Config::get();
   const char* user = cfg["web"]["user"]     | "";
-  const char* pass = cfg["web"]["password"] | "";
+  char passBuf[Secret::MAX_LEN];
+  const char* pass = Secret::resolve("web_password", cfg["web"]["password"] | "",
+                                     passBuf, sizeof(passBuf));
   if (strlen(user) == 0 && strlen(pass) == 0) {
     static bool _warnedOnce = false;
     if (!_warnedOnce) { Log::warn(TAG, "No web credentials configured - admin endpoints unprotected"); _warnedOnce = true; }

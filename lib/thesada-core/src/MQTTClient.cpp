@@ -3,6 +3,8 @@
 #include "MQTTClient.h"
 #include <thesada_config.h>
 #include "Config.h"
+#include "Secret.h"
+#include "cli_payload.h"
 #include "EventBus.h"
 #include "WiFiManager.h"
 #include "Log.h"
@@ -532,7 +534,9 @@ void MQTTClient::connect() {
   JsonObject  cfg      = Config::get();
   const char* clientId = cfg["device"]["name"]   | "thesada-node";
   const char* user     = cfg["mqtt"]["user"]      | "";
-  const char* password = cfg["mqtt"]["password"]  | "";
+  char        passwordBuf[Secret::MAX_LEN];
+  const char* password = Secret::resolve("mqtt_password", cfg["mqtt"]["password"] | "",
+                                         passwordBuf, sizeof(passwordBuf));
   const char* prefix   = cfg["mqtt"]["topic_prefix"] | "thesada/node";
 
   char availTopic[64];
@@ -1297,54 +1301,100 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
       resp["cmd"] = cmd;
       if (hasReqId) resp["req_id"] = reqId;
 
-      const char* nl = strchr(payload, '\n');
-      if (!nl) {
+      char type[32];
+      const char* pem; size_t pemLen;
+      CliSplit st = cliSplitFieldValue(payload, plen, type, sizeof(type),
+                                       &pem, &pemLen);
+      if (st == CliSplit::NoNewline) {
         resp["ok"] = false;
         resp["output"][0] = "Usage: payload = <type>\\n<PEM>  (type: client_cert|client_key)";
       } else {
-        char type[32];
-        size_t typeLen = min((size_t)(nl - payload), sizeof(type) - 1);
-        memcpy(type, payload, typeLen);
-        type[typeLen] = '\0';
-        const char* pem = nl + 1;
-        size_t pemLen = plen - typeLen - 1;
-
-        if (pemLen >= CERT_MAX_LEN) {
+        if (st == CliSplit::FieldTooLong) {
+          resp["ok"] = false;
+          resp["output"][0] = "type too long";
+        } else if (pemLen >= CERT_MAX_LEN) {
           resp["ok"] = false;
           resp["output"][0] = "PEM too large (>4000 B)";
-        } else if (strcmp(type, "client_cert") == 0) {
-          char* buf = (char*)malloc(pemLen + 1);
-          if (!buf) {
-            resp["ok"] = false;
-            resp["output"][0] = "malloc failed";
-          } else {
-            memcpy(buf, pem, pemLen);
-            buf[pemLen] = '\0';
-            bool ok = storeClientCert(buf, nullptr);
-            free(buf);
-            resp["ok"] = ok;
-            resp["output"][0] = ok ? "Client cert stored in NVS" : "NVS write failed";
-          }
-        } else if (strcmp(type, "client_key") == 0) {
-          char* buf = (char*)malloc(pemLen + 1);
-          if (!buf) {
-            resp["ok"] = false;
-            resp["output"][0] = "malloc failed";
-          } else {
-            memcpy(buf, pem, pemLen);
-            buf[pemLen] = '\0';
-            bool ok = storeClientCert(nullptr, buf);
-            // Zeroize before free: a lingering key in heap can surface via
-            // debug commands or crash dumps. mbedtls_platform_zeroize is
-            // not optimised away by the compiler.
-            mbedtls_platform_zeroize(buf, pemLen + 1);
-            free(buf);
-            resp["ok"] = ok;
-            resp["output"][0] = ok ? "Client key stored in NVS" : "NVS write failed";
-          }
         } else {
+          if (strcmp(type, "client_cert") == 0) {
+            char* buf = (char*)malloc(pemLen + 1);
+            if (!buf) {
+              resp["ok"] = false;
+              resp["output"][0] = "malloc failed";
+            } else {
+              memcpy(buf, pem, pemLen);
+              buf[pemLen] = '\0';
+              bool ok = storeClientCert(buf, nullptr);
+              free(buf);
+              resp["ok"] = ok;
+              resp["output"][0] = ok ? "Client cert stored in NVS" : "NVS write failed";
+            }
+          } else if (strcmp(type, "client_key") == 0) {
+            char* buf = (char*)malloc(pemLen + 1);
+            if (!buf) {
+              resp["ok"] = false;
+              resp["output"][0] = "malloc failed";
+            } else {
+              memcpy(buf, pem, pemLen);
+              buf[pemLen] = '\0';
+              bool ok = storeClientCert(nullptr, buf);
+              // Zeroize before free: a lingering key in heap can surface via
+              // debug commands or crash dumps. mbedtls_platform_zeroize is
+              // not optimised away by the compiler.
+              mbedtls_platform_zeroize(buf, pemLen + 1);
+              free(buf);
+              resp["ok"] = ok;
+              resp["output"][0] = ok ? "Client key stored in NVS" : "NVS write failed";
+            }
+          } else {
+            resp["ok"] = false;
+            resp["output"][0] = "Unknown type - expected client_cert or client_key";
+          }
+        }
+      }
+
+      char respTopic[64];
+      snprintf(respTopic, sizeof(respTopic), "%s/cli/response", prefix);
+      size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
+      char* rp = (char*)malloc(bufSz);
+      if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
+      goto cleanup;
+    }
+
+    // secret.set: payload = "<field>\n<value>". Provisions a per-device secret
+    // into NVS so config.json can stay blank. Mirrors cert.set; value zeroized.
+    if (strcmp(cmd, "secret.set") == 0 && payload && plen > 0) {
+      JsonDocument resp;
+      resp["cmd"] = cmd;
+      if (hasReqId) resp["req_id"] = reqId;
+
+      char field[48];
+      const char* value; size_t valueLen;
+      CliSplit st = cliSplitFieldValue(payload, plen, field, sizeof(field),
+                                       &value, &valueLen);
+      if (st == CliSplit::NoNewline) {
+        resp["ok"] = false;
+        resp["output"][0] = "Usage: payload = <field>\\n<value>";
+      } else if (st == CliSplit::FieldTooLong) {
+        resp["ok"] = false;
+        resp["output"][0] = "field too long";
+      } else if (valueLen >= Secret::MAX_LEN) {
+        resp["ok"] = false;
+        resp["output"][0] = "value too long";
+      } else {
+        char* buf = (char*)malloc(valueLen + 1);
+        if (!buf) {
           resp["ok"] = false;
-          resp["output"][0] = "Unknown type - expected client_cert or client_key";
+          resp["output"][0] = "malloc failed";
+        } else {
+          memcpy(buf, value, valueLen);
+          buf[valueLen] = '\0';
+          bool ok = Secret::set(field, buf);
+          mbedtls_platform_zeroize(buf, valueLen + 1);
+          free(buf);
+          resp["ok"] = ok;
+          resp["output"][0] = ok ? "secret stored in NVS"
+                                 : "unknown field or NVS write failed";
         }
       }
 

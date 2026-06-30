@@ -3,6 +3,7 @@
 
 #include "Shell.h"
 #include "Config.h"
+#include "Secret.h"
 #include "Console.h"
 #include "Log.h"
 #include "WiFiManager.h"
@@ -12,6 +13,7 @@
 #include "SensorRegistry.h"
 #include "Net.h"
 #include <thesada_config.h>
+#include <mbedtls/platform_util.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
 #include <esp_task_wdt.h>
@@ -1475,6 +1477,49 @@ static void cmd_cert_clear(int argc, char** argv, ShellOutput out) {
   }
 }
 
+// Provision a per-device secret into NVS. Fields: mqtt.password,
+// telegram.bot_token, web.password, wifi.ap_password, wifi.password:<ssid>.
+static void cmd_secret_set(int argc, char** argv, ShellOutput out) {
+  if (argc < 3) { out("Usage: secret.set <field> <value>"); return; }
+  String value;
+  for (int i = 2; i < argc; i++) { if (i > 2) value += " "; value += argv[i]; }
+  if (value.length() >= 2 && value.charAt(0) == '"' &&
+      value.charAt(value.length() - 1) == '"') {
+    value = value.substring(1, value.length() - 1);
+  }
+  bool ok = Secret::set(argv[1], value.c_str());
+  // Wipe the plaintext secret from the String's heap buffer before it frees.
+  mbedtls_platform_zeroize((void*)value.c_str(), value.length());
+  out(ok ? "secret stored in NVS" : "unknown field or NVS write failed");
+}
+
+// Erase a secret from NVS; the read site falls back to config.json/empty.
+static void cmd_secret_clear(int argc, char** argv, ShellOutput out) {
+  if (argc < 2) { out("Usage: secret.clear <field>"); return; }
+  out(Secret::clear(argv[1]) ? "secret cleared (falls back to config.json/empty)"
+                             : "unknown field");
+}
+
+// Presence report only - never prints a secret value (write-only contract).
+static void cmd_secret_info(int argc, char** argv, ShellOutput out) {
+  const char* scalars[] = { "mqtt.password", "telegram.bot_token",
+                            "web.password", "wifi.ap_password" };
+  char line[128];
+  for (auto f : scalars) {
+    snprintf(line, sizeof(line), "%-22s %s", f, Secret::has(f) ? "nvs" : "config/none");
+    out(line);
+  }
+  JsonArray nets = Config::get()["wifi"]["networks"].as<JsonArray>();
+  for (JsonObject net : nets) {
+    const char* ssid = net["ssid"] | "";
+    if (!*ssid) continue;
+    char field[80];
+    snprintf(field, sizeof(field), "wifi.password:%s", ssid);
+    snprintf(line, sizeof(line), "%-22s %s", field, Secret::has(field) ? "nvs" : "config/none");
+    out(line);
+  }
+}
+
 // Uses the ESP-IDF esp_ota API directly so it works regardless of whether
 // the Arduino Update wrapper has been touched this boot.
 static void cmd_ota_status(int argc, char** argv, ShellOutput out) {
@@ -2008,6 +2053,9 @@ void Shell::registerBuiltins() {
   registerCommand("cert.info",     "Show stored client cert metadata",  cmd_cert_info);
   registerCommand("cert.apply",    "Reconnect MQTT with stored cert",   cmd_cert_apply);
   registerCommand("cert.clear",    "Erase client cert from NVS",        cmd_cert_clear);
+  registerCommand("secret.set",    "Provision a secret into NVS",       cmd_secret_set);
+  registerCommand("secret.info",   "Show which secrets are NVS-backed", cmd_secret_info);
+  registerCommand("secret.clear",  "Erase a secret from NVS",           cmd_secret_clear);
   registerCommand("boot.info",     "Last reset reason + uptime",    cmd_boot_info);
   registerCommand("partitions",    "Full partition table dump",     cmd_partitions);
   registerCommand("chip.info",     "Chip revision, flash, PSRAM",   cmd_chip_info);
