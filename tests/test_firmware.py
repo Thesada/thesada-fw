@@ -858,6 +858,58 @@ def test_config(r):
         r.fail("config.dump", "no JSON or missing expected keys")
 
 
+def test_secrets(r):
+    r.group("3b · Secrets")
+    sh = r.sh
+    FIELD = "mqtt.password"
+
+    def secret_info():
+        # A prior group's large output (config.dump) can leave stale lines in
+        # the serial buffer; retry until the presence table actually appears.
+        lines = []
+        for _ in range(3):
+            lines = sh.cmd("secret.info")
+            if any(l.split() and l.split()[-1] in ("nvs", "config/none") for l in lines):
+                break
+        return lines
+
+    def info_state(field):
+        for l in secret_info():
+            parts = l.split()
+            if len(parts) >= 2 and parts[0] == field:
+                return parts[-1]
+        return None
+
+    # Drains/resyncs the buffer before the first assertion below.
+    base = info_state(FIELD)
+
+    # An unknown field must be rejected, never silently written to a wrong key.
+    out = " ".join(sh.cmd("secret.set bogus.field x"))
+    if "unknown field" in out.lower():
+        r.ok("secret.set rejects unknown field")
+    else:
+        r.fail("secret.set rejects unknown field", out[:60])
+    if base == "config/none":
+        # Unprovisioned: safe to run the full cycle and restore to config/none.
+        sh.cmd(f"secret.set {FIELD} testbench_pw")
+        st = info_state(FIELD)
+        r.ok("secret.set -> info=nvs") if st == "nvs" else r.fail("secret.set -> info=nvs", st)
+
+        if "testbench_pw" not in " ".join(sh.cmd("secret.info")):
+            r.ok("secret.info hides value")
+        else:
+            r.fail("secret.info hides value", "value echoed in output")
+
+        sh.cmd(f"secret.clear {FIELD}")
+        st = info_state(FIELD)
+        r.ok("secret.clear -> info=config/none") if st == "config/none" else \
+            r.fail("secret.clear -> info=config/none", st)
+    elif base == "nvs":
+        r.warn("secret set/clear cycle skipped", f"{FIELD} already provisioned - not clobbering")
+    else:
+        r.warn("secret.info unavailable", f"{FIELD} not listed (state={base})")
+
+
 def _uptime_secs(sh):
     """Parse `uptime` (e.g. '0d 00:02:25') to total seconds, or None."""
     for l in sh.cmd("uptime"):
@@ -1635,6 +1687,7 @@ Examples:
         test_filesystem(r)
         test_chunked_io(r)
         test_config(r)
+        test_secrets(r)
         test_network(r)
         test_shell(r)
         test_module_gating(r)
