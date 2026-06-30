@@ -488,8 +488,9 @@ length makes the value/PEM length too large and reads past the payload
 end.
 
 Source: `lib/thesada-core/src/Config.cpp::set`,
-`lib/thesada-core/src/MQTTClient.cpp::runCli` (`fs.write`, `fs.cat`,
-`secret.set`, `cert.set`).
+`lib/thesada-core/src/MQTTClient.cpp::runCli` (`fs.write`, `fs.cat`),
+`lib/thesada-core/src/cli_payload.h::cliSplitFieldValue` (`secret.set`,
+`cert.set`, host-unit-tested in `test/test_cli_payload`).
 
 ### `Config::load` leaves a clean doc on a malformed `/config.json`
 

@@ -4,6 +4,7 @@
 #include <thesada_config.h>
 #include "Config.h"
 #include "Secret.h"
+#include "cli_payload.h"
 #include "EventBus.h"
 #include "WiFiManager.h"
 #include "Log.h"
@@ -1186,27 +1187,21 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
       resp["cmd"] = cmd;
       if (hasReqId) resp["req_id"] = reqId;
 
-      const char* nl = strchr(payload, '\n');
-      if (!nl) {
+      char type[32];
+      const char* pem; size_t pemLen;
+      CliSplit st = cliSplitFieldValue(payload, plen, type, sizeof(type),
+                                       &pem, &pemLen);
+      if (st == CliSplit::NoNewline) {
         resp["ok"] = false;
         resp["output"][0] = "Usage: payload = <type>\\n<PEM>  (type: client_cert|client_key)";
       } else {
-        // Reject (never clip) an overlong type: a clipped typeLen would make
-        // pemLen too large and read past the payload end.
-        size_t typeLen = (size_t)(nl - payload);
-        char type[32];
-        const char* pem = nl + 1;
-        size_t pemLen = plen - typeLen - 1;
-
-        if (typeLen >= sizeof(type)) {
+        if (st == CliSplit::FieldTooLong) {
           resp["ok"] = false;
           resp["output"][0] = "type too long";
         } else if (pemLen >= CERT_MAX_LEN) {
           resp["ok"] = false;
           resp["output"][0] = "PEM too large (>4000 B)";
         } else {
-          memcpy(type, payload, typeLen);
-          type[typeLen] = '\0';
           if (strcmp(type, "client_cert") == 0) {
             char* buf = (char*)malloc(pemLen + 1);
             if (!buf) {
@@ -1259,41 +1254,33 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
       resp["cmd"] = cmd;
       if (hasReqId) resp["req_id"] = reqId;
 
-      const char* nl = strchr(payload, '\n');
-      if (!nl) {
+      char field[48];
+      const char* value; size_t valueLen;
+      CliSplit st = cliSplitFieldValue(payload, plen, field, sizeof(field),
+                                       &value, &valueLen);
+      if (st == CliSplit::NoNewline) {
         resp["ok"] = false;
         resp["output"][0] = "Usage: payload = <field>\\n<value>";
+      } else if (st == CliSplit::FieldTooLong) {
+        resp["ok"] = false;
+        resp["output"][0] = "field too long";
+      } else if (valueLen >= Secret::MAX_LEN) {
+        resp["ok"] = false;
+        resp["output"][0] = "value too long";
       } else {
-        // Reject (never clip) an overlong field: a clipped fieldLen would make
-        // valueLen too large and read past the payload end.
-        size_t fieldLen = (size_t)(nl - payload);
-        char field[48];
-        const char* value = nl + 1;
-        size_t valueLen = plen - fieldLen - 1;
-
-        if (fieldLen >= sizeof(field)) {
+        char* buf = (char*)malloc(valueLen + 1);
+        if (!buf) {
           resp["ok"] = false;
-          resp["output"][0] = "field too long";
-        } else if (valueLen >= Secret::MAX_LEN) {
-          resp["ok"] = false;
-          resp["output"][0] = "value too long";
+          resp["output"][0] = "malloc failed";
         } else {
-          memcpy(field, payload, fieldLen);
-          field[fieldLen] = '\0';
-          char* buf = (char*)malloc(valueLen + 1);
-          if (!buf) {
-            resp["ok"] = false;
-            resp["output"][0] = "malloc failed";
-          } else {
-            memcpy(buf, value, valueLen);
-            buf[valueLen] = '\0';
-            bool ok = Secret::set(field, buf);
-            mbedtls_platform_zeroize(buf, valueLen + 1);
-            free(buf);
-            resp["ok"] = ok;
-            resp["output"][0] = ok ? "secret stored in NVS"
-                                   : "unknown field or NVS write failed";
-          }
+          memcpy(buf, value, valueLen);
+          buf[valueLen] = '\0';
+          bool ok = Secret::set(field, buf);
+          mbedtls_platform_zeroize(buf, valueLen + 1);
+          free(buf);
+          resp["ok"] = ok;
+          resp["output"][0] = ok ? "secret stored in NVS"
+                                 : "unknown field or NVS write failed";
         }
       }
 

@@ -5,14 +5,11 @@
 // normal standalone path and Preferences ERROR-logs every miss (un-maskable
 // ARDUINO tag); the nvs calls return ESP_ERR_NVS_NOT_FOUND quietly.
 #include "Secret.h"
+#include "secret_keymap.h"
 #include <nvs.h>
 #include <string.h>
 
 static const char* SECRET_NS = "thesada-secrets";
-
-// wifi.password:<ssid> -> wifi_pw_<6 hex>; everything after the prefix is the
-// SSID (SSIDs may contain ':' so only the first one delimits).
-static const char* WIFI_PW_PREFIX = "wifi.password:";
 
 const char* Secret::resolve(const char* nvsKey, const char* fallback,
                             char* out, size_t maxLen) {
@@ -34,35 +31,13 @@ const char* Secret::resolve(const char* nvsKey, const char* fallback,
   return out;
 }
 
+// wifiKey / nvsKeyFor delegate to the pure secret_keymap unit (host-tested).
 void Secret::wifiKey(const char* ssid, char* out, size_t maxLen) {
-  uint32_t h = 2166136261u;              // FNV-1a 32-bit
-  for (const char* p = ssid; p && *p; ++p) {
-    h ^= (uint8_t)*p;
-    h *= 16777619u;
-  }
-  snprintf(out, maxLen, "wifi_pw_%06x", (unsigned)(h & 0xFFFFFFu));
+  secretWifiKey(ssid, out, maxLen);
 }
 
 bool Secret::nvsKeyFor(const char* field, char* keyOut, size_t maxLen) {
-  if (!field || !keyOut) return false;
-  struct { const char* field; const char* key; } map[] = {
-    { "mqtt.password",      "mqtt_password"  },
-    { "telegram.bot_token", "telegram_token" },
-    { "web.password",       "web_password"   },
-    { "wifi.ap_password",   "ap_password"    },
-  };
-  for (auto& m : map) {
-    if (strcmp(field, m.field) == 0) {
-      snprintf(keyOut, maxLen, "%s", m.key);
-      return true;
-    }
-  }
-  size_t plen = strlen(WIFI_PW_PREFIX);
-  if (strncmp(field, WIFI_PW_PREFIX, plen) == 0 && field[plen]) {
-    wifiKey(field + plen, keyOut, maxLen);
-    return true;
-  }
-  return false;
+  return secretNvsKeyFor(field, keyOut, maxLen);
 }
 
 bool Secret::set(const char* field, const char* value) {

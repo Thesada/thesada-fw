@@ -292,7 +292,7 @@ void HttpServer::setupRoutes() {
                                         webPassBuf, sizeof(webPassBuf));
 
   if (strcmp(webPass, "changeme") == 0) {
-    Log::warn(TAG, "Default password in use - change web.password in config.json");
+    Log::warn(TAG, "Default password in use - set web.password via config.json or 'secret.set web.password'");
   }
 
   // ── Dashboard HTML - public (sensor data is read-only) ────────────────────

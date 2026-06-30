@@ -96,6 +96,25 @@ jobs:
       - name: Run Lua test suite
         run: lua5.3 tests/lua/run_all.lua
 
+  native-tests:
+    # Host-native unit tests for the pure security logic (parse bounds, key
+    # mapping, rollback policy). No board, fast, gates the release.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Run native unit tests
+        run: pio test -e native
+
   invariant-ledger:
     # Server-side mirror of scripts/hooks/pre-commit: refuses a push or PR
     # that touches load-bearing source without updating docs/invariants.md.
@@ -153,7 +172,7 @@ jobs:
         run: echo "INVARIANT_OK trailer found in commit range - skipping ledger check."
 
   release:
-    needs: [build, lua-tests, invariant-ledger]
+    needs: [build, lua-tests, native-tests, invariant-ledger]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
