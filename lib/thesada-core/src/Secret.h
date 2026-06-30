@@ -7,6 +7,12 @@
 
 class Secret {
 public:
+  // Single max length for any secret. set() rejects longer values and every
+  // read-site buffer is sized to this, so a stored value always fits resolve()
+  // - an undersized read buffer makes NVS look empty and silently falls back to
+  // config.json, breaking NVS-wins. Covers WPA2 PSK (63), tokens, passwords.
+  static constexpr size_t MAX_LEN = 160;
+
   // Effective value of nvsKey: NVS -> fallback -> "". Always written into out
   // (out must outlive the returned pointer); returns out.
   static const char* resolve(const char* nvsKey, const char* fallback,

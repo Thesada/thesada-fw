@@ -65,7 +65,7 @@ void WiFiManager::scanAndConnect() {
   // Match configured networks against scan results; record best RSSI per SSID.
   // Stack-allocated; supports up to 8 configured networks. password is a buffer
   // (not a pointer) so a per-network NVS secret resolves into stable storage.
-  struct Candidate { const char* ssid; char password[72]; int32_t rssi; };
+  struct Candidate { const char* ssid; char password[Secret::MAX_LEN]; int32_t rssi; };
   Candidate candidates[8];
   uint8_t   count = 0;
 
@@ -203,7 +203,7 @@ void WiFiManager::startFallbackAP() {
 
   JsonObject  cfg      = Config::get();
   const char* name     = cfg["device"]["name"]        | "thesada-node";
-  char        apPassBuf[72];
+  char        apPassBuf[Secret::MAX_LEN];
   const char* apPass   = Secret::resolve("ap_password", cfg["wifi"]["ap_password"] | "",
                                          apPassBuf, sizeof(apPassBuf));
   _apTimeoutMs         = (uint32_t)(cfg["wifi"]["ap_timeout_s"] | 300) * 1000UL;

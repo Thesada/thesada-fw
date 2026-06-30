@@ -13,6 +13,7 @@
 #include "SensorRegistry.h"
 #include "Net.h"
 #include <thesada_config.h>
+#include <mbedtls/platform_util.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
 #include <esp_task_wdt.h>
@@ -1486,8 +1487,10 @@ static void cmd_secret_set(int argc, char** argv, ShellOutput out) {
       value.charAt(value.length() - 1) == '"') {
     value = value.substring(1, value.length() - 1);
   }
-  out(Secret::set(argv[1], value.c_str()) ? "secret stored in NVS"
-                                          : "unknown field or NVS write failed");
+  bool ok = Secret::set(argv[1], value.c_str());
+  // Wipe the plaintext secret from the String's heap buffer before it frees.
+  mbedtls_platform_zeroize((void*)value.c_str(), value.length());
+  out(ok ? "secret stored in NVS" : "unknown field or NVS write failed");
 }
 
 // Erase a secret from NVS; the read site falls back to config.json/empty.

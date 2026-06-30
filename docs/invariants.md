@@ -482,10 +482,14 @@ fixed-buffer copy of an operator-supplied key adds the same length
 check. The MQTT binary handlers apply the same rule: `fs.write` rejects
 a path that would not fit `path[64]` and `fs.cat` rejects args longer
 than `pbuf[256]`, publishing an error rather than acting on a clipped
-path/range.
+path/range. `secret.set` and `cert.set` likewise reject an over-long
+`<field>` / `<type>` before the `\n` rather than clipping it - a clipped
+length makes the value/PEM length too large and reads past the payload
+end.
 
 Source: `lib/thesada-core/src/Config.cpp::set`,
-`lib/thesada-core/src/MQTTClient.cpp::runCli` (`fs.write`, `fs.cat`).
+`lib/thesada-core/src/MQTTClient.cpp::runCli` (`fs.write`, `fs.cat`,
+`secret.set`, `cert.set`).
 
 ### `Config::load` leaves a clean doc on a malformed `/config.json`
 
@@ -579,10 +583,17 @@ standalone path and must not ERROR-log on every connect/scan/auth.
 `Preferences` logs those under the un-maskable `ARDUINO` tag; the raw nvs
 calls return `ESP_ERR_NVS_NOT_FOUND` silently.
 
+`Secret::set` rejects a value `>= Secret::MAX_LEN` and every read-site
+buffer is sized to `MAX_LEN`, so any value `set()` accepts fits `resolve()`.
+An undersized read buffer would make `nvs_get_str` fail and `resolve()`
+silently fall back to config.json, breaking NVS-wins. `web.password` is
+resolved per request in `HttpServer::_checkAuth`, not captured at route
+registration, so `secret.set web.password` takes effect without a restart.
+
 How enforced: any new plaintext-secret read site routes through
-`Secret::resolve`; any new provisioning path zeroes the transient value
-buffer (see the mTLS-zeroize invariant). `secret.info` must never print a
-value.
+`Secret::resolve` with a `MAX_LEN` buffer; any new provisioning path zeroes
+the transient value buffer (see the mTLS-zeroize invariant). `secret.info`
+must never print a value.
 
 Source: `lib/thesada-core/src/Secret.h`, `Secret.cpp`;
 `lib/thesada-core/src/MQTTClient.cpp` (connect read site + secret.set

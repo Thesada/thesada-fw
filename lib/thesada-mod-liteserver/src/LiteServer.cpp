@@ -29,7 +29,7 @@ static bool checkAuth() {
   if (WiFiManager::isAPActive()) return true;
   JsonObject cfg = Config::get();
   const char* user = cfg["web"]["user"]     | "";
-  char passBuf[128];
+  char passBuf[Secret::MAX_LEN];
   const char* pass = Secret::resolve("web_password", cfg["web"]["password"] | "",
                                      passBuf, sizeof(passBuf));
   if (strlen(user) == 0 && strlen(pass) == 0) {

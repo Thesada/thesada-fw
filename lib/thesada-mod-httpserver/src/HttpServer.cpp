@@ -153,7 +153,9 @@ static bool _validateToken(const char* token) {
 }
 
 // Check auth: Basic Auth OR Bearer token. Returns true if authorized.
-static bool _checkAuth(AsyncWebServerRequest* req, const String& webUser, const String& webPass) {
+// Credentials are resolved per request so secret.set / secret.clear
+// web.password take effect without a restart.
+static bool _checkAuth(AsyncWebServerRequest* req) {
   // Check Bearer token first
   if (req->hasHeader("Authorization")) {
     String authHeader = req->header("Authorization");
@@ -162,8 +164,13 @@ static bool _checkAuth(AsyncWebServerRequest* req, const String& webUser, const 
       if (_validateToken(token.c_str())) return true;
     }
   }
-  // Fall back to Basic Auth
-  return req->authenticate(webUser.c_str(), webPass.c_str());
+  // Fall back to Basic Auth against the current credentials.
+  JsonObject cfg = Config::get();
+  const char* webUser = cfg["web"]["user"] | "admin";
+  char passBuf[Secret::MAX_LEN];
+  const char* webPass = Secret::resolve("web_password", cfg["web"]["password"] | "changeme",
+                                        passBuf, sizeof(passBuf));
+  return req->authenticate(webUser, webPass);
 }
 
 // IP-based WS pre-auth: GET /api/ws/token (auth-gated) marks the caller's IP as
@@ -278,12 +285,13 @@ void HttpServer::subscribeToEvents() {
 // Register all HTTP routes, WebSocket handler, OTA endpoint, and captive portal
 void HttpServer::setupRoutes() {
   JsonObject cfg = Config::get();
-  String webUser = cfg["web"]["user"]     | "admin";
-  char webPassBuf[128];
-  String webPass = Secret::resolve("web_password", cfg["web"]["password"] | "changeme",
-                                   webPassBuf, sizeof(webPassBuf));
+  // Credentials are resolved per request in _checkAuth; resolve once here only
+  // for the boot-time default-password warning.
+  char webPassBuf[Secret::MAX_LEN];
+  const char* webPass = Secret::resolve("web_password", cfg["web"]["password"] | "changeme",
+                                        webPassBuf, sizeof(webPassBuf));
 
-  if (webPass == "changeme") {
+  if (strcmp(webPass, "changeme") == 0) {
     Log::warn(TAG, "Default password in use - change web.password in config.json");
   }
 
@@ -297,13 +305,13 @@ void HttpServer::setupRoutes() {
   // Must NOT call requestAuthentication() here - that would send WWW-Authenticate
   // which causes the browser to silently retry with cached credentials, bypassing
   // the JS modal check entirely.
-  server.on("/api/auth/check", HTTP_GET, [webUser, webPass](AsyncWebServerRequest* req) {
+  server.on("/api/auth/check", HTTP_GET, [](AsyncWebServerRequest* req) {
     String ip = req->client()->remoteIP().toString();
     if (!_rlAllow(ip)) {
       req->send(429, "application/json", "{\"ok\":false,\"error\":\"Too many attempts - wait 30s\"}");
       return;
     }
-    if (!req->authenticate(webUser.c_str(), webPass.c_str())) {
+    if (!_checkAuth(req)) {
       _rlFail(ip);
       req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}");
       return;
@@ -313,13 +321,13 @@ void HttpServer::setupRoutes() {
   });
 
   // ── POST /api/login - exchange Basic Auth for a Bearer token ────────────────
-  server.on("/api/login", HTTP_POST, [webUser, webPass](AsyncWebServerRequest* req) {
+  server.on("/api/login", HTTP_POST, [](AsyncWebServerRequest* req) {
     String ip = req->client()->remoteIP().toString();
     if (!_rlAllow(ip)) {
       req->send(429, "application/json", "{\"ok\":false,\"error\":\"Too many attempts - wait 30s\"}");
       return;
     }
-    if (!req->authenticate(webUser.c_str(), webPass.c_str())) {
+    if (!_checkAuth(req)) {
       _rlFail(ip);
       req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}");
       return;
@@ -336,8 +344,8 @@ void HttpServer::setupRoutes() {
 
   // ── GET /api/ws/token - issue a short-lived WS token (auth required) ────────
   // Clients call this before opening /ws/serial, then pass ?token=<hex>.
-  server.on("/api/ws/token", HTTP_GET, [webUser, webPass](AsyncWebServerRequest* req) {
-    if (!_checkAuth(req, webUser, webPass)) {
+  server.on("/api/ws/token", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!_checkAuth(req)) {
       req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}");
       return;
     }
@@ -385,8 +393,8 @@ void HttpServer::setupRoutes() {
   });
 
   // ── GET /api/config - read config.json ────────────────────────────────────
-  server.on("/api/config", HTTP_GET, [webUser, webPass](AsyncWebServerRequest* req) {
-    if (!_checkAuth(req, webUser, webPass)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
+  server.on("/api/config", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!_checkAuth(req)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
     if (!LittleFS.exists("/config.json")) {
       req->send(404, "application/json", "{\"error\":\"config.json not found\"}");
       return;
@@ -405,8 +413,8 @@ void HttpServer::setupRoutes() {
     if (index == 0) { _cfgBodyBuf = ""; _cfgBodyBuf.reserve(total); }
     _cfgBodyBuf.concat((const char*)data, len);
   });
-  cfgHandler->onRequest([webUser, webPass](AsyncWebServerRequest* req) {
-    if (!_checkAuth(req, webUser, webPass)) {
+  cfgHandler->onRequest([](AsyncWebServerRequest* req) {
+    if (!_checkAuth(req)) {
       _cfgBodyBuf = "";  // discard unauthenticated body
       req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}");
       return;
@@ -422,8 +430,8 @@ void HttpServer::setupRoutes() {
   server.addHandler(cfgHandler);
 
   // ── POST /api/backup - copy config.json to SD (auth required) ────────────
-  server.on("/api/backup", HTTP_POST, [webUser, webPass](AsyncWebServerRequest* req) {
-    if (!_checkAuth(req, webUser, webPass)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
+  server.on("/api/backup", HTTP_POST, [](AsyncWebServerRequest* req) {
+    if (!_checkAuth(req)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
     if (!LittleFS.exists("/config.json")) {
       req->send(200, "application/json", "{\"ok\":false,\"error\":\"config.json not found\"}");
       return;
@@ -446,8 +454,8 @@ void HttpServer::setupRoutes() {
   });
 
   // ── POST /api/restart (auth required) ─────────────────────────────────────
-  server.on("/api/restart", HTTP_POST, [webUser, webPass](AsyncWebServerRequest* req) {
-    if (!_checkAuth(req, webUser, webPass)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
+  server.on("/api/restart", HTTP_POST, [](AsyncWebServerRequest* req) {
+    if (!_checkAuth(req)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
     req->send(200, "application/json", "{\"ok\":true}");
     _restartPending = true;
   });
@@ -463,8 +471,8 @@ void HttpServer::setupRoutes() {
     if (index == 0) { _cmdBodyBuf = ""; _cmdBodyBuf.reserve(total); }
     _cmdBodyBuf.concat((const char*)data, len);
   });
-  cmdHandler->onRequest([webUser, webPass](AsyncWebServerRequest* req) {
-    if (!_checkAuth(req, webUser, webPass)) {
+  cmdHandler->onRequest([](AsyncWebServerRequest* req) {
+    if (!_checkAuth(req)) {
       _cmdBodyBuf = "";
       req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}");
       return;
@@ -540,8 +548,8 @@ void HttpServer::setupRoutes() {
   // ── POST /ota - firmware binary upload (auth required) ────────────────────
   // Accepts multipart/form-data with field "firmware". Uses ESP-IDF Update.h.
   server.on("/ota", HTTP_POST,
-    [webUser, webPass](AsyncWebServerRequest* req) {
-      if (!_checkAuth(req, webUser, webPass)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
+    [](AsyncWebServerRequest* req) {
+      if (!_checkAuth(req)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
       bool ok = !Update.hasError();
       if (ok) {
         req->send(200, "application/json", "{\"ok\":true}");
@@ -589,8 +597,8 @@ void HttpServer::setupRoutes() {
 
   // ── GET /api/files - list files (auth required) ──────────────────────────
   // Query param: source=sd (default) or source=littlefs or source=scripts
-  server.on("/api/files", HTTP_GET, [webUser, webPass](AsyncWebServerRequest* req) {
-    if (!_checkAuth(req, webUser, webPass)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
+  server.on("/api/files", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!_checkAuth(req)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
     String src = req->hasParam("source") ? req->getParam("source")->value() : "sd";
     bool useLFS     = (src == "littlefs");
     bool useScripts = (src == "scripts");
@@ -621,8 +629,8 @@ void HttpServer::setupRoutes() {
   });
 
   // ── GET /api/file?path=...&source=sd|littlefs|scripts - read file (auth, max 64 KB)
-  server.on("/api/file", HTTP_GET, [webUser, webPass](AsyncWebServerRequest* req) {
-    if (!_checkAuth(req, webUser, webPass)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
+  server.on("/api/file", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!_checkAuth(req)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
     if (!req->hasParam("path")) { req->send(400, "text/plain", "missing path"); return; }
     String path = req->getParam("path")->value();
     if (!_pathSafe(path)) { req->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid path\"}"); return; }
@@ -643,8 +651,8 @@ void HttpServer::setupRoutes() {
   });
 
   // ── DELETE /api/file?path=...&source=sd|littlefs|scripts - delete file (auth)
-  server.on("/api/file", HTTP_DELETE, [webUser, webPass](AsyncWebServerRequest* req) {
-    if (!_checkAuth(req, webUser, webPass)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
+  server.on("/api/file", HTTP_DELETE, [](AsyncWebServerRequest* req) {
+    if (!_checkAuth(req)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
     if (!req->hasParam("path")) { req->send(400, "application/json", "{\"error\":\"missing path\"}"); return; }
     String path = req->getParam("path")->value();
     if (!_pathSafe(path)) { req->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid path\"}"); return; }
@@ -668,8 +676,8 @@ void HttpServer::setupRoutes() {
     }
     _fileBodyBuf.concat((const char*)data, len);
   });
-  fileHandler->onRequest([webUser, webPass](AsyncWebServerRequest* req) {
-    if (!_checkAuth(req, webUser, webPass)) {
+  fileHandler->onRequest([](AsyncWebServerRequest* req) {
+    if (!_checkAuth(req)) {
       _fileBodyBuf = "";
       req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}");
       return;

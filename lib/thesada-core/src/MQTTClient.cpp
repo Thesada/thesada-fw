@@ -426,7 +426,7 @@ void MQTTClient::connect() {
   JsonObject  cfg      = Config::get();
   const char* clientId = cfg["device"]["name"]   | "thesada-node";
   const char* user     = cfg["mqtt"]["user"]      | "";
-  char        passwordBuf[128];
+  char        passwordBuf[Secret::MAX_LEN];
   const char* password = Secret::resolve("mqtt_password", cfg["mqtt"]["password"] | "",
                                          passwordBuf, sizeof(passwordBuf));
   const char* prefix   = cfg["mqtt"]["topic_prefix"] | "thesada/node";
@@ -1191,49 +1191,56 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
         resp["ok"] = false;
         resp["output"][0] = "Usage: payload = <type>\\n<PEM>  (type: client_cert|client_key)";
       } else {
+        // Reject (never clip) an overlong type: a clipped typeLen would make
+        // pemLen too large and read past the payload end.
+        size_t typeLen = (size_t)(nl - payload);
         char type[32];
-        size_t typeLen = min((size_t)(nl - payload), sizeof(type) - 1);
-        memcpy(type, payload, typeLen);
-        type[typeLen] = '\0';
         const char* pem = nl + 1;
         size_t pemLen = plen - typeLen - 1;
 
-        if (pemLen >= CERT_MAX_LEN) {
+        if (typeLen >= sizeof(type)) {
+          resp["ok"] = false;
+          resp["output"][0] = "type too long";
+        } else if (pemLen >= CERT_MAX_LEN) {
           resp["ok"] = false;
           resp["output"][0] = "PEM too large (>4000 B)";
-        } else if (strcmp(type, "client_cert") == 0) {
-          char* buf = (char*)malloc(pemLen + 1);
-          if (!buf) {
-            resp["ok"] = false;
-            resp["output"][0] = "malloc failed";
-          } else {
-            memcpy(buf, pem, pemLen);
-            buf[pemLen] = '\0';
-            bool ok = storeClientCert(buf, nullptr);
-            free(buf);
-            resp["ok"] = ok;
-            resp["output"][0] = ok ? "Client cert stored in NVS" : "NVS write failed";
-          }
-        } else if (strcmp(type, "client_key") == 0) {
-          char* buf = (char*)malloc(pemLen + 1);
-          if (!buf) {
-            resp["ok"] = false;
-            resp["output"][0] = "malloc failed";
-          } else {
-            memcpy(buf, pem, pemLen);
-            buf[pemLen] = '\0';
-            bool ok = storeClientCert(nullptr, buf);
-            // Zeroize before free: a lingering key in heap can surface via
-            // debug commands or crash dumps. mbedtls_platform_zeroize is
-            // not optimised away by the compiler.
-            mbedtls_platform_zeroize(buf, pemLen + 1);
-            free(buf);
-            resp["ok"] = ok;
-            resp["output"][0] = ok ? "Client key stored in NVS" : "NVS write failed";
-          }
         } else {
-          resp["ok"] = false;
-          resp["output"][0] = "Unknown type - expected client_cert or client_key";
+          memcpy(type, payload, typeLen);
+          type[typeLen] = '\0';
+          if (strcmp(type, "client_cert") == 0) {
+            char* buf = (char*)malloc(pemLen + 1);
+            if (!buf) {
+              resp["ok"] = false;
+              resp["output"][0] = "malloc failed";
+            } else {
+              memcpy(buf, pem, pemLen);
+              buf[pemLen] = '\0';
+              bool ok = storeClientCert(buf, nullptr);
+              free(buf);
+              resp["ok"] = ok;
+              resp["output"][0] = ok ? "Client cert stored in NVS" : "NVS write failed";
+            }
+          } else if (strcmp(type, "client_key") == 0) {
+            char* buf = (char*)malloc(pemLen + 1);
+            if (!buf) {
+              resp["ok"] = false;
+              resp["output"][0] = "malloc failed";
+            } else {
+              memcpy(buf, pem, pemLen);
+              buf[pemLen] = '\0';
+              bool ok = storeClientCert(nullptr, buf);
+              // Zeroize before free: a lingering key in heap can surface via
+              // debug commands or crash dumps. mbedtls_platform_zeroize is
+              // not optimised away by the compiler.
+              mbedtls_platform_zeroize(buf, pemLen + 1);
+              free(buf);
+              resp["ok"] = ok;
+              resp["output"][0] = ok ? "Client key stored in NVS" : "NVS write failed";
+            }
+          } else {
+            resp["ok"] = false;
+            resp["output"][0] = "Unknown type - expected client_cert or client_key";
+          }
         }
       }
 
@@ -1257,17 +1264,22 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
         resp["ok"] = false;
         resp["output"][0] = "Usage: payload = <field>\\n<value>";
       } else {
+        // Reject (never clip) an overlong field: a clipped fieldLen would make
+        // valueLen too large and read past the payload end.
+        size_t fieldLen = (size_t)(nl - payload);
         char field[48];
-        size_t fieldLen = min((size_t)(nl - payload), sizeof(field) - 1);
-        memcpy(field, payload, fieldLen);
-        field[fieldLen] = '\0';
         const char* value = nl + 1;
         size_t valueLen = plen - fieldLen - 1;
 
-        if (valueLen >= 256) {
+        if (fieldLen >= sizeof(field)) {
           resp["ok"] = false;
-          resp["output"][0] = "value too large (>256 B)";
+          resp["output"][0] = "field too long";
+        } else if (valueLen >= Secret::MAX_LEN) {
+          resp["ok"] = false;
+          resp["output"][0] = "value too long";
         } else {
+          memcpy(field, payload, fieldLen);
+          field[fieldLen] = '\0';
           char* buf = (char*)malloc(valueLen + 1);
           if (!buf) {
             resp["ok"] = false;

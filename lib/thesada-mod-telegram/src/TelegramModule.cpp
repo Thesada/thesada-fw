@@ -46,7 +46,7 @@ void TelegramModule::begin() {
   _ready = true;
 
   JsonObject cfg    = Config::get();
-  char tokenBuf[64];
+  char tokenBuf[Secret::MAX_LEN];
   const char* token = Secret::resolve("telegram_token", cfg["telegram"]["bot_token"] | "",
                                       tokenBuf, sizeof(tokenBuf));
   JsonVariant chatIds = cfg["telegram"]["chat_ids"];
@@ -146,7 +146,7 @@ bool TelegramModule::sendTo(const char* chatId, const char* message) {
   }
 
   JsonObject cfg    = Config::get();
-  char tokenBuf[64];
+  char tokenBuf[Secret::MAX_LEN];
   const char* token = Secret::resolve("telegram_token", cfg["telegram"]["bot_token"] | "",
                                       tokenBuf, sizeof(tokenBuf));
   if (strlen(token) == 0) { Log::warn(TAG, "No bot_token"); return false; }
@@ -260,7 +260,7 @@ bool TelegramModule::send(const char* message) {
 // Report Telegram module status
 void TelegramModule::status(ShellOutput out) {
   JsonObject cfg = Config::get();
-  char tokenBuf[64];
+  char tokenBuf[Secret::MAX_LEN];
   const char* token = Secret::resolve("telegram_token", cfg["telegram"]["bot_token"] | "",
                                       tokenBuf, sizeof(tokenBuf));
   JsonArray chatIds = cfg["telegram"]["chat_ids"].as<JsonArray>();

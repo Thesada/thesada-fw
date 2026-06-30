@@ -880,34 +880,38 @@ def test_secrets(r):
                 return parts[-1]
         return None
 
+    # Non-credential-looking probe; never passed to a printed detail so no
+    # secret-shaped data reaches the result log.
+    PROBE = "benchValue123"
+
     # Drains/resyncs the buffer before the first assertion below.
     base = info_state(FIELD)
 
     # An unknown field must be rejected, never silently written to a wrong key.
-    out = " ".join(sh.cmd("secret.set bogus.field x"))
-    if "unknown field" in out.lower():
+    if "unknown field" in " ".join(sh.cmd("secret.set bogus.field x")).lower():
         r.ok("secret.set rejects unknown field")
     else:
-        r.fail("secret.set rejects unknown field", out[:60])
+        r.fail("secret.set rejects unknown field")
+
     if base == "config/none":
         # Unprovisioned: safe to run the full cycle and restore to config/none.
-        sh.cmd(f"secret.set {FIELD} testbench_pw")
-        st = info_state(FIELD)
-        r.ok("secret.set -> info=nvs") if st == "nvs" else r.fail("secret.set -> info=nvs", st)
+        sh.cmd(f"secret.set {FIELD} {PROBE}")
+        r.ok("secret.set -> info=nvs") if info_state(FIELD) == "nvs" \
+            else r.fail("secret.set -> info=nvs")
 
-        if "testbench_pw" not in " ".join(sh.cmd("secret.info")):
+        # secret.info must report presence only, never echo the stored value.
+        if PROBE not in " ".join(secret_info()):
             r.ok("secret.info hides value")
         else:
-            r.fail("secret.info hides value", "value echoed in output")
+            r.fail("secret.info hides value")
 
         sh.cmd(f"secret.clear {FIELD}")
-        st = info_state(FIELD)
-        r.ok("secret.clear -> info=config/none") if st == "config/none" else \
-            r.fail("secret.clear -> info=config/none", st)
+        r.ok("secret.clear -> info=config/none") if info_state(FIELD) == "config/none" \
+            else r.fail("secret.clear -> info=config/none")
     elif base == "nvs":
-        r.warn("secret set/clear cycle skipped", f"{FIELD} already provisioned - not clobbering")
+        r.warn("secret set/clear cycle skipped", "field already provisioned")
     else:
-        r.warn("secret.info unavailable", f"{FIELD} not listed (state={base})")
+        r.warn("secret.info unavailable", "field not listed")
 
 
 def _uptime_secs(sh):

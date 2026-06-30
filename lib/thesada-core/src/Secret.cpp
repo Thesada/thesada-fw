@@ -68,7 +68,8 @@ bool Secret::nvsKeyFor(const char* field, char* keyOut, size_t maxLen) {
 bool Secret::set(const char* field, const char* value) {
   char key[16];
   if (!nvsKeyFor(field, key, sizeof(key))) return false;
-  if (!value || !*value) return clear(field);  // empty value = clear
+  if (!value || !*value) return clear(field);   // empty value = clear
+  if (strlen(value) >= MAX_LEN) return false;    // must fit every read buffer
   nvs_handle_t h;
   if (nvs_open(SECRET_NS, NVS_READWRITE, &h) != ESP_OK) return false;
   esp_err_t e = nvs_set_str(h, key, value);
@@ -81,11 +82,14 @@ bool Secret::clear(const char* field) {
   char key[16];
   if (!nvsKeyFor(field, key, sizeof(key))) return false;
   nvs_handle_t h;
-  if (nvs_open(SECRET_NS, NVS_READWRITE, &h) != ESP_OK) return true;  // ns absent = clear
-  esp_err_t e = nvs_erase_key(h, key);
-  if (e == ESP_OK) nvs_commit(h);
+  esp_err_t e = nvs_open(SECRET_NS, NVS_READWRITE, &h);
+  if (e == ESP_ERR_NVS_NOT_FOUND) return true;   // namespace never created = clear
+  if (e != ESP_OK) return false;                  // real open failure
+  e = nvs_erase_key(h, key);
+  if (e == ESP_ERR_NVS_NOT_FOUND) { nvs_close(h); return true; }  // key absent = clear
+  if (e == ESP_OK) e = nvs_commit(h);
   nvs_close(h);
-  return e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND;  // absent key = already clear
+  return e == ESP_OK;
 }
 
 bool Secret::has(const char* field) {
