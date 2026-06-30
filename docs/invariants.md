@@ -554,19 +554,23 @@ Source: `lib/thesada-core/src/MQTTClient.cpp::connect`.
 
 The connection-critical keys (`broker`, `port`, `user`, `password`)
 snapshot to NVS (`thesada-boot`, `mqtt_lg`) on every successful connect.
-At boot `rollbackIfUncommitted()` restores the snapshot only when all three
-hold: a snapshot exists, the current critical config differs from it, and
-`mqttRebootCount() > 0` (an exhaustion reboot happened this streak). The
-last two guards keep a merely-offline broker - same config, just down -
-from triggering a rollback; it shares the no-connect signal with the
-broker-exhaustion bound above. Boot-time only, mirrors OTA commit /
-pending-verify.
+When an exhaustion reboot fires, the config that is failing is recorded to
+`mqtt_rb_cfg`. At boot `rollbackIfUncommitted()` restores the snapshot only
+when the still-current critical config equals `mqtt_rb_cfg` (this exact
+config rebooted without connecting) AND differs from `mqtt_lg`. Keying on
+the recorded failing candidate - not merely a nonzero reboot counter - is
+what keeps two cases from rolling back: a merely-offline broker (config
+unchanged, equals `mqtt_lg`), and a user's recovery edit made after an
+unrelated offline streak (config differs from the recorded candidate).
+`mqtt_rb_cfg` is cleared on the next successful connect and after a
+rollback. Boot-time only, mirrors OTA commit / pending-verify.
 
-How enforced: rollback runs before the first `connect()` in `main.cpp`.
-Any change to the guard set must preserve the offline-broker exemption.
+How enforced: the decision lives in the pure `rollbackDecision()` predicate
+(unit-tested); `rollbackIfUncommitted()` only does the NVS I/O around it and
+runs before the first `connect()` in `main.cpp`.
 
-Source: `lib/thesada-core/src/MQTTClient.cpp::snapshotGoodConfig`,
-`rollbackIfUncommitted`; `src/main.cpp` boot call.
+Source: `lib/thesada-core/src/MQTTClient.cpp::rollbackDecision`,
+`snapshotGoodConfig`, `rollbackIfUncommitted`; `src/main.cpp` boot call.
 
 ---
 
