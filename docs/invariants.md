@@ -4,7 +4,7 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-06-21. Bump the date on every edit.
+Dated 2026-06-29. Bump the date on every edit.
 
 ---
 
@@ -549,6 +549,28 @@ How enforced: the `_retryCount >= 30` branch in `connect()` is gated by
 reboot trigger in this file must justify why it cannot loop.
 
 Source: `lib/thesada-core/src/MQTTClient.cpp::connect`.
+
+### A critical mqtt config that never connects rolls back to the last-good snapshot
+
+The connection-critical keys (`broker`, `port`, `user`, `password`)
+snapshot to NVS (`thesada-boot`, `mqtt_lg`) on every successful connect.
+When an exhaustion reboot fires, the config that is failing is recorded to
+`mqtt_rb_cfg`. At boot `rollbackIfUncommitted()` restores the snapshot only
+when the still-current critical config equals `mqtt_rb_cfg` (this exact
+config rebooted without connecting) AND differs from `mqtt_lg`. Keying on
+the recorded failing candidate - not merely a nonzero reboot counter - is
+what keeps two cases from rolling back: a merely-offline broker (config
+unchanged, equals `mqtt_lg`), and a user's recovery edit made after an
+unrelated offline streak (config differs from the recorded candidate).
+`mqtt_rb_cfg` is cleared on the next successful connect and after a
+rollback. Boot-time only, mirrors OTA commit / pending-verify.
+
+How enforced: the decision lives in the pure `rollbackDecision()` predicate
+(unit-tested); `rollbackIfUncommitted()` only does the NVS I/O around it and
+runs before the first `connect()` in `main.cpp`.
+
+Source: `lib/thesada-core/src/MQTTClient.cpp::rollbackDecision`,
+`snapshotGoodConfig`, `rollbackIfUncommitted`; `src/main.cpp` boot call.
 
 ---
 

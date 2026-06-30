@@ -35,6 +35,16 @@ static const char* RB_KEY_COUNT   = "mqtt_reboots";  // uint8: consecutive
                                                      //   exhaustion reboots
 static const char* RB_KEY_EPOCH   = "mqtt_rb_at";    // uint32: epoch (s)
                                                      //   of the last one
+static const char* RB_KEY_LG      = "mqtt_lg";       // string: last-good
+                                                     //   critical mqtt cfg (JSON)
+static const char* RB_KEY_LGSET   = "mqtt_lg_set";   // uint8: 1 once a snapshot
+                                                     //   exists
+static const char* RB_KEY_RBCFG   = "mqtt_rb_cfg";   // string: critical cfg live
+                                                     //   when a reboot fired
+
+// Buffer for the connection-critical mqtt subset (broker/port/user/password)
+// serialized as JSON. Comfortably fits a hostname + creds.
+static constexpr size_t LG_MAX_LEN = 384;
 
 // Consecutive exhaustion reboots older than this age out: a one-off
 // outage weeks apart never accumulates toward a halt. Only applied when
@@ -414,6 +424,103 @@ static void mqttRebootCountClear() {
   prefs.end();
 }
 
+// Record / clear the critical config that was live when an exhaustion reboot
+// fired. The rollback decision keys off this so it restores only the config
+// that actually rebooted-without-connecting, never an unrelated later edit.
+static void mqttWriteRbCfg(const char* json) {
+  Preferences prefs;
+  if (!prefs.begin(BOOT_NS, false)) return;
+  prefs.putString(RB_KEY_RBCFG, json);
+  prefs.end();
+}
+
+static void mqttClearRbCfg() {
+  Preferences prefs;
+  if (!prefs.begin(BOOT_NS, false)) return;
+  if (prefs.isKey(RB_KEY_RBCFG)) prefs.remove(RB_KEY_RBCFG);
+  prefs.end();
+}
+
+// Pure rollback decision (no NVS / Config) so it is unit-testable. Roll back
+// iff a snapshot exists, the current config is the exact one that rebooted
+// without connecting (rbCfg), and it differs from last-good.
+bool MQTTClient::rollbackDecision(const char* lg, bool haveLg,
+                                  const char* rbCfg, const char* cur) {
+  if (!haveLg || !lg || !*lg) return false;      // nothing to fall back to
+  if (!rbCfg || !*rbCfg) return false;           // no failing candidate recorded
+  if (!cur) return false;
+  if (strcmp(cur, rbCfg) != 0) return false;     // current != the config that failed
+  if (strcmp(cur, lg) == 0) return false;        // current == last-good
+  return true;
+}
+
+// Serialize the connection-critical mqtt keys in a fixed order so two identical
+// configs yield identical strings. out: bytes written (0 on overflow/failure).
+static size_t mqttCriticalJson(char* out, size_t maxLen) {
+  JsonObject m = Config::get()["mqtt"];
+  JsonDocument d;
+  d["broker"]   = m["broker"]   | "";
+  d["port"]     = m["port"]     | 0;
+  d["user"]     = m["user"]     | "";
+  d["password"] = m["password"] | "";
+  size_t n = serializeJson(d, out, maxLen);
+  return (n > 0 && n < maxLen) ? n : 0;
+}
+
+// Snapshot the connection-critical mqtt config as last-good. Writes NVS only
+// when it changed (flash wear).
+void MQTTClient::snapshotGoodConfig() {
+  char cur[LG_MAX_LEN];
+  if (mqttCriticalJson(cur, sizeof(cur)) == 0) return;
+
+  Preferences prefs;
+  if (!prefs.begin(BOOT_NS, false)) return;
+  char prev[LG_MAX_LEN] = {0};
+  prefs.getString(RB_KEY_LG, prev, sizeof(prev));
+  if (strcmp(cur, prev) != 0) {
+    // Both writes must land, else mqtt_lg / mqtt_lg_set diverge; report failure
+    // rather than logging a commit that did not persist.
+    bool ok = prefs.putString(RB_KEY_LG, cur) > 0;
+    ok = (prefs.putUChar(RB_KEY_LGSET, 1) > 0) && ok;
+    Log::info(TAG, ok ? "mqtt.config_committed" : "mqtt.config_commit_failed");
+  }
+  prefs.end();
+}
+
+// Restore the last-good snapshot if the still-current critical config is the
+// exact one that rebooted without connecting. A merely-offline broker (config
+// unchanged) and an unrelated later edit both fall through - see rollbackDecision.
+void MQTTClient::rollbackIfUncommitted() {
+  Preferences prefs;
+  if (!prefs.begin(BOOT_NS, true)) return;
+  uint8_t haveLg = prefs.getUChar(RB_KEY_LGSET, 0);
+  char lgJson[LG_MAX_LEN] = {0};
+  char rbJson[LG_MAX_LEN] = {0};
+  if (haveLg) prefs.getString(RB_KEY_LG, lgJson, sizeof(lgJson));
+  prefs.getString(RB_KEY_RBCFG, rbJson, sizeof(rbJson));
+  prefs.end();
+
+  char cur[LG_MAX_LEN];
+  if (mqttCriticalJson(cur, sizeof(cur)) == 0) return;
+  if (!rollbackDecision(lgJson, haveLg != 0, rbJson, cur)) return;
+
+  JsonDocument lg;
+  if (deserializeJson(lg, lgJson)) return;  // corrupt snapshot: leave config alone
+
+  JsonObject m = Config::get()["mqtt"];
+  m["broker"]   = String((const char*)(lg["broker"] | ""));
+  m["port"]     = lg["port"] | 0;
+  m["user"]     = String((const char*)(lg["user"]     | ""));
+  m["password"] = String((const char*)(lg["password"] | ""));
+  if (Config::save()) {
+    mqttRebootCountClear();                 // fresh reboot budget for the restored config
+    mqttClearRbCfg();
+    Log::warn(TAG, "mqtt.config_rollback");
+  } else {
+    Log::error(TAG, "mqtt.config_rollback_save_failed");
+  }
+}
+
 // ---------------------------------------------------------------------------
 
 // Connect to the MQTT broker. Applies mTLS when a client cert is present.
@@ -527,6 +634,9 @@ void MQTTClient::connect() {
     // Clear the reboot guard: a future failure starts a fresh streak.
     _rebootHalted  = false;
     mqttRebootCountClear();
+    mqttClearRbCfg();   // this config connected: it is no longer a failing candidate
+    // This config just connected: commit it as the last-good rollback target.
+    snapshotGoodConfig();
     _lastSuccessMs    = millis();
     _connectedSinceMs = millis();
     Log::info(TAG, "Connected");
@@ -588,6 +698,10 @@ void MQTTClient::connect() {
                  (unsigned)rebootAfter, (unsigned)(count + 1),
                  (unsigned)maxReboots);
         Log::error(TAG, m);
+        // Record the config that is failing so the boot-time rollback restores
+        // exactly this one, not an unrelated later edit.
+        char failing[LG_MAX_LEN];
+        if (mqttCriticalJson(failing, sizeof(failing)) > 0) mqttWriteRbCfg(failing);
         mqttRebootCountBump(count + 1);
         delay(1000);
         ESP.restart();
