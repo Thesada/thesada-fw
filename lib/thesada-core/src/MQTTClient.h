@@ -37,6 +37,9 @@ struct MQTTSubscription {
 class MQTTClient {
 public:
   static void begin();
+  // Restore mqtt.* from the last-good snapshot if a bad config rebooted the
+  // device without connecting. Call at boot before begin().
+  static void rollbackIfUncommitted();
   static void reinitSubscriptions();
   static void loop();
   static void tick();  // lightweight keepalive - call during long init phases
@@ -134,6 +137,7 @@ public:
 
 private:
   static void connect();
+  static void snapshotGoodConfig();  // commit current critical mqtt cfg as last-good
   static void flushQueue();
   static void enqueue(const char* topic, const char* payload);
   static void onMessage(char* topic, uint8_t* payload, unsigned int length);

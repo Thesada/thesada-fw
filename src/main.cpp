@@ -155,7 +155,12 @@ void setup() {
   }
   // Registers the subscription set that Cellular::smsubAll mirrors onto the
   // cellular MQTT session on failover. connect() is a no-op if WiFi is down.
-  if (_mqttEnabled) MQTTClient::begin();
+  if (_mqttEnabled) {
+    // Roll back mqtt.* to last-good if a bad config rebooted us without ever
+    // connecting; no-op otherwise. Must precede the first connect attempt.
+    MQTTClient::rollbackIfUncommitted();
+    MQTTClient::begin();
+  }
 
   Shell::begin();
   if (_heartbeatEnabled) HeartbeatLED::begin();

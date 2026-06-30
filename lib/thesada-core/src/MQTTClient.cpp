@@ -35,6 +35,14 @@ static const char* RB_KEY_COUNT   = "mqtt_reboots";  // uint8: consecutive
                                                      //   exhaustion reboots
 static const char* RB_KEY_EPOCH   = "mqtt_rb_at";    // uint32: epoch (s)
                                                      //   of the last one
+static const char* RB_KEY_LG      = "mqtt_lg";       // string: last-good
+                                                     //   critical mqtt cfg (JSON)
+static const char* RB_KEY_LGSET   = "mqtt_lg_set";   // uint8: 1 once a snapshot
+                                                     //   exists
+
+// Buffer for the connection-critical mqtt subset (broker/port/user/password)
+// serialized as JSON. Comfortably fits a hostname + creds.
+static constexpr size_t LG_MAX_LEN = 384;
 
 // Consecutive exhaustion reboots older than this age out: a one-off
 // outage weeks apart never accumulates toward a halt. Only applied when
@@ -414,6 +422,73 @@ static void mqttRebootCountClear() {
   prefs.end();
 }
 
+// Serialize the connection-critical mqtt keys in a fixed order so two identical
+// configs yield identical strings. out: bytes written (0 on overflow/failure).
+static size_t mqttCriticalJson(char* out, size_t maxLen) {
+  JsonObject m = Config::get()["mqtt"];
+  JsonDocument d;
+  d["broker"]   = m["broker"]   | "";
+  d["port"]     = m["port"]     | 0;
+  d["user"]     = m["user"]     | "";
+  d["password"] = m["password"] | "";
+  size_t n = serializeJson(d, out, maxLen);
+  return (n > 0 && n < maxLen) ? n : 0;
+}
+
+// Snapshot the connection-critical mqtt config as last-good. Writes NVS only
+// when it changed (flash wear).
+void MQTTClient::snapshotGoodConfig() {
+  char cur[LG_MAX_LEN];
+  if (mqttCriticalJson(cur, sizeof(cur)) == 0) return;
+
+  Preferences prefs;
+  if (!prefs.begin(BOOT_NS, false)) return;
+  char prev[LG_MAX_LEN] = {0};
+  prefs.getString(RB_KEY_LG, prev, sizeof(prev));
+  if (strcmp(cur, prev) != 0) {
+    prefs.putString(RB_KEY_LG, cur);
+    prefs.putUChar(RB_KEY_LGSET, 1);
+    Log::info(TAG, "mqtt.config_committed");
+  }
+  prefs.end();
+}
+
+// Restore the last-good snapshot if a critical-config change rebooted the
+// device without ever connecting. The guards below keep a merely-offline
+// broker from triggering it.
+void MQTTClient::rollbackIfUncommitted() {
+  Preferences prefs;
+  if (!prefs.begin(BOOT_NS, true)) return;
+  uint8_t haveLg = prefs.getUChar(RB_KEY_LGSET, 0);
+  char lgJson[LG_MAX_LEN] = {0};
+  size_t lgLen = haveLg ? prefs.getString(RB_KEY_LG, lgJson, sizeof(lgJson)) : 0;
+  prefs.end();
+  if (!haveLg || lgLen == 0) return;        // nothing to fall back to yet
+
+  // A reboot from exhaustion must have happened this streak; counter 0 means
+  // the broker is merely offline, not that a new config is bad.
+  if (mqttRebootCount() == 0) return;
+
+  char cur[LG_MAX_LEN];
+  if (mqttCriticalJson(cur, sizeof(cur)) == 0) return;
+  if (strcmp(cur, lgJson) == 0) return;     // current == last-good: not a config break
+
+  JsonDocument lg;
+  if (deserializeJson(lg, lgJson)) return;  // corrupt snapshot: leave config alone
+
+  JsonObject m = Config::get()["mqtt"];
+  m["broker"]   = String((const char*)(lg["broker"] | ""));
+  m["port"]     = lg["port"] | 0;
+  m["user"]     = String((const char*)(lg["user"]     | ""));
+  m["password"] = String((const char*)(lg["password"] | ""));
+  if (Config::save()) {
+    mqttRebootCountClear();                 // fresh reboot budget for the restored config
+    Log::warn(TAG, "mqtt.config_rollback");
+  } else {
+    Log::error(TAG, "mqtt.config_rollback_save_failed");
+  }
+}
+
 // ---------------------------------------------------------------------------
 
 // Connect to the MQTT broker. Applies mTLS when a client cert is present.
@@ -527,6 +602,8 @@ void MQTTClient::connect() {
     // Clear the reboot guard: a future failure starts a fresh streak.
     _rebootHalted  = false;
     mqttRebootCountClear();
+    // This config just connected: commit it as the last-good rollback target.
+    snapshotGoodConfig();
     _lastSuccessMs    = millis();
     _connectedSinceMs = millis();
     Log::info(TAG, "Connected");
