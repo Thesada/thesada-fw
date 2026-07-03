@@ -1718,50 +1718,21 @@ static void cmd_chip_info(int argc, char** argv, ShellOutput out) {
 // Module commands
 // ---------------------------------------------------------------------------
 
+// Both module commands walk ModuleRegistry - a module compiled into the build
+// is exactly one that self-registered via MODULE_REGISTER, so list and status
+// always show the same set (the old hardcoded #ifdef list here drifted and
+// omitted registered modules like HttpServer/ScriptEngine/GNSS).
 static void cmd_module_list(int argc, char** argv, ShellOutput out) {
-  out("Compiled modules:");
-
-  #ifdef ENABLE_TEMPERATURE
-  out("  [x] temperature");
-  #else
-  out("  [ ] temperature");
-  #endif
-
-  #ifdef ENABLE_ADS1115
-  out("  [x] ads1115");
-  #else
-  out("  [ ] ads1115");
-  #endif
-
-  #ifdef ENABLE_PWM
-  out("  [x] pwm");
-  #else
-  out("  [ ] pwm");
-  #endif
-
-  #ifdef ENABLE_SD
-  out("  [x] sd");
-  #else
-  out("  [ ] sd");
-  #endif
-
-  #ifdef ENABLE_CELLULAR
-  out("  [x] cellular");
-  #else
-  out("  [ ] cellular");
-  #endif
-
-  #ifdef ENABLE_TELEGRAM
-  out("  [x] telegram");
-  #else
-  out("  [ ] telegram");
-  #endif
-
-  #ifdef ENABLE_LORA
-  out("  [x] lora");
-  #else
-  out("  [ ] lora");
-  #endif
+  out("Registered modules ([x] enabled, [ ] disabled by config):");
+  for (uint8_t i = 0; i < ModuleRegistry::count(); i++) {
+    Module* m = ModuleRegistry::get(i);
+    if (!m) continue;
+    char line[96];
+    snprintf(line, sizeof(line), "  [%c] %-14s %s%s",
+             ModuleRegistry::enabled(i) ? 'x' : ' ',
+             m->configKey(), m->name(), m->coreModule() ? " (core)" : "");
+    out(line);
+  }
 }
 
 static void cmd_module_status(int argc, char** argv, ShellOutput out) {
@@ -1769,17 +1740,31 @@ static void cmd_module_status(int argc, char** argv, ShellOutput out) {
     Module* m = ModuleRegistry::get(i);
     if (!m) continue;
     // Disabled modules never ran begin(); don't call status() on uninit state.
-    char buf[160] = {};
-    size_t off = snprintf(buf, sizeof(buf), "  %-14s ", m->name());
     if (!ModuleRegistry::enabled(i)) {
-      snprintf(buf + off, sizeof(buf) - off, "disabled");
-      out(buf);
+      char line[64];
+      snprintf(line, sizeof(line), "  %-14s disabled", m->name());
+      out(line);
       continue;
     }
-    m->status([&buf, &off](const char* s) {
-      snprintf(buf + off, sizeof(buf) - off, "%s", s);
+    // Emit every status() line; continuation lines align under the first
+    // (the old single-buffer version overwrote, so only the last line of a
+    // multi-line status survived).
+    bool first = true;
+    m->status([&out, &first, m](const char* s) {
+      char line[176];
+      if (first) {
+        snprintf(line, sizeof(line), "  %-14s %s", m->name(), s);
+        first = false;
+      } else {
+        snprintf(line, sizeof(line), "  %-14s %s", "", s);
+      }
+      out(line);
     });
-    out(buf);
+    if (first) {  // status() emitted nothing
+      char line[64];
+      snprintf(line, sizeof(line), "  %-14s (no status)", m->name());
+      out(line);
+    }
   }
 }
 
