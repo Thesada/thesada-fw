@@ -4,7 +4,7 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-06-29. Bump the date on every edit.
+Dated 2026-07-02. Bump the date on every edit.
 
 ---
 
@@ -124,6 +124,27 @@ TLS config.
 
 Source: `lib/thesada-core/src/OTAUpdate.cpp::configureSecureClient`,
 `lib/thesada-mod-cellular/src/Cellular.cpp` HTTPS client wiring.
+
+### MQTT TLS is always certificate-validated - no pre-NTP insecure window
+
+`MQTTClient::connect()` has no `setInsecure()` fallback for an unsynced
+clock. Instead, `begin()` applies a boot clock floor before the first
+handshake: `settimeofday(max(persisted NVS floor, firmware build stamp))`
+when the clock sits below it, so certificate validity checks pass without
+NTP. The floor is re-persisted from `loop()` at most daily; the clock only
+advances at real-time rate, so the stored value is always a valid lower
+bound of real time - across reboots, NTP or not. A certificate the floored
+clock rejects (e.g. `NotBefore` ahead of a stale floor) fails closed and
+retries until NTP corrects. The clock is never moved backwards.
+
+How enforced: decision logic is pure (`clock_floor_policy.h`,
+host-tested in `test/test_clock_floor`). Do not reintroduce a
+clock-conditional `setInsecure()` in the connect path; the only remaining
+`setInsecure()` in MQTTClient is the `begin()`-time last resort for a
+missing CA bundle, which logs loudly.
+
+Source: `lib/thesada-core/src/clock_floor_policy.h`,
+`lib/thesada-core/src/MQTTClient.cpp` begin()/connect()/loop().
 
 ---
 

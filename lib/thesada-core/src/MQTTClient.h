@@ -207,7 +207,6 @@ public:
 
   static uint32_t      _lastSuccessMs;      // millis() of last successful publish or MQTT loop
   static uint32_t      _connectedSinceMs;   // millis() when current connection was established
-  static bool          _insecureFallback;   // true if connected without cert validation (NTP not synced)
 
   static uint32_t      _lastHeapPublishMs;  // millis() of last heap stats publish
   static uint32_t      _lastHeapFree;       // last sampled ESP.getFreeHeap() for alert tagging
