@@ -260,12 +260,47 @@ if (!g.ok()) {
 
 ---
 
-## Test naming
+## Native unit harness
+
+### Extract tricky logic to a pure header, test it off-board
+
+The host-native test env is real and gating, not aspirational. Decision
+logic that is worth getting right - security predicates, parsers, byte
+layouts - lives in pure headers with no Arduino/IDF/NVS includes, so it
+compiles and runs on the host:
+
+- `*_policy.h` - decision predicates (`mqtt_rollback_policy.h`,
+  `clock_floor_policy.h`, `web_auth_policy.h`). Pure inputs, small output,
+  no side effects.
+- `*_payload.h` - wire/payload parsing and shaping (`cli_payload.h`).
+- `*_keymap.h` - static lookup/mapping tables (`secret_keymap.h`).
+
+The board-side `.cpp` includes the header and wraps the I/O around it; the
+host test includes the same header directly. When a bug lives in logic
+that currently only exists inside a `.cpp`, extract the logic to a pure
+header first, then test it - that extraction is the fix, not an
+afterthought.
+
+Run them:
+
+```bash
+pio test -e native                    # all native suites
+pio test -e native -f test_rollback   # one suite
+```
+
+Static analysis gates the same units: `scripts/static-check.sh` runs
+cppcheck over every `*_policy.h` / `*_payload.h` / `*_keymap.h`, and CI
+runs it in the `static-analysis` job. It catches the buffer-over-read
+class the on-device bench never exercises.
+
+To add a suite: create `test/test_<name>/test_<name>.cpp`, `#include` the
+pure header, write Unity `TEST_ASSERT_*` cases, and wire a `main()` that
+calls `UNITY_BEGIN()` / `RUN_TEST` / `UNITY_END()` (copy an existing
+suite's `main`). It joins `pio test -e native` automatically.
 
 ### Tests are documentation of the contract
 
-Native unit tests live in `tests/` (Lua) and the PlatformIO `native`
-env. Test names describe what the system promises.
+Test names describe what the system promises.
 
 Good:
 ```
