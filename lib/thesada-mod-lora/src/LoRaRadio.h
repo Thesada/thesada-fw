@@ -11,13 +11,16 @@
 class SX1262;    // RadioLib, forward-declared
 class SPIClass;  // Arduino SPI, forward-declared
 
-// Result of a receive poll.
+// Result of a receive poll. data is a raw byte buffer, NOT a C string:
+// Meshtastic frames are encrypted binary and legally contain NUL bytes
+// (String-based readData truncates at the first one).
 struct LoRaRx {
-  bool   received = false;  // a packet was read without a read error
-  bool   crcErr   = false;  // RX_DONE but CRC failed
-  String data;
-  float  rssi = 0.0f;
-  float  snr  = 0.0f;
+  bool    received = false;  // a packet was read without a read error
+  bool    crcErr   = false;  // RX_DONE but CRC failed
+  uint8_t data[256];         // SX1262 max LoRa packet is 255 B
+  size_t  len = 0;
+  float   rssi = 0.0f;
+  float   snr  = 0.0f;
 };
 
 class LoRaRadio {

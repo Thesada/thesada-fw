@@ -9,6 +9,7 @@ files=(
   lib/thesada-core/src/*_policy.h
   lib/thesada-core/src/*_payload.h
   lib/thesada-core/src/*_keymap.h
+  lib/thesada-core/src/meshtastic_*.h
 )
 if [ ${#files[@]} -eq 0 ]; then
   echo "static-check: no pure units found - nothing to do"

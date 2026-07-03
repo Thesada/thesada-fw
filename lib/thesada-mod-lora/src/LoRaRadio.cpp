@@ -62,7 +62,9 @@ bool LoRaRadio::poll(LoRaRx& out) {
   if (!(f & RADIOLIB_SX126X_IRQ_RX_DONE)) return false;
 
   out.crcErr   = (f & RADIOLIB_SX126X_IRQ_CRC_ERR) != 0;
-  out.received = (_radio->readData(out.data) == RADIOLIB_ERR_NONE);
+  out.len      = _radio->getPacketLength();
+  if (out.len > sizeof(out.data)) out.len = sizeof(out.data);
+  out.received = (_radio->readData(out.data, out.len) == RADIOLIB_ERR_NONE);
   out.rssi     = _radio->getRSSI();
   out.snr      = _radio->getSNR();
   _radio->startReceive();

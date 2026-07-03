@@ -1,7 +1,7 @@
 // thesada-fw - MeshtasticFrame.h
-// Meshtastic interop: LongFast/US default-channel PHY constants + frame
-// build/parse (16B PacketHeader + AES128-CTR over a protobuf Data message).
-// No RadioLib types here - just byte buffers - so it composes with LoRaRadio.
+// Meshtastic interop shim: runtime channel state + AES-CTR (mbedtls) around
+// the pure codec in thesada-core's meshtastic_frame.h. No RadioLib types
+// here - just byte buffers - so it composes with LoRaRadio.
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
@@ -9,22 +9,28 @@
 
 #ifdef ENABLE_LORA
 
+#include <meshtastic_frame.h>
+
 namespace mesh {
 
-// LongFast preset on the US default channel (slot 19 -> 906.875 MHz).
-constexpr float    FREQ_MHZ = 906.875f;
-constexpr float    BW_KHZ   = 250.0f;
-constexpr uint8_t  SF       = 11;
-constexpr uint8_t  CR       = 5;
-constexpr uint8_t  SYNC     = 0x2b;
-constexpr uint16_t PREAMBLE = 16;
-constexpr uint8_t  CHANNEL  = 0x08;  // xorHash("LongFast") ^ xorHash(default key)
+// Channel crypto state, derived once from config at module begin().
+struct Channel {
+  uint8_t key[32] = {0};
+  size_t  keyLen  = 0;   // 16 = AES128, 32 = AES256, 0 = crypto off
+  uint8_t hash    = 0;
+};
 
-// Build a broadcast TEXT_MESSAGE_APP frame into out. Returns total length, 0 on overflow.
-size_t buildText(const char* text, uint32_t fromNode, uint32_t packetId, uint8_t* out, size_t cap);
+enum class Parse { Ok, NotOurs, ForeignPort, Malformed };
 
-// If buf is a text message on our channel, set text + fromNode and return true.
-bool parseText(const uint8_t* buf, size_t len, String& text, uint32_t& fromNode);
+// Build a broadcast TEXT_MESSAGE_APP frame on ch into out. Returns total
+// length, 0 on overflow.
+size_t buildText(const Channel& ch, const char* text, uint32_t fromNode,
+                 uint32_t packetId, uint8_t* out, size_t cap);
+
+// Decode a received frame against ch. Ok: text + fromNode set. ForeignPort:
+// a clean decode for some other app - portnum is set so the caller can log it.
+Parse parseText(const Channel& ch, const uint8_t* buf, size_t len,
+                String& text, uint32_t& fromNode, uint32_t& portnum);
 
 }  // namespace mesh
 
