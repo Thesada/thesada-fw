@@ -12,6 +12,7 @@
 #include "HttpServer.h"
 #include <Config.h>
 #include <Secret.h>
+#include <web_auth_policy.h>
 #include <EventBus.h>
 #include <Log.h>
 #include <ScriptEngine.h>
@@ -152,25 +153,52 @@ static bool _validateToken(const char* token) {
   return found;
 }
 
+// True while web.password is still the shipped default (or empty). Resolved
+// per call so secret.set / secret.clear web.password take effect immediately.
+static bool _defaultPassActive() {
+  JsonObject cfg = Config::get();
+  char passBuf[Secret::MAX_LEN];
+  const char* webPass = Secret::resolve("web_password", cfg["web"]["password"] | "changeme",
+                                        passBuf, sizeof(passBuf));
+  return webAuthPassIsDefault(webPass);
+}
+
 // Check auth: Basic Auth OR Bearer token. Returns true if authorized.
 // Credentials are resolved per request so secret.set / secret.clear
 // web.password take effect without a restart.
+// While web.password is default/empty, nothing authenticates - not even a
+// Bearer token (see web_auth_policy.h). The dashboard and other public
+// routes stay up; only the authenticated surface is refused.
 static bool _checkAuth(AsyncWebServerRequest* req) {
-  // Check Bearer token first
-  if (req->hasHeader("Authorization")) {
-    String authHeader = req->header("Authorization");
-    if (authHeader.startsWith("Bearer ")) {
-      String token = authHeader.substring(7);
-      if (_validateToken(token.c_str())) return true;
-    }
-  }
-  // Fall back to Basic Auth against the current credentials.
   JsonObject cfg = Config::get();
   const char* webUser = cfg["web"]["user"] | "admin";
   char passBuf[Secret::MAX_LEN];
   const char* webPass = Secret::resolve("web_password", cfg["web"]["password"] | "changeme",
                                         passBuf, sizeof(passBuf));
-  return req->authenticate(webUser, webPass);
+
+  const bool passIsDefault = webAuthPassIsDefault(webPass);
+  if (passIsDefault) {
+    // Throttled: one warn per minute, not one per probe.
+    static uint32_t lastWarnMs = 0;
+    if (lastWarnMs == 0 || millis() - lastWarnMs > 60000UL) {
+      lastWarnMs = millis();
+      Log::warn(TAG, "Admin route refused - web.password is default/empty. "
+                     "Set it via 'secret.set web.password' or config.json");
+    }
+  }
+
+  bool bearerValid = false;
+  if (req->hasHeader("Authorization")) {
+    String authHeader = req->header("Authorization");
+    if (authHeader.startsWith("Bearer ")) {
+      String token = authHeader.substring(7);
+      bearerValid = _validateToken(token.c_str());
+    }
+  }
+  // Skip the Basic check when Bearer already verified (or the veto decides).
+  const bool basicOk = !passIsDefault && !bearerValid &&
+                       req->authenticate(webUser, webPass);
+  return webAuthAllowed(passIsDefault, bearerValid, basicOk);
 }
 
 // IP-based WS pre-auth: GET /api/ws/token (auth-gated) marks the caller's IP as
@@ -284,15 +312,11 @@ void HttpServer::subscribeToEvents() {
 
 // Register all HTTP routes, WebSocket handler, OTA endpoint, and captive portal
 void HttpServer::setupRoutes() {
-  JsonObject cfg = Config::get();
-  // Credentials are resolved per request in _checkAuth; resolve once here only
+  // Credentials are resolved per request in _checkAuth; check once here only
   // for the boot-time default-password warning.
-  char webPassBuf[Secret::MAX_LEN];
-  const char* webPass = Secret::resolve("web_password", cfg["web"]["password"] | "changeme",
-                                        webPassBuf, sizeof(webPassBuf));
-
-  if (strcmp(webPass, "changeme") == 0) {
-    Log::warn(TAG, "Default password in use - set web.password via config.json or 'secret.set web.password'");
+  if (_defaultPassActive()) {
+    Log::warn(TAG, "web.password is default/empty - ADMIN ROUTES LOCKED until set "
+                   "via 'secret.set web.password' or config.json");
   }
 
   // ── Dashboard HTML - public (sensor data is read-only) ────────────────────
@@ -309,6 +333,15 @@ void HttpServer::setupRoutes() {
     String ip = req->client()->remoteIP().toString();
     if (!_rlAllow(ip)) {
       req->send(429, "application/json", "{\"ok\":false,\"error\":\"Too many attempts - wait 30s\"}");
+      return;
+    }
+    // Say WHY when the admin surface is locked by the default password -
+    // otherwise the login modal just loops with no way to tell. 403 (not
+    // 401): no credentials can succeed until web.password is set.
+    if (_defaultPassActive()) {
+      req->send(403, "application/json",
+                "{\"ok\":false,\"error\":\"web.password is default/empty - admin locked. "
+                "Set it via 'secret.set web.password' on the serial console\"}");
       return;
     }
     if (!_checkAuth(req)) {
