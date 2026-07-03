@@ -197,12 +197,33 @@ directly.
 Source: `lib/thesada-mod-httpserver/src/HttpServer.cpp::cmdHandler`,
 `lib/thesada-core/src/Shell.cpp::enqueueDeferred`.
 
-### Bearer token comparison is constant-time (WIP)
+### Default/empty `web.password` serves no authenticated route
 
-Currently `strcmp`, which returns early on first byte mismatch and
-leaks effective leading-byte count via timing. Tokens are 128-bit
-`esp_random` so unexploitable in practice, but the right pattern is
-to fix.
+While `web.password` resolves to the shipped default (`changeme`),
+empty, or missing, `_checkAuth` refuses everything - Basic auth with
+the default credentials AND Bearer tokens, so a token minted before a
+password reset cannot outlive the reset. Public routes (dashboard,
+`/api/info`, `/api/state`) stay up; `/api/auth/check` answers 403 with
+an explanation so the login modal can say why. The veto lifts the
+moment `secret.set web.password` lands - credentials are resolved per
+request, no restart needed.
+
+How enforced: the veto is the pure predicate `webAuthPassIsDefault` /
+`webAuthAllowed` (`web_auth_policy.h`, host-tested in
+`test/test_web_auth`). New auth schemes must route through
+`webAuthAllowed`, never around it.
+
+Source: `lib/thesada-core/src/web_auth_policy.h`,
+`lib/thesada-mod-httpserver/src/HttpServer.cpp::_checkAuth`.
+
+### Bearer token comparison is constant-time
+
+`_validateToken` compares via `_constTimeEq` (no early return) and
+walks every token slot regardless of an early match, so neither the
+per-byte compare nor the slot loop leaks token correctness via
+response timing.
+
+Source: `lib/thesada-mod-httpserver/src/HttpServer.cpp::_validateToken`.
 
 ### HTTP rate limiter: 5 fails -> 30 s lockout, 16 IP table, auto-reset on success
 
