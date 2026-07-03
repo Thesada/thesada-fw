@@ -15,6 +15,7 @@
 // never sees RadioLib's Module.
 #include "../../thesada-core/src/Module.h"
 #include "LoRaRadio.h"
+#include "MeshtasticFrame.h"
 
 class LoRaModule : public Module {
 public:
@@ -28,12 +29,17 @@ private:
   bool transmit(const char* msg);
   void publishRx(const LoRaRx& rx);
   void setListening(bool on);
+  bool meshConfig();
 
   LoRaRadio _radio;
   bool      _ok        = false;
   bool      _listening = false;
-  bool      _meshtastic = false;  // frame as Meshtastic LongFast instead of raw text
+  bool      _meshtastic = false;  // lora.mode: Meshtastic framing + derived PHY
   uint32_t  _nodeNum    = 0;      // our Meshtastic node id (low 4 bytes of MAC by default)
+
+  mesh::Channel _chan;            // derived channel crypto (meshtastic mode)
+  uint16_t      _slot = 0;        // 0-based frequency slot (UI shows slot+1)
+  char          _chanName[33] = {0};
 
   float    _freq     = 915.0f;
   float    _bw       = 125.0f;
