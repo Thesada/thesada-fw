@@ -6,6 +6,7 @@
 #include "Secret.h"
 #include "cli_payload.h"
 #include "mqtt_rollback_policy.h"
+#include "clock_floor_policy.h"
 #include "EventBus.h"
 #include "WiFiManager.h"
 #include "Log.h"
@@ -23,6 +24,7 @@
 #include <string>
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
+#include <sys/time.h>
 #include <esp_chip_info.h>
 
 // NVS namespace separate from Config: cert survives factory reset and never
@@ -44,6 +46,12 @@ static const char* RB_KEY_LGSET   = "mqtt_lg_set";   // uint8: 1 once a snapshot
                                                      //   exists
 static const char* RB_KEY_RBCFG   = "mqtt_rb_cfg";   // string: critical cfg live
                                                      //   when a reboot fired
+static const char* CLK_KEY_FLOOR  = "clk_floor";     // uint32: last persisted
+                                                     //   clock floor, epoch (s)
+
+// Last floor value read from / written to NVS this boot. Bounds persist
+// writes to one per CLOCK_FLOOR_PERSIST_INTERVAL_S.
+static uint32_t s_clkFloorStored = 0;
 
 // Buffer for the connection-critical mqtt subset (broker/port/user/password)
 // serialized as JSON. Comfortably fits a hostname + creds.
@@ -151,7 +159,6 @@ MQTTSubscription MQTTClient::_subs[MQTT_MAX_SUBS];
 uint8_t          MQTTClient::_subCount = 0;
 uint32_t         MQTTClient::_lastSuccessMs    = 0;
 uint32_t         MQTTClient::_connectedSinceMs = 0;
-bool             MQTTClient::_insecureFallback = false;
 uint32_t         MQTTClient::_lastHeapPublishMs = 0;
 uint32_t         MQTTClient::_lastHeapFree      = 0;
 uint32_t         MQTTClient::_lowHeapSinceMs    = 0;
@@ -258,6 +265,29 @@ void MQTTClient::begin() {
   _client.setCallback(onMessage);
 
 #ifdef MQTT_TLS
+  // Boot clock floor: lift an epoch clock to a sane lower bound of real time
+  // before the first TLS handshake, so certificate validity checks pass from
+  // the very first connect and no insecure window exists. Floor = newer of
+  // the persisted floor and the firmware build stamp; the clock is never
+  // moved backwards, so an already-synced clock is untouched.
+  {
+    Preferences prefs;
+    if (prefs.begin(BOOT_NS, true)) {
+      s_clkFloorStored = prefs.getUInt(CLK_KEY_FLOOR, 0);
+      prefs.end();
+    }
+    const uint32_t floorEpoch =
+        clockFloorTarget(s_clkFloorStored, clockFloorBuildEpoch(__DATE__, __TIME__));
+    if (clockFloorShouldApply(time(nullptr), floorEpoch)) {
+      struct timeval tv = { (time_t)floorEpoch, 0 };
+      settimeofday(&tv, nullptr);
+      char msg[80];
+      snprintf(msg, sizeof(msg), "Clock floor applied: %lu (NTP corrects forward)",
+               (unsigned long)floorEpoch);
+      Log::info(TAG, msg);
+    }
+  }
+
   // Keep well under the 30 s hardware watchdog.
   // v2.x setTimeout takes seconds; v3.x takes milliseconds. Setting both
   // handles the difference. setHandshakeTimeout is always in seconds.
@@ -398,7 +428,7 @@ static uint8_t mqttRebootCount() {
   prefs.end();
 
   time_t now = time(nullptr);
-  if (count > 0 && now > 1700000000L && epoch > 0 &&
+  if (count > 0 && now > (time_t)CLOCK_FLOOR_SANE_EPOCH && epoch > 0 &&
       (uint32_t)now - epoch > RB_STALE_WINDOW_S) {
     return 0;  // streak aged out
   }
@@ -411,7 +441,7 @@ static void mqttRebootCountBump(uint8_t newCount) {
   if (!prefs.begin(BOOT_NS, false)) return;
   prefs.putUChar(RB_KEY_COUNT, newCount);
   time_t now = time(nullptr);
-  prefs.putUInt(RB_KEY_EPOCH, (now > 1700000000L) ? (uint32_t)now : 0);
+  prefs.putUInt(RB_KEY_EPOCH, (now > (time_t)CLOCK_FLOOR_SANE_EPOCH) ? (uint32_t)now : 0);
   prefs.end();
 }
 
@@ -554,29 +584,10 @@ void MQTTClient::connect() {
   // tears the connection down on any failure.
   _wifiClient.stop();
 
-  // If NTP hasn't synced yet, cert validation will fail (clock at epoch = every
-  // cert looks expired). Temporarily use insecure mode and reconnect with proper
-  // validation once NTP syncs in the background.
-  time_t now = time(nullptr);
-  if (now < 1700000000 && _caCert && _caCertLen > 0) {
-    if (!_insecureFallback) {
-      Log::warn(TAG, "NTP not synced - connecting without cert validation");
-      _wifiClient.setInsecure();
-      _insecureFallback = true;
-    }
-  } else if (_insecureFallback && now > 1700000000 && ESP.getMaxAllocHeap() > 40000) {
-    // NTP synced since last attempt - restore cert validation
-    Log::info(TAG, "NTP synced - restoring cert validation");
-    _wifiClient.setCACert(_caCert);
-    _insecureFallback = false;
-  } else if (_insecureFallback && now > 1700000000) {
-    // NTP synced but not enough contiguous heap for TLS - stay insecure
-    static bool _heapWarnLogged = false;
-    if (!_heapWarnLogged) {
-      Log::warn(TAG, "Heap too low for TLS cert validation - staying insecure");
-      _heapWarnLogged = true;
-    }
-  }
+  // No pre-NTP insecure fallback here: the boot clock floor in begin() keeps
+  // the clock at a sane lower bound of real time, so cert validation works
+  // from the first connect. A cert the floored clock rejects (e.g. NotBefore
+  // ahead of a stale floor) fails closed and retries until NTP corrects.
 
   // Load client cert from NVS into module-level buffers. WiFiClientSecure
   // holds the raw pointer for the TLS session lifetime, so buffers must
@@ -584,7 +595,7 @@ void MQTTClient::connect() {
   // there is no clear-cert API, so a bad pointer breaks every future
   // reconnect until restart.
   _mtlsActive = false;
-  if (!_insecureFallback && hasClientCert()) {
+  if (hasClientCert()) {
     if (!_clientCert) _clientCert = (char*)malloc(CERT_MAX_LEN);
     if (!_clientKey)  _clientKey  = (char*)malloc(CERT_MAX_LEN);
     if (_clientCert && _clientKey &&
@@ -731,6 +742,28 @@ void MQTTClient::tick() {
 // ---------------------------------------------------------------------------
 
 void MQTTClient::loop() {
+#ifdef MQTT_TLS
+  // Persist the clock floor at most daily (see clock_floor_policy.h). The
+  // clock only advances at real-time rate, so the stored value is always a
+  // valid lower bound of real time for the next boot - NTP or not.
+  {
+    static uint32_t lastFloorCheckMs = 0;
+    if (millis() - lastFloorCheckMs > 60000UL) {
+      lastFloorCheckMs = millis();
+      time_t nowT = time(nullptr);
+      if (clockFloorShouldPersist(nowT, s_clkFloorStored)) {
+        Preferences prefs;
+        if (prefs.begin(BOOT_NS, false)) {
+          prefs.putUInt(CLK_KEY_FLOOR, (uint32_t)nowT);
+          prefs.end();
+          s_clkFloorStored = (uint32_t)nowT;
+          Log::info(TAG, "clock_floor.persisted");
+        }
+      }
+    }
+  }
+#endif
+
   // Reboot if heap stays below floor for HEAP_REBOOT_HOLD_MS: mbedtls OOM
   // mid-handshake wedges the connection with no clean recovery; a fresh
   // boot defragments. Set HEAP_REBOOT_FLOOR_BYTES=0 to disable.
@@ -807,17 +840,6 @@ void MQTTClient::loop() {
   }
 
   if (_client.connected()) {
-    // NTP has synced since the insecure connect - reconnect with cert
-    // validation. Skip if contiguous heap < 40 KB (TLS needs ~30 KB).
-    if (_insecureFallback && time(nullptr) > 1700000000 && ESP.getMaxAllocHeap() > 40000) {
-      Log::info(TAG, "NTP synced - upgrading to cert-validated connection");
-      _connectedSinceMs = 0;  // suppress spurious "lost after 0 seconds" log
-      _client.disconnect();
-      _wifiClient.stop();
-      _retryInterval = RETRY_MIN_MS;
-      return;
-    }
-
     uint32_t now = millis();
     if (_lastSuccessMs > 0 && (now - _lastSuccessMs > WATCHDOG_MS)) {
       uint32_t uptime = (now - _connectedSinceMs) / 1000;
