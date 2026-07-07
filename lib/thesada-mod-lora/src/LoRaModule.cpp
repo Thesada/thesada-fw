@@ -42,7 +42,7 @@ void LoRaModule::begin() {
   _syncWord = cfg["lora"]["sync_word"]    | 0x12;
   bool listenBoot = cfg["lora"]["listen_on_boot"] | true;
 
-  // Mode: "thesada" (default, raw #505 path) or "meshtastic" (derived PHY +
+  // Mode: "thesada" (default, raw path) or "meshtastic" (derived PHY +
   // frame interop). The v0 bool `lora.meshtastic: true` stays as an alias
   // for one release.
   const char* mode = cfg["lora"]["mode"] | "";

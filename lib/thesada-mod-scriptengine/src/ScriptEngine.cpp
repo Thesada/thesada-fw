@@ -414,7 +414,7 @@ void ScriptEngine::createState() {
   luaL_requiref(gL, "table",  luaopen_table,  1); lua_pop(gL, 1);
   luaL_requiref(gL, "string", luaopen_string, 1); lua_pop(gL, 1);
 
-  // Sandbox: nil out dangerous globals (Forgejo #91). MQTT broker creds =
+  // Sandbox: nil out dangerous globals. MQTT broker creds =
   // device root, so cli/lua.exec must NOT see io/os/debug/package. Native
   // bindings (Config/MQTT/Telegram/Display/Node/EventBus/JSON) cover all
   // legitimate script needs. The bespoke os.remove injection below is
