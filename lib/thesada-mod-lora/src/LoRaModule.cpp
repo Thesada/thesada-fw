@@ -237,9 +237,9 @@ void LoRaModule::publishRx(const LoRaRx& rx) {
       Log::debug(TAG, m);
       return;
     }
-    // Broadcast retransmits reuse (src, packetId) - drop repeats before
-    // they republish to MQTT. Debug-visible, counted for module.status.
-    static mesh::DedupRing<16> rxSeen;
+    // Broadcast retransmits reuse (src, packetId) - drop repeats before they
+    // republish. Shared FIFO, sized for a busy small mesh; counted in status.
+    static mesh::DedupRing<64> rxSeen;
     if (rxSeen.seenAndRecord(from, pid)) {
       _rxDupCount++;
       char m[48];
