@@ -27,10 +27,11 @@ enum class Parse { Ok, NotOurs, ForeignPort, Malformed };
 size_t buildText(const Channel& ch, const char* text, uint32_t fromNode,
                  uint32_t packetId, uint8_t* out, size_t cap);
 
-// Decode a received frame against ch. Ok: text + fromNode set. ForeignPort:
-// a clean decode for some other app - portnum is set so the caller can log it.
+// Decode a received frame against ch. Ok: text + fromNode + packetId set.
+// ForeignPort: clean decode for another app - portnum set for the caller's log.
 Parse parseText(const Channel& ch, const uint8_t* buf, size_t len,
-                String& text, uint32_t& fromNode, uint32_t& portnum);
+                String& text, uint32_t& fromNode, uint32_t& portnum,
+                uint32_t& packetId);
 
 }  // namespace mesh
 

@@ -45,8 +45,10 @@ size_t mesh::buildText(const Channel& ch, const char* text, uint32_t fromNode,
 }
 
 mesh::Parse mesh::parseText(const Channel& ch, const uint8_t* buf, size_t len,
-                            String& text, uint32_t& fromNode, uint32_t& portnum) {
+                            String& text, uint32_t& fromNode, uint32_t& portnum,
+                            uint32_t& packetId) {
   portnum = 0;
+  packetId = 0;
   Header h;
   const uint8_t* body = nullptr;
   size_t blen = 0;
@@ -67,6 +69,7 @@ mesh::Parse mesh::parseText(const Channel& ch, const uint8_t* buf, size_t len,
   text.reserve(plen);
   for (size_t k = 0; k < plen; k++) text += (char)payload[k];
   fromNode = h.src;
+  packetId = h.packetId;
   return Parse::Ok;
 }
 
