@@ -27,7 +27,7 @@
 #endif
 
 // Emit a single line at cold boot summarising why the chip restarted.
-// Helps debrief outages (see Forgejo #353): pairs esp_reset_reason() with
+// Helps debrief outages: pairs esp_reset_reason() with
 // per-core rtc_get_reset_reason() (legacy ROM API; covers panic faults
 // that the unified API maps to ESP_RST_PANIC) and a persistent brownout
 // counter in NVS namespace "boot" key "brownout_n". The counter only

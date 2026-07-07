@@ -37,7 +37,7 @@ H.test("EventBus.subscribe receives fired events", function()
 end)
 
 -- ── Fire-streak hysteresis (the canonical rules.lua pattern) ────────────────
--- Mirrors the suppression logic #164 calls out: only alert after N
+-- Mirrors the suppression logic: only alert after N
 -- consecutive low readings, and only once per streak.
 
 local FIRE_STREAK_SCRIPT = [[

@@ -52,6 +52,7 @@ private:
   float    _lastRssi = 0.0f;
   float    _lastSnr  = 0.0f;
   uint32_t _rxCount  = 0;
+  uint32_t _rxDupCount = 0;
 };
 
 #endif // ENABLE_LORA

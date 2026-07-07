@@ -10,6 +10,7 @@
 #include <EventBus.h>
 #include <MQTTClient.h>
 #include <Log.h>
+#include <lora_dedup_policy.h>
 #include <ModuleRegistry.h>
 #include <Shell.h>
 #include <ArduinoJson.h>
@@ -41,7 +42,7 @@ void LoRaModule::begin() {
   _syncWord = cfg["lora"]["sync_word"]    | 0x12;
   bool listenBoot = cfg["lora"]["listen_on_boot"] | true;
 
-  // Mode: "thesada" (default, raw #505 path) or "meshtastic" (derived PHY +
+  // Mode: "thesada" (default, raw path) or "meshtastic" (derived PHY +
   // frame interop). The v0 bool `lora.meshtastic: true` stays as an alias
   // for one release.
   const char* mode = cfg["lora"]["mode"] | "";
@@ -220,7 +221,8 @@ void LoRaModule::publishRx(const LoRaRx& rx) {
     // Ignore mesh traffic that isn't a text message on our channel, but
     // name a foreign portnum at debug so bench diagnosis is not blind.
     uint32_t port = 0;
-    mesh::Parse pr = mesh::parseText(_chan, rx.data, rx.len, text, from, port);
+    uint32_t pid = 0;
+    mesh::Parse pr = mesh::parseText(_chan, rx.data, rx.len, text, from, port, pid);
     if (pr != mesh::Parse::Ok) {
       // Never drop silently - undecodable traffic is invisible otherwise
       // (cost a bench session to a quiet console).
@@ -232,6 +234,16 @@ void LoRaModule::publishRx(const LoRaRx& rx) {
                  pr == mesh::Parse::NotOurs ? "other_channel" : "malformed",
                  (unsigned)rx.len);
       }
+      Log::debug(TAG, m);
+      return;
+    }
+    // Broadcast retransmits reuse (src, packetId) - drop repeats before they
+    // republish. Shared FIFO, sized for a busy small mesh; counted in status.
+    static mesh::DedupRing<64> rxSeen;
+    if (rxSeen.seenAndRecord(from, pid)) {
+      _rxDupCount++;
+      char m[48];
+      snprintf(m, sizeof(m), "lora.rx_dup from=%08x id=%08x", (unsigned)from, (unsigned)pid);
       Log::debug(TAG, m);
       return;
     }
@@ -273,10 +285,10 @@ void LoRaModule::status(ShellOutput out) {
   if (!_ok) { out("  radio not initialized"); return; }
   char line[160];
   snprintf(line, sizeof(line),
-           "mode=%s freq=%.3fMHz sf=%d bw=%.0fkHz power=%ddBm listening=%s rx=%lu last_rssi=%.1f last_snr=%.1f",
+           "mode=%s freq=%.3fMHz sf=%d bw=%.0fkHz power=%ddBm listening=%s rx=%lu rx_dup=%lu last_rssi=%.1f last_snr=%.1f",
            _meshtastic ? "meshtastic" : "thesada",
            _freq, _sf, _bw, _power, _listening ? "yes" : "no",
-           (unsigned long)_rxCount, _lastRssi, _lastSnr);
+           (unsigned long)_rxCount, (unsigned long)_rxDupCount, _lastRssi, _lastSnr);
   out(line);
   if (_meshtastic) {
     snprintf(line, sizeof(line), "channel=%s slot=%u key=%ubit hash=0x%02x",

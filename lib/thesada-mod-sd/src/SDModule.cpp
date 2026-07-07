@@ -66,8 +66,8 @@ bool SDModule::_openNextLog() {
 //
 // Walk log999 -> log001 looking for the highest-numbered existing file.
 // If found and under _maxBytes, resume appending to it: _logPath = path,
-// _logBytes = on-disk size. Avoids the per-boot empty-file pile-up
-// (Forgejo #312). If the highest file is at/over the limit, or none
+// _logBytes = on-disk size. Avoids the per-boot empty-file pile-up.
+// If the highest file is at/over the limit, or none
 // exist, fall back to _openNextLog() to claim a fresh slot.
 //
 // Returns true on success (either resumed or new slot opened).

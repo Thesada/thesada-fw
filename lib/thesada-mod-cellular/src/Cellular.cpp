@@ -1169,7 +1169,7 @@ bool Cellular::powerOn() {
 
 // --- Incremental activation state machine ----------------------------------
 // begin() used to run power-on through MQTT-connect in one blocking call,
-// freezing every other module loop for 30-120 s (Forgejo FW M1). The
+// freezing every other module loop for 30-120 s. The
 // tickActivation() state machine below walks the same bring-up one phase
 // per call instead; CellularModule polls it every loop while ACTIVATING.
 // State is module-static - only one activation runs at a time and
