@@ -58,6 +58,7 @@ void WiFiManager::scanAndConnect() {
   int found = WiFi.scanNetworks();
   {
     char msg[48];
+    // TODO: migrate to structured logging
     snprintf(msg, sizeof(msg), "Scan complete: %d AP(s) visible", found);
     Log::info(TAG, msg);
   }
@@ -81,6 +82,7 @@ void WiFiManager::scanAndConnect() {
 
     if (bestRssi == INT32_MIN) {
       char msg[48];
+      // TODO: migrate to structured logging
       snprintf(msg, sizeof(msg), "Not in range: %s", ssid);
       Log::debug(TAG, msg);
       continue;
@@ -122,6 +124,7 @@ void WiFiManager::scanAndConnect() {
   for (uint8_t attempt = 1; attempt <= maxRetries; attempt++) {
     for (uint8_t i = 0; i < count; i++) {
       char msg[80];
+      // TODO: migrate to structured logging
       snprintf(msg, sizeof(msg), "Trying %s (RSSI %d dBm, attempt %d/%d, timeout %lus)...",
                candidates[i].ssid, candidates[i].rssi, attempt, maxRetries, timeout / 1000UL);
       Log::info(TAG, msg);
@@ -129,6 +132,7 @@ void WiFiManager::scanAndConnect() {
       if (tryConnect(candidates[i].ssid, candidates[i].password, timeout)) {
         _status   = WiFiStatus::CONNECTED;
         _apActive = false;
+        // TODO: migrate to structured logging
         snprintf(msg, sizeof(msg), "Connected to %s - IP: %s",
                  candidates[i].ssid, WiFi.localIP().toString().c_str());
         Log::info(TAG, msg);
@@ -224,6 +228,7 @@ void WiFiManager::startFallbackAP() {
   _dnsServer.start(53, "*", WiFi.softAPIP());
 
   char msg[80];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Fallback AP: %s (captive portal at %s, timeout %lus)",
            apSSID, WiFi.softAPIP().toString().c_str(), _apTimeoutMs / 1000UL);
   Log::warn(TAG, msg);

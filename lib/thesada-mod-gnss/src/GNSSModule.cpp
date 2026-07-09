@@ -24,6 +24,7 @@ void GNSSModule::begin() {
   _publishWithoutFix  = cfg["gnss"]["publish_without_fix"] | false;
 
   char msg[96];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Ready - interval %lus, cold fix <=%lus, warm fix <=%lus",
            (unsigned long)(_intervalMs / 1000),
            (unsigned long)(_coldFixMs / 1000),
@@ -130,6 +131,7 @@ void GNSSModule::readAndPublish() {
 
   if (_hasFix) {
     char log[96];
+    // TODO: migrate to structured logging
     snprintf(log, sizeof(log), "fix lat=%.6f lon=%.6f alt=%.1fm sats=%d/%d",
              _lat, _lon, _alt, _satsUsed, _satsInView);
     Log::info(TAG, log);

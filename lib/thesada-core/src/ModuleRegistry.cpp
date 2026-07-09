@@ -38,11 +38,13 @@ void ModuleRegistry::beginAll() {
     _entries[i].enabled = en;
     if (!en) {
       char msg[48];
+      // TODO: migrate to structured logging
       snprintf(msg, sizeof(msg), "Skip [%d]: %s (disabled)", _entries[i].priority, m->name());
       Log::info("Registry", msg);
       continue;
     }
     char msg[48];
+    // TODO: migrate to structured logging
     snprintf(msg, sizeof(msg), "Init [%d]: %s", _entries[i].priority, m->name());
     Log::info("Registry", msg);
     m->begin();

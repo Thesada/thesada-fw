@@ -52,6 +52,7 @@ void HeartbeatLED::begin() {
     pinMode(_pin, OUTPUT);
     digitalWrite(_pin, _activeLow ? HIGH : LOW);  // off state
     char msg[48];
+    // TODO: migrate to structured logging
     snprintf(msg, sizeof(msg), "Using GPIO %d%s", _pin, _activeLow ? " (active low)" : "");
     Log::info(TAG, msg);
   }

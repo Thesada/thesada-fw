@@ -26,6 +26,7 @@ void BatteryModule::begin() {
   _lowPct        = cfg["battery"]["low_pct"] | 20;
 
   char msg[64];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Ready - every %lus, low alert at %d%%",
            (unsigned long)(_intervalMs / 1000), _lowPct);
   Log::info(TAG, msg);
@@ -105,6 +106,7 @@ void BatteryModule::readAndPublish() {
   // Log summary
   if (present) {
     char log[64];
+    // TODO: migrate to structured logging
     snprintf(log, sizeof(log), "%.2fV  %d%%  %s",
              voltage, percent, charging ? "charging" : "discharging");
     Log::info(TAG, log);

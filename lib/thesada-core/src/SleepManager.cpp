@@ -66,6 +66,7 @@ void SleepManager::begin() {
   _wakeDeadline = millis() + (wakeS * 1000);
 
   char msg[80];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Enabled - awake %lus, sleep %lus (boot #%lu)",
            (unsigned long)wakeS, (unsigned long)sleepS, (unsigned long)_rtc.bootCount);
   Log::info(TAG, msg);

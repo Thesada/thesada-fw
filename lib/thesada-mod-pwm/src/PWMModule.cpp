@@ -36,6 +36,7 @@ void PWMModule::begin() {
 #endif
 
   char msg[64];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Ready - GPIO%d, %luHz, %d-bit", _pin, _frequency, _resolution);
   Log::info(TAG, msg);
 
@@ -60,6 +61,7 @@ void PWMModule::setLevel(float level) {
 #endif
 
   char msg[64];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Level set to %.0f%% (duty %lu/%lu)", level * 100, duty, maxVal);
   Log::info(TAG, msg);
 

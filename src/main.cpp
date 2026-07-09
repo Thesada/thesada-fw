@@ -68,6 +68,7 @@ static void logBootCause() {
 #endif
 
   char line[160];
+  // TODO: migrate to structured logging
   snprintf(line, sizeof(line),
     "reset=%s (%d) rtc_core0=%d rtc_core1=%d brownout_total=%lu",
     reasonStr, (int)reason, rtc0, rtc1, (unsigned long)brownouts);

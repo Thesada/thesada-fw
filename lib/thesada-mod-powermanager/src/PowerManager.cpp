@@ -86,6 +86,7 @@ void PowerManager::begin() {
     _pmu.setChargeTargetVoltage(volIdx);
 
     char chgMsg[64];
+    // TODO: migrate to structured logging
     snprintf(chgMsg, sizeof(chgMsg), "PMU ready - charge %dmA / %.1fV cutoff", chgMa, chgV);
     Log::info(TAG, chgMsg);
   } else {

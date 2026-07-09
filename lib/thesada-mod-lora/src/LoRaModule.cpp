@@ -48,6 +48,7 @@ void LoRaModule::begin() {
   JsonVariant meshCfg = cfg["lora"]["meshtastic"];
   if (*mode && strcmp(mode, "thesada") != 0 && strcmp(mode, "meshtastic") != 0) {
     char m[64];
+    // TODO: migrate to structured logging
     snprintf(m, sizeof(m), "lora.mode_invalid mode=%s", mode);
     Log::error(TAG, m);
     return;  // fail closed - a mistyped mode must not come up off-mesh
@@ -63,6 +64,7 @@ void LoRaModule::begin() {
                         _freq, _bw, _sf, _cr, _syncWord, _power, _preamble, LORA_TCXO_V);
   if (st != 0) {
     char m[48];
+    // TODO: migrate to structured logging
     snprintf(m, sizeof(m), "lora.init_failed code=%d", st);
     Log::error(TAG, m);
     return;
@@ -100,6 +102,7 @@ void LoRaModule::begin() {
     });
 
   char msg[96];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "lora.ready freq=%.3f sf=%d bw=%.0f power=%d listen=%d mode=%s",
            _freq, _sf, _bw, _power, _listening, _meshtastic ? "meshtastic" : "thesada");
   Log::info(TAG, msg);
@@ -124,6 +127,7 @@ bool LoRaModule::meshConfig() {
   const mesh::Region* r = mesh::regionFind(region);
   if (!p || !r) {
     char m[96];
+    // TODO: migrate to structured logging
     snprintf(m, sizeof(m), "lora.mesh_config_invalid preset=%s region=%s", preset, region);
     Log::error(TAG, m);
     return false;
@@ -141,6 +145,7 @@ bool LoRaModule::meshConfig() {
   }
   if (!mesh::pskExpand(psk, pskLen, _chan.key, _chan.keyLen)) {
     char m[48];
+    // TODO: migrate to structured logging
     snprintf(m, sizeof(m), "lora.mesh_psk_invalid len=%u", (unsigned)pskLen);
     Log::error(TAG, m);
     return false;
@@ -150,6 +155,7 @@ bool LoRaModule::meshConfig() {
   float f = mesh::slotFreqMhz(*r, p->bwKhz, channel, _slot);
   if (f <= 0.0f) {
     char m[96];
+    // TODO: migrate to structured logging
     snprintf(m, sizeof(m), "lora.mesh_config_invalid preset=%s too wide for region=%s", preset, region);
     Log::error(TAG, m);
     return false;
@@ -160,6 +166,7 @@ bool LoRaModule::meshConfig() {
   snprintf(_chanName, sizeof(_chanName), "%s", channel);
 
   char m[112];
+  // TODO: migrate to structured logging
   snprintf(m, sizeof(m), "lora.mesh_channel name=%s slot=%u freq=%.3f key=%ubit hash=0x%02x",
            _chanName, _slot + 1, _freq, (unsigned)(_chan.keyLen * 8), _chan.hash);
   Log::info(TAG, m);
@@ -179,6 +186,7 @@ void LoRaModule::loop() {
     publishRx(rx);
   } else {
     char m[64];
+    // TODO: migrate to structured logging
     snprintf(m, sizeof(m), "lora.rx_dropped crc=%d rssi=%.1f", rx.crcErr, rx.rssi);
     Log::warn(TAG, m);
   }
@@ -201,6 +209,7 @@ bool LoRaModule::transmit(const char* msg) {
   if (wasListening) _radio.startReceive();
 
   char m[64];
+  // TODO: migrate to structured logging
   snprintf(m, sizeof(m), "lora.tx done=%d len=%d", done, (int)strlen(msg));
   Log::info(TAG, m);
   return done;
@@ -226,8 +235,10 @@ void LoRaModule::publishRx(const LoRaRx& rx) {
       // (cost a bench session to a quiet console).
       char m[56];
       if (pr == mesh::Parse::ForeignPort) {
+        // TODO: migrate to structured logging
         snprintf(m, sizeof(m), "lora.rx_foreign_port port=%u", (unsigned)port);
       } else {
+        // TODO: migrate to structured logging
         snprintf(m, sizeof(m), "lora.rx_undecoded %s len=%u",
                  pr == mesh::Parse::NotOurs ? "other_channel" : "malformed",
                  (unsigned)rx.len);
@@ -264,6 +275,7 @@ void LoRaModule::publishRx(const LoRaRx& rx) {
   EventBus::publish("lora", doc.as<JsonObject>());
 
   char m[80];
+  // TODO: migrate to structured logging
   snprintf(m, sizeof(m), "lora.rx len=%d rssi=%.1f snr=%.1f",
            (int)text.length(), rx.rssi, rx.snr);
   Log::info(TAG, m);

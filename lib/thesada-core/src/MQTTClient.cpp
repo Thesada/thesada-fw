@@ -204,6 +204,7 @@ void MQTTClient::setFallbackPublishing(bool active) {
     // alert condition still holds.
     if (_queueCount > 0) {
       char dmsg[80];
+      // TODO: migrate to structured logging
       snprintf(dmsg, sizeof(dmsg),
                "Cellular handoff: dropping %d queued WiFi msg(s)",
                (int)_queueCount);
@@ -282,6 +283,7 @@ void MQTTClient::begin() {
       struct timeval tv = { (time_t)floorEpoch, 0 };
       settimeofday(&tv, nullptr);
       char msg[80];
+      // TODO: migrate to structured logging
       snprintf(msg, sizeof(msg), "Clock floor applied: %lu (NTP corrects forward)",
                (unsigned long)floorEpoch);
       Log::info(TAG, msg);
@@ -313,6 +315,7 @@ void MQTTClient::begin() {
           _caCert[readBytes] = '\0';
           _caCertLen = readBytes;
           char msg[96];
+          // TODO: migrate to structured logging
           snprintf(msg, sizeof(msg), "CA cert loaded from /ca.crt (%u B in %s)",
                    (unsigned)readBytes, heapTag);
           Log::info(TAG, msg);
@@ -340,6 +343,7 @@ void MQTTClient::begin() {
         _caCert[pmLen] = '\0';
         _caCertLen = pmLen;
         char msg[96];
+        // TODO: migrate to structured logging
         snprintf(msg, sizeof(msg),
                  "No /ca.crt - using baked PROGMEM CA bundle (%u B in %s)",
                  (unsigned)pmLen, heapTag);
@@ -567,6 +571,7 @@ void MQTTClient::connect() {
   snprintf(availTopic, sizeof(availTopic), "%s/status", prefix);
 
   char msg[64];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Connecting as %s...", clientId);
   Log::info(TAG, msg);
 
@@ -676,6 +681,7 @@ void MQTTClient::connect() {
     flushQueue();
   } else {
     char err[64];
+    // TODO: migrate to structured logging
     snprintf(err, sizeof(err), "Failed (rc=%d) - retry in %lums",
              _client.state(), _retryInterval);
     Log::warn(TAG, err);
@@ -702,6 +708,7 @@ void MQTTClient::connect() {
       uint8_t count      = mqttRebootCount();
       if (count < maxReboots) {
         char m[96];
+        // TODO: migrate to structured logging
         snprintf(m, sizeof(m),
                  "MQTT failed %ux - reboot %u/%u to recover",
                  (unsigned)rebootAfter, (unsigned)(count + 1),
@@ -718,6 +725,7 @@ void MQTTClient::connect() {
         // Budget spent. Keep retrying, never reboot again.
         _rebootHalted = true;
         char m[128];
+        // TODO: migrate to structured logging
         snprintf(m, sizeof(m),
                  "MQTT failed %ux after %u reboots - staying alive, "
                  "retrying without reboot (check broker config)",
@@ -774,12 +782,14 @@ void MQTTClient::loop() {
       if (_lowHeapSinceMs == 0) {
         _lowHeapSinceMs = now;
         char wmsg[96];
+        // TODO: migrate to structured logging
         snprintf(wmsg, sizeof(wmsg),
                  "free heap %lu B below floor %d B - watchdog armed",
                  (unsigned long)freeHeap, (int)HEAP_REBOOT_FLOOR_BYTES);
         Log::warn(TAG, wmsg);
       } else if ((now - _lowHeapSinceMs) >= (uint32_t)HEAP_REBOOT_HOLD_MS) {
         char emsg[96];
+        // TODO: migrate to structured logging
         snprintf(emsg, sizeof(emsg),
                  "free heap stuck below %d B for %d ms - rebooting",
                  (int)HEAP_REBOOT_FLOOR_BYTES, (int)HEAP_REBOOT_HOLD_MS);
@@ -844,6 +854,7 @@ void MQTTClient::loop() {
     if (_lastSuccessMs > 0 && (now - _lastSuccessMs > WATCHDOG_MS)) {
       uint32_t uptime = (now - _connectedSinceMs) / 1000;
       char wmsg[80];
+      // TODO: migrate to structured logging
       snprintf(wmsg, sizeof(wmsg), "Watchdog: no activity for %lus - forcing reconnect (up %lus)", WATCHDOG_MS / 1000, uptime);
       Log::warn(TAG, wmsg);
       _client.disconnect();
@@ -877,6 +888,7 @@ void MQTTClient::loop() {
   if (_connectedSinceMs > 0) {
     uint32_t uptime = (millis() - _connectedSinceMs) / 1000;
     char dmsg[64];
+    // TODO: migrate to structured logging
     snprintf(dmsg, sizeof(dmsg), "Connection lost after %lu seconds", uptime);
     Log::warn(TAG, dmsg);
     _connectedSinceMs = 0;
@@ -1025,6 +1037,7 @@ void MQTTClient::subscribe(const char* topic, MQTTCallback callback) {
   _subCount++;
 
   char msg[128];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Registered sub: %s (%d/%d)", topic, _subCount, MQTT_MAX_SUBS);
   Log::info(TAG, msg);
 
@@ -1198,6 +1211,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
           f.close();
           resp["ok"] = true;
           char msg[64];
+          // TODO: migrate to structured logging
           snprintf(msg, sizeof(msg), "%s %d bytes to %s",
                    mode[0] == 'a' ? "Appended" : "Wrote", (int)written, path);
           resp["output"][0] = msg;
@@ -1563,6 +1577,7 @@ void MQTTClient::resubscribeAll() {
     if (!_subs[i].active) continue;
     _client.subscribe(_subs[i].topic);
     char msg[128];
+    // TODO: migrate to structured logging
     snprintf(msg, sizeof(msg), "Subscribed: %s", _subs[i].topic);
     Log::info(TAG, msg);
   }
@@ -1795,7 +1810,7 @@ static void sha256Hex(const char* data, size_t len, char* out) {
   mbedtls_sha256_update(&ctx, (const unsigned char*)data, len);
   mbedtls_sha256_finish(&ctx, hash);
   mbedtls_sha256_free(&ctx);
-  for (int i = 0; i < 32; i++) sprintf(out + i * 2, "%02x", hash[i]);
+  for (int i = 0; i < 32; i++) snprintf(out + i * 2, 3, "%02x", hash[i]);
   out[64] = '\0';
 }
 
@@ -1819,7 +1834,7 @@ static void sha256File(const char* path, char* out) {
   uint8_t hash[32];
   mbedtls_sha256_finish(&ctx, hash);
   mbedtls_sha256_free(&ctx);
-  for (int i = 0; i < 32; i++) sprintf(out + i * 2, "%02x", hash[i]);
+  for (int i = 0; i < 32; i++) snprintf(out + i * 2, 3, "%02x", hash[i]);
   out[64] = '\0';
 }
 
@@ -1928,6 +1943,7 @@ void MQTTClient::enqueue(const char* topic, const char* payload) {
   _queueCount++;
 
   char log[64];
+  // TODO: migrate to structured logging
   snprintf(log, sizeof(log), "Queued (%d/%d): %s", _queueCount, MQTT_QUEUE_SIZE, topic);
   Log::info(TAG, log);
 }
@@ -1941,6 +1957,7 @@ void MQTTClient::flushQueue() {
       _client.publish(msg.topic, msg.payload);
       msg.valid = false;
       char log[64];
+      // TODO: migrate to structured logging
       snprintf(log, sizeof(log), "Flushed queued: %s", msg.topic);
       Log::info(TAG, log);
     }
@@ -2080,7 +2097,7 @@ bool MQTTClient::getCertInfo(char* cn, char* serial, char* notBefore, char* notA
   char* sp = serial;
   char* se = serial + maxLen - 1;
   for (size_t i = 0; i < crt.serial.len && sp + 2 < se; i++) {
-    sp += sprintf(sp, "%02x", crt.serial.p[i]);
+    sp += snprintf(sp, 3, "%02x", crt.serial.p[i]);
   }
   *sp = '\0';
 

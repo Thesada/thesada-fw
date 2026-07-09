@@ -135,6 +135,7 @@ static void handleWifi() {
   wf.close();
 
   char msg[96];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "WiFi set to %s - rebooting", ssid.c_str());
   Log::info(TAG, msg);
   _server.send(200, "text/html", "<h2>Saved - rebooting...</h2><p>Connect to your WiFi network and find the device IP.</p>");
@@ -154,6 +155,7 @@ static void handleRestart() {
 static void handleOtaDone() {
   if (Update.hasError()) {
     char msg[128];
+    // TODO: migrate to structured logging
     snprintf(msg, sizeof(msg), "OTA failed: %s", Update.errorString());
     _server.send(500, "text/plain", msg);
     Log::error(TAG, msg);
@@ -180,6 +182,7 @@ static void handleOtaUpload() {
     }
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
       char msg[64];
+      // TODO: migrate to structured logging
       snprintf(msg, sizeof(msg), "Update.begin failed: %s", Update.errorString());
       Log::error(TAG, msg);
     }
@@ -188,16 +191,19 @@ static void handleOtaUpload() {
     yield();
     if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
       char msg[64];
+      // TODO: migrate to structured logging
       snprintf(msg, sizeof(msg), "Update.write failed: %s", Update.errorString());
       Log::error(TAG, msg);
     }
   } else if (upload.status == UPLOAD_FILE_END) {
     if (!Update.end(true)) {
       char msg[64];
+      // TODO: migrate to structured logging
       snprintf(msg, sizeof(msg), "Update.end failed: %s", Update.errorString());
       Log::error(TAG, msg);
     } else {
       char msg[48];
+      // TODO: migrate to structured logging
       snprintf(msg, sizeof(msg), "OTA complete: %u bytes", upload.totalSize);
       Log::info(TAG, msg);
     }

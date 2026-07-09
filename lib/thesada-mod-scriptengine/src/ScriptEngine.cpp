@@ -112,6 +112,7 @@ static int lua_mqtt_subscribe(lua_State* L) {
     if (lua_pcall(gL, 2, 0, 0) != LUA_OK) {
       const char* err = lua_tostring(gL, -1);
       char msg[128];
+      // TODO: migrate to structured logging
       snprintf(msg, sizeof(msg), "MQTT callback error: %.100s", err ? err : "unknown");
       Log::error("Lua", msg);
       lua_pop(gL, 1);
@@ -119,6 +120,7 @@ static int lua_mqtt_subscribe(lua_State* L) {
   });
 
   char msg[96];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Lua subscribed to MQTT: %s", topic);
   Log::info("Lua", msg);
   return 0;
@@ -330,6 +332,7 @@ static int lua_eventbus_subscribe(lua_State* L) {
     if (lua_pcall(gL, 1, 0, 0) != LUA_OK) {
       const char* err = lua_tostring(gL, -1);
       char msg[128];
+      // TODO: migrate to structured logging
       snprintf(msg, sizeof(msg), "Callback error: %.100s", err ? err : "unknown");
       Log::error("Lua", msg);
       lua_pop(gL, 1);
@@ -337,6 +340,7 @@ static int lua_eventbus_subscribe(lua_State* L) {
   });
 
   char msg[64];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Subscribed to event: %s", event);
   Log::info(TAG, msg);
   return 0;
@@ -485,6 +489,7 @@ bool ScriptEngine::executeFile(const char* path) {
 
   if (!LittleFS.exists(path)) {
     char msg[64];
+    // TODO: migrate to structured logging
     snprintf(msg, sizeof(msg), "%s not found - skipping", path);
     Log::info(TAG, msg);
     return false;
@@ -493,6 +498,7 @@ bool ScriptEngine::executeFile(const char* path) {
   File f = LittleFS.open(path, "r");
   if (!f) {
     char msg[64];
+    // TODO: migrate to structured logging
     snprintf(msg, sizeof(msg), "Failed to open %s", path);
     Log::error(TAG, msg);
     return false;
@@ -518,6 +524,7 @@ bool ScriptEngine::executeFile(const char* path) {
   if (result != LUA_OK) {
     const char* err = lua_tostring(gL, -1);
     char msg[196];
+    // TODO: migrate to structured logging
     snprintf(msg, sizeof(msg), "%s error: %.160s", path, err ? err : "unknown");
     Log::error(TAG, msg);
     lua_pop(gL, 1);
@@ -525,6 +532,7 @@ bool ScriptEngine::executeFile(const char* path) {
   }
 
   char msg[64];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "%s executed", path);
   Log::info(TAG, msg);
   return true;
@@ -560,6 +568,7 @@ void ScriptEngine::begin() {
   });
 
   char msg[128];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Ready - reload via MQTT: %s", topic);
   Log::info(TAG, msg);
 
@@ -646,6 +655,7 @@ void ScriptEngine::reload() {
   executeFile("/scripts/rules.lua");
 
   char msg[64];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Reloaded (generation %lu)", _generation);
   Log::info(TAG, msg);
 }
@@ -677,6 +687,7 @@ void ScriptEngine::loop() {
       if (lua_pcall(gL, 0, 0, 0) != LUA_OK) {
         const char* err = lua_tostring(gL, -1);
         char msg[128];
+        // TODO: migrate to structured logging
         snprintf(msg, sizeof(msg), "Timer error: %.100s", err ? err : "unknown");
         Log::error("Lua", msg);
         lua_pop(gL, 1);
