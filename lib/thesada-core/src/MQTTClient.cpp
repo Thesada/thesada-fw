@@ -683,7 +683,7 @@ void MQTTClient::connect() {
     char err[64];
     // TODO: migrate to structured logging
     snprintf(err, sizeof(err), "Failed (rc=%d) - retry in %lums",
-             _client.state(), _retryInterval);
+             _client.state(), (unsigned long)_retryInterval);
     Log::warn(TAG, err);
     _retryCount++;
     _retryInterval = min(_retryInterval * 2, (uint32_t)RETRY_MAX_MS);
@@ -855,7 +855,7 @@ void MQTTClient::loop() {
       uint32_t uptime = (now - _connectedSinceMs) / 1000;
       char wmsg[80];
       // TODO: migrate to structured logging
-      snprintf(wmsg, sizeof(wmsg), "Watchdog: no activity for %lus - forcing reconnect (up %lus)", WATCHDOG_MS / 1000, uptime);
+      snprintf(wmsg, sizeof(wmsg), "Watchdog: no activity for %lus - forcing reconnect (up %lus)", (unsigned long)(WATCHDOG_MS / 1000), (unsigned long)uptime);
       Log::warn(TAG, wmsg);
       _client.disconnect();
       _wifiClient.stop();
@@ -889,7 +889,7 @@ void MQTTClient::loop() {
     uint32_t uptime = (millis() - _connectedSinceMs) / 1000;
     char dmsg[64];
     // TODO: migrate to structured logging
-    snprintf(dmsg, sizeof(dmsg), "Connection lost after %lu seconds", uptime);
+    snprintf(dmsg, sizeof(dmsg), "Connection lost after %lu seconds", (unsigned long)uptime);
     Log::warn(TAG, dmsg);
     _connectedSinceMs = 0;
   }
