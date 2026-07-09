@@ -43,6 +43,7 @@ void TemperatureModule::begin() {
   if (_autoDiscover) saveDiscovered();
 
   char msg[64];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "temp.ready sensors=%d buses=%d",
            (int)_sensorList.size(), (int)_buses.size());
   Log::info(TAG, msg);
@@ -94,6 +95,7 @@ void TemperatureModule::loadConfigSensors() {
   }
 
   char msg[64];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "temp.config_loaded sensors=%d", (int)_sensorList.size());
   Log::info(TAG, msg);
 }
@@ -117,6 +119,7 @@ void TemperatureModule::discoverSensors(bool addNew) {
     int found = dt->getDeviceCount();
 
     char msg[64];
+    // TODO: migrate to structured logging
     snprintf(msg, sizeof(msg), "temp.bus_scan bus=%u gpio=%u found=%d",
              (unsigned)b, (unsigned)_buses[b].pin, found);
     Log::info(TAG, msg);
@@ -149,6 +152,7 @@ void TemperatureModule::discoverSensors(bool addNew) {
       _sensorList.push_back(sensor);
 
       char log[64];
+      // TODO: migrate to structured logging
       snprintf(log, sizeof(log), "temp.sensor_new bus=%u addr=%s", (unsigned)b, addrStr);
       Log::info(TAG, log);
     }
@@ -320,6 +324,7 @@ float TemperatureModule::readSensorC(TempSensor& s) {
   if (_maxDeltaC > 0.0f && s.lastTemp != DEVICE_DISCONNECTED_C &&
       fabsf(temp - s.lastTemp) > _maxDeltaC) {
     char log[96];
+    // TODO: migrate to structured logging
     snprintf(log, sizeof(log), "temp.read_rejected addr=%s last=%.2f got=%.2f reason=implausible",
              s.addressStr, s.lastTemp, temp);
     Log::warn(TAG, log);
@@ -348,6 +353,7 @@ void TemperatureModule::readAndPublish() {
 
     if (temp == DEVICE_DISCONNECTED_C) {
       char log[64];
+      // TODO: migrate to structured logging
       snprintf(log, sizeof(log), "temp.sensor_disconnected addr=%s", s.addressStr);
       Log::warn(TAG, log);
       // Still include sensor with last known value so HA discovery works

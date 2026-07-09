@@ -1,4 +1,5 @@
 // thesada-fw - PROGMEM CA root for Telegram Bot API TLS validation.
+// SPDX-License-Identifier: GPL-3.0-only
 //
 // The Telegram module previously called WiFiClientSecure::setInsecure(),
 // so every Bot API request was sent over unverified TLS. The bot token

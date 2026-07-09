@@ -60,6 +60,7 @@ void SHT31Module::begin() {
   uint8_t err = Wire.endTransmission();
   if (err != 0) {
     char msg[64];
+    // TODO: migrate to structured logging
     snprintf(msg, sizeof(msg), "no device at 0x%02X (SDA=%d SCL=%d) - sensor absent", _addr, sda, scl);
     Log::info(TAG, msg);
     return;
@@ -79,6 +80,7 @@ void SHT31Module::begin() {
     }, this, true);
 
   char msg[64];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Ready - SDA=%d SCL=%d addr=0x%02X interval=%lus", sda, scl, _addr, iv);
   Log::info(TAG, msg);
 
@@ -212,6 +214,7 @@ void SHT31Module::readAndPublish() {
   EventBus::publish("temperature", doc.as<JsonObject>());
 
   char msg[64];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "%.1f%s  %.1f%%", displayTemp, unit, humid);
   Log::info(TAG, msg);
 }

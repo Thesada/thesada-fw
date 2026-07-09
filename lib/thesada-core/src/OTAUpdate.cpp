@@ -285,6 +285,7 @@ static bool downloadBinaryChunkedCellular(
                                  offset, end);
     if (!ok || (status != 206 && status != 200)) {
       char msg[160];
+      // TODO: migrate to structured logging
       snprintf(msg, sizeof(msg),
                "Range chunk failed at offset %u (status=%d, ok=%d)",
                (unsigned)offset, status, (int)ok);
@@ -386,6 +387,7 @@ void OTAUpdate::begin() {
 
   if (_enabled) {
     char msg[128];
+    // TODO: migrate to structured logging
     snprintf(msg, sizeof(msg), "Enabled - check every %lus, manifest: %.80s",
              intervalS, manifestUrl);
     Log::info(TAG, msg);
@@ -552,6 +554,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
   }
 
   char msg[160];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Remote: %s, local: %s",
            remoteVersion.c_str(), FIRMWARE_VERSION);
   Log::info(TAG, msg);
@@ -575,6 +578,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
     Log::warn(TAG, "Force flag set - re-flashing same or older version");
   }
 
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Updating to %s from %.80s",
            remoteVersion.c_str(), binUrl.c_str());
   Log::info(TAG, msg);
@@ -628,6 +632,7 @@ bool OTAUpdate::fetchManifest(const char* url,
 
   if (!transportOk || status != 200) {
     char msg[80];
+    // TODO: migrate to structured logging
     snprintf(msg, sizeof(msg), "Manifest fetch failed (status=%d, bytes=%u)",
              status, (unsigned)total);
     Log::error(TAG, msg);
@@ -711,10 +716,12 @@ bool OTAUpdate::applyUpdate(const String& binUrl, const String& expectedSha256,
     if (now - lastProgress > 5000) {
       char msg[96];
       if (expectedSize > 0) {
+        // TODO: migrate to structured logging
         snprintf(msg, sizeof(msg), "Downloaded %u / %u bytes (%u%%)",
                  (unsigned)written, (unsigned)expectedSize,
                  (unsigned)((written * 100) / expectedSize));
       } else {
+        // TODO: migrate to structured logging
         snprintf(msg, sizeof(msg), "Downloaded %u bytes", (unsigned)written);
       }
       Log::info(TAG, msg);
@@ -753,6 +760,7 @@ bool OTAUpdate::applyUpdate(const String& binUrl, const String& expectedSha256,
   if (!transportOk || status != 200 || !writeOk || written == 0 ||
       (expectedSize > 0 && written < expectedSize)) {
     char msg[160];
+    // TODO: migrate to structured logging
     snprintf(msg, sizeof(msg),
              "Download failed (transport=%d status=%d writeOk=%d bytes=%u/%u)",
              (int)transportOk, status, (int)writeOk,
@@ -769,7 +777,7 @@ bool OTAUpdate::applyUpdate(const String& binUrl, const String& expectedSha256,
 
   char computedHex[65];
   for (int i = 0; i < 32; i++) {
-    sprintf(computedHex + (i * 2), "%02x", hash[i]);
+    snprintf(computedHex + (i * 2), 3, "%02x", hash[i]);
   }
   computedHex[64] = '\0';
 
@@ -788,6 +796,7 @@ bool OTAUpdate::applyUpdate(const String& binUrl, const String& expectedSha256,
   }
 
   char msg[80];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Downloaded + verified %u bytes", (unsigned)written);
   Log::info(TAG, msg);
   return true;

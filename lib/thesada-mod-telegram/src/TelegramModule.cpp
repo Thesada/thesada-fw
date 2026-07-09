@@ -93,6 +93,7 @@ void TelegramModule::begin() {
   _webhookClient.setTimeout(10);
 
   char msg[64];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Ready - token=%s, %d chat(s)", hasToken ? "yes" : "no", nChats);
   Log::info(TAG, msg);
 
@@ -137,6 +138,7 @@ bool TelegramModule::sendTo(const char* chatId, const char* message) {
     uint32_t freeHeap = ESP.getFreeHeap();
     if (freeHeap < TELEGRAM_HEAP_FLOOR_BYTES) {
       char wmsg[96];
+      // TODO: migrate to structured logging
       snprintf(wmsg, sizeof(wmsg),
                "heap %lu B below floor %d B - skipping (MQTT priority)",
                (unsigned long)freeHeap, (int)TELEGRAM_HEAP_FLOOR_BYTES);
@@ -173,11 +175,13 @@ bool TelegramModule::sendTo(const char* chatId, const char* message) {
 
   if (code == 200) {
     char smsg[64];
+    // TODO: migrate to structured logging
     snprintf(smsg, sizeof(smsg), "Sent to %s", chatId);
     Log::info(TAG, smsg);
     return true;
   } else {
     char emsg[64];
+    // TODO: migrate to structured logging
     snprintf(emsg, sizeof(emsg), "HTTP %d for %s", code, chatId);
     Log::warn(TAG, emsg);
     return false;
@@ -245,6 +249,7 @@ bool TelegramModule::send(const char* message) {
       int code = http.POST(postBody);
       if (code > 0) {
         char wmsg[48];
+        // TODO: migrate to structured logging
         snprintf(wmsg, sizeof(wmsg), "Webhook HTTP %d", code);
         Log::info(TAG, wmsg);
       } else {

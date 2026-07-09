@@ -21,6 +21,7 @@ void Config::load() {
   if (err) {
     _doc.clear();
     char msg[64];
+    // TODO: migrate to structured logging
     snprintf(msg, sizeof(msg), "config.json parse failed (%s) - using defaults", err.c_str());
     Log::error(TAG, msg);
   }
@@ -37,12 +38,14 @@ bool Config::save() {
   f.close();
   if (written < expected) {
     char msg[64];
+    // TODO: migrate to structured logging
     snprintf(msg, sizeof(msg), "Short write to config.json: %u/%u bytes",
              (unsigned)written, (unsigned)expected);
     Log::error(TAG, msg);
     return false;
   }
   char msg[48];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Saved %u bytes to /config.json", (unsigned)written);
   Log::info(TAG, msg);
   return true;
@@ -56,6 +59,7 @@ void Config::replace(const char* json) {
   DeserializationError err = deserializeJson(_doc, json);
   if (err) {
     char msg[64];
+    // TODO: migrate to structured logging
     snprintf(msg, sizeof(msg), "Replace failed: %s", err.c_str());
     Log::error(TAG, msg);
     load();  // rollback to file on disk
@@ -122,6 +126,7 @@ bool Config::set(const char* path, const char* value) {
     return false;
   }
   char msg[128];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Set %s = %s", path, value);
   Log::info(TAG, msg);
   return true;

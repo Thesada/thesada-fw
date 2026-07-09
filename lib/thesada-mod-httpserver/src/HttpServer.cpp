@@ -109,7 +109,7 @@ static _TokenEntry _tokens[MAX_TOKENS] = {};
 static void _genToken(char* out) {
   for (uint8_t i = 0; i < TOKEN_LEN; i++) {
     uint8_t b = (uint8_t)esp_random();
-    sprintf(out + i * 2, "%02x", b);
+    snprintf(out + i * 2, 3, "%02x", b);
   }
   out[TOKEN_LEN * 2] = '\0';
 }
@@ -599,10 +599,12 @@ void HttpServer::setupRoutes() {
         // Use content length from request if available, otherwise unknown
         size_t totalSize = req->contentLength();
         char msg[64];
+        // TODO: migrate to structured logging
         snprintf(msg, sizeof(msg), "OTA upload: %s (%u bytes)", filename.c_str(), (unsigned)totalSize);
         Log::info(TAG, msg);
         if (!Update.begin(totalSize > 0 ? totalSize : UPDATE_SIZE_UNKNOWN)) {
           char err[64];
+          // TODO: migrate to structured logging
           snprintf(err, sizeof(err), "Update.begin() failed: %s", Update.errorString());
           Log::error(TAG, err);
         }
@@ -610,6 +612,7 @@ void HttpServer::setupRoutes() {
       if (Update.isRunning()) {
         if (Update.write(data, len) != len) {
           char err[64];
+          // TODO: migrate to structured logging
           snprintf(err, sizeof(err), "Update.write() failed: %s", Update.errorString());
           Log::error(TAG, err);
         }
@@ -617,10 +620,12 @@ void HttpServer::setupRoutes() {
       if (final) {
         if (Update.end(true)) {
           char msg[48];
+          // TODO: migrate to structured logging
           snprintf(msg, sizeof(msg), "OTA complete: %u bytes", (unsigned)(index + len));
           Log::info(TAG, msg);
         } else {
           char err[64];
+          // TODO: migrate to structured logging
           snprintf(err, sizeof(err), "OTA failed: %s", Update.errorString());
           Log::error(TAG, err);
         }

@@ -96,6 +96,7 @@ bool SDModule::_resumeOrOpen() {
 // Rotate to a new log file when the current one exceeds the size limit
 void SDModule::_rotate() {
   char msg[48];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Rotating - %s full", _logPath.c_str());
   Log::info(TAG, msg);
   if (!_openNextLog()) {
@@ -103,6 +104,7 @@ void SDModule::_rotate() {
     _maxBytes = 0;
     return;
   }
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Logging to %s", _logPath.c_str());
   Log::info(TAG, msg);
 }
@@ -138,6 +140,7 @@ void SDModule::begin() {
     }
     _mounted = true;
     char info[80];
+    // TODO: migrate to structured logging
     snprintf(info, sizeof(info), "Mounted (SPI, CS=%d) - %.1f MB",
              cs, (float)SD.totalBytes() / (1024.0f * 1024.0f));
     Log::info(TAG, info);
@@ -160,6 +163,7 @@ void SDModule::begin() {
     }
     _mounted = true;
     char info[80];
+    // TODO: migrate to structured logging
     snprintf(info, sizeof(info), "Mounted (SD_MMC) - %.1f MB",
              (float)SD_MMC.totalBytes() / (1024.0f * 1024.0f));
     Log::info(TAG, info);
@@ -173,9 +177,11 @@ void SDModule::begin() {
 
   char info[96];
   if (_maxBytes > 0)
+    // TODO: migrate to structured logging
     snprintf(info, sizeof(info), "Logging to %s  (%lu B, max %lu KB per file)",
              _logPath.c_str(), (unsigned long)_logBytes, (unsigned long)maxKb);
   else
+    // TODO: migrate to structured logging
     snprintf(info, sizeof(info), "Logging to %s  (%lu B, no size limit)",
              _logPath.c_str(), (unsigned long)_logBytes);
   Log::info(TAG, info);

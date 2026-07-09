@@ -368,6 +368,7 @@ bool Shell::registerFS(const char* prefix, fs::FS* fs, FSDfFn dfUsed, FSDfFn dfT
   }
   _fsMounts[_fsMountCount++] = { prefix, len, fs, dfUsed, dfTotal };
   char msg[64];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "FS mount: %s -> %p", prefix, (void*)fs);
   Log::info("Shell", msg);
   return true;
@@ -2055,6 +2056,7 @@ void Shell::begin() {
   registerBuiltins();
 
   char msg[48];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Shell ready - %d commands", _commandCount);
   Log::info("Shell", msg);
 }

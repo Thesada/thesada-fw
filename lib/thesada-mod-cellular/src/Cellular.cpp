@@ -172,6 +172,7 @@ static uint32_t           s_mqttRetryMs      = MQTT_RETRY_INIT_MS;
 static void mqttBackoffWait(Cellular::ATGuard* guard = nullptr) {
   uint32_t ms = s_mqttRetryMs;
   char msg[64];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "Retry MQTT in %lu s", (unsigned long)(ms / 1000UL));
   Log::warn(TAG, msg);
   if (guard) {
@@ -509,6 +510,7 @@ bool Cellular::writeClientCert() {
   }
 
   char msg[80];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg),
            "Client cert+key written to modem (cert %u B, key %u B)",
            (unsigned)certLen, (unsigned)keyLen);
@@ -554,6 +556,7 @@ void Cellular::radioConfigure() {
 
   // Critical: let LTE-M radio settle before polling registration.
   char msg[64];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "RF settle %lu ms...", (unsigned long)rfSettleMs);
   Log::info(TAG, msg);
   uint32_t remaining = rfSettleMs;
@@ -582,6 +585,7 @@ int Cellular::pollRegistration() {
   if (millis() - lastDiag > 5000UL) {
     lastDiag = millis();
     char dbg[160];
+    // TODO: migrate to structured logging
     snprintf(dbg, sizeof(dbg), "diag: regStatus=%d CSQ=%d",
              (int)s, modem.getSignalQuality());
     Log::info(TAG, dbg);
@@ -596,6 +600,7 @@ int Cellular::pollRegistration() {
       buf.replace("\r", " ");
       buf.replace("\n", " | ");
       char line[256];
+      // TODO: migrate to structured logging
       snprintf(line, sizeof(line), "AT%s -> %s", cmd, buf.c_str());
       Log::info(TAG, line);
     };
@@ -630,6 +635,7 @@ bool Cellular::activateBearer() {
   }
 
   char ipMsg[64];
+  // TODO: migrate to structured logging
   snprintf(ipMsg, sizeof(ipMsg), "IP: %s", modem.localIP().toString().c_str());
   Log::info(TAG, ipMsg);
   return true;
@@ -707,6 +713,7 @@ bool Cellular::mqttConnect() {
     if (!networkConnect()) return false;
   } else if (smState != 0) {
     char dbg[64];
+    // TODO: migrate to structured logging
     snprintf(dbg, sizeof(dbg), "SMSTATE=%d not idle, recycling bearer", smState);
     Log::warn(TAG, dbg);
     modem.sendAT("+CNACT=0,0");
@@ -722,6 +729,7 @@ bool Cellular::mqttConnect() {
   if (modem.waitResponse() != 1) {
     String tail = drainModemTail();
     char line[256];
+    // TODO: migrate to structured logging
     snprintf(line, sizeof(line), "MQTT URL failed: %s", tail.c_str());
     Log::error(TAG, line);
     return false;
@@ -832,6 +840,7 @@ bool Cellular::mqttConnect() {
     // full chatter so the log line carries the real reason.
     String tail = drainModemTail(5000UL);
     char line[384];
+    // TODO: migrate to structured logging
     snprintf(line, sizeof(line), "MQTT connect failed: %s", tail.c_str());
     Log::error(TAG, line);
     return false;
@@ -873,6 +882,7 @@ void Cellular::routeSmsubLine(char* line) {
   *payloadEnd = '\0';
 
   char dmsg[160];
+  // TODO: migrate to structured logging
   snprintf(dmsg, sizeof(dmsg), "RX %s (%u B)", topicStart,
            (unsigned)(payloadEnd - payloadStart));
   Log::info(TAG, dmsg);
@@ -1346,6 +1356,7 @@ Cellular::ActStatus Cellular::tickActivation() {
       uint32_t next = s_mqttRetryMs * 2UL;
       s_mqttRetryMs = (next > MQTT_RETRY_MAX_MS) ? MQTT_RETRY_MAX_MS : next;
       char msg[64];
+      // TODO: migrate to structured logging
       snprintf(msg, sizeof(msg), "MQTT connect failed - retry in %lu s",
                (unsigned long)((s_nextRetryMs - millis()) / 1000UL));
       Log::warn(TAG, msg);
@@ -1699,6 +1710,7 @@ bool Cellular::smsub(const char* topic) {
   esp_task_wdt_reset();
   if (res != 1) {
     char wmsg[80];
+    // TODO: migrate to structured logging
     snprintf(wmsg, sizeof(wmsg), "SMSUB failed for %s", topic);
     Log::warn(TAG, wmsg);
     return false;
@@ -1730,6 +1742,7 @@ bool Cellular::smsubAll() {
     count++;
   });
   char msg[80];
+  // TODO: migrate to structured logging
   snprintf(msg, sizeof(msg), "SMSUB %d topic(s) on cellular MQTT", count);
   Log::info(TAG, msg);
   return allOk;
@@ -1767,6 +1780,7 @@ void Cellular::pumpInbound() {
       // Diag: log every line so we can see exactly what reaches pumpInbound.
       if (lineLen > 0) {
         char dmsg[160];
+        // TODO: migrate to structured logging
         snprintf(dmsg, sizeof(dmsg), "rx: %s", line);
         Log::info(TAG, dmsg);
       }
@@ -1842,6 +1856,7 @@ bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
 
   {
     char msg[200];
+    // TODO: migrate to structured logging
     snprintf(msg, sizeof(msg), "httpsGet: connect %s:%u", host, port);
     Log::info(TAG, msg);
   }
@@ -1973,6 +1988,7 @@ bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
     if (millis() - lastByte > kBodyIdleTimeoutMs) {
       if (contentLen > 0 && bodyBytes < (size_t)contentLen) {
         char msg[120];
+        // TODO: migrate to structured logging
         snprintf(msg, sizeof(msg),
                  "httpsGet: body stall %u/%d bytes after %u ms idle - aborting",
                  (unsigned)bodyBytes, contentLen,
@@ -1992,6 +2008,7 @@ bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
   }
   {
     char msg[120];
+    // TODO: migrate to structured logging
     snprintf(msg, sizeof(msg),
              "httpsGet: done status=%d body=%u bytes (content-length header=%d)",
              status, (unsigned)bodyBytes, contentLen);
