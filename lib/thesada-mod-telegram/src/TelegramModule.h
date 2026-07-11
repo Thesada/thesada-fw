@@ -32,8 +32,12 @@ private:
   // handshake. Loaded once in begin().
   static String _caCert;
   // Separate client for the optional user-configured HTTPS webhook.
-  // The webhook URL is an arbitrary operator-chosen endpoint (possibly
-  // self-signed or internal), so it stays unverified rather than being
-  // forced to chain to the Telegram CA. Also single-instance.
+  // Verified against /webhook-ca.crt when the operator uploads one;
+  // otherwise unverified - the endpoint is arbitrary (possibly
+  // self-signed or internal), so it cannot be forced to chain to the
+  // Telegram CA. Also single-instance.
   static WiFiClientSecure _webhookClient;
+  // PEM CA for the webhook client - same pointer-lifetime contract as
+  // _caCert. Empty = no /webhook-ca.crt uploaded, client stays insecure.
+  static String _webhookCaCert;
 };

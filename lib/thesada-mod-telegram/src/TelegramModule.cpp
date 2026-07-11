@@ -37,6 +37,7 @@ static const char* TAG = "Telegram";
 bool TelegramModule::_ready = false;
 WiFiClientSecure TelegramModule::_secClient;
 String TelegramModule::_caCert;
+String TelegramModule::_webhookCaCert;
 WiFiClientSecure TelegramModule::_webhookClient;
 
 // ---------------------------------------------------------------------------
@@ -87,9 +88,33 @@ void TelegramModule::begin() {
   }
   _secClient.setTimeout(10);
 
-  // Webhook client: optional operator-chosen endpoint, kept unverified
-  // (it may be self-signed or internal - not in scope for CA pinning).
-  _webhookClient.setInsecure();
+  // Webhook client: /webhook-ca.crt on LittleFS enables verified TLS
+  // (upload the endpoint's root, self-signed certs included - same
+  // override pattern as /telegram-ca.crt). Without it the endpoint is
+  // an arbitrary operator-chosen URL we cannot pin, so it stays
+  // unverified - documented fallback, not an oversight.
+  _webhookCaCert = "";
+  bool webhookCaFileExists = LittleFS.exists("/webhook-ca.crt");
+  if (webhookCaFileExists) {
+    File wf = LittleFS.open("/webhook-ca.crt", "r");
+    if (wf) {
+      _webhookCaCert = wf.readString();
+      wf.close();
+    }
+  }
+  if (!_webhookCaCert.isEmpty()) {
+    _webhookClient.setCACert(_webhookCaCert.c_str());
+    Log::info(TAG, "Webhook CA loaded from /webhook-ca.crt - TLS verified");
+  } else {
+    _webhookClient.setInsecure();
+    if (webhookCaFileExists) {
+      // The operator uploaded a CA expecting verified TLS; a quiet insecure
+      // fallback here would misreport the security posture, so shout.
+      Log::error(TAG, "/webhook-ca.crt present but unreadable/empty - webhook TLS UNVERIFIED");
+    } else {
+      Log::warn(TAG, "No /webhook-ca.crt - webhook TLS unverified");
+    }
+  }
   _webhookClient.setTimeout(10);
 
   char msg[64];
