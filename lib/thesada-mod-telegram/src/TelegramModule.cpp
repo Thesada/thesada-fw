@@ -94,7 +94,8 @@ void TelegramModule::begin() {
   // an arbitrary operator-chosen URL we cannot pin, so it stays
   // unverified - documented fallback, not an oversight.
   _webhookCaCert = "";
-  if (LittleFS.exists("/webhook-ca.crt")) {
+  bool webhookCaFileExists = LittleFS.exists("/webhook-ca.crt");
+  if (webhookCaFileExists) {
     File wf = LittleFS.open("/webhook-ca.crt", "r");
     if (wf) {
       _webhookCaCert = wf.readString();
@@ -106,7 +107,13 @@ void TelegramModule::begin() {
     Log::info(TAG, "Webhook CA loaded from /webhook-ca.crt - TLS verified");
   } else {
     _webhookClient.setInsecure();
-    Log::warn(TAG, "No /webhook-ca.crt - webhook TLS unverified");
+    if (webhookCaFileExists) {
+      // The operator uploaded a CA expecting verified TLS; a quiet insecure
+      // fallback here would misreport the security posture, so shout.
+      Log::error(TAG, "/webhook-ca.crt present but unreadable/empty - webhook TLS UNVERIFIED");
+    } else {
+      Log::warn(TAG, "No /webhook-ca.crt - webhook TLS unverified");
+    }
   }
   _webhookClient.setTimeout(10);
 
