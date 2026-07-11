@@ -130,6 +130,24 @@ void test_data_decode_rejects_malformed(void) {
   TEST_ASSERT_FALSE(mesh::dataDecode(group, 6, port, p, plen));
 }
 
+// Length varint 0xFFFFFFFF: on the 32-bit target the old additive bounds
+// check (i + l > len) wrapped and accepted a ~4 GB plen from a 240-byte
+// frame, and the text-copy loop then walked off the stack (LoadProhibited).
+// The remaining-bytes form (l > len - i) cannot wrap at any size_t width;
+// this host test pins the contract even though 64-bit size_t masks the
+// original wrap.
+void test_data_decode_rejects_overflowing_length(void) {
+  uint32_t port;
+  const uint8_t* p;
+  size_t plen;
+  // field 2 payload with 5-byte varint len = 0xFFFFFFFF, one trailing byte
+  const uint8_t hugePayload[] = {0x08, 0x01, 0x12, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x61};
+  TEST_ASSERT_FALSE(mesh::dataDecode(hugePayload, sizeof(hugePayload), port, p, plen));
+  // same varint on the unknown-field skip path (field 15, wire 2)
+  const uint8_t hugeUnknown[] = {0x08, 0x01, 0x7A, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x61};
+  TEST_ASSERT_FALSE(mesh::dataDecode(hugeUnknown, sizeof(hugeUnknown), port, p, plen));
+}
+
 // Meshtastic 2.5+ appends Data.bitfield (field 9, varint) to every text
 // message - decode must skip unknown fields, not reject them. This exact
 // shape (portnum, payload, bitfield=1) is what a 2.7 peer sends.
@@ -213,6 +231,7 @@ int main(int, char**) {
   RUN_TEST(test_data_roundtrip_short);
   RUN_TEST(test_data_roundtrip_long_payload);
   RUN_TEST(test_data_decode_rejects_malformed);
+  RUN_TEST(test_data_decode_rejects_overflowing_length);
   RUN_TEST(test_data_decode_skips_unknown_fields);
   RUN_TEST(test_data_decode_foreign_portnum);
   RUN_TEST(test_channel_hash_golden);

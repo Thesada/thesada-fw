@@ -21,8 +21,10 @@
 static constexpr uint8_t MQTT_MAX_SUBS  = 16;  // max MQTT subscriptions (CLI + Lua + modules)
 
 struct MQTTMessage {
+  // payload sized to cover the 256-byte alert serialization buffer in
+  // begin() - alerts are exactly the messages queued during outages.
   char topic[64];
-  char payload[128];
+  char payload[256];
   bool valid;
 };
 

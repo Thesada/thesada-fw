@@ -688,12 +688,31 @@ void MQTTClient::connect() {
     _retryCount++;
     _retryInterval = min(_retryInterval * 2, (uint32_t)RETRY_MAX_MS);
 
-    // mbedtls needs ~30 KB contiguous; retrying without a reboot just
-    // fails again. Allow 3 attempts for transient failures first.
-    if (_retryCount >= 3 && ESP.getMaxAllocHeap() < 40000) {
-      Log::error(TAG, "TLS alloc failed 3x with low heap - rebooting to defrag");
-      delay(1000);
-      ESP.restart();
+    // mbedtls needs ~30 KB contiguous; a fragmented heap kills the TLS
+    // handshake before the broker is ever reached, which reports
+    // MQTT_CONNECT_FAILED. rc >= 1 means the broker answered (bad creds,
+    // unavailable, ...) - heap was fine, a reboot fixes nothing. And on
+    // heap-constrained boards MaxAllocHeap < 40 KB is the steady state, so
+    // the heap check alone must not trigger. Consume the same NVS reboot
+    // budget as the exhaustion path below - unbudgeted, a plain broker
+    // outage on a CYD rebooted the device every ~15 s forever.
+    if (_retryCount >= 3 && _client.state() == MQTT_CONNECT_FAILED &&
+        ESP.getMaxAllocHeap() < 40000 && !_rebootHalted) {
+      uint8_t maxReboots = Config::get()["mqtt"]["max_exhaust_reboots"] | 3;
+      uint8_t count      = mqttRebootCount();
+      if (count < maxReboots) {
+        char m[80];
+        // TODO: migrate to structured logging
+        snprintf(m, sizeof(m),
+                 "TLS connect failed 3x with low heap - defrag reboot %u/%u",
+                 (unsigned)(count + 1), (unsigned)maxReboots);
+        Log::error(TAG, m);
+        mqttRebootCountBump(count + 1);
+        delay(1000);
+        ESP.restart();
+      }
+      // Budget spent: fall through to backoff; the exhaustion path below
+      // owns the halt messaging.
     }
 
     // Broker-misconfiguration safety net. A bad host/port/creds used to
@@ -1926,6 +1945,18 @@ uint32_t MQTTClient::currentFreeHeap() {
 // ---------------------------------------------------------------------------
 
 void MQTTClient::enqueue(const char* topic, const char* payload) {
+  // Reject rather than truncate (same policy as fs.write): a clipped
+  // payload reaches the platform as malformed JSON after reconnect,
+  // which is worse than a logged drop.
+  if (strlen(topic)   >= sizeof(_queue[0].topic) ||
+      strlen(payload) >= sizeof(_queue[0].payload)) {
+    char log[96];
+    // TODO: migrate to structured logging
+    snprintf(log, sizeof(log), "Queue reject - oversize (%u byte payload): %s",
+             (unsigned)strlen(payload), topic);
+    Log::warn(TAG, log);
+    return;
+  }
   if (_queueCount == MQTT_QUEUE_SIZE) {
     Log::warn(TAG, "Queue full - dropping oldest message");
     _queueHead = (_queueHead + 1) % MQTT_QUEUE_SIZE;

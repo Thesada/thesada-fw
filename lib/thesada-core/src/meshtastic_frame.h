@@ -138,7 +138,10 @@ inline bool dataDecode(const uint8_t* buf, size_t len, uint32_t& portnum,
       if (!ok) return false;
     } else if (field == 2 && wire == 2) {
       uint32_t l = varintRead(buf, len, i, ok);
-      if (!ok || i + l > len) return false;
+      // l is attacker-controlled up to 0xFFFFFFFF; on 32-bit size_t the
+      // additive form (i + l > len) wraps and passes. i <= len holds here,
+      // so compare against the remaining bytes instead.
+      if (!ok || l > len - i) return false;
       payload = buf + i;
       plen = l;
       i += l;
@@ -154,7 +157,7 @@ inline bool dataDecode(const uint8_t* buf, size_t len, uint32_t& portnum,
           break;
         case 2: {                                      // length-delimited
           uint32_t l = varintRead(buf, len, i, ok);
-          if (!ok || i + l > len) return false;
+          if (!ok || l > len - i) return false;        // no i + l: wraps on 32-bit
           i += l;
           break;
         }

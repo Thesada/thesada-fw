@@ -4,7 +4,7 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-07-02. Bump the date on every edit.
+Dated 2026-07-10. Bump the date on every edit.
 
 ---
 
@@ -237,6 +237,28 @@ How enforced: the veto is the pure predicate `webAuthPassIsDefault` /
 Source: `lib/thesada-core/src/web_auth_policy.h`,
 `lib/thesada-mod-httpserver/src/HttpServer.cpp::_checkAuth`.
 
+### OTA upload chunks are auth-gated before any `Update` call
+
+ESPAsyncWebServer invokes the `/ota` upload callback for every
+multipart chunk BEFORE the onRequest handler runs, so an auth check in
+onRequest alone fires only after the attacker's image is already
+staged and the boot partition switched. The upload callback therefore
+checks `_checkAuth` itself at chunk 0 and records the verdict in
+`req->_tempObject` (heap marker, freed by the request destructor;
+NULL = unauthorized); no chunk touches `Update.begin/write/end` without
+it. Arduino WebServer (LiteServer) has the same callback ordering, so
+`handleOtaUpload` gates at `UPLOAD_FILE_START` via `_otaAuthorized` and
+`handleOtaDone` re-checks with the 401-sending `checkAuth()`.
+
+How enforced: both upload callbacks bail before their first `Update`
+call when the auth marker is absent. Any new firmware-accepting
+endpoint (HTTP or otherwise) authenticates before the first byte
+reaches `Update`, not in a completion handler.
+
+Source: `lib/thesada-mod-httpserver/src/HttpServer.cpp` (`/ota` upload
+lambda), `lib/thesada-mod-liteserver/src/LiteServer.cpp::handleOtaUpload`,
+`handleOtaDone`.
+
 ### Bearer token comparison is constant-time
 
 `_validateToken` compares via `_constTimeEq` (no early return) and
@@ -397,6 +419,25 @@ path only.
 Source: `lib/thesada-mod-cellular/src/Cellular.cpp::tickActivation`,
 `lib/thesada-mod-cellular/src/CellularModule.cpp::loop`.
 
+### Modem FS chunk uploads are bounded - no unbounded retry on the AT bus
+
+The CFSWFILE chunk loops (`writeCACert`, `writeModemFile`) abort after
+3 consecutive failed chunks, and a missing DOWNLOAD prompt is a hard
+failure (the payload is never written blind after a prompt timeout).
+Both paths CFSTERM and return false so the caller re-walks the state
+machine. Unbounded, a wedged modem FS session spun these loops forever
+while holding the AT-bus mutex - and because `waitChunked` feeds the
+TWDT internally, the watchdog never fired and the activation deadline
+(evaluated between `tickActivation` calls) never got the chance to:
+the whole main loop hung permanently with no recovery path.
+
+How enforced: every retry loop around a modem AT exchange carries a
+bounded failure counter and a hard-fail return; feeding the TWDT inside
+a loop obliges the loop to bound itself.
+
+Source: `lib/thesada-mod-cellular/src/Cellular.cpp::writeCACert`,
+`writeModemFile`.
+
 ---
 
 ## Lua sandbox
@@ -508,6 +549,37 @@ guard runs before the command reaches `Shell::enqueueDeferred`.
 
 Source: `lib/thesada-core/src/MQTTClient.cpp::runCli`.
 
+### The offline publish queue rejects oversized messages, never truncates
+
+`enqueue()` refuses a topic or payload that does not fit the
+`MQTTMessage` buffers (topic 64, payload 256 - sized to cover the alert
+serialization buffer) and logs a warn. A clipped payload would be
+flushed to the platform after reconnect as malformed JSON - and the
+queue holds precisely the alerts that fire during connectivity trouble,
+so silent truncation corrupted the highest-value messages first. Same
+reject-over-truncate policy as the `fs.write`/`config.set` guards.
+
+Source: `lib/thesada-core/src/MQTTClient.cpp::enqueue`,
+`lib/thesada-core/src/MQTTClient.h::MQTTMessage`.
+
+### Meshtastic frame bounds checks are wrap-proof
+
+`dataDecode` compares an attacker-controlled length varint against the
+remaining bytes (`l > len - i`, with `i <= len` held at every site) -
+never the additive form `i + l > len`, which wraps 32-bit `size_t` on
+the ESP32 (l = 0xFFFFFFFF, i = 5 -> passes) and hands the consumer a
+~4 GB `plen` over a 240-byte radio buffer; the text-copy loop then
+walks off the stack and panics. Reachable by anyone with a LoRa radio
+on the well-known default channel key, so this parser is a security
+surface, not a convenience.
+
+How enforced: host-unit-tested with crafted 5-byte 0xFFFFFFFF length
+varints on both the payload and unknown-field-skip paths
+(`test/test_meshtastic_frame::test_data_decode_rejects_overflowing_length`).
+New length checks in wire parsers use the remaining-bytes form.
+
+Source: `lib/thesada-core/src/meshtastic_frame.h::dataDecode`.
+
 ### `Config::set` rejects a dot-path it cannot store, never truncates it
 
 `config.set` (serial and MQTT cli) copies the dot-path into a fixed
@@ -565,6 +637,28 @@ mutate-then-save path reloads the persisted state.
 
 Source: `lib/thesada-core/src/Config.cpp::save`, `set`, `replace`.
 
+### `/config.json` is never truncated in place - every writer goes tmp + rename
+
+Opening `/config.json` with `"w"` truncates the last good config before
+the new bytes are known to fit; a short write (LittleFS full, flash
+error) then leaves partial JSON on disk, and the `load()` rollback path
+parses that corpse and wipes the live in-memory config too - persistent
+loss of WiFi/MQTT/prefix from one full filesystem. Every config writer
+therefore serializes to `/config.json.tmp`, verifies the written length,
+and `LittleFS.rename()`s over the original (lfs rename atomically
+replaces the destination). On any failure the tmp is removed and the
+original is untouched.
+
+How enforced: the writers are `Config::save()`, `Shell.cpp::
+shellConfigWrite` (config.set / config.del / config.save), and
+`LiteServer.cpp::atomicConfigWrite` (web config editor + WiFi
+provisioning). Any new code path that persists config routes through
+one of these three, never a direct `LittleFS.open("/config.json", "w")`.
+
+Source: `lib/thesada-core/src/Config.cpp::save`,
+`lib/thesada-core/src/Shell.cpp::shellConfigWrite`,
+`lib/thesada-mod-liteserver/src/LiteServer.cpp::atomicConfigWrite`.
+
 ### Dashboard / shell HTML output is escaped via the browser's serializer
 
 Dashboard XSS path uses `_escEl.textContent = s; return _escEl.innerHTML`
@@ -589,10 +683,17 @@ streak older than 6 h ages out so unrelated outages never accumulate.
 
 Why: a reboot loop leaves the device reachable only briefly each
 ~30 min cycle, making remote recovery from a config mistake nearly
-impossible. The TLS-OOM fast-reboot (`MaxAllocHeap` low) is a separate
-path and is intentionally not counted - it genuinely defragments.
+impossible.
 
-How enforced: the `_retryCount >= 30` branch in `connect()` is gated by
+The TLS-OOM fast-reboot (3 fails + `MaxAllocHeap` < 40 KB) consumes the
+SAME budget: heap-constrained boards sit under 40 KB in steady state,
+so uncounted it rebooted every ~15 s through any plain broker outage -
+exactly the loop this invariant exists to prevent. It additionally
+fires only on `MQTT_CONNECT_FAILED` (TCP/TLS never came up); an rc >= 1
+means the broker answered, the heap was sufficient, and a defrag fixes
+nothing.
+
+How enforced: BOTH reboot branches in `connect()` are gated by
 `!_rebootHalted` and the `mqttRebootCount()` budget check. Any new
 reboot trigger in this file must justify why it cannot loop.
 

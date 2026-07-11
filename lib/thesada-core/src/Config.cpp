@@ -30,18 +30,28 @@ void Config::load() {
 // Persist the in-memory doc to /config.json. out: true on success;
 // false if the file cannot be opened or the write came up short (e.g.
 // LittleFS full) so callers never report a save that did not happen.
+// Writes go to a temp file first, then rename over config.json - lfs
+// rename atomically replaces the destination, so a short write never
+// destroys the last good config and the load() rollback in set()/
+// replace() genuinely restores it.
 bool Config::save() {
-  File f = LittleFS.open("/config.json", "w");
-  if (!f) { Log::error(TAG, "Failed to open config.json for writing"); return false; }
+  File f = LittleFS.open("/config.json.tmp", "w");
+  if (!f) { Log::error(TAG, "Failed to open config.json.tmp for writing"); return false; }
   size_t written  = serializeJson(_doc, f);
   size_t expected = measureJson(_doc);
   f.close();
   if (written < expected) {
     char msg[64];
     // TODO: migrate to structured logging
-    snprintf(msg, sizeof(msg), "Short write to config.json: %u/%u bytes",
+    snprintf(msg, sizeof(msg), "Short write to config.json.tmp: %u/%u bytes",
              (unsigned)written, (unsigned)expected);
     Log::error(TAG, msg);
+    LittleFS.remove("/config.json.tmp");
+    return false;
+  }
+  if (!LittleFS.rename("/config.json.tmp", "/config.json")) {
+    Log::error(TAG, "Rename config.json.tmp over config.json failed");
+    LittleFS.remove("/config.json.tmp");
     return false;
   }
   char msg[48];
