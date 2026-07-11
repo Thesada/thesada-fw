@@ -782,6 +782,7 @@ bool OTAUpdate::applyUpdate(const String& binUrl, const String& expectedSha256,
   computedHex[64] = '\0';
 
   if (strcasecmp(computedHex, expectedSha256.c_str()) != 0) {
+    // TODO: migrate to structured logging
     Log::error(TAG, "SHA256 mismatch!");
     Log::error(TAG, computedHex);
     Update.abort();

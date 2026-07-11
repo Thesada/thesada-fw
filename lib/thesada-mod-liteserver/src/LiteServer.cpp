@@ -24,8 +24,9 @@
 static const char* TAG = "LiteServer";
 static WebServer _server(80);
 
-// Check Basic Auth - skip in AP mode (no credentials configured yet)
-static bool checkAuth() {
+// Check Basic Auth - skip in AP mode (no credentials configured yet).
+// No response side effects, so it is safe inside upload callbacks.
+static bool authOk() {
   if (WiFiManager::isAPActive()) return true;
   JsonObject cfg = Config::get();
   const char* user = cfg["web"]["user"]     | "";
@@ -37,7 +38,12 @@ static bool checkAuth() {
     if (!_warnedOnce) { Log::warn(TAG, "No web credentials configured - admin endpoints unprotected"); _warnedOnce = true; }
     return true;
   }
-  if (!_server.authenticate(user, pass)) {
+  return _server.authenticate(user, pass);
+}
+
+// authOk plus the 401 challenge - use in request handlers
+static bool checkAuth() {
+  if (!authOk()) {
     _server.requestAuthentication();
     return false;
   }
@@ -89,6 +95,23 @@ static void handleConfigGet() {
   f.close();
 }
 
+// Write body to config.json via tmp + rename so a short write (fs full)
+// never destroys the last good config - same policy as Config::save().
+// out: true on success; on failure the tmp is removed and the original
+// file is untouched.
+static bool atomicConfigWrite(const String& body) {
+  File f = LittleFS.open("/config.json.tmp", "w");
+  if (!f) return false;
+  size_t written = f.print(body);
+  f.close();
+  if (written != body.length() ||
+      !LittleFS.rename("/config.json.tmp", "/config.json")) {
+    LittleFS.remove("/config.json.tmp");
+    return false;
+  }
+  return true;
+}
+
 // Save posted JSON body to config.json
 static void handleConfigPost() {
   if (!checkAuth()) return;
@@ -97,10 +120,7 @@ static void handleConfigPost() {
   // Validate JSON before saving
   JsonDocument doc;
   if (deserializeJson(doc, body)) { _server.send(400, "text/plain", "invalid JSON"); return; }
-  File f = LittleFS.open("/config.json", "w");
-  if (!f) { _server.send(500, "text/plain", "write failed"); return; }
-  f.print(body);
-  f.close();
+  if (!atomicConfigWrite(body)) { _server.send(500, "text/plain", "write failed"); return; }
   Config::load();
   _server.send(200, "text/plain", "saved");
   Log::info(TAG, "Config saved via LiteServer");
@@ -129,10 +149,9 @@ static void handleWifi() {
   net["ssid"] = ssid;
   net["password"] = pass;
 
-  File wf = LittleFS.open("/config.json", "w");
-  if (!wf) { _server.send(500, "text/plain", "write failed"); return; }
-  serializeJsonPretty(doc, wf);
-  wf.close();
+  String out;
+  serializeJsonPretty(doc, out);
+  if (out.isEmpty() || !atomicConfigWrite(out)) { _server.send(500, "text/plain", "write failed"); return; }
 
   char msg[96];
   // TODO: migrate to structured logging
@@ -151,8 +170,14 @@ static void handleRestart() {
   ESP.restart();
 }
 
+// True while the in-flight OTA upload passed auth at UPLOAD_FILE_START
+static bool _otaAuthorized = false;
+
 // OTA upload - completion handler
 static void handleOtaDone() {
+  if (!checkAuth()) return;
+  if (!_otaAuthorized) { _server.send(400, "text/plain", "no firmware received"); return; }
+  _otaAuthorized = false;
   if (Update.hasError()) {
     char msg[128];
     // TODO: migrate to structured logging
@@ -170,7 +195,11 @@ static void handleOtaDone() {
 // OTA upload - chunk handler
 static void handleOtaUpload() {
   HTTPUpload& upload = _server.upload();
+  // Upload chunks arrive before handleOtaDone runs its auth check, so gate
+  // here too - unauthorized bodies must never reach Update.
   if (upload.status == UPLOAD_FILE_START) {
+    _otaAuthorized = authOk();
+    if (!_otaAuthorized) { Log::warn(TAG, "OTA upload refused - unauthorized"); return; }
     Log::info(TAG, "OTA upload started");
     // Free MQTT TLS buffers so Update.begin() can malloc on low-heap boards
     if (MQTTClient::connected() && ESP.getMaxAllocHeap() < 40000) {
@@ -186,6 +215,8 @@ static void handleOtaUpload() {
       snprintf(msg, sizeof(msg), "Update.begin failed: %s", Update.errorString());
       Log::error(TAG, msg);
     }
+  } else if (!_otaAuthorized) {
+    return;
   } else if (upload.status == UPLOAD_FILE_WRITE) {
     esp_task_wdt_reset();
     yield();

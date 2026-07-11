@@ -44,7 +44,9 @@ def generate_manifest(source, target, env):
     # SHA256 check matches exactly. The manifest itself is published as the
     # "latest/download" permalink so devices always fetch the newest manifest.
     GITHUB_REPO = "Thesada/thesada-fw"
-    url = f"https://github.com/{GITHUB_REPO}/releases/download/v{version}/firmware.bin"
+    # CalVer release tags carry no v-prefix (ci.yml creates "26.07.1"), and
+    # GitHub asset URLs require an exact tag match.
+    url = f"https://github.com/{GITHUB_REPO}/releases/download/{version}/firmware.bin"
     manifest = {
         "version": version,
         "url": url,

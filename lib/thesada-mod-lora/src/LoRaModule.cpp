@@ -254,6 +254,7 @@ void LoRaModule::publishRx(const LoRaRx& rx) {
     if (rxSeen.seenAndRecord(from, pid)) {
       _rxDupCount++;
       char m[48];
+      // TODO: migrate to structured logging (already key=value; swap to Log::kv when the helper lands)
       snprintf(m, sizeof(m), "lora.rx_dup from=%08x id=%08x", (unsigned)from, (unsigned)pid);
       Log::debug(TAG, m);
       return;

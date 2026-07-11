@@ -583,6 +583,9 @@ void HttpServer::setupRoutes() {
   server.on("/ota", HTTP_POST,
     [](AsyncWebServerRequest* req) {
       if (!_checkAuth(req)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
+      // No authorized-upload marker = no chunk was ever accepted (empty body
+      // or marker alloc failure) - nothing was flashed, don't restart.
+      if (req->_tempObject == nullptr) { req->send(400, "application/json", "{\"ok\":false,\"error\":\"no firmware received\"}"); return; }
       bool ok = !Update.hasError();
       if (ok) {
         req->send(200, "application/json", "{\"ok\":true}");
@@ -595,6 +598,15 @@ void HttpServer::setupRoutes() {
     },
     [](AsyncWebServerRequest* req, const String& filename,
        size_t index, uint8_t* data, size_t len, bool final) {
+      // Upload chunks arrive BEFORE the onRequest auth check fires, so auth
+      // must be enforced here. _tempObject doubles as the per-request
+      // authorized marker: heap pointer set on success, freed by the request
+      // destructor. NULL = unauthorized, drop every chunk untouched.
+      if (index == 0 && _checkAuth(req)) req->_tempObject = malloc(1);
+      if (req->_tempObject == nullptr) {
+        if (index == 0) Log::warn(TAG, "OTA upload refused - unauthorized");
+        return;
+      }
       if (index == 0) {
         // Use content length from request if available, otherwise unknown
         size_t totalSize = req->contentLength();

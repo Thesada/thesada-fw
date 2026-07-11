@@ -646,6 +646,25 @@ static void cmd_config_get(int argc, char** argv, ShellOutput out) {
   }
 }
 
+// Persist a document to /config.json via tmp + rename - same policy as
+// Config::save(), so a short write (fs full) never destroys the last
+// good config. Reports failure to the shell caller.
+static bool shellConfigWrite(JsonVariantConst src, ShellOutput out, size_t* bytes = nullptr) {
+  File wf = LittleFS.open("/config.json.tmp", "w");
+  if (!wf) { out("Failed to write config.json"); return false; }
+  size_t written  = serializeJsonPretty(src, wf);
+  size_t expected = measureJsonPretty(src);
+  wf.close();
+  if (written < expected ||
+      !LittleFS.rename("/config.json.tmp", "/config.json")) {
+    LittleFS.remove("/config.json.tmp");
+    out("Failed to write config.json (fs full?)");
+    return false;
+  }
+  if (bytes) *bytes = written;
+  return true;
+}
+
 static void cmd_config_set(int argc, char** argv, ShellOutput out) {
   if (argc < 3) { out("Usage: config.set <key> <value>  (then config.save to persist)"); return; }
 
@@ -827,10 +846,7 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
   }
 
   save:
-  File wf = LittleFS.open("/config.json", "w");
-  if (!wf) { out("Failed to write config.json"); return; }
-  serializeJsonPretty(doc, wf);
-  wf.close();
+  if (!shellConfigWrite(doc.as<JsonVariantConst>(), out)) return;
 
   // Does NOT trigger MQTT reconnect - that requires config.reload.
   Config::load();
@@ -847,13 +863,42 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
 // For programmatic changes to Config::get() that bypass config.set.
 static void cmd_config_save(int argc, char** argv, ShellOutput out) {
   JsonObject cfg = Config::get();
-  File f = LittleFS.open("/config.json", "w");
-  if (!f) { out("Failed to write config.json"); return; }
-  size_t bytes = serializeJsonPretty(cfg, f);
-  f.close();
+  size_t bytes = 0;
+  if (!shellConfigWrite(cfg, out, &bytes)) return;
   char msg[64];
   snprintf(msg, sizeof(msg), "Config saved to /config.json (%d bytes)", (int)bytes);
   out(msg);
+}
+
+// Delete a config key. Dotted keys go through the config.set --delete
+// path (object member removed; array slot nulled so sibling indices stay
+// stable). A bare top-level key removes the whole section - the cleanup
+// for a key whose type changed between releases (e.g. bool -> object):
+// delete the stale node, then config.set recreates it with the new shape.
+static void cmd_config_del(int argc, char** argv, ShellOutput out) {
+  if (argc < 2) { out("Usage: config.del <key>  (dot notation; bare section name deletes the section)"); return; }
+
+  if (!strchr(argv[1], '.')) {
+    if (!LittleFS.exists("/config.json")) { out("config.json not found"); return; }
+    File f = LittleFS.open("/config.json", "r");
+    if (!f) { out("Failed to read config.json"); return; }
+    String json = f.readString();
+    f.close();
+    JsonDocument doc;
+    if (deserializeJson(doc, json)) { out("JSON parse error in config.json"); return; }
+    JsonObject root = doc.as<JsonObject>();
+    if (root[argv[1]].isNull()) { out("Key not found"); return; }
+    root.remove(argv[1]);
+    if (!shellConfigWrite(doc.as<JsonVariantConst>(), out)) return;
+    Config::load();
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Deleted %s (saved)", argv[1]);
+    out(msg);
+    return;
+  }
+
+  char* delArgv[3] = { argv[0], argv[1], (char*)"--delete" };
+  cmd_config_set(3, delArgv, out);
 }
 
 // Reload config from flash. If network-affecting keys changed, reinit MQTT
@@ -948,6 +993,42 @@ static void cmd_ifconfig(int argc, char** argv, ShellOutput out) {
   } else if (cell) {
     out("Cellular: down");
   }
+}
+
+// Dump visible 2.4 GHz APs: SSID, RSSI, channel, auth. The tool for "device
+// says not-in-range but the network should be there" - a 5 GHz-only or
+// hidden SSID never shows up here, which is the answer.
+static void cmd_wifi_scan(int argc, char** argv, ShellOutput out) {
+  out("Scanning...");
+  // show_hidden=true: a hidden AP beacons with an empty SSID and would
+  // otherwise be filtered out - the exact case this command exists to catch.
+  int16_t n = WiFi.scanNetworks(false, true);
+  if (n <= 0) {
+    out(n == 0 ? "No networks found" : "Scan failed");
+    WiFi.scanDelete();
+    return;
+  }
+  char line[128];
+  for (int16_t i = 0; i < n; i++) {
+    const char* auth = "?";
+    switch (WiFi.encryptionType(i)) {
+      case WIFI_AUTH_OPEN:            auth = "open";     break;
+      case WIFI_AUTH_WEP:             auth = "wep";      break;
+      case WIFI_AUTH_WPA_PSK:         auth = "wpa";      break;
+      case WIFI_AUTH_WPA2_PSK:        auth = "wpa2";     break;
+      case WIFI_AUTH_WPA_WPA2_PSK:    auth = "wpa/wpa2"; break;
+      case WIFI_AUTH_WPA2_ENTERPRISE: auth = "wpa2-ent"; break;
+      case WIFI_AUTH_WPA3_PSK:        auth = "wpa3";     break;
+      case WIFI_AUTH_WPA2_WPA3_PSK:   auth = "wpa2/wpa3";break;
+      default: break;
+    }
+    String ssid = WiFi.SSID(i);
+    snprintf(line, sizeof(line), "%-32s  %4d dBm  ch%-2d  %s",
+             ssid.isEmpty() ? "<hidden>" : ssid.c_str(),
+             WiFi.RSSI(i), WiFi.channel(i), auth);
+    out(line);
+  }
+  WiFi.scanDelete();
 }
 
 // Test connectivity by resolving a hostname via DNS. Routes by transport:
@@ -2022,12 +2103,14 @@ void Shell::registerBuiltins() {
   // Config
   registerCommand("config.get",    "Read config key (dot notation)",   cmd_config_get);
   registerCommand("config.set",    "Set config key (saves + reloads)", cmd_config_set);
+  registerCommand("config.del",    "Delete config key or section",     cmd_config_del);
   registerCommand("config.save",   "Save current config to flash",     cmd_config_save);
   registerCommand("config.reload", "Reload config from flash",         cmd_config_reload);
   registerCommand("config.dump",   "Print full config JSON",           cmd_config_dump);
 
   // Network
   registerCommand("net.ip",        "Network interface info",        cmd_ifconfig);
+  registerCommand("net.scan",      "List visible WiFi APs (ssid/rssi/ch/auth)", cmd_wifi_scan);
   registerCommand("net.ping",      "DNS resolve test",              cmd_ping);
   registerCommand("net.ntp",       "NTP status / net.ntp set <epoch|ISO8601>", cmd_ntp);
   registerCommand("net.mqtt",      "MQTT connection + subscription dump", cmd_mqtt);

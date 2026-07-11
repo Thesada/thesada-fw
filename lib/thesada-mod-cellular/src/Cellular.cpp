@@ -382,17 +382,33 @@ bool Cellular::writeCACert() {
     return false;
   }
 
-  size_t total   = certLen;
-  size_t written = 0;
+  // Bounded retries: a wedged FS session (CFSINIT dropped, modem reset,
+  // FS full) previously spun here forever holding the AT-bus mutex, and
+  // the activation deadline never fired. Fail hard so the caller re-walks
+  // the state machine.
+  size_t  total    = certLen;
+  size_t  written  = 0;
+  uint8_t failures = 0;
   while (total > 0) {
     size_t chunk = total > 10000 ? 10000 : total;
     modem.sendAT("+CFSWFILE=", 3, ",\"server-ca.crt\",",
                  (written > 0 ? 1 : 0), ",", chunk, ",10000");
-    waitChunked(30000UL, "DOWNLOAD");
+    if (waitChunked(30000UL, "DOWNLOAD") != 1) {
+      Log::error(TAG, "CA chunk DOWNLOAD prompt missing - aborting");
+      modem.sendAT("+CFSTERM");
+      modem.waitResponse();
+      return false;
+    }
     modem.stream.write(cert + written, chunk);
     if (waitChunked(30000UL) == 1) {
-      written += chunk;
-      total   -= chunk;
+      written  += chunk;
+      total    -= chunk;
+      failures  = 0;
+    } else if (++failures >= 3) {
+      Log::error(TAG, "CA chunk write failed 3x - aborting");
+      modem.sendAT("+CFSTERM");
+      modem.waitResponse();
+      return false;
     } else {
       Log::warn(TAG, "CA chunk write failed, retrying");
       delay(1000);
@@ -424,17 +440,30 @@ static bool writeModemFile(TinyGsm& modem, const char* filename,
   modem.sendAT("+CFSINIT");
   if (modem.waitResponse() != 1) return false;
 
-  size_t remaining = length;
-  size_t written   = 0;
+  // Bounded retries - same abort policy as writeCACert.
+  size_t  remaining = length;
+  size_t  written   = 0;
+  uint8_t failures  = 0;
   while (remaining > 0) {
     size_t chunk = remaining > 10000 ? 10000 : remaining;
     modem.sendAT("+CFSWFILE=", 3, ",\"", filename, "\",",
                  (written > 0 ? 1 : 0), ",", chunk, ",10000");
-    waitChunked(30000UL, "DOWNLOAD");
+    if (waitChunked(30000UL, "DOWNLOAD") != 1) {
+      Log::error(TAG, "chunk DOWNLOAD prompt missing - aborting");
+      modem.sendAT("+CFSTERM");
+      modem.waitResponse();
+      return false;
+    }
     modem.stream.write(data + written, chunk);
     if (waitChunked(30000UL) == 1) {
       written   += chunk;
       remaining -= chunk;
+      failures   = 0;
+    } else if (++failures >= 3) {
+      Log::error(TAG, "chunk write failed 3x - aborting");
+      modem.sendAT("+CFSTERM");
+      modem.waitResponse();
+      return false;
     } else {
       delay(1000);
     }
