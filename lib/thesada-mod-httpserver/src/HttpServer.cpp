@@ -13,6 +13,7 @@
 #include <Config.h>
 #include <Secret.h>
 #include <web_auth_policy.h>
+#include <ttl_policy.h>
 #include <EventBus.h>
 #include <Log.h>
 #include <ScriptEngine.h>
@@ -54,11 +55,12 @@ struct _RLEntry { char ip[20]; uint8_t fails; uint32_t until; };
 static _RLEntry _rlTable[16] = {};
 static uint8_t  _rlCount     = 0;
 
-// Check if an IP is allowed or currently rate-limited
+// Check if an IP is allowed or currently rate-limited (rollover-safe, see
+// ttl_policy.h - a plain compare re-opens lockouts across the millis() wrap).
 static bool _rlAllow(const String& ip) {
   for (uint8_t i = 0; i < _rlCount; i++) {
     if (strcmp(_rlTable[i].ip, ip.c_str()) != 0) continue;
-    return millis() >= _rlTable[i].until;
+    return ttlReached(millis(), _rlTable[i].until);
   }
   return true;
 }
@@ -118,10 +120,13 @@ static void _genToken(char* out) {
 static const char* _createToken() {
   uint32_t now = millis();
   uint8_t slot = 0;
-  uint32_t oldest = UINT32_MAX;
+  int32_t minRemain = INT32_MAX;
   for (uint8_t i = 0; i < MAX_TOKENS; i++) {
-    if (_tokens[i].expiry == 0 || now >= _tokens[i].expiry) { slot = i; break; }
-    if (_tokens[i].expiry < oldest) { oldest = _tokens[i].expiry; slot = i; }
+    if (!ttlActive(now, _tokens[i].expiry)) { slot = i; break; }
+    // Evict by smallest remaining time, never by raw expiry values (which
+    // sort wrongly across the millis() wrap).
+    int32_t remain = ttlRemaining(now, _tokens[i].expiry);
+    if (remain < minRemain) { minRemain = remain; slot = i; }
   }
   _genToken(_tokens[slot].token);
   _tokens[slot].expiry = now + TOKEN_TTL_MS;
@@ -146,7 +151,7 @@ static bool _validateToken(const char* token) {
   uint32_t now = millis();
   bool found = false;
   for (uint8_t i = 0; i < MAX_TOKENS; i++) {
-    bool active = (_tokens[i].expiry > 0 && now < _tokens[i].expiry);
+    bool active = ttlActive(now, _tokens[i].expiry);
     bool match  = _constTimeEq(_tokens[i].token, token, tlen);
     if (active && match) found = true;
   }
@@ -211,7 +216,7 @@ static void _grantWsAuth(const String& ip) {
   uint32_t now = millis();
   uint8_t  slot = 0;
   for (uint8_t i = 0; i < 4; i++) {
-    if (_wsAuth[i].expiry == 0 || now >= _wsAuth[i].expiry) { slot = i; break; }
+    if (!ttlActive(now, _wsAuth[i].expiry)) { slot = i; break; }
   }
   strncpy(_wsAuth[slot].ip, ip.c_str(), sizeof(_wsAuth[0].ip) - 1);
   _wsAuth[slot].ip[sizeof(_wsAuth[0].ip) - 1] = '\0';
@@ -222,7 +227,7 @@ static void _grantWsAuth(const String& ip) {
 static bool _consumeWsAuth(const String& ip) {
   uint32_t now = millis();
   for (uint8_t i = 0; i < 4; i++) {
-    if (now < _wsAuth[i].expiry && strcmp(_wsAuth[i].ip, ip.c_str()) == 0) {
+    if (ttlActive(now, _wsAuth[i].expiry) && strcmp(_wsAuth[i].ip, ip.c_str()) == 0) {
       _wsAuth[i].expiry = 0;  // one-time use
       return true;
     }
