@@ -4,7 +4,8 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-07-10. Bump the date on every edit.
+Dated 2026-07-11 (rollover-safe auth TTLs via ttl_policy.h; Telegram
+webhook optional /webhook-ca.crt). Bump the date on every edit.
 
 ---
 
@@ -76,7 +77,13 @@ This is a pure fallback - `/ca.crt` in LittleFS always overrides, so
 the rotation path stays flash-based.
 
 How enforced: any change to `OTAUpdate::configureSecureClient` must
-keep both guards. Reviewers grep for new `setInsecure()` calls.
+keep both guards. Reviewers grep for new `setInsecure()` calls. The
+one sanctioned `setInsecure()` is the Telegram webhook client, and
+only when no `/webhook-ca.crt` exists in LittleFS: the endpoint is an
+arbitrary operator-chosen URL that cannot be pinned ahead of time.
+Uploading `/webhook-ca.crt` (the endpoint's root, self-signed
+included) switches it to verified TLS - same override pattern as
+`/telegram-ca.crt` and `/ca.crt`.
 
 Source: `lib/thesada-core/src/OTAUpdate.cpp` `begin()`, `check()`,
 `configureSecureClient()`, `loadCaCert()`; `lib/thesada-core/src/MQTTClient.cpp`
@@ -236,6 +243,28 @@ How enforced: the veto is the pure predicate `webAuthPassIsDefault` /
 
 Source: `lib/thesada-core/src/web_auth_policy.h`,
 `lib/thesada-mod-httpserver/src/HttpServer.cpp::_checkAuth`.
+
+### Auth-state TTLs compare rollover-safe, never `now < expiry`
+
+Bearer-token expiry, the 30 s WS pre-auth window, and the login
+rate-limit lockout are persistent auth state gated on `millis()`. A
+plain `now < expiry` flips its answer at the ~49.7 d wrap: expired
+entries spring back to life (stale WS grants, dead tokens) and
+lockouts re-open or extend (F4). All such compares go through the
+signed-subtraction helpers in `ttl_policy.h`; oldest-slot eviction
+compares remaining time, never raw expiry values, which sort wrongly
+across the wrap. Transient sub-minute `while (millis() < deadline)`
+poll loops (cellular AT, OTA pacing, shell drains) are exempt - worst
+case there is one early timeout at the wrap, self-healing on retry.
+
+How enforced: the helpers are pure and host-tested
+(`test/test_ttl_policy`, including both wrap directions). New
+`millis()`-based auth state must use `ttlActive` / `ttlReached` /
+`ttlRemaining`; reviewers grep new auth code for raw expiry compares.
+
+Source: `lib/thesada-core/src/ttl_policy.h`,
+`lib/thesada-mod-httpserver/src/HttpServer.cpp` (`_rlAllow`,
+`_createToken`, `_validateToken`, `_grantWsAuth`, `_consumeWsAuth`).
 
 ### OTA upload chunks are auth-gated before any `Update` call
 
