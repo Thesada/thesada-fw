@@ -35,7 +35,7 @@ static bool authOk() {
                                      passBuf, sizeof(passBuf));
   if (strlen(user) == 0 && strlen(pass) == 0) {
     static bool _warnedOnce = false;
-    if (!_warnedOnce) { Log::warn(TAG, "No web credentials configured - admin endpoints unprotected"); _warnedOnce = true; }
+    if (!_warnedOnce) { Log::kvfw(TAG, "web.admin_unprotected reason=no_credentials"); _warnedOnce = true; }
     return true;
   }
   return _server.authenticate(user, pass);

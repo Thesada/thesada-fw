@@ -320,8 +320,7 @@ void HttpServer::setupRoutes() {
   // Credentials are resolved per request in _checkAuth; check once here only
   // for the boot-time default-password warning.
   if (_defaultPassActive()) {
-    Log::warn(TAG, "web.password is default/empty - ADMIN ROUTES LOCKED until set "
-                   "via 'secret.set web.password' or config.json");
+    Log::kvfw(TAG, "web.admin_locked reason=default_password");
   }
 
   // ── Dashboard HTML - public (sensor data is read-only) ────────────────────

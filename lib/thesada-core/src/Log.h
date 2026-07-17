@@ -5,6 +5,7 @@
 
 #include <thesada_config.h>
 #include <Arduino.h>
+#include <stdarg.h>
 
 enum class LogLevel {
   DEBUG,
@@ -19,6 +20,12 @@ public:
   static void info(const char* tag, const char* msg);
   static void warn(const char* tag, const char* msg);
   static void error(const char* tag, const char* msg);
+
+  // Structured key=value events, printf-style ("module.event k=v ...").
+  // kvf=info, kvfw=warn, kvfe=error; truncates safely at LOG_LINE_LEN.
+  static void kvf(const char* tag, const char* fmt, ...);
+  static void kvfw(const char* tag, const char* fmt, ...);
+  static void kvfe(const char* tag, const char* fmt, ...);
 
   // Optional callback for remote log relay (e.g. WebSocket terminal).
   // The formatted line "[INF][Tag] message" is passed to the handler.
@@ -38,6 +45,7 @@ public:
 
 private:
   static void write(LogLevel level, const char* tag, const char* msg);
+  static void vkvf(LogLevel level, const char* tag, const char* fmt, va_list ap);
   static const char* levelStr(LogLevel level);
   static void (*_remoteHandler)(const char* line);
 

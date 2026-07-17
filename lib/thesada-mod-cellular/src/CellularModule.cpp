@@ -221,7 +221,7 @@ void CellularModule::loop() {
       if (!wifiUp) {
         if (_wifiDownSince == 0) _wifiDownSince = now;
         if (now - _wifiDownSince >= WIFI_DOWN_HOLD_MS) {
-          Log::warn(TAG, "WiFi down >60s - activating cellular");
+          Log::kvfw(TAG, "cellular.state_change from=standby to=activating reason=wifi_down_60s");
           _state = State::ACTIVATING;
         }
       } else {
@@ -241,7 +241,7 @@ void CellularModule::loop() {
 
         case Cellular::ActStatus::DONE: {
           Cellular::setPublishGate(true);
-          Log::info(TAG, "Cellular ACTIVE");
+          Log::kvf(TAG, "cellular.state_change from=activating to=active");
           _state           = State::ACTIVE;
           _wifiUpSince     = 0;
           _lastTelemetryMs = 0;
@@ -280,7 +280,7 @@ void CellularModule::loop() {
           // Hard failure or the activation deadline expired. Drop back to
           // STANDBY and reset the down-hold so we do not retry on every
           // loop tick - the next 60 s WiFi-down hold re-arms activation.
-          Log::warn(TAG, "Cellular activation failed - back to standby");
+          Log::kvfw(TAG, "cellular.state_change from=activating to=standby reason=activation_failed");
           _wifiDownSince = now;
           _state         = State::STANDBY;
           break;
@@ -293,7 +293,7 @@ void CellularModule::loop() {
       // false. Detect that and re-walk bring-up; Cellular::loop is a
       // no-op while _started=false and would otherwise leave us stuck.
       if (!Cellular::isModemAlive()) {
-        Log::warn(TAG, "Modem hard-reset detected - re-walking activation");
+        Log::kvfw(TAG, "cellular.state_change from=active to=activating reason=modem_hard_reset");
         MQTTClient::setFallbackPublishing(false);
         _state           = State::ACTIVATING;
         _lastTelemetryMs = 0;
@@ -306,7 +306,7 @@ void CellularModule::loop() {
       if (wifiUp) {
         if (_wifiUpSince == 0) _wifiUpSince = now;
         if (now - _wifiUpSince >= WIFI_UP_HOLD_MS) {
-          Log::info(TAG, "WiFi up >60s - yielding to WiFi");
+          Log::kvf(TAG, "cellular.state_change from=active to=standby reason=wifi_up_60s");
           emitActive(0);
           // Close the publish gate but leave the modem registered.
           // Re-takeover from a future WiFi drop only needs to re-open

@@ -4,8 +4,9 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-07-11 (rollover-safe auth TTLs via ttl_policy.h; Telegram
-webhook optional /webhook-ca.crt). Bump the date on every edit.
+Dated 2026-07-16 (structured state_change/phase_change events via the
+Log::kvf helpers; pure formatting core in log_kv_policy.h). Bump the
+date on every edit.
 
 ---
 
@@ -827,15 +828,27 @@ Source: `lib/thesada-core/src/Net.h`, `Net.cpp`;
 
 ## State machines must emit structured transitions
 
-Aspirational. Every state-machine transition gets a key=value log
-line so a reader can reconstruct a fault at 3am from the log without
-reading the code.
+Every state-machine transition emits a structured key=value event so a
+reader can reconstruct a fault at 3am from the log without reading the
+code.
 
-Format: `Log::kv("subsystem.state_change", "from", old, "to", new,
-"reason", why)`. The `Log::kv` helper is WIP.
+Format: `<subsystem>.state_change from=<old> to=<new> reason=<why>`
+(reason only where a real cause exists), emitted via the printf-style
+`Log::kvf` / `kvfw` / `kvfe` helpers (info/warn/error). The formatting
+core is pure (`log_kv_policy.h`, host-tested in `test/test_log_kv`):
+a line past `LOG_LINE_LEN` truncates NUL-terminated, never overruns.
 
-Today the cellular state machine (STANDBY / ACTIVATING / ACTIVE)
-emits per-transition lines but they are free text, not structured.
+Wired today: CellularModule policy (STANDBY/ACTIVATING/ACTIVE),
+Cellular MQTT session flags (`cellular.mqtt.state_change`), MQTTClient
+connect/disconnect (`mqtt.state_change`, broker host only - never
+credentials), WiFiManager (CONNECTED/SCANNING/ALL_FAILED), OTA phases
+(`ota.phase_change`: idle/check/fetch_manifest/download/verify/apply
+plus failure exits with `reason=`), LoRa init->ready. New state
+machines and transition writes follow the same convention.
+
+Source: `lib/thesada-core/src/Log.h`, `Log.cpp`, `log_kv_policy.h`;
+call sites in `CellularModule.cpp`, `Cellular.cpp`, `MQTTClient.cpp`,
+`WiFiManager.cpp`, `OTAUpdate.cpp`, `LoRaModule.cpp`.
 
 ---
 

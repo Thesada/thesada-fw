@@ -366,7 +366,7 @@ bool Cellular::writeCACert() {
     if (cf) { certBuf = cf.readString(); cf.close(); Log::info(TAG, "CA cert loaded from /ca.crt"); }
   }
   if (certBuf.isEmpty()) {
-    Log::warn(TAG, "No /ca.crt - skipping CA cert write, TLS without verification");
+    Log::kvfw(TAG, "cellular.tls_insecure reason=no_ca");
     _hasCACert = false;
     return true;
   }
@@ -1375,6 +1375,7 @@ Cellular::ActStatus Cellular::tickActivation() {
         _mqttConnected    = true;
         _publishGate      = true;
         _lastSignalSample = 0;
+        Log::kvf(TAG, "cellular.mqtt.state_change from=disconnected to=connected");
         sampleSignalQuality();
         s_actPhase = ActPhase::INIT;
         return ActStatus::DONE;
@@ -1384,11 +1385,8 @@ Cellular::ActStatus Cellular::tickActivation() {
       s_nextRetryMs = millis() + s_mqttRetryMs;
       uint32_t next = s_mqttRetryMs * 2UL;
       s_mqttRetryMs = (next > MQTT_RETRY_MAX_MS) ? MQTT_RETRY_MAX_MS : next;
-      char msg[64];
-      // TODO: migrate to structured logging
-      snprintf(msg, sizeof(msg), "MQTT connect failed - retry in %lu s",
-               (unsigned long)((s_nextRetryMs - millis()) / 1000UL));
-      Log::warn(TAG, msg);
+      Log::kvfw(TAG, "cellular.mqtt.connect_failed retry_s=%lu",
+                (unsigned long)((s_nextRetryMs - millis()) / 1000UL));
       return ActStatus::PENDING;
     }
   }
@@ -1434,7 +1432,9 @@ void Cellular::loop() {
   // Recovery: network dropped.
   if (!isRegistered() || !isGprsConnectedRaw()) {
     esp_task_wdt_reset();
-    Log::warn(TAG, "Network lost - re-registering");
+    if (_mqttConnected) {
+      Log::kvfw(TAG, "cellular.mqtt.state_change from=connected to=disconnected reason=network_lost");
+    }
     _mqttConnected = false;
     while (!networkConnect()) {
       Log::warn(TAG, "Retry network in 10s");
@@ -1450,6 +1450,7 @@ void Cellular::loop() {
     }
     mqttBackoffReset();
     _mqttConnected = true;
+    Log::kvf(TAG, "cellular.mqtt.state_change from=disconnected to=connected reason=network_recovered");
     return;
   }
 
@@ -1458,11 +1459,14 @@ void Cellular::loop() {
   // Recovery: MQTT dropped, network still up.
   if (!mqttIsConnected()) {
     esp_task_wdt_reset();
-    Log::warn(TAG, "MQTT dropped - reconnecting");
+    if (_mqttConnected) {
+      Log::kvfw(TAG, "cellular.mqtt.state_change from=connected to=disconnected reason=mqtt_dropped");
+    }
     _mqttConnected = false;
     if (mqttConnect()) {
       _mqttConnected = true;
       mqttBackoffReset();
+      Log::kvf(TAG, "cellular.mqtt.state_change from=disconnected to=connected reason=reconnected");
     } else {
       mqttBackoffWait(&g);
     }
@@ -1471,7 +1475,7 @@ void Cellular::loop() {
     // OK timed out at 5 s and we marked _mqttConnected=false; the OK
     // eventually arrived and the broker thinks we're still subscribed).
     // Re-sync the flag so Cellular::publish stops silently dropping.
-    Log::info(TAG, "MQTT flag re-synced: modem session is up");
+    Log::kvf(TAG, "cellular.mqtt.state_change from=disconnected to=connected reason=flag_resync");
     _mqttConnected = true;
   }
 
