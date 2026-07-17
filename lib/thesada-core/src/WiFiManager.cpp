@@ -20,6 +20,15 @@
 static const char* TAG = "WiFi";
 static DNSServer   _dnsServer;
 
+static const char* wifiStateName(WiFiStatus s) {
+  switch (s) {
+    case WiFiStatus::CONNECTED:  return "connected";
+    case WiFiStatus::SCANNING:   return "scanning";
+    case WiFiStatus::ALL_FAILED: return "all_failed";
+    default:                     return "unknown";
+  }
+}
+
 WiFiStatus WiFiManager::_status            = WiFiStatus::SCANNING;
 bool       WiFiManager::_apActive          = false;
 uint32_t   WiFiManager::_lastRecheck       = 0;
@@ -101,7 +110,7 @@ void WiFiManager::scanAndConnect() {
   WiFi.scanDelete();
 
   if (count == 0) {
-    Log::warn(TAG, "No configured network in range");
+    Log::kvfw(TAG, "wifi.state_change from=scanning to=all_failed reason=none_in_range");
     startFallbackAP();
     _status = WiFiStatus::ALL_FAILED;
     return;
@@ -132,10 +141,8 @@ void WiFiManager::scanAndConnect() {
       if (tryConnect(candidates[i].ssid, candidates[i].password, timeout)) {
         _status   = WiFiStatus::CONNECTED;
         _apActive = false;
-        // TODO: migrate to structured logging
-        snprintf(msg, sizeof(msg), "Connected to %s - IP: %s",
+        Log::kvf(TAG, "wifi.state_change from=scanning to=connected ssid=%s ip=%s",
                  candidates[i].ssid, WiFi.localIP().toString().c_str());
-        Log::info(TAG, msg);
 
         // Start NTP sync and wait up to 15 s.
         {
@@ -163,7 +170,7 @@ void WiFiManager::scanAndConnect() {
     }
   }
 
-  Log::warn(TAG, "All networks failed - starting fallback AP");
+  Log::kvfw(TAG, "wifi.state_change from=scanning to=all_failed reason=all_ssids_failed");
   _status = WiFiStatus::ALL_FAILED;
   startFallbackAP();
 }
@@ -262,7 +269,8 @@ void WiFiManager::loop() {
 
     // AP timeout: stop AP and retry WiFi scan.
     if (_apTimeoutMs > 0 && millis() - _apStartTime >= _apTimeoutMs) {
-      Log::info(TAG, "AP timeout - retrying WiFi");
+      Log::kvf(TAG, "wifi.state_change from=%s to=scanning reason=ap_timeout",
+               wifiStateName(_status));
       stopFallbackAP();
       scanAndConnect();
     }
@@ -273,7 +281,7 @@ void WiFiManager::loop() {
   if (_status == WiFiStatus::ALL_FAILED) return;
 
   if (WiFi.status() != WL_CONNECTED) {
-    Log::warn(TAG, "Connection lost - re-scanning");
+    Log::kvfw(TAG, "wifi.state_change from=connected to=scanning reason=link_lost");
     scanAndConnect();
   }
 }
@@ -298,7 +306,8 @@ bool WiFiManager::recheckWiFi() {
   if (now - _lastRecheck < _recheckIntervalMs) return false;
   _lastRecheck = now;
 
-  Log::info(TAG, "Periodic WiFi re-check...");
+  Log::kvf(TAG, "wifi.state_change from=%s to=scanning reason=periodic_recheck",
+           wifiStateName(_status));
   scanAndConnect();
   return _status == WiFiStatus::CONNECTED;
 }

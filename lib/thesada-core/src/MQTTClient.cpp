@@ -352,7 +352,7 @@ void MQTTClient::begin() {
     }
   }
   if (!_caCert || _caCertLen == 0) {
-    Log::warn(TAG, "No /ca.crt AND PROGMEM bundle empty - TLS without cert verification");
+    Log::kvfw(TAG, "mqtt.tls_insecure reason=no_ca");
     _wifiClient.setInsecure();
   } else {
     _wifiClient.setCACert(_caCert);
@@ -611,7 +611,7 @@ void MQTTClient::connect() {
         _mtlsActive = true;
         Log::info(TAG, "mTLS: client cert loaded from NVS");
       } else {
-        Log::warn(TAG, "mTLS: stored cert/key failed mbedtls validation - password fallback");
+        Log::kvfw(TAG, "mqtt.mtls_cert_invalid fallback=password");
       }
     } else {
       // Free both on any failure (malloc partial or NVS miss) - a stranded
@@ -653,7 +653,7 @@ void MQTTClient::connect() {
     snapshotGoodConfig();
     _lastSuccessMs    = millis();
     _connectedSinceMs = millis();
-    Log::info(TAG, "Connected");
+    Log::kvf(TAG, "mqtt.state_change from=disconnected to=connected broker=%s", _brokerHost);
 
     // TCP keepalive catches dead connections faster than MQTT-level keepalive.
     int fd = _wifiClient.fd();
@@ -872,10 +872,8 @@ void MQTTClient::loop() {
     uint32_t now = millis();
     if (_lastSuccessMs > 0 && (now - _lastSuccessMs > WATCHDOG_MS)) {
       uint32_t uptime = (now - _connectedSinceMs) / 1000;
-      char wmsg[80];
-      // TODO: migrate to structured logging
-      snprintf(wmsg, sizeof(wmsg), "Watchdog: no activity for %lus - forcing reconnect (up %lus)", (unsigned long)(WATCHDOG_MS / 1000), (unsigned long)uptime);
-      Log::warn(TAG, wmsg);
+      Log::kvfw(TAG, "mqtt.state_change from=connected to=disconnected reason=watchdog_no_activity idle_s=%lu uptime_s=%lu",
+                (unsigned long)(WATCHDOG_MS / 1000), (unsigned long)uptime);
       _client.disconnect();
       _wifiClient.stop();
       _lastSuccessMs = 0;
@@ -906,10 +904,8 @@ void MQTTClient::loop() {
 
   if (_connectedSinceMs > 0) {
     uint32_t uptime = (millis() - _connectedSinceMs) / 1000;
-    char dmsg[64];
-    // TODO: migrate to structured logging
-    snprintf(dmsg, sizeof(dmsg), "Connection lost after %lu seconds", (unsigned long)uptime);
-    Log::warn(TAG, dmsg);
+    Log::kvfw(TAG, "mqtt.state_change from=connected to=disconnected reason=connection_lost uptime_s=%lu",
+              (unsigned long)uptime);
     _connectedSinceMs = 0;
   }
 
@@ -1586,7 +1582,7 @@ void MQTTClient::reinitSubscriptions() {
 
   if (_client.connected()) {
     _client.disconnect();
-    Log::info(TAG, "Disconnected for subscription reinit");
+    Log::kvf(TAG, "mqtt.state_change from=connected to=disconnected reason=sub_reinit");
   }
   _reinitPending = true;
 }

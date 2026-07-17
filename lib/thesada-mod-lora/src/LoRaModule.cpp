@@ -102,11 +102,8 @@ void LoRaModule::begin() {
       out(line);
     });
 
-  char msg[96];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "lora.ready freq=%.3f sf=%d bw=%.0f power=%d listen=%d mode=%s",
+  Log::kvf(TAG, "lora.state_change from=init to=ready freq=%.3f sf=%d bw=%.0f power=%d listen=%d mode=%s",
            _freq, _sf, _bw, _power, _listening, _meshtastic ? "meshtastic" : "thesada");
-  Log::info(TAG, msg);
 }
 
 // Derive the Meshtastic PHY + channel crypto from config. False (with a log)

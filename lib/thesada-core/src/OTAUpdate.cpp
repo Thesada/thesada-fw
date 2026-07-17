@@ -67,7 +67,7 @@ static void loadCaCert() {
     if (!_otaCaCert.isEmpty()) {
       Log::warn(TAG, "No /ca.crt in LittleFS - using baked PROGMEM CA bundle");
     } else {
-      Log::error(TAG, "No /ca.crt AND PROGMEM bundle empty - HTTPS will use insecure mode");
+      Log::kvfw(TAG, "ota.tls_insecure reason=no_ca");
     }
   }
 }
@@ -381,7 +381,7 @@ void OTAUpdate::begin() {
       Log::error(TAG, "OTA disabled - no /ca.crt and ota.allow_insecure not set");
       _enabled = false;
     } else if (_otaCaCert.isEmpty() && allowInsecure) {
-      Log::warn(TAG, "OTA: ota.allow_insecure=true - HTTPS without cert verification");
+      Log::kvfw(TAG, "ota.tls_insecure reason=allow_insecure_set");
     }
   }
 
@@ -514,12 +514,12 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
   loadCaCert();
   bool allowInsecure = cfg["ota"]["allow_insecure"] | false;
   if (_otaCaCert.isEmpty() && !allowInsecure) {
-    Log::error(TAG, "OTA check refused - no /ca.crt and ota.allow_insecure not set");
+    Log::kvfw(TAG, "ota.check_refused reason=no_ca");
     publishOtaRefusal("no-ca");
     return;
   }
 
-  Log::info(TAG, force ? "Checking for update (FORCED)..." : "Checking for update...");
+  Log::kvf(TAG, "ota.phase_change from=idle to=check force=%d", (int)force);
 
   // On heap-constrained boards (CYD/WROOM), MQTT's TLS session fragments
   // heap so a second TLS connection for the manifest fetch will OOM.
@@ -535,20 +535,21 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
   if (WiFiManager::connected() &&
       MQTTClient::connected() && ESP.getMaxAllocHeap() < 40000) {
     if (!force) {
-      Log::info(TAG, "Skipping OTA check - heap too low for second TLS session");
+      Log::kvfw(TAG, "ota.check_skipped reason=heap_low");
       publishOtaRefusal("heap-low");
       return;
     }
-    Log::warn(TAG, "Heap low - disconnecting MQTT to free TLS buffers for forced OTA");
+    Log::kvf(TAG, "ota.heap_low action=mqtt_disconnect");
     MQTTClient::_client.disconnect();
     MQTTClient::_wifiClient.stop();
     delay(200);  // let TCP teardown + free mbedtls context
   }
 
+  Log::kvf(TAG, "ota.phase_change from=check to=fetch_manifest");
   String remoteVersion, binUrl, sha256;
   size_t binSize = 0;
   if (!fetchManifest(url, remoteVersion, binUrl, sha256, binSize)) {
-    Log::error(TAG, "Manifest fetch failed");
+    Log::kvfe(TAG, "ota.phase_change from=fetch_manifest to=idle reason=fetch_failed");
     publishOtaRefusal("manifest-fetch-failed");
     return;
   }
@@ -560,7 +561,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
   Log::info(TAG, msg);
 
   if (!force && !isNewer(remoteVersion.c_str(), FIRMWARE_VERSION)) {
-    Log::info(TAG, "Already up to date");
+    Log::kvf(TAG, "ota.phase_change from=fetch_manifest to=idle reason=up_to_date");
     // Publish so operators see the check completed and the device is on
     // the latest. Without this an up-to-date check looks identical to
     // "device offline" or "silent refusal" from the broker side.
@@ -578,10 +579,8 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
     Log::warn(TAG, "Force flag set - re-flashing same or older version");
   }
 
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Updating to %s from %.80s",
+  Log::kvf(TAG, "ota.phase_change from=fetch_manifest to=download version=%s url=%.80s",
            remoteVersion.c_str(), binUrl.c_str());
-  Log::info(TAG, msg);
 
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
   char statusTopic[96];
@@ -594,7 +593,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
   delay(100);
 
   if (applyUpdate(binUrl, sha256, binSize)) {
-    Log::info(TAG, "Update applied - restarting");
+    Log::kvf(TAG, "ota.phase_change from=apply to=reboot version=%s", remoteVersion.c_str());
     delay(500);
     ESP.restart();
   } else {
@@ -690,7 +689,7 @@ bool OTAUpdate::fetchManifest(const char* url,
 bool OTAUpdate::applyUpdate(const String& binUrl, const String& expectedSha256,
                             size_t expectedSize) {
   if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-    Log::error(TAG, "Update.begin() failed");
+    Log::kvfe(TAG, "ota.phase_change from=download to=idle reason=update_begin_failed");
     return false;
   }
 
@@ -748,7 +747,7 @@ bool OTAUpdate::applyUpdate(const String& binUrl, const String& expectedSha256,
       // so synthesize a 200 for the success-path branch below.
       if (transportOk) status = 200;
     } else {
-      Log::warn(TAG, "Manifest missing 'size' - single-GET fallback (may stall on cellular)");
+      Log::kvfw(TAG, "ota.manifest_missing_size fallback=single_get");
       transportOk = otaHttpGetCellular(binUrl.c_str(), cb, &status, &total);
     }
   }
@@ -759,18 +758,15 @@ bool OTAUpdate::applyUpdate(const String& binUrl, const String& expectedSha256,
 
   if (!transportOk || status != 200 || !writeOk || written == 0 ||
       (expectedSize > 0 && written < expectedSize)) {
-    char msg[160];
-    // TODO: migrate to structured logging
-    snprintf(msg, sizeof(msg),
-             "Download failed (transport=%d status=%d writeOk=%d bytes=%u/%u)",
-             (int)transportOk, status, (int)writeOk,
-             (unsigned)written, (unsigned)expectedSize);
-    Log::error(TAG, msg);
+    Log::kvfe(TAG, "ota.phase_change from=download to=idle reason=download_failed transport=%d status=%d write_ok=%d bytes=%u expected=%u",
+              (int)transportOk, status, (int)writeOk,
+              (unsigned)written, (unsigned)expectedSize);
     mbedtls_sha256_free(&sha_ctx);
     Update.abort();
     return false;
   }
 
+  Log::kvf(TAG, "ota.phase_change from=download to=verify bytes=%u", (unsigned)written);
   uint8_t hash[32];
   mbedtls_sha256_finish(&sha_ctx, hash);
   mbedtls_sha256_free(&sha_ctx);
@@ -782,17 +778,15 @@ bool OTAUpdate::applyUpdate(const String& binUrl, const String& expectedSha256,
   computedHex[64] = '\0';
 
   if (strcasecmp(computedHex, expectedSha256.c_str()) != 0) {
-    // TODO: migrate to structured logging
-    Log::error(TAG, "SHA256 mismatch!");
-    Log::error(TAG, computedHex);
+    Log::kvfe(TAG, "ota.phase_change from=verify to=idle reason=sha256_mismatch computed=%s", computedHex);
     Update.abort();
     return false;
   }
 
-  Log::info(TAG, "SHA256 verified");
+  Log::kvf(TAG, "ota.phase_change from=verify to=apply");
 
   if (!Update.end(true)) {
-    Log::error(TAG, "Update.end() failed");
+    Log::kvfe(TAG, "ota.phase_change from=apply to=idle reason=update_end_failed");
     return false;
   }
 

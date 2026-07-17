@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "Log.h"
 #include "Console.h"
+#include "log_kv_policy.h"
 
 void (*Log::_remoteHandler)(const char* line) = nullptr;
 char    Log::_ring[RING_SIZE][LOG_LINE_LEN] = {};
@@ -59,3 +60,30 @@ void Log::debug(const char* tag, const char* msg) { write(LogLevel::DEBUG, tag, 
 void Log::info(const char* tag, const char* msg)  { write(LogLevel::INFO,  tag, msg); }
 void Log::warn(const char* tag, const char* msg)  { write(LogLevel::WARN,  tag, msg); }
 void Log::error(const char* tag, const char* msg) { write(LogLevel::ERROR, tag, msg); }
+
+void Log::vkvf(LogLevel level, const char* tag, const char* fmt, va_list ap) {
+  char msg[LOG_LINE_LEN];
+  logKvFormatV(msg, sizeof(msg), fmt, ap);
+  write(level, tag, msg);
+}
+
+void Log::kvf(const char* tag, const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vkvf(LogLevel::INFO, tag, fmt, ap);
+  va_end(ap);
+}
+
+void Log::kvfw(const char* tag, const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vkvf(LogLevel::WARN, tag, fmt, ap);
+  va_end(ap);
+}
+
+void Log::kvfe(const char* tag, const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vkvf(LogLevel::ERROR, tag, fmt, ap);
+  va_end(ap);
+}

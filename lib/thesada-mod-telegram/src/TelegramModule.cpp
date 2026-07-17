@@ -110,7 +110,7 @@ void TelegramModule::begin() {
     if (webhookCaFileExists) {
       // The operator uploaded a CA expecting verified TLS; a quiet insecure
       // fallback here would misreport the security posture, so shout.
-      Log::error(TAG, "/webhook-ca.crt present but unreadable/empty - webhook TLS UNVERIFIED");
+      Log::kvfw(TAG, "telegram.webhook_ca_invalid reason=unreadable tls=unverified");
     } else {
       Log::warn(TAG, "No /webhook-ca.crt - webhook TLS unverified");
     }
