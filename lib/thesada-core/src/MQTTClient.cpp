@@ -877,6 +877,7 @@ void MQTTClient::loop() {
       _client.disconnect();
       _wifiClient.stop();
       _lastSuccessMs = 0;
+      _connectedSinceMs = 0;
       _retryInterval = RETRY_MIN_MS;
       return;
     }
@@ -1582,6 +1583,7 @@ void MQTTClient::reinitSubscriptions() {
 
   if (_client.connected()) {
     _client.disconnect();
+    _connectedSinceMs = 0;
     Log::kvf(TAG, "mqtt.state_change from=connected to=disconnected reason=sub_reinit");
   }
   _reinitPending = true;

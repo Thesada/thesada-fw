@@ -58,11 +58,19 @@ void test_degenerate_buffers(void) {
   TEST_ASSERT_FALSE(logKvFormat(nullptr, 8, "x"));
 }
 
+// nullptr fmt must yield an empty string, never indeterminate contents.
+void test_null_fmt_yields_empty(void) {
+  char buf[8] = "keep";
+  TEST_ASSERT_FALSE(logKvFormat(buf, sizeof(buf), nullptr));
+  TEST_ASSERT_EQUAL_STRING("", buf);
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_format_fits);
   RUN_TEST(test_truncation_stays_nul_terminated);
   RUN_TEST(test_boundary_exact_fit);
   RUN_TEST(test_degenerate_buffers);
+  RUN_TEST(test_null_fmt_yields_empty);
   return UNITY_END();
 }

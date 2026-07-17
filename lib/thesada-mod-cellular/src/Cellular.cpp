@@ -1432,7 +1432,9 @@ void Cellular::loop() {
   // Recovery: network dropped.
   if (!isRegistered() || !isGprsConnectedRaw()) {
     esp_task_wdt_reset();
-    Log::kvfw(TAG, "cellular.mqtt.state_change from=connected to=disconnected reason=network_lost");
+    if (_mqttConnected) {
+      Log::kvfw(TAG, "cellular.mqtt.state_change from=connected to=disconnected reason=network_lost");
+    }
     _mqttConnected = false;
     while (!networkConnect()) {
       Log::warn(TAG, "Retry network in 10s");
@@ -1457,7 +1459,9 @@ void Cellular::loop() {
   // Recovery: MQTT dropped, network still up.
   if (!mqttIsConnected()) {
     esp_task_wdt_reset();
-    Log::kvfw(TAG, "cellular.mqtt.state_change from=connected to=disconnected reason=mqtt_dropped");
+    if (_mqttConnected) {
+      Log::kvfw(TAG, "cellular.mqtt.state_change from=connected to=disconnected reason=mqtt_dropped");
+    }
     _mqttConnected = false;
     if (mqttConnect()) {
       _mqttConnected = true;

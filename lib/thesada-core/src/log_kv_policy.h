@@ -7,12 +7,14 @@
 #include <stdio.h>
 #include <stddef.h>
 
-// Format into out[cap]; vsnprintf NUL-terminates within cap on any input.
-// Returns true when the full string fit, false on truncation or error.
+// Format into out[cap]; out is always NUL-terminated within cap, even on
+// vsnprintf encoding error. Returns true when the full string fit.
 inline bool logKvFormatV(char* out, size_t cap, const char* fmt, va_list ap) {
   if (!out || cap == 0) return false;
+  if (!fmt) { out[0] = '\0'; return false; }
   int n = vsnprintf(out, cap, fmt, ap);
-  return n >= 0 && (size_t)n < cap;
+  if (n < 0) { out[0] = '\0'; return false; }
+  return (size_t)n < cap;
 }
 
 inline bool logKvFormat(char* out, size_t cap, const char* fmt, ...) {
