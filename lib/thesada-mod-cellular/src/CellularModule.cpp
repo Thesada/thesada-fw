@@ -202,7 +202,7 @@ void CellularModule::begin() {
   };
   Net::setCellularProvider(provider);
 
-  Log::info(TAG, "Cellular module ready (standby)");
+  Log::info(TAG, "cellular.module_ready state=standby");
 }
 
 // ---------------------------------------------------------------------------
@@ -266,9 +266,9 @@ void CellularModule::loop() {
             const char* nsrv = ncfg["ntp"]["server"]         | "pool.ntp.org";
             uint32_t    nto  = (ncfg["ntp"]["cell_timeout_s"] | 60) * 1000UL;
             if (Cellular::ntpSync(nsrv, nto)) {
-              Log::info(TAG, "Clock synced via cellular NTP");
+              Log::info(TAG, "cellular.ntp_synced");
             } else {
-              Log::warn(TAG, "Cellular NTP sync failed - clock still unset");
+              Log::warn(TAG, "cellular.ntp_sync_failed clock=unset");
             }
           }
 

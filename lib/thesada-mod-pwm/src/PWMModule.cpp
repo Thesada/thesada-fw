@@ -35,10 +35,8 @@ void PWMModule::begin() {
   ledcWrite(_channel, 0);
 #endif
 
-  char msg[64];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Ready - GPIO%d, %luHz, %d-bit", _pin, _frequency, _resolution);
-  Log::info(TAG, msg);
+  Log::kvf(TAG, "pwm.ready gpio=%d freq_hz=%lu resolution_bits=%d",
+           _pin, _frequency, _resolution);
 
   subscribeEventBus();
   subscribeMQTT();
@@ -60,10 +58,7 @@ void PWMModule::setLevel(float level) {
   ledcWrite(_channel, duty);
 #endif
 
-  char msg[64];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Level set to %.0f%% (duty %lu/%lu)", level * 100, duty, maxVal);
-  Log::info(TAG, msg);
+  Log::kvf(TAG, "pwm.level_set pct=%.0f duty=%lu max=%lu", level * 100, duty, maxVal);
 
   JsonObject  cfg    = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
@@ -80,7 +75,7 @@ void PWMModule::subscribeEventBus() {
   EventBus::subscribe("pwm_set", [](JsonObject data) {
     float level = data["level"] | -1.0f;
     if (level < 0.0f || level > 1.0f) {
-      Log::warn(TAG, "Invalid level in pwm_set event - expected 0.0-1.0");
+      Log::warn(TAG, "pwm.level_invalid source=event expected=0.0-1.0");
       return;
     }
     PWMModule::setLevel(level);
@@ -89,14 +84,14 @@ void PWMModule::subscribeEventBus() {
 
 // Register MQTT command topic for PWM control
 void PWMModule::subscribeMQTT() {
-  Log::info(TAG, "MQTT cmd topic ready (requires MQTTClient subscription dispatch)");
+  Log::info(TAG, "pwm.mqtt_cmd_ready via=mqttclient_dispatch");
 }
 
 // Handle an incoming MQTT PWM command (expects 0-100 percent string)
 void PWMModule::onMQTTCommand(const char* payload) {
   int percent = atoi(payload);
   if (percent < 0 || percent > 100) {
-    Log::warn(TAG, "Invalid PWM percent - expected 0-100");
+    Log::warn(TAG, "pwm.percent_invalid source=mqtt expected=0-100");
     return;
   }
   setLevel(percent / 100.0f);

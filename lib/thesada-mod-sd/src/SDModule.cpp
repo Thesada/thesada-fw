@@ -95,18 +95,13 @@ bool SDModule::_resumeOrOpen() {
 
 // Rotate to a new log file when the current one exceeds the size limit
 void SDModule::_rotate() {
-  char msg[48];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Rotating - %s full", _logPath.c_str());
-  Log::info(TAG, msg);
+  Log::kvf(TAG, "sd.log_rotate reason=file_full path=%s", _logPath.c_str());
   if (!_openNextLog()) {
-    Log::error(TAG, "No free log slot - stopping rotation");
+    Log::error(TAG, "sd.log_rotate_failed reason=no_free_slot action=stop_rotation");
     _maxBytes = 0;
     return;
   }
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Logging to %s", _logPath.c_str());
-  Log::info(TAG, msg);
+  Log::kvf(TAG, "sd.log_open path=%s", _logPath.c_str());
 }
 
 // Mount the SD card, open the first log file, and subscribe to sensor events
@@ -129,21 +124,18 @@ void SDModule::begin() {
     digitalWrite(cs, HIGH);
     delay(10);
     if (!SD.begin(cs, SPI, 4000000)) {
-      Log::error(TAG, "SPI mount failed - check wiring or card");
+      Log::error(TAG, "sd.mount_failed mode=spi hint=wiring_or_card");
       return;
     }
     uint8_t cardType = SD.cardType();
     if (cardType == CARD_NONE) {
-      Log::error(TAG, "No card detected");
+      Log::error(TAG, "sd.no_card mode=spi");
       SD.end();
       return;
     }
     _mounted = true;
-    char info[80];
-    // TODO: migrate to structured logging
-    snprintf(info, sizeof(info), "Mounted (SPI, CS=%d) - %.1f MB",
+    Log::kvf(TAG, "sd.mounted mode=spi cs=%d size_mb=%.1f",
              cs, (float)SD.totalBytes() / (1024.0f * 1024.0f));
-    Log::info(TAG, info);
     Shell::registerFS("/sd", &SD, _dfUsed, _dfTotal);
   } else {
     // SD_MMC mode - LILYGO and boards with dedicated SDMMC pins
@@ -152,39 +144,32 @@ void SDModule::begin() {
     uint8_t pinData = cfg["sd"]["pin_data"] | 40;
     SD_MMC.setPins(pinClk, pinCmd, pinData);
     if (!SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT)) {
-      Log::error(TAG, "SD_MMC mount failed - check wiring or card");
+      Log::error(TAG, "sd.mount_failed mode=sdmmc hint=wiring_or_card");
       return;
     }
     uint8_t cardType = SD_MMC.cardType();
     if (cardType == CARD_NONE) {
-      Log::error(TAG, "No card detected");
+      Log::error(TAG, "sd.no_card mode=sdmmc");
       SD_MMC.end();
       return;
     }
     _mounted = true;
-    char info[80];
-    // TODO: migrate to structured logging
-    snprintf(info, sizeof(info), "Mounted (SD_MMC) - %.1f MB",
+    Log::kvf(TAG, "sd.mounted mode=sdmmc size_mb=%.1f",
              (float)SD_MMC.totalBytes() / (1024.0f * 1024.0f));
-    Log::info(TAG, info);
     Shell::registerFS("/sd", &SD_MMC, _dfUsed, _dfTotal);
   }
 
   if (!_resumeOrOpen()) {
-    Log::error(TAG, "Could not find free log slot (log001-log999 all exist?)");
+    Log::error(TAG, "sd.log_open_failed reason=no_free_slot range=log001-log999");
     return;
   }
 
-  char info[96];
   if (_maxBytes > 0)
-    // TODO: migrate to structured logging
-    snprintf(info, sizeof(info), "Logging to %s  (%lu B, max %lu KB per file)",
+    Log::kvf(TAG, "sd.log_open path=%s bytes=%lu max_kb=%lu",
              _logPath.c_str(), (unsigned long)_logBytes, (unsigned long)maxKb);
   else
-    // TODO: migrate to structured logging
-    snprintf(info, sizeof(info), "Logging to %s  (%lu B, no size limit)",
+    Log::kvf(TAG, "sd.log_open path=%s bytes=%lu max_kb=unlimited",
              _logPath.c_str(), (unsigned long)_logBytes);
-  Log::info(TAG, info);
 
   subscribeEvents();
 }

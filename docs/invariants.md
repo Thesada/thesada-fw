@@ -4,9 +4,10 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-07-16 (structured state_change/phase_change events via the
-Log::kvf helpers; pure formatting core in log_kv_policy.h). Bump the
-date on every edit.
+Dated 2026-07-20 (structured-logging phase 3: every remaining free-text
+Log:: prose call converted to dotted `module.event key=value` events;
+formatting core unchanged in log_kv_policy.h). Bump the date on every
+edit.
 
 ---
 
@@ -845,6 +846,19 @@ credentials), WiFiManager (CONNECTED/SCANNING/ALL_FAILED), OTA phases
 (`ota.phase_change`: idle/check/fetch_manifest/download/verify/apply
 plus failure exits with `reason=`), LoRa init->ready. New state
 machines and transition writes follow the same convention.
+
+Coverage: as of 2026-07-20 every Log::info/warn/error call site in
+src/ and lib/ emits a dotted `module.event key=value` line (prefixes:
+boot, wifi, mqtt, ota, cellular, web (HttpServer + LiteServer),
+telegram, script, lora, temp, gnss, sd, config, sht31, pwm, ads,
+battery, power, sleep, shell, sensors, registry, heartbeat).
+Deliberate free-text exceptions: the Lua `Log.*` script bindings
+(relay user-authored text), the `Sensors` JSON state dump in
+HttpServer::printState, raw AT/serial traces inside
+`THESADA_CELL_DEBUG` blocks, and debug-level lines (no kv helper at
+DEBUG; those format the same grammar via snprintf). Never log
+secrets/credentials/tokens - hosts, ports, and client/chat IDs are
+fine. New log lines follow the same grammar.
 
 Source: `lib/thesada-core/src/Log.h`, `Log.cpp`, `log_kv_policy.h`;
 call sites in `CellularModule.cpp`, `Cellular.cpp`, `MQTTClient.cpp`,

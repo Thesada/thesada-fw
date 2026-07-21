@@ -26,7 +26,7 @@ void HeartbeatLED::begin() {
   int32_t interval_s = cfg["device"]["heartbeat_s"] | -1;
 
   if (interval_s < 0) {
-    Log::info(TAG, "Disabled");
+    Log::info(TAG, "heartbeat.disabled");
     return;
   }
   if (interval_s < 5) interval_s = 5;
@@ -36,14 +36,14 @@ void HeartbeatLED::begin() {
 #ifdef ENABLE_PMU
   if (PowerManager::isPmuOk()) {
     _usePmu = true;
-    Log::info(TAG, "Using AXP2101 LED");
+    Log::info(TAG, "heartbeat.led driver=axp2101");
   }
 #endif
 
   if (!_usePmu) {
     int rawPin = cfg["device"]["heartbeat_pin"] | 0;
     if (rawPin == 0) {
-      Log::info(TAG, "No PMU and no heartbeat_pin - disabled");
+      Log::info(TAG, "heartbeat.disabled reason=no_pmu_no_pin");
       _intervalMs = -1;
       return;
     }
@@ -51,10 +51,8 @@ void HeartbeatLED::begin() {
     _pin = _activeLow ? -rawPin : rawPin;
     pinMode(_pin, OUTPUT);
     digitalWrite(_pin, _activeLow ? HIGH : LOW);  // off state
-    char msg[48];
-    // TODO: migrate to structured logging
-    snprintf(msg, sizeof(msg), "Using GPIO %d%s", _pin, _activeLow ? " (active low)" : "");
-    Log::info(TAG, msg);
+    Log::kvf(TAG, "heartbeat.led driver=gpio pin=%d active_low=%d",
+             _pin, (int)_activeLow);
   }
 
   _lastBeat = millis();

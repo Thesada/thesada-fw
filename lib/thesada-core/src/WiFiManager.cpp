@@ -57,20 +57,15 @@ void WiFiManager::scanAndConnect() {
   _recheckIntervalMs  = (uint32_t)(cfg["wifi"]["wifi_check_interval_s"] | 900) * 1000UL;
 
   if (networks.isNull() || networks.size() == 0) {
-    Log::warn(TAG, "No networks configured - starting fallback AP");
+    Log::warn(TAG, "wifi.no_networks action=fallback_ap");
     startFallbackAP();
     return;
   }
 
   // Passive scan of visible APs.
-  Log::info(TAG, "Scanning...");
+  Log::info(TAG, "wifi.scan_start");
   int found = WiFi.scanNetworks();
-  {
-    char msg[48];
-    // TODO: migrate to structured logging
-    snprintf(msg, sizeof(msg), "Scan complete: %d AP(s) visible", found);
-    Log::info(TAG, msg);
-  }
+  Log::kvf(TAG, "wifi.scan_done visible=%d", found);
 
   // Match configured networks against scan results; record best RSSI per SSID.
   // Stack-allocated; supports up to 8 configured networks. password is a buffer
@@ -90,9 +85,9 @@ void WiFiManager::scanAndConnect() {
     }
 
     if (bestRssi == INT32_MIN) {
-      char msg[48];
-      // TODO: migrate to structured logging
-      snprintf(msg, sizeof(msg), "Not in range: %s", ssid);
+      // Debug level has no kv helper; format the event line by hand.
+      char msg[64];
+      snprintf(msg, sizeof(msg), "wifi.ssid_not_in_range ssid=%s", ssid);
       Log::debug(TAG, msg);
       continue;
     }
@@ -132,11 +127,8 @@ void WiFiManager::scanAndConnect() {
 
   for (uint8_t attempt = 1; attempt <= maxRetries; attempt++) {
     for (uint8_t i = 0; i < count; i++) {
-      char msg[80];
-      // TODO: migrate to structured logging
-      snprintf(msg, sizeof(msg), "Trying %s (RSSI %d dBm, attempt %d/%d, timeout %lus)...",
+      Log::kvf(TAG, "wifi.connect_attempt ssid=%s rssi=%d attempt=%d max=%d timeout_s=%lu",
                candidates[i].ssid, candidates[i].rssi, attempt, maxRetries, timeout / 1000UL);
-      Log::info(TAG, msg);
 
       if (tryConnect(candidates[i].ssid, candidates[i].password, timeout)) {
         _status   = WiFiStatus::CONNECTED;
@@ -158,15 +150,15 @@ void WiFiManager::scanAndConnect() {
             delay(200);
           }
           if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
-            Log::info(TAG, "NTP synced");
+            Log::info(TAG, "wifi.ntp_synced");
           } else {
-            Log::warn(TAG, "NTP pending - will sync in background");
+            Log::warn(TAG, "wifi.ntp_pending sync=background");
           }
         }
         return;
       }
 
-      Log::warn(TAG, "Timed out, trying next...");
+      Log::warn(TAG, "wifi.connect_timeout action=try_next");
     }
   }
 
@@ -190,7 +182,7 @@ bool WiFiManager::tryConnect(const char* ssid, const char* password, uint32_t ti
       sn.fromString(cfg["wifi"]["subnet"]  | "255.255.255.0");
       dns.fromString(cfg["wifi"]["dns"]    | "8.8.8.8");
       WiFi.config(ip, gw, sn, dns);
-      Log::info(TAG, "Static IP configured");
+      Log::info(TAG, "wifi.static_ip_configured");
     }
   }
   WiFi.begin(ssid, password);
@@ -234,11 +226,8 @@ void WiFiManager::startFallbackAP() {
   // Captive portal: redirect all DNS queries to AP IP.
   _dnsServer.start(53, "*", WiFi.softAPIP());
 
-  char msg[80];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Fallback AP: %s (captive portal at %s, timeout %lus)",
-           apSSID, WiFi.softAPIP().toString().c_str(), _apTimeoutMs / 1000UL);
-  Log::warn(TAG, msg);
+  Log::kvfw(TAG, "wifi.fallback_ap_started ssid=%s ip=%s timeout_s=%lu",
+            apSSID, WiFi.softAPIP().toString().c_str(), _apTimeoutMs / 1000UL);
 }
 
 // ---------------------------------------------------------------------------
@@ -250,7 +239,7 @@ void WiFiManager::stopFallbackAP() {
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
   _apActive = false;
-  Log::info(TAG, "Fallback AP stopped");
+  Log::info(TAG, "wifi.fallback_ap_stopped");
 }
 
 // ---------------------------------------------------------------------------

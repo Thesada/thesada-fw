@@ -123,7 +123,7 @@ static void handleConfigPost() {
   if (!atomicConfigWrite(body)) { _server.send(500, "text/plain", "write failed"); return; }
   Config::load();
   _server.send(200, "text/plain", "saved");
-  Log::info(TAG, "Config saved via LiteServer");
+  Log::info(TAG, "web.config_saved via=liteserver");
 }
 
 // Save WiFi credentials and reboot
@@ -153,10 +153,7 @@ static void handleWifi() {
   serializeJsonPretty(doc, out);
   if (out.isEmpty() || !atomicConfigWrite(out)) { _server.send(500, "text/plain", "write failed"); return; }
 
-  char msg[96];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "WiFi set to %s - rebooting", ssid.c_str());
-  Log::info(TAG, msg);
+  Log::kvf(TAG, "web.wifi_config_saved ssid=%s action=reboot", ssid.c_str());
   _server.send(200, "text/html", "<h2>Saved - rebooting...</h2><p>Connect to your WiFi network and find the device IP.</p>");
   delay(500);
   ESP.restart();
@@ -180,13 +177,12 @@ static void handleOtaDone() {
   _otaAuthorized = false;
   if (Update.hasError()) {
     char msg[128];
-    // TODO: migrate to structured logging
     snprintf(msg, sizeof(msg), "OTA failed: %s", Update.errorString());
     _server.send(500, "text/plain", msg);
-    Log::error(TAG, msg);
+    Log::kvfe(TAG, "web.ota_failed err=\"%s\"", Update.errorString());
   } else {
     _server.send(200, "text/plain", "OK - rebooting");
-    Log::info(TAG, "OTA success - rebooting");
+    Log::info(TAG, "web.ota_done action=reboot");
     delay(500);
     ESP.restart();
   }
@@ -199,21 +195,18 @@ static void handleOtaUpload() {
   // here too - unauthorized bodies must never reach Update.
   if (upload.status == UPLOAD_FILE_START) {
     _otaAuthorized = authOk();
-    if (!_otaAuthorized) { Log::warn(TAG, "OTA upload refused - unauthorized"); return; }
-    Log::info(TAG, "OTA upload started");
+    if (!_otaAuthorized) { Log::warn(TAG, "web.ota_upload_refused reason=unauthorized"); return; }
+    Log::info(TAG, "web.ota_upload_start");
     // Free MQTT TLS buffers so Update.begin() can malloc on low-heap boards
     if (MQTTClient::connected() && ESP.getMaxAllocHeap() < 40000) {
-      Log::info(TAG, "Low heap - disconnecting MQTT for OTA");
+      Log::info(TAG, "web.mqtt_disconnect reason=heap_low_for_ota");
       MQTTClient::_client.disconnect();
       MQTTClient::_wifiClient.stop();
       MQTTClient::_connectedSinceMs = 0;
       delay(100);
     }
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-      char msg[64];
-      // TODO: migrate to structured logging
-      snprintf(msg, sizeof(msg), "Update.begin failed: %s", Update.errorString());
-      Log::error(TAG, msg);
+      Log::kvfe(TAG, "web.ota_begin_failed err=\"%s\"", Update.errorString());
     }
   } else if (!_otaAuthorized) {
     return;
@@ -221,22 +214,13 @@ static void handleOtaUpload() {
     esp_task_wdt_reset();
     yield();
     if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-      char msg[64];
-      // TODO: migrate to structured logging
-      snprintf(msg, sizeof(msg), "Update.write failed: %s", Update.errorString());
-      Log::error(TAG, msg);
+      Log::kvfe(TAG, "web.ota_write_failed err=\"%s\"", Update.errorString());
     }
   } else if (upload.status == UPLOAD_FILE_END) {
     if (!Update.end(true)) {
-      char msg[64];
-      // TODO: migrate to structured logging
-      snprintf(msg, sizeof(msg), "Update.end failed: %s", Update.errorString());
-      Log::error(TAG, msg);
+      Log::kvfe(TAG, "web.ota_end_failed err=\"%s\"", Update.errorString());
     } else {
-      char msg[48];
-      // TODO: migrate to structured logging
-      snprintf(msg, sizeof(msg), "OTA complete: %u bytes", upload.totalSize);
-      Log::info(TAG, msg);
+      Log::kvf(TAG, "web.ota_upload_done bytes=%u", upload.totalSize);
     }
   }
 }
@@ -264,7 +248,7 @@ void LiteServer::begin() {
   _server.onNotFound(handleNotFound);
 
   _server.begin();
-  Log::info(TAG, "LiteServer started on port 80");
+  Log::info(TAG, "web.server_started port=80 variant=lite");
 }
 
 // Process incoming HTTP requests (must be called every loop cycle)

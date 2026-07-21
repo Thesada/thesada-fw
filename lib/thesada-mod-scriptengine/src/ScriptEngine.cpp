@@ -111,18 +111,13 @@ static int lua_mqtt_subscribe(lua_State* L) {
     lua_pushstring(gL, payload);
     if (lua_pcall(gL, 2, 0, 0) != LUA_OK) {
       const char* err = lua_tostring(gL, -1);
-      char msg[128];
-      // TODO: migrate to structured logging
-      snprintf(msg, sizeof(msg), "MQTT callback error: %.100s", err ? err : "unknown");
-      Log::error("Lua", msg);
+      Log::kvfe("Lua", "script.callback_error source=mqtt_sub err=\"%.100s\"",
+                err ? err : "unknown");
       lua_pop(gL, 1);
     }
   });
 
-  char msg[96];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Lua subscribed to MQTT: %s", topic);
-  Log::info("Lua", msg);
+  Log::kvf("Lua", "script.mqtt_subscribed topic=%s", topic);
   return 0;
 }
 
@@ -160,14 +155,14 @@ static int lua_node_setTimeout(lua_State* L) {
     }
   }
   luaL_unref(L, LUA_REGISTRYINDEX, ref);
-  Log::warn("Lua", "Timer queue full (max 8)");
+  Log::kvfw("Lua", "script.timer_queue_full max=%d", MAX_TIMERS);
   lua_pushboolean(L, false);
   return 1;
 }
 
 // Lua binding: Node.restart() - reboot the device
 static int lua_node_restart(lua_State* L) {
-  Log::info("Lua", "Restart requested from script");
+  Log::info("Lua", "script.restart_requested");
   delay(100);
   ESP.restart();
   return 0;
@@ -331,18 +326,13 @@ static int lua_eventbus_subscribe(lua_State* L) {
     jsonObjectToLuaTable(gL, data);
     if (lua_pcall(gL, 1, 0, 0) != LUA_OK) {
       const char* err = lua_tostring(gL, -1);
-      char msg[128];
-      // TODO: migrate to structured logging
-      snprintf(msg, sizeof(msg), "Callback error: %.100s", err ? err : "unknown");
-      Log::error("Lua", msg);
+      Log::kvfe("Lua", "script.callback_error source=eventbus err=\"%.100s\"",
+                err ? err : "unknown");
       lua_pop(gL, 1);
     }
   });
 
-  char msg[64];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Subscribed to event: %s", event);
-  Log::info(TAG, msg);
+  Log::kvf(TAG, "script.event_subscribed event=%s", event);
   return 0;
 }
 
@@ -407,7 +397,7 @@ void ScriptEngine::createState() {
 
   gL = luaL_newstate();
   if (!gL) {
-    Log::error(TAG, "Failed to create Lua state - out of memory?");
+    Log::error(TAG, "script.state_create_failed reason=oom");
     return;
   }
 
@@ -434,7 +424,7 @@ void ScriptEngine::createState() {
   lua_pushnil(gL); lua_setglobal(gL, "loadstring");
 
   callAllRegistrars();
-  Log::info(TAG, "Lua state created");
+  Log::info(TAG, "script.state_created");
 }
 
 // Close and free the current Lua state
@@ -442,7 +432,7 @@ void ScriptEngine::destroyState() {
   if (gL) {
     lua_close(gL);
     gL = nullptr;
-    Log::info(TAG, "Lua state destroyed");
+    Log::info(TAG, "script.state_destroyed");
   }
 }
 
@@ -488,19 +478,13 @@ bool ScriptEngine::executeFile(const char* path) {
   if (!gL) return false;
 
   if (!LittleFS.exists(path)) {
-    char msg[64];
-    // TODO: migrate to structured logging
-    snprintf(msg, sizeof(msg), "%s not found - skipping", path);
-    Log::info(TAG, msg);
+    Log::kvf(TAG, "script.file_missing path=%s action=skip", path);
     return false;
   }
 
   File f = LittleFS.open(path, "r");
   if (!f) {
-    char msg[64];
-    // TODO: migrate to structured logging
-    snprintf(msg, sizeof(msg), "Failed to open %s", path);
-    Log::error(TAG, msg);
+    Log::kvfe(TAG, "script.file_open_failed path=%s", path);
     return false;
   }
 
@@ -523,18 +507,13 @@ bool ScriptEngine::executeFile(const char* path) {
   if (result == LUA_OK) result = lua_pcall(gL, 0, LUA_MULTRET, 0);
   if (result != LUA_OK) {
     const char* err = lua_tostring(gL, -1);
-    char msg[196];
-    // TODO: migrate to structured logging
-    snprintf(msg, sizeof(msg), "%s error: %.160s", path, err ? err : "unknown");
-    Log::error(TAG, msg);
+    Log::kvfe(TAG, "script.exec_failed path=%s err=\"%.160s\"",
+              path, err ? err : "unknown");
     lua_pop(gL, 1);
     return false;
   }
 
-  char msg[64];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "%s executed", path);
-  Log::info(TAG, msg);
+  Log::kvf(TAG, "script.executed path=%s", path);
   return true;
 }
 
@@ -563,14 +542,11 @@ void ScriptEngine::begin() {
   }
 
   MQTTClient::subscribe(topic, [](const char* topic, const char* payload) {
-    Log::info(TAG, "MQTT Lua reload trigger received");
+    Log::info(TAG, "script.reload_trigger source=mqtt");
     ScriptEngine::reload();
   });
 
-  char msg[128];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Ready - reload via MQTT: %s", topic);
-  Log::info(TAG, msg);
+  Log::kvf(TAG, "script.ready reload_topic=%s", topic);
 
   // Register Lua shell commands
   Shell::registerCommand("lua.exec", "Execute inline Lua code",
@@ -644,7 +620,7 @@ void ScriptEngine::begin() {
 
 // Hot-reload scripts by bumping generation and re-creating the Lua state
 void ScriptEngine::reload() {
-  Log::info(TAG, "Reloading scripts...");
+  Log::info(TAG, "script.reload_start");
   _generation++;
 
   destroyState();
@@ -654,10 +630,7 @@ void ScriptEngine::reload() {
   executeFile("/scripts/main.lua");
   executeFile("/scripts/rules.lua");
 
-  char msg[64];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Reloaded (generation %lu)", _generation);
-  Log::info(TAG, msg);
+  Log::kvf(TAG, "script.reloaded generation=%lu", _generation);
 }
 
 // Return the current script generation counter
@@ -686,10 +659,8 @@ void ScriptEngine::loop() {
       lua_rawgeti(gL, LUA_REGISTRYINDEX, ref);
       if (lua_pcall(gL, 0, 0, 0) != LUA_OK) {
         const char* err = lua_tostring(gL, -1);
-        char msg[128];
-        // TODO: migrate to structured logging
-        snprintf(msg, sizeof(msg), "Timer error: %.100s", err ? err : "unknown");
-        Log::error("Lua", msg);
+        Log::kvfe("Lua", "script.timer_error err=\"%.100s\"",
+                  err ? err : "unknown");
         lua_pop(gL, 1);
       }
       luaL_unref(gL, LUA_REGISTRYINDEX, ref);

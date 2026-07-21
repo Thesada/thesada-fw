@@ -203,12 +203,8 @@ void MQTTClient::setFallbackPublishing(bool active) {
     // triggered and will refire on their next module cycle if any
     // alert condition still holds.
     if (_queueCount > 0) {
-      char dmsg[80];
-      // TODO: migrate to structured logging
-      snprintf(dmsg, sizeof(dmsg),
-               "Cellular handoff: dropping %d queued WiFi msg(s)",
+      Log::kvf(TAG, "mqtt.queue_dropped reason=cellular_handoff count=%d",
                (int)_queueCount);
-      Log::info(TAG, dmsg);
       for (uint8_t i = 0; i < MQTT_QUEUE_SIZE; ++i) _queue[i].valid = false;
       _queueHead  = 0;
       _queueTail  = 0;
@@ -246,7 +242,7 @@ void MQTTClient::begin() {
   _minIntervalMs   = ivs * 1000UL;
 
   if (strlen(host) == 0) {
-    Log::error(TAG, "No broker in config");
+    Log::error(TAG, "mqtt.config_missing key=broker");
     return;
   }
 
@@ -282,11 +278,8 @@ void MQTTClient::begin() {
     if (clockFloorShouldApply(time(nullptr), floorEpoch)) {
       struct timeval tv = { (time_t)floorEpoch, 0 };
       settimeofday(&tv, nullptr);
-      char msg[80];
-      // TODO: migrate to structured logging
-      snprintf(msg, sizeof(msg), "Clock floor applied: %lu (NTP corrects forward)",
+      Log::kvf(TAG, "mqtt.clock_floor_applied epoch=%lu ntp=corrects_forward",
                (unsigned long)floorEpoch);
-      Log::info(TAG, msg);
     }
   }
 
@@ -314,13 +307,10 @@ void MQTTClient::begin() {
           size_t readBytes = cf.readBytes(_caCert, sz);
           _caCert[readBytes] = '\0';
           _caCertLen = readBytes;
-          char msg[96];
-          // TODO: migrate to structured logging
-          snprintf(msg, sizeof(msg), "CA cert loaded from /ca.crt (%u B in %s)",
+          Log::kvf(TAG, "mqtt.ca_loaded path=/ca.crt bytes=%u heap=%s",
                    (unsigned)readBytes, heapTag);
-          Log::info(TAG, msg);
         } else {
-          Log::error(TAG, "CA cert alloc failed");
+          Log::error(TAG, "mqtt.ca_alloc_failed");
         }
       }
       cf.close();
@@ -342,12 +332,8 @@ void MQTTClient::begin() {
         memcpy_P(_caCert, OTA_CA_PROGMEM, pmLen);
         _caCert[pmLen] = '\0';
         _caCertLen = pmLen;
-        char msg[96];
-        // TODO: migrate to structured logging
-        snprintf(msg, sizeof(msg),
-                 "No /ca.crt - using baked PROGMEM CA bundle (%u B in %s)",
-                 (unsigned)pmLen, heapTag);
-        Log::warn(TAG, msg);
+        Log::kvfw(TAG, "mqtt.ca_fallback source=progmem bytes=%u heap=%s",
+                  (unsigned)pmLen, heapTag);
       }
     }
   }
@@ -411,7 +397,7 @@ void MQTTClient::begin() {
                              payloadCopy.empty() ? nullptr : payloadCopy.c_str(),
                              payloadCopy.size());
         });
-      if (!ok) Log::warn("MQTT", "CLI busy - command dropped");
+      if (!ok) Log::warn("MQTT", "mqtt.cli_dropped reason=busy");
     });
   }
 
@@ -570,10 +556,7 @@ void MQTTClient::connect() {
   char availTopic[64];
   snprintf(availTopic, sizeof(availTopic), "%s/status", prefix);
 
-  char msg[64];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Connecting as %s...", clientId);
-  Log::info(TAG, msg);
+  Log::kvf(TAG, "mqtt.connect_start client_id=%s", clientId);
 
 #ifdef MQTT_TLS
   // Force a fresh mbedtls context on every connect attempt. When a
@@ -609,7 +592,7 @@ void MQTTClient::connect() {
         _wifiClient.setCertificate(_clientCert);
         _wifiClient.setPrivateKey(_clientKey);
         _mtlsActive = true;
-        Log::info(TAG, "mTLS: client cert loaded from NVS");
+        Log::info(TAG, "mqtt.mtls_cert_loaded source=nvs");
       } else {
         Log::kvfw(TAG, "mqtt.mtls_cert_invalid fallback=password");
       }
@@ -618,7 +601,7 @@ void MQTTClient::connect() {
       // 4 KB buffer starves the next connect attempt. free(nullptr) is safe.
       free(_clientCert); _clientCert = nullptr;
       free(_clientKey);  _clientKey  = nullptr;
-      Log::warn(TAG, "mTLS: NVS load failed, falling back to password auth");
+      Log::warn(TAG, "mqtt.mtls_load_failed fallback=password");
     }
   }
   // When dropping from mTLS to password auth, pass nullptr to evict the
@@ -626,7 +609,7 @@ void MQTTClient::connect() {
   if (_mtlsWasActive && !_mtlsActive) {
     _wifiClient.setCertificate(nullptr);
     _wifiClient.setPrivateKey(nullptr);
-    Log::info(TAG, "mTLS cleared - prior cert pointer reset in WiFiClientSecure");
+    Log::info(TAG, "mqtt.mtls_cleared cert_ptr=reset");
   }
   _mtlsWasActive = _mtlsActive;
 #endif
@@ -666,7 +649,7 @@ void MQTTClient::connect() {
       setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepIdle,     sizeof(keepIdle));
       setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL,&keepInterval, sizeof(keepInterval));
       setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,  &keepCount,    sizeof(keepCount));
-      Log::info(TAG, "TCP keepalive enabled (30s/10s/3)");
+      Log::info(TAG, "mqtt.tcp_keepalive_enabled idle_s=30 interval_s=10 count=3");
     }
 
     // Reset manifest; modules repopulate it during this session.
@@ -680,11 +663,8 @@ void MQTTClient::connect() {
     publishRetainedSet(true);
     flushQueue();
   } else {
-    char err[64];
-    // TODO: migrate to structured logging
-    snprintf(err, sizeof(err), "Failed (rc=%d) - retry in %lums",
-             _client.state(), (unsigned long)_retryInterval);
-    Log::warn(TAG, err);
+    Log::kvfw(TAG, "mqtt.connect_failed rc=%d retry_ms=%lu",
+              _client.state(), (unsigned long)_retryInterval);
     _retryCount++;
     _retryInterval = min(_retryInterval * 2, (uint32_t)RETRY_MAX_MS);
 
@@ -701,12 +681,8 @@ void MQTTClient::connect() {
       uint8_t maxReboots = Config::get()["mqtt"]["max_exhaust_reboots"] | 3;
       uint8_t count      = mqttRebootCount();
       if (count < maxReboots) {
-        char m[80];
-        // TODO: migrate to structured logging
-        snprintf(m, sizeof(m),
-                 "TLS connect failed 3x with low heap - defrag reboot %u/%u",
-                 (unsigned)(count + 1), (unsigned)maxReboots);
-        Log::error(TAG, m);
+        Log::kvfe(TAG, "mqtt.defrag_reboot reason=tls_low_heap fails=3 reboot=%u max=%u",
+                  (unsigned)(count + 1), (unsigned)maxReboots);
         mqttRebootCountBump(count + 1);
         delay(1000);
         ESP.restart();
@@ -726,13 +702,9 @@ void MQTTClient::connect() {
       uint8_t maxReboots = Config::get()["mqtt"]["max_exhaust_reboots"] | 3;
       uint8_t count      = mqttRebootCount();
       if (count < maxReboots) {
-        char m[96];
-        // TODO: migrate to structured logging
-        snprintf(m, sizeof(m),
-                 "MQTT failed %ux - reboot %u/%u to recover",
-                 (unsigned)rebootAfter, (unsigned)(count + 1),
-                 (unsigned)maxReboots);
-        Log::error(TAG, m);
+        Log::kvfe(TAG, "mqtt.recovery_reboot fails=%u reboot=%u max=%u",
+                  (unsigned)rebootAfter, (unsigned)(count + 1),
+                  (unsigned)maxReboots);
         // Record the config that is failing so the boot-time rollback restores
         // exactly this one, not an unrelated later edit.
         char failing[LG_MAX_LEN];
@@ -743,13 +715,8 @@ void MQTTClient::connect() {
       } else {
         // Budget spent. Keep retrying, never reboot again.
         _rebootHalted = true;
-        char m[128];
-        // TODO: migrate to structured logging
-        snprintf(m, sizeof(m),
-                 "MQTT failed %ux after %u reboots - staying alive, "
-                 "retrying without reboot (check broker config)",
-                 (unsigned)rebootAfter, (unsigned)maxReboots);
-        Log::error(TAG, m);
+        Log::kvfe(TAG, "mqtt.reboot_budget_spent fails=%u reboots=%u action=retry_no_reboot hint=check_broker_config",
+                  (unsigned)rebootAfter, (unsigned)maxReboots);
       }
     }
   }
@@ -800,24 +767,16 @@ void MQTTClient::loop() {
     if (freeHeap < HEAP_REBOOT_FLOOR_BYTES) {
       if (_lowHeapSinceMs == 0) {
         _lowHeapSinceMs = now;
-        char wmsg[96];
-        // TODO: migrate to structured logging
-        snprintf(wmsg, sizeof(wmsg),
-                 "free heap %lu B below floor %d B - watchdog armed",
-                 (unsigned long)freeHeap, (int)HEAP_REBOOT_FLOOR_BYTES);
-        Log::warn(TAG, wmsg);
+        Log::kvfw(TAG, "mqtt.heap_watchdog_armed free_b=%lu floor_b=%d",
+                  (unsigned long)freeHeap, (int)HEAP_REBOOT_FLOOR_BYTES);
       } else if ((now - _lowHeapSinceMs) >= (uint32_t)HEAP_REBOOT_HOLD_MS) {
-        char emsg[96];
-        // TODO: migrate to structured logging
-        snprintf(emsg, sizeof(emsg),
-                 "free heap stuck below %d B for %d ms - rebooting",
-                 (int)HEAP_REBOOT_FLOOR_BYTES, (int)HEAP_REBOOT_HOLD_MS);
-        Log::error(TAG, emsg);
+        Log::kvfe(TAG, "mqtt.heap_watchdog_reboot floor_b=%d hold_ms=%d",
+                  (int)HEAP_REBOOT_FLOOR_BYTES, (int)HEAP_REBOOT_HOLD_MS);
         delay(100);
         esp_restart();
       }
     } else if (_lowHeapSinceMs != 0) {
-      Log::info(TAG, "free heap recovered - watchdog disarmed");
+      Log::info(TAG, "mqtt.heap_watchdog_disarmed reason=heap_recovered");
       _lowHeapSinceMs = 0;
     }
   }
@@ -1009,7 +968,7 @@ void MQTTClient::publishRetainedManifest() {
   _manifestPublished    = true;
   _manifestDirty        = false;
   _manifestDirtySinceMs = 0;
-  Log::info(TAG, (String("retained-topics manifest: ") + _retainedTopics.size() + " entries").c_str());
+  Log::kvf(TAG, "mqtt.manifest_published entries=%u", (unsigned)_retainedTopics.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -1041,7 +1000,7 @@ void MQTTClient::publishRetainedSet(bool force) {
 
 void MQTTClient::subscribe(const char* topic, MQTTCallback callback) {
   if (_subCount >= MQTT_MAX_SUBS) {
-    Log::error(TAG, "Max subscriptions reached");
+    Log::kvfe(TAG, "mqtt.sub_rejected reason=max_subs max=%d", MQTT_MAX_SUBS);
     return;
   }
 
@@ -1052,10 +1011,8 @@ void MQTTClient::subscribe(const char* topic, MQTTCallback callback) {
   sub.active = true;
   _subCount++;
 
-  char msg[128];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Registered sub: %s (%d/%d)", topic, _subCount, MQTT_MAX_SUBS);
-  Log::info(TAG, msg);
+  Log::kvf(TAG, "mqtt.sub_registered topic=%s count=%d max=%d",
+           topic, _subCount, MQTT_MAX_SUBS);
 
   // Feed keepalive during bulk Lua subscription (>10 s): without this the
   // broker or HAProxy drops the idle TCP connection.
@@ -1227,11 +1184,11 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
           f.close();
           resp["ok"] = true;
           char msg[64];
-          // TODO: migrate to structured logging
           snprintf(msg, sizeof(msg), "%s %d bytes to %s",
                    mode[0] == 'a' ? "Appended" : "Wrote", (int)written, path);
           resp["output"][0] = msg;
-          Log::info("MQTT", msg);
+          Log::kvf("MQTT", "mqtt.fs_write mode=%s bytes=%d path=%s",
+                   mode[0] == 'a' ? "append" : "write", (int)written, path);
         } else {
           resp["ok"] = false;
           resp["output"][0] = "Failed to open file";
@@ -1576,7 +1533,7 @@ void MQTTClient::reinitSubscriptions() {
                            payloadCopy.empty() ? nullptr : payloadCopy.c_str(),
                            payloadCopy.size());
       });
-    if (!ok) Log::warn("MQTT", "CLI busy - command dropped");
+    if (!ok) Log::warn("MQTT", "mqtt.cli_dropped reason=busy");
   });
 
   OTAUpdate::begin();
@@ -1593,10 +1550,7 @@ void MQTTClient::resubscribeAll() {
   for (uint8_t i = 0; i < _subCount; i++) {
     if (!_subs[i].active) continue;
     _client.subscribe(_subs[i].topic);
-    char msg[128];
-    // TODO: migrate to structured logging
-    snprintf(msg, sizeof(msg), "Subscribed: %s", _subs[i].topic);
-    Log::info(TAG, msg);
+    Log::kvf(TAG, "mqtt.sub_resubscribed topic=%s", _subs[i].topic);
   }
 }
 
@@ -1606,7 +1560,7 @@ void MQTTClient::publishDiscovery() {
   JsonObject cfg = Config::get();
   bool enabled = cfg["mqtt"]["ha_discovery"] | true;
   if (!enabled) {
-    Log::info(TAG, "HA discovery disabled");
+    Log::info(TAG, "mqtt.ha_discovery_disabled");
     return;
   }
 
@@ -1752,7 +1706,7 @@ void MQTTClient::publishDiscovery() {
 
   publishHeapStats();
 
-  Log::info(TAG, "HA discovery published");
+  Log::info(TAG, "mqtt.ha_discovery_published");
 }
 
 // ---------------------------------------------------------------------------
@@ -1948,15 +1902,12 @@ void MQTTClient::enqueue(const char* topic, const char* payload) {
   // which is worse than a logged drop.
   if (strlen(topic)   >= sizeof(_queue[0].topic) ||
       strlen(payload) >= sizeof(_queue[0].payload)) {
-    char log[96];
-    // TODO: migrate to structured logging
-    snprintf(log, sizeof(log), "Queue reject - oversize (%u byte payload): %s",
-             (unsigned)strlen(payload), topic);
-    Log::warn(TAG, log);
+    Log::kvfw(TAG, "mqtt.queue_rejected reason=oversize payload_b=%u topic=%s",
+              (unsigned)strlen(payload), topic);
     return;
   }
   if (_queueCount == MQTT_QUEUE_SIZE) {
-    Log::warn(TAG, "Queue full - dropping oldest message");
+    Log::warn(TAG, "mqtt.queue_full action=drop_oldest");
     _queueHead = (_queueHead + 1) % MQTT_QUEUE_SIZE;
     _queueCount--;
   }
@@ -1971,10 +1922,8 @@ void MQTTClient::enqueue(const char* topic, const char* payload) {
   _queueTail = (_queueTail + 1) % MQTT_QUEUE_SIZE;
   _queueCount++;
 
-  char log[64];
-  // TODO: migrate to structured logging
-  snprintf(log, sizeof(log), "Queued (%d/%d): %s", _queueCount, MQTT_QUEUE_SIZE, topic);
-  Log::info(TAG, log);
+  Log::kvf(TAG, "mqtt.queued count=%d max=%d topic=%s",
+           _queueCount, MQTT_QUEUE_SIZE, topic);
 }
 
 // ---------------------------------------------------------------------------
@@ -1985,10 +1934,7 @@ void MQTTClient::flushQueue() {
     if (msg.valid) {
       _client.publish(msg.topic, msg.payload);
       msg.valid = false;
-      char log[64];
-      // TODO: migrate to structured logging
-      snprintf(log, sizeof(log), "Flushed queued: %s", msg.topic);
-      Log::info(TAG, log);
+      Log::kvf(TAG, "mqtt.queue_flushed topic=%s", msg.topic);
     }
     _queueHead = (_queueHead + 1) % MQTT_QUEUE_SIZE;
     _queueCount--;
@@ -2017,27 +1963,27 @@ time_t MQTTClient::lastPublishTime() {
 bool MQTTClient::storeClientCert(const char* certPEM, const char* keyPEM) {
   Preferences prefs;
   if (!prefs.begin(CERT_NS, false)) {
-    Log::error(TAG, "NVS open failed (rw)");
+    Log::error(TAG, "mqtt.cert_store_failed reason=nvs_open");
     return false;
   }
   bool ok = true;
   if (certPEM && *certPEM) {
     size_t len = strlen(certPEM);
     if (len >= CERT_MAX_LEN) {
-      Log::error(TAG, "cert too large for NVS");
+      Log::error(TAG, "mqtt.cert_store_failed reason=cert_too_large");
       ok = false;
     } else if (!prefs.putString(CERT_KEY_CERT, certPEM)) {
-      Log::error(TAG, "NVS putString(cert) failed");
+      Log::error(TAG, "mqtt.cert_store_failed reason=nvs_put_cert");
       ok = false;
     }
   }
   if (ok && keyPEM && *keyPEM) {
     size_t len = strlen(keyPEM);
     if (len >= CERT_MAX_LEN) {
-      Log::error(TAG, "key too large for NVS");
+      Log::error(TAG, "mqtt.cert_store_failed reason=key_too_large");
       ok = false;
     } else if (!prefs.putString(CERT_KEY_KEY, keyPEM)) {
-      Log::error(TAG, "NVS putString(key) failed");
+      Log::error(TAG, "mqtt.cert_store_failed reason=nvs_put_key");
       ok = false;
     }
   }

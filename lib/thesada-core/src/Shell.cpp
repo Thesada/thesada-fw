@@ -363,14 +363,11 @@ bool Shell::registerFS(const char* prefix, fs::FS* fs, FSDfFn dfUsed, FSDfFn dfT
   size_t len = strlen(prefix);
   if (len < 2 || prefix[len - 1] == '/') return false;
   if (_fsMountCount >= FS_MOUNTS_MAX) {
-    Log::warn("Shell", "FS mount table full");
+    Log::warn("Shell", "shell.fs_mount_failed reason=table_full");
     return false;
   }
   _fsMounts[_fsMountCount++] = { prefix, len, fs, dfUsed, dfTotal };
-  char msg[64];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "FS mount: %s -> %p", prefix, (void*)fs);
-  Log::info("Shell", msg);
+  Log::kvf("Shell", "shell.fs_mount prefix=%s fs=%p", prefix, (void*)fs);
   return true;
 }
 
@@ -2138,8 +2135,5 @@ void Shell::registerBuiltins() {
 void Shell::begin() {
   registerBuiltins();
 
-  char msg[48];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Shell ready - %d commands", _commandCount);
-  Log::info("Shell", msg);
+  Log::kvf("Shell", "shell.ready commands=%d", _commandCount);
 }

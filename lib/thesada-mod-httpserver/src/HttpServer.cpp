@@ -187,8 +187,8 @@ static bool _checkAuth(AsyncWebServerRequest* req) {
     static uint32_t lastWarnMs = 0;
     if (lastWarnMs == 0 || millis() - lastWarnMs > 60000UL) {
       lastWarnMs = millis();
-      Log::warn(TAG, "Admin route refused - web.password is default/empty. "
-                     "Set it via 'secret.set web.password' or config.json");
+      Log::warn(TAG, "web.admin_refused reason=default_password "
+                     "hint=\"set via secret.set web.password or config.json\"");
     }
   }
 
@@ -245,7 +245,7 @@ static bool _consumeWsAuth(const String& ip) {
 // Start the HTTP server, register routes, and hook up log broadcasting
 void HttpServer::begin() {
   if (!LittleFS.begin()) {
-    Log::warn(TAG, "LittleFS not mounted - config editor will be read-only");
+    Log::warn(TAG, "web.littlefs_unmounted config_editor=read_only");
   }
 
   // Relay log lines to WebSocket terminal clients.
@@ -255,7 +255,7 @@ void HttpServer::begin() {
   setupRoutes();
 
   server.begin();
-  Log::info(TAG, "HTTP server started on port 80");
+  Log::info(TAG, "web.server_started port=80");
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +280,7 @@ void HttpServer::printState() {
 void HttpServer::loop() {
   _ws.cleanupClients();  // required by ESPAsyncWebServer 3.x to drain the WS send queue
   if (_restartPending) {
-    Log::info(TAG, "Restarting as requested...");
+    Log::info(TAG, "web.restart reason=api_request");
     delay(500);
     ESP.restart();
   }
@@ -376,7 +376,7 @@ void HttpServer::setupRoutes() {
       "{\"ok\":true,\"token\":\"%s\",\"expires_in\":%lu}",
       token, (unsigned long)(TOKEN_TTL_MS / 1000));
     req->send(200, "application/json", body);
-    Log::info(TAG, "Token issued");
+    Log::info(TAG, "web.token_issued");
   });
 
   // ── GET /api/ws/token - issue a short-lived WS token (auth required) ────────
@@ -486,7 +486,7 @@ void HttpServer::setupRoutes() {
     }
     while (src.available()) dst.write(src.read());
     src.close(); dst.close();
-    Log::info(TAG, "Config backed up to SD:/config_backup.json");
+    Log::info(TAG, "web.config_backup dest=sd:/config_backup.json");
     req->send(200, "application/json", "{\"ok\":true}");
   });
 
@@ -608,42 +608,28 @@ void HttpServer::setupRoutes() {
       // destructor. NULL = unauthorized, drop every chunk untouched.
       if (index == 0 && _checkAuth(req)) req->_tempObject = malloc(1);
       if (req->_tempObject == nullptr) {
-        if (index == 0) Log::warn(TAG, "OTA upload refused - unauthorized");
+        if (index == 0) Log::warn(TAG, "web.ota_upload_refused reason=unauthorized");
         return;
       }
       if (index == 0) {
         // Use content length from request if available, otherwise unknown
         size_t totalSize = req->contentLength();
-        char msg[64];
-        // TODO: migrate to structured logging
-        snprintf(msg, sizeof(msg), "OTA upload: %s (%u bytes)", filename.c_str(), (unsigned)totalSize);
-        Log::info(TAG, msg);
+        Log::kvf(TAG, "web.ota_upload_start file=%s bytes=%u",
+                 filename.c_str(), (unsigned)totalSize);
         if (!Update.begin(totalSize > 0 ? totalSize : UPDATE_SIZE_UNKNOWN)) {
-          char err[64];
-          // TODO: migrate to structured logging
-          snprintf(err, sizeof(err), "Update.begin() failed: %s", Update.errorString());
-          Log::error(TAG, err);
+          Log::kvfe(TAG, "web.ota_begin_failed err=\"%s\"", Update.errorString());
         }
       }
       if (Update.isRunning()) {
         if (Update.write(data, len) != len) {
-          char err[64];
-          // TODO: migrate to structured logging
-          snprintf(err, sizeof(err), "Update.write() failed: %s", Update.errorString());
-          Log::error(TAG, err);
+          Log::kvfe(TAG, "web.ota_write_failed err=\"%s\"", Update.errorString());
         }
       }
       if (final) {
         if (Update.end(true)) {
-          char msg[48];
-          // TODO: migrate to structured logging
-          snprintf(msg, sizeof(msg), "OTA complete: %u bytes", (unsigned)(index + len));
-          Log::info(TAG, msg);
+          Log::kvf(TAG, "web.ota_upload_done bytes=%u", (unsigned)(index + len));
         } else {
-          char err[64];
-          // TODO: migrate to structured logging
-          snprintf(err, sizeof(err), "OTA failed: %s", Update.errorString());
-          Log::error(TAG, err);
+          Log::kvfe(TAG, "web.ota_upload_failed err=\"%s\"", Update.errorString());
         }
       }
     }
@@ -793,7 +779,7 @@ void HttpServer::setupRoutes() {
       // AsyncClient::getRemoteAddress().
       String ip = client->remoteIP().toString();
       if (!_consumeWsAuth(ip)) {
-        Log::warn(TAG, "WS: rejected - not pre-authorized");
+        Log::warn(TAG, "web.ws_rejected reason=not_preauthorized");
         client->close();
         return;
       }
@@ -856,7 +842,7 @@ void HttpServer::setupRoutes() {
     }
   });
 
-  Log::info(TAG, "Routes registered");
+  Log::info(TAG, "web.routes_registered");
 }
 
 // Module wrapper for self-registration
