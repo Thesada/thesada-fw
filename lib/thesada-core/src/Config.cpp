@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "Config.h"
 #include "Log.h"
+#include "log_kv_policy.h"
 #include <LittleFS.h>
 #include <cmath>
 #include <climits>
@@ -123,7 +124,12 @@ bool Config::set(const char* path, const char* value) {
     load();
     return false;
   }
-  Log::kvf(TAG, "config.set path=%s value=%s", path, value);
+  if (logPathIsSensitive(path)) {
+    Log::kvf(TAG, "config.set path=%s value=<redacted> value_len=%u",
+             path, (unsigned)strlen(value));
+  } else {
+    Log::kvf(TAG, "config.set path=%s value=%s", path, value);
+  }
   return true;
 }
 
