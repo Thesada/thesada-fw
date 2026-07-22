@@ -70,13 +70,13 @@ void TelegramModule::begin() {
     if (cf) {
       _caCert = cf.readString();
       cf.close();
-      Log::info(TAG, "CA loaded from /telegram-ca.crt");
+      Log::info(TAG, "telegram.ca_loaded path=/telegram-ca.crt");
     }
   }
   if (_caCert.isEmpty()) {
     _caCert = String(FPSTR(TELEGRAM_CA_PROGMEM));
     if (!_caCert.isEmpty()) {
-      Log::warn(TAG, "No /telegram-ca.crt - using baked PROGMEM CA");
+      Log::warn(TAG, "telegram.ca_fallback source=progmem");
     }
   }
   if (!_caCert.isEmpty()) {
@@ -84,7 +84,7 @@ void TelegramModule::begin() {
   } else {
     // No CA at all: leave the client unconfigured so the handshake
     // fails closed. Refusing to send beats leaking the token insecurely.
-    Log::error(TAG, "No Telegram CA - sends will fail (refusing insecure)");
+    Log::error(TAG, "telegram.ca_missing sends=fail_closed");
   }
   _secClient.setTimeout(10);
 
@@ -104,7 +104,7 @@ void TelegramModule::begin() {
   }
   if (!_webhookCaCert.isEmpty()) {
     _webhookClient.setCACert(_webhookCaCert.c_str());
-    Log::info(TAG, "Webhook CA loaded from /webhook-ca.crt - TLS verified");
+    Log::info(TAG, "telegram.webhook_ca_loaded path=/webhook-ca.crt tls=verified");
   } else {
     _webhookClient.setInsecure();
     if (webhookCaFileExists) {
@@ -112,15 +112,12 @@ void TelegramModule::begin() {
       // fallback here would misreport the security posture, so shout.
       Log::kvfw(TAG, "telegram.webhook_ca_invalid reason=unreadable tls=unverified");
     } else {
-      Log::warn(TAG, "No /webhook-ca.crt - webhook TLS unverified");
+      Log::warn(TAG, "telegram.webhook_ca_missing tls=unverified");
     }
   }
   _webhookClient.setTimeout(10);
 
-  char msg[64];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Ready - token=%s, %d chat(s)", hasToken ? "yes" : "no", nChats);
-  Log::info(TAG, msg);
+  Log::kvf(TAG, "telegram.ready token=%s chats=%d", hasToken ? "yes" : "no", nChats);
 
   // Register Lua bindings (Telegram.send, Telegram.broadcast)
   #ifdef ENABLE_SCRIPTENGINE
@@ -157,17 +154,13 @@ void TelegramModule::loop() {}
 // MQTT has hard priority because it carries OTA.
 bool TelegramModule::sendTo(const char* chatId, const char* message) {
   if (!chatId || strlen(chatId) == 0 || !message || strlen(message) == 0) return false;
-  if (!WiFiManager::connected()) { Log::warn(TAG, "WiFi down - skipping"); return false; }
+  if (!WiFiManager::connected()) { Log::warn(TAG, "telegram.send_skipped reason=wifi_down"); return false; }
 
   if (TELEGRAM_HEAP_FLOOR_BYTES > 0) {
     uint32_t freeHeap = ESP.getFreeHeap();
     if (freeHeap < TELEGRAM_HEAP_FLOOR_BYTES) {
-      char wmsg[96];
-      // TODO: migrate to structured logging
-      snprintf(wmsg, sizeof(wmsg),
-               "heap %lu B below floor %d B - skipping (MQTT priority)",
-               (unsigned long)freeHeap, (int)TELEGRAM_HEAP_FLOOR_BYTES);
-      Log::warn(TAG, wmsg);
+      Log::kvfw(TAG, "telegram.send_skipped reason=heap_low free_b=%lu floor_b=%d priority=mqtt",
+                (unsigned long)freeHeap, (int)TELEGRAM_HEAP_FLOOR_BYTES);
       return false;
     }
   }
@@ -176,7 +169,7 @@ bool TelegramModule::sendTo(const char* chatId, const char* message) {
   char tokenBuf[Secret::MAX_LEN];
   const char* token = Secret::resolve("telegram_token", cfg["telegram"]["bot_token"] | "",
                                       tokenBuf, sizeof(tokenBuf));
-  if (strlen(token) == 0) { Log::warn(TAG, "No bot_token"); return false; }
+  if (strlen(token) == 0) { Log::warn(TAG, "telegram.send_skipped reason=no_bot_token"); return false; }
 
   char url[128];
   snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/sendMessage", token);
@@ -199,16 +192,10 @@ bool TelegramModule::sendTo(const char* chatId, const char* message) {
   http.end();
 
   if (code == 200) {
-    char smsg[64];
-    // TODO: migrate to structured logging
-    snprintf(smsg, sizeof(smsg), "Sent to %s", chatId);
-    Log::info(TAG, smsg);
+    Log::kvf(TAG, "telegram.sent chat_id=%s", chatId);
     return true;
   } else {
-    char emsg[64];
-    // TODO: migrate to structured logging
-    snprintf(emsg, sizeof(emsg), "HTTP %d for %s", code, chatId);
-    Log::warn(TAG, emsg);
+    Log::kvfw(TAG, "telegram.send_failed status=%d chat_id=%s", code, chatId);
     return false;
   }
 }
@@ -221,7 +208,7 @@ bool TelegramModule::sendTo(const char* chatId, const char* message) {
 // mode for this device class, and the heap value at the moment of alert is
 // the single most useful datapoint for diagnosing it.
 bool TelegramModule::send(const char* message) {
-  if (!_ready) { Log::warn(TAG, "not ready"); return false; }
+  if (!_ready) { Log::warn(TAG, "telegram.send_skipped reason=not_ready"); return false; }
 
   char tagged[256];
   snprintf(tagged, sizeof(tagged), "%s [heap=%lu]",
@@ -273,12 +260,9 @@ bool TelegramModule::send(const char* message) {
       http.addHeader("Content-Type", "application/json");
       int code = http.POST(postBody);
       if (code > 0) {
-        char wmsg[48];
-        // TODO: migrate to structured logging
-        snprintf(wmsg, sizeof(wmsg), "Webhook HTTP %d", code);
-        Log::info(TAG, wmsg);
+        Log::kvf(TAG, "telegram.webhook_response status=%d", code);
       } else {
-        Log::warn(TAG, "Webhook POST failed");
+        Log::warn(TAG, "telegram.webhook_post_failed");
       }
       http.end();
     }

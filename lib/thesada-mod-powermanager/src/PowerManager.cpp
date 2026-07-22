@@ -85,12 +85,9 @@ void PowerManager::begin() {
     else                    volIdx = XPOWERS_AXP2101_CHG_VOL_4V4;
     _pmu.setChargeTargetVoltage(volIdx);
 
-    char chgMsg[64];
-    // TODO: migrate to structured logging
-    snprintf(chgMsg, sizeof(chgMsg), "PMU ready - charge %dmA / %.1fV cutoff", chgMa, chgV);
-    Log::info(TAG, chgMsg);
+    Log::kvf(TAG, "power.pmu_ready charge_ma=%d cutoff_v=%.1f", chgMa, chgV);
   } else {
-    Log::error(TAG, "PMU init failed");
+    Log::error(TAG, "power.pmu_init_failed");
   }
 
   // Charging LED - show hardware charge status if heartbeat not using the LED.
@@ -100,7 +97,7 @@ void PowerManager::begin() {
     bool chargingLed = cfg["device"]["charging_led"] | true;
     if (chargingLed) {
       _pmu.setChargingLedMode(XPOWERS_CHG_LED_CTRL_CHG);
-      Log::info(TAG, "LED: charging indicator");
+      Log::info(TAG, "power.led_mode mode=charging_indicator");
     } else {
       _pmu.setChargingLedMode(XPOWERS_CHG_LED_OFF);
     }

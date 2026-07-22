@@ -44,11 +44,8 @@ void ADS1115Module::begin() {
     addDevice(cfg["ads1115"]["address"] | 0x48, cfg["ads1115"]["channels"].as<JsonArray>());
   }
 
-  char msg[64];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "ads.ready devices=%d channels=%d",
+  Log::kvf(TAG, "ads.ready devices=%d channels=%d",
            (int)_devices.size(), (int)channelCount());
-  Log::info(TAG, msg);
 
   SensorRegistry::add("current", "ADS1115 CT channels (RMS current)",
     [](ShellOutput out, void* ctx) {
@@ -66,10 +63,7 @@ void ADS1115Module::addDevice(uint8_t address, JsonArray channels) {
   dev.ads     = new Adafruit_ADS1115();
   dev.ok      = dev.ads->begin(address, &Wire);
   if (!dev.ok) {
-    char msg[48];
-    // TODO: migrate to structured logging
-    snprintf(msg, sizeof(msg), "ads.device_missing addr=0x%02X", address);
-    Log::error(TAG, msg);
+    Log::kvfe(TAG, "ads.device_missing addr=0x%02X", address);
   }
   loadChannels(channels, dev.channels, address);
   _devices.push_back(dev);
@@ -87,10 +81,7 @@ void ADS1115Module::loadChannels(JsonArray src, std::vector<ADS1115Channel>& dst
     float       gain  = ch["gain"] | 1.024f;
     float       clamp = ch["clamp_a_per_v"] | 30.0f;  // SCT-013-030 default
     if (clamp <= 0.0f) {                              // bad config -> default
-      char w[64];
-      // TODO: migrate to structured logging
-      snprintf(w, sizeof(w), "ads.clamp_invalid name=%s reason=nonpositive", cname);
-      Log::warn(TAG, w);
+      Log::kvfw(TAG, "ads.clamp_invalid name=%s reason=nonpositive", cname);
       clamp = 30.0f;
     }
 
@@ -103,11 +94,8 @@ void ADS1115Module::loadChannels(JsonArray src, std::vector<ADS1115Channel>& dst
     c.clampAPerV = clamp;
     dst.push_back(c);
 
-    char msg[96];
-    // TODO: migrate to structured logging
-    snprintf(msg, sizeof(msg), "ads.channel addr=0x%02X name=%s mux=%s gain=%.3f clamp=%g",
+    Log::kvf(TAG, "ads.channel addr=0x%02X name=%s mux=%s gain=%.3f clamp=%g",
              address, cname, muxS, gain, clamp);
-    Log::info(TAG, msg);
   }
 }
 
@@ -278,10 +266,7 @@ ADS1115Mux ADS1115Module::muxFromString(const char* s) {
   if (strcmp(s, "A1_GND") == 0) return ADS1115Mux::SINGLE_1;
   if (strcmp(s, "A2_GND") == 0) return ADS1115Mux::SINGLE_2;
   if (strcmp(s, "A3_GND") == 0) return ADS1115Mux::SINGLE_3;
-  char w[48];
-  // TODO: migrate to structured logging
-  snprintf(w, sizeof(w), "ads.mux_unknown value=%s", s);
-  Log::warn(TAG, w);
+  Log::kvfw(TAG, "ads.mux_unknown value=%s", s);
   return ADS1115Mux::DIFF_0_1;
 }
 

@@ -55,7 +55,7 @@ static void loadCaCert() {
     if (cf) {
       _otaCaCert = cf.readString();
       cf.close();
-      Log::info(TAG, "CA cert loaded from /ca.crt");
+      Log::info(TAG, "ota.ca_loaded path=/ca.crt");
     }
   }
   if (_otaCaCert.isEmpty()) {
@@ -65,7 +65,7 @@ static void loadCaCert() {
     // because _otaCaCert is then reused for every subsequent fetch.
     _otaCaCert = String(FPSTR(OTA_CA_PROGMEM));
     if (!_otaCaCert.isEmpty()) {
-      Log::warn(TAG, "No /ca.crt in LittleFS - using baked PROGMEM CA bundle");
+      Log::warn(TAG, "ota.ca_fallback source=progmem");
     } else {
       Log::kvfw(TAG, "ota.tls_insecure reason=no_ca");
     }
@@ -246,7 +246,7 @@ static bool downloadBinaryChunkedCellular(
   const char* path = nullptr;
   uint16_t port = 443;
   if (!parseUrl(url, host, sizeof(host), &path, &port)) {
-    Log::error(TAG, "downloadBinaryChunked: bad URL");
+    Log::error(TAG, "ota.download_failed reason=bad_url");
     return false;
   }
 
@@ -284,12 +284,8 @@ static bool downloadBinaryChunkedCellular(
     bool ok = Cellular::httpsGet(host, path, port, writeCallback, &status,
                                  offset, end);
     if (!ok || (status != 206 && status != 200)) {
-      char msg[160];
-      // TODO: migrate to structured logging
-      snprintf(msg, sizeof(msg),
-               "Range chunk failed at offset %u (status=%d, ok=%d)",
-               (unsigned)offset, status, (int)ok);
-      Log::error(TAG, msg);
+      Log::kvfe(TAG, "ota.chunk_failed offset=%u status=%d ok=%d",
+                (unsigned)offset, status, (int)ok);
       return false;
     }
     offset = end + 1;
@@ -303,7 +299,7 @@ static bool downloadBinaryChunkedCellular(
     // operator-side flow counters reset. Cheap (~1-2 s) compared to
     // the recovery cost when a chunk eventually stalls without it.
     if (chunkIdx % CHUNK_BOUNCE_EVERY == 0) {
-      Log::info(TAG, "Bouncing PDP context (CNACT cycle)");
+      Log::info(TAG, "ota.pdp_bounce method=cnact_cycle");
       Cellular::atPassthrough("+CNACT=0,0", 5000UL, [](const char*){});
       delay(500);
       Cellular::atPassthrough("+CNACT=0,1", 10000UL, [](const char*){});
@@ -342,7 +338,7 @@ static bool otaHttpGet(const char* url,
     return otaHttpGetCellular(url, writeCallback, outStatus, outLen);
   }
 #endif
-  Log::warn(TAG, "otaHttpGet: no transport available");
+  Log::warn(TAG, "ota.http_get_failed reason=no_transport");
   return false;
 }
 
@@ -365,7 +361,7 @@ void OTAUpdate::begin() {
 
   const char* manifestUrl = cfg["ota"]["manifest_url"] | "";
   if (strlen(manifestUrl) == 0) {
-    Log::warn(TAG, "No manifest_url in config - periodic OTA disabled");
+    Log::warn(TAG, "ota.disabled reason=no_manifest_url");
     _enabled = false;
   }
 
@@ -378,7 +374,7 @@ void OTAUpdate::begin() {
     loadCaCert();
     bool allowInsecure = cfg["ota"]["allow_insecure"] | false;
     if (_otaCaCert.isEmpty() && !allowInsecure) {
-      Log::error(TAG, "OTA disabled - no /ca.crt and ota.allow_insecure not set");
+      Log::error(TAG, "ota.disabled reason=no_ca allow_insecure=unset");
       _enabled = false;
     } else if (_otaCaCert.isEmpty() && allowInsecure) {
       Log::kvfw(TAG, "ota.tls_insecure reason=allow_insecure_set");
@@ -386,11 +382,8 @@ void OTAUpdate::begin() {
   }
 
   if (_enabled) {
-    char msg[128];
-    // TODO: migrate to structured logging
-    snprintf(msg, sizeof(msg), "Enabled - check every %lus, manifest: %.80s",
+    Log::kvf(TAG, "ota.enabled interval_s=%lu manifest=%.80s",
              intervalS, manifestUrl);
-    Log::info(TAG, msg);
   }
 
   // On-demand checks come from the `ota.check` shell command (serial or
@@ -404,7 +397,7 @@ void OTAUpdate::begin() {
     topic[sizeof(topic) - 1] = '\0';
 
     MQTTClient::subscribe(topic, [](const char* topic, const char* payload) {
-      Log::info(TAG, "MQTT OTA trigger received");
+      Log::info(TAG, "ota.trigger source=mqtt");
       _checkRequested = true;
       if (payload && strlen(payload) > 8) {
         _pendingManifestUrl = payload;
@@ -429,7 +422,7 @@ void OTAUpdate::begin() {
 void OTAUpdate::checkNow() {
   if (!_enabled) return;
   if (!anyTransportUp()) return;
-  Log::info(TAG, "Boot-time OTA check (clean heap)");
+  Log::info(TAG, "ota.boot_check heap=clean");
   check();
   _lastCheck = millis();
 }
@@ -485,7 +478,7 @@ void OTAUpdate::loop() {
 
 void OTAUpdate::check(const char* manifestOverride, bool force) {
   if (!anyTransportUp()) {
-    Log::warn(TAG, "No transport - skipping OTA check");
+    Log::warn(TAG, "ota.check_skipped reason=no_transport");
     publishOtaRefusal("no-transport");
     return;
   }
@@ -496,7 +489,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
                       : (cfg["ota"]["manifest_url"] | "");
 
   if (strlen(url) == 0) {
-    Log::error(TAG, "No manifest URL");
+    Log::error(TAG, "ota.check_refused reason=no_manifest_url");
     publishOtaRefusal("no-manifest-url");
     return;
   }
@@ -554,11 +547,8 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
     return;
   }
 
-  char msg[160];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Remote: %s, local: %s",
+  Log::kvf(TAG, "ota.version_check remote=%s local=%s",
            remoteVersion.c_str(), FIRMWARE_VERSION);
-  Log::info(TAG, msg);
 
   if (!force && !isNewer(remoteVersion.c_str(), FIRMWARE_VERSION)) {
     Log::kvf(TAG, "ota.phase_change from=fetch_manifest to=idle reason=up_to_date");
@@ -576,7 +566,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
     return;
   }
   if (force && !isNewer(remoteVersion.c_str(), FIRMWARE_VERSION)) {
-    Log::warn(TAG, "Force flag set - re-flashing same or older version");
+    Log::warn(TAG, "ota.force_reflash version=same_or_older");
   }
 
   Log::kvf(TAG, "ota.phase_change from=fetch_manifest to=download version=%s url=%.80s",
@@ -597,7 +587,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
     delay(500);
     ESP.restart();
   } else {
-    Log::error(TAG, "Update failed");
+    Log::error(TAG, "ota.update_failed");
     snprintf(statusPayload, sizeof(statusPayload),
              "{\"state\":\"failed\",\"version\":\"%s\"}", FIRMWARE_VERSION);
     MQTTClient::publish(statusTopic, statusPayload);
@@ -630,11 +620,8 @@ bool OTAUpdate::fetchManifest(const char* url,
   bool transportOk = otaHttpGet(url, cb, &status, &total);
 
   if (!transportOk || status != 200) {
-    char msg[80];
-    // TODO: migrate to structured logging
-    snprintf(msg, sizeof(msg), "Manifest fetch failed (status=%d, bytes=%u)",
-             status, (unsigned)total);
-    Log::error(TAG, msg);
+    Log::kvfe(TAG, "ota.manifest_fetch_failed status=%d bytes=%u",
+              status, (unsigned)total);
     return false;
   }
 
@@ -644,7 +631,7 @@ bool OTAUpdate::fetchManifest(const char* url,
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, body);
   if (err) {
-    Log::error(TAG, "Manifest JSON parse failed");
+    Log::error(TAG, "ota.manifest_parse_failed");
     return false;
   }
 
@@ -656,7 +643,7 @@ bool OTAUpdate::fetchManifest(const char* url,
   size_t      sz = doc["size"]   | (size_t)0;
 
   if (strlen(v) == 0 || strlen(u) == 0 || strlen(s) == 0) {
-    Log::error(TAG, "Manifest missing required fields (version, url, sha256)");
+    Log::error(TAG, "ota.manifest_invalid missing=version_url_sha256");
     return false;
   }
 
@@ -705,7 +692,7 @@ bool OTAUpdate::applyUpdate(const String& binUrl, const String& expectedSha256,
     if (!writeOk) return false;
     size_t w = Update.write(const_cast<uint8_t*>(buf), len);
     if (w != len) {
-      Log::error(TAG, "Update.write() short write");
+      Log::error(TAG, "ota.flash_write_failed reason=short_write");
       writeOk = false;
       return false;
     }
@@ -713,17 +700,13 @@ bool OTAUpdate::applyUpdate(const String& binUrl, const String& expectedSha256,
     written += len;
     uint32_t now = millis();
     if (now - lastProgress > 5000) {
-      char msg[96];
       if (expectedSize > 0) {
-        // TODO: migrate to structured logging
-        snprintf(msg, sizeof(msg), "Downloaded %u / %u bytes (%u%%)",
+        Log::kvf(TAG, "ota.download_progress bytes=%u total=%u pct=%u",
                  (unsigned)written, (unsigned)expectedSize,
                  (unsigned)((written * 100) / expectedSize));
       } else {
-        // TODO: migrate to structured logging
-        snprintf(msg, sizeof(msg), "Downloaded %u bytes", (unsigned)written);
+        Log::kvf(TAG, "ota.download_progress bytes=%u", (unsigned)written);
       }
-      Log::info(TAG, msg);
       lastProgress = now;
     }
     esp_task_wdt_reset();
@@ -753,7 +736,7 @@ bool OTAUpdate::applyUpdate(const String& binUrl, const String& expectedSha256,
   }
 #endif
   else {
-    Log::error(TAG, "No transport for binary download");
+    Log::error(TAG, "ota.download_failed reason=no_transport");
   }
 
   if (!transportOk || status != 200 || !writeOk || written == 0 ||
@@ -790,10 +773,7 @@ bool OTAUpdate::applyUpdate(const String& binUrl, const String& expectedSha256,
     return false;
   }
 
-  char msg[80];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Downloaded + verified %u bytes", (unsigned)written);
-  Log::info(TAG, msg);
+  Log::kvf(TAG, "ota.download_verified bytes=%u", (unsigned)written);
   return true;
 }
 

@@ -104,7 +104,7 @@ void Cellular::ATGuard::pause(uint32_t pauseMs) {
     if (xSemaphoreTakeRecursive(_atMutex, to) == pdTRUE) {
       _held = true;
     } else {
-      Log::warn("Cellular", "ATGuard pause: re-acquire timed out");
+      Log::warn("Cellular", "cellular.at_reacquire_timeout");
     }
   }
 }
@@ -171,10 +171,7 @@ static uint32_t           s_mqttRetryMs      = MQTT_RETRY_INIT_MS;
 // out: none (uses module-static s_mqttRetryMs)
 static void mqttBackoffWait(Cellular::ATGuard* guard = nullptr) {
   uint32_t ms = s_mqttRetryMs;
-  char msg[64];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Retry MQTT in %lu s", (unsigned long)(ms / 1000UL));
-  Log::warn(TAG, msg);
+  Log::kvfw(TAG, "cellular.mqtt.retry_wait retry_s=%lu", (unsigned long)(ms / 1000UL));
   if (guard) {
     guard->pause(ms);
   } else {
@@ -208,9 +205,9 @@ static inline void mqttBackoffReset() {
 // out: bool   true if AT comes back within REBOOT_BUDGET_MS
 static bool modemSoftReset() {
   static constexpr uint32_t REBOOT_BUDGET_MS = 60UL * 1000UL;
-  Log::warn(TAG, "Hardware-resetting modem (DC3 power-cycle)");
+  Log::warn(TAG, "cellular.modem_reset method=dc3_power_cycle");
   if (!PowerManager::resetModem()) {
-    Log::error(TAG, "PMU resetModem failed");
+    Log::error(TAG, "cellular.modem_reset_failed reason=pmu_reset_failed");
     return false;
   }
 
@@ -225,13 +222,13 @@ static bool modemSoftReset() {
     delay(1000);
     esp_task_wdt_reset();
     if (modem.testAT(1000UL)) {
-      Log::info(TAG, "Modem back after hardware reset");
+      Log::info(TAG, "cellular.modem_reset_ok");
       modem.sendAT("+CMEE=2");
       modem.waitResponse(2000UL);
       return true;
     }
   }
-  Log::error(TAG, "Modem hardware-reset timeout");
+  Log::error(TAG, "cellular.modem_reset_timeout");
   return false;
 }
 
@@ -249,11 +246,11 @@ void Cellular::invalidateClientCert() {
     // The bus is busy - the next health probe / reconnect will pick
     // up _hasClientCertOnModem=false and re-decide; the live session
     // continues until then. Acceptable for a runtime cert.clear.
-    Log::warn(TAG, "invalidateClientCert: AT bus busy - deferring SMDISC");
+    Log::warn(TAG, "cellular.cert_invalidate_deferred reason=at_bus_busy");
     return;
   }
   if (_mqttConnected) {
-    Log::info(TAG, "cert.clear: dropping modem MQTT session");
+    Log::info(TAG, "cellular.mqtt.session_drop reason=cert_clear");
     modem.sendAT("+SMDISC");
     modem.waitResponse(5000UL);
     _mqttConnected = false;
@@ -267,7 +264,7 @@ void Cellular::invalidateClientCert() {
 bool Cellular::hardReset() {
   ATGuard g(120000UL);
   if (!g.ok()) {
-    Log::error(TAG, "hardReset: AT bus stuck");
+    Log::error(TAG, "cellular.hard_reset_failed reason=at_bus_stuck");
     return false;
   }
   bool ok = modemSoftReset();
@@ -311,10 +308,10 @@ static String drainModemTail(uint32_t windowMs = 300UL) {
 // buffer, crashing the next battery poll with "NULL TX buffer pointer".
 void Cellular::initPMU() {
   if (!PowerManager::setModemRails()) {
-    Log::error(TAG, "PMU not available - cannot bring up modem rails");
+    Log::error(TAG, "cellular.modem_rails_failed reason=pmu_unavailable");
     return;
   }
-  Log::info(TAG, "PMU ready");
+  Log::info(TAG, "cellular.pmu_ready");
 }
 
 // ---------------------------------------------------------------------------
@@ -334,18 +331,18 @@ bool Cellular::wakeModem() {
   while (!modem.testAT(1000)) {
     esp_task_wdt_reset();
     if (millis() - start > WAKE_BUDGET_MS) {
-      Log::error(TAG, "Modem AT timeout");
+      Log::error(TAG, "cellular.modem_wake_timeout");
       return false;
     }
     if (++retry > 6) {
-      Log::info(TAG, "PWRKEY pulse");
+      Log::info(TAG, "cellular.pwrkey_pulse");
       digitalWrite(PIN_MODEM_PWR, LOW);  delay(100); esp_task_wdt_reset();
       digitalWrite(PIN_MODEM_PWR, HIGH); delay(1000); esp_task_wdt_reset();
       digitalWrite(PIN_MODEM_PWR, LOW);
       retry = 0;
     }
   }
-  Log::info(TAG, "Modem alive");
+  Log::info(TAG, "cellular.modem_alive");
 
   // Verbose CME ERROR (text) so failure tail logs are actionable. Mode 2
   // returns the textual cause string after every CME ERROR.
@@ -363,7 +360,7 @@ bool Cellular::writeCACert() {
   String certBuf;
   if (LittleFS.exists("/ca.crt")) {
     File cf = LittleFS.open("/ca.crt", "r");
-    if (cf) { certBuf = cf.readString(); cf.close(); Log::info(TAG, "CA cert loaded from /ca.crt"); }
+    if (cf) { certBuf = cf.readString(); cf.close(); Log::info(TAG, "cellular.ca_loaded path=/ca.crt"); }
   }
   if (certBuf.isEmpty()) {
     Log::kvfw(TAG, "cellular.tls_insecure reason=no_ca");
@@ -378,7 +375,7 @@ bool Cellular::writeCACert() {
   modem.waitResponse();
   modem.sendAT("+CFSINIT");
   if (modem.waitResponse() != 1) {
-    Log::error(TAG, "CFSINIT failed");
+    Log::error(TAG, "cellular.ca_write_failed step=cfsinit");
     return false;
   }
 
@@ -394,7 +391,7 @@ bool Cellular::writeCACert() {
     modem.sendAT("+CFSWFILE=", 3, ",\"server-ca.crt\",",
                  (written > 0 ? 1 : 0), ",", chunk, ",10000");
     if (waitChunked(30000UL, "DOWNLOAD") != 1) {
-      Log::error(TAG, "CA chunk DOWNLOAD prompt missing - aborting");
+      Log::error(TAG, "cellular.ca_write_failed step=download_prompt");
       modem.sendAT("+CFSTERM");
       modem.waitResponse();
       return false;
@@ -405,12 +402,12 @@ bool Cellular::writeCACert() {
       total    -= chunk;
       failures  = 0;
     } else if (++failures >= 3) {
-      Log::error(TAG, "CA chunk write failed 3x - aborting");
+      Log::error(TAG, "cellular.ca_write_failed step=chunk_write attempts=3");
       modem.sendAT("+CFSTERM");
       modem.waitResponse();
       return false;
     } else {
-      Log::warn(TAG, "CA chunk write failed, retrying");
+      Log::warn(TAG, "cellular.ca_chunk_retry");
       delay(1000);
     }
   }
@@ -418,7 +415,7 @@ bool Cellular::writeCACert() {
   modem.sendAT("+CFSTERM");
   modem.waitResponse();
   _hasCACert = true;
-  Log::info(TAG, "CA cert written to modem");
+  Log::info(TAG, "cellular.ca_written");
   return true;
 }
 
@@ -449,7 +446,7 @@ static bool writeModemFile(TinyGsm& modem, const char* filename,
     modem.sendAT("+CFSWFILE=", 3, ",\"", filename, "\",",
                  (written > 0 ? 1 : 0), ",", chunk, ",10000");
     if (waitChunked(30000UL, "DOWNLOAD") != 1) {
-      Log::error(TAG, "chunk DOWNLOAD prompt missing - aborting");
+      Log::kvfe(TAG, "cellular.file_write_failed step=download_prompt file=%s", filename);
       modem.sendAT("+CFSTERM");
       modem.waitResponse();
       return false;
@@ -460,7 +457,7 @@ static bool writeModemFile(TinyGsm& modem, const char* filename,
       remaining -= chunk;
       failures   = 0;
     } else if (++failures >= 3) {
-      Log::error(TAG, "chunk write failed 3x - aborting");
+      Log::kvfe(TAG, "cellular.file_write_failed step=chunk_write attempts=3 file=%s", filename);
       modem.sendAT("+CFSTERM");
       modem.waitResponse();
       return false;
@@ -507,20 +504,20 @@ bool Cellular::writeClientCert() {
   };
 
   if (!certBuf || !keyBuf) {
-    Log::error(TAG, "writeClientCert: heap alloc failed");
+    Log::error(TAG, "cellular.client_cert_write_failed reason=alloc");
     wipe_and_free(certBuf, keyBuf);
     return false;
   }
 
   if (!MQTTClient::loadClientCert(certBuf, keyBuf, maxLen)) {
-    Log::warn(TAG, "writeClientCert: NVS load failed");
+    Log::warn(TAG, "cellular.client_cert_write_failed reason=nvs_load");
     wipe_and_free(certBuf, keyBuf);
     return false;
   }
   size_t certLen = strlen(certBuf);
   size_t keyLen  = strlen(keyBuf);
   if (certLen == 0 || keyLen == 0) {
-    Log::warn(TAG, "writeClientCert: empty cert or key");
+    Log::warn(TAG, "cellular.client_cert_write_failed reason=empty_cert_or_key");
     wipe_and_free(certBuf, keyBuf);
     return false;
   }
@@ -534,16 +531,12 @@ bool Cellular::writeClientCert() {
 
   wipe_and_free(certBuf, keyBuf);
   if (!ok) {
-    Log::error(TAG, "writeClientCert: upload failed");
+    Log::error(TAG, "cellular.client_cert_write_failed reason=upload");
     return false;
   }
 
-  char msg[80];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg),
-           "Client cert+key written to modem (cert %u B, key %u B)",
+  Log::kvf(TAG, "cellular.client_cert_written cert_b=%u key_b=%u",
            (unsigned)certLen, (unsigned)keyLen);
-  Log::info(TAG, msg);
   return true;
 }
 
@@ -562,7 +555,7 @@ void Cellular::radioConfigure() {
   const char* apn        = cfg["cellular"]["apn"]          | "OSC";
   uint32_t    rfSettleMs = cfg["cellular"]["rf_settle_ms"] | 15000;
 
-  Log::info(TAG, "Configuring radio...");
+  Log::info(TAG, "cellular.radio_configure");
   modem.sendAT("+CFUN=0");
   waitChunked(20000UL);
   delay(500);
@@ -584,10 +577,7 @@ void Cellular::radioConfigure() {
   waitChunked(20000UL);
 
   // Critical: let LTE-M radio settle before polling registration.
-  char msg[64];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "RF settle %lu ms...", (unsigned long)rfSettleMs);
-  Log::info(TAG, msg);
+  Log::kvf(TAG, "cellular.rf_settle ms=%lu", (unsigned long)rfSettleMs);
   uint32_t remaining = rfSettleMs;
   while (remaining) {
     uint32_t step = remaining > 500UL ? 500UL : remaining;
@@ -606,18 +596,15 @@ void Cellular::radioConfigure() {
 int Cellular::pollRegistration() {
   esp_task_wdt_reset();
   SIM70xxRegStatus s = modem.getRegistrationStatus();
-  if (s == REG_OK_HOME)    { Log::info(TAG, "Registered - HOME");    return 1; }
-  if (s == REG_OK_ROAMING) { Log::info(TAG, "Registered - ROAMING"); return 1; }
-  if (s == REG_DENIED)     { Log::error(TAG, "Registration DENIED"); return -1; }
+  if (s == REG_OK_HOME)    { Log::info(TAG, "cellular.registered network=home");    return 1; }
+  if (s == REG_OK_ROAMING) { Log::info(TAG, "cellular.registered network=roaming"); return 1; }
+  if (s == REG_DENIED)     { Log::error(TAG, "cellular.registration_denied");       return -1; }
 #ifdef THESADA_CELL_DEBUG
   static uint32_t lastDiag = 0;
   if (millis() - lastDiag > 5000UL) {
     lastDiag = millis();
-    char dbg[160];
-    // TODO: migrate to structured logging
-    snprintf(dbg, sizeof(dbg), "diag: regStatus=%d CSQ=%d",
+    Log::kvf(TAG, "cellular.reg_diag status=%d csq=%d",
              (int)s, modem.getSignalQuality());
-    Log::info(TAG, dbg);
     auto dumpAT = [](const char* cmd) {
       Serial1.printf("AT%s\r\n", cmd);
       uint32_t t0 = millis();
@@ -629,7 +616,7 @@ int Cellular::pollRegistration() {
       buf.replace("\r", " ");
       buf.replace("\n", " | ");
       char line[256];
-      // TODO: migrate to structured logging
+      // Raw AT-protocol trace - kept free-text on purpose (kv would obscure it).
       snprintf(line, sizeof(line), "AT%s -> %s", cmd, buf.c_str());
       Log::info(TAG, line);
     };
@@ -650,7 +637,7 @@ bool Cellular::activateBearer() {
   JsonObject  cfg = Config::get();
   const char* apn = cfg["cellular"]["apn"] | "OSC";
 
-  Log::info(TAG, "Activating bearer...");
+  Log::info(TAG, "cellular.bearer_activate");
   if (!modem.isGprsConnected()) {
     modem.sendAT("+CNACT=0,1");
     if (waitChunked(30000UL) != 1) {
@@ -659,14 +646,11 @@ bool Cellular::activateBearer() {
   }
 
   if (!modem.isGprsConnected()) {
-    Log::error(TAG, "Bearer activation failed");
+    Log::error(TAG, "cellular.bearer_failed");
     return false;
   }
 
-  char ipMsg[64];
-  // TODO: migrate to structured logging
-  snprintf(ipMsg, sizeof(ipMsg), "IP: %s", modem.localIP().toString().c_str());
-  Log::info(TAG, ipMsg);
+  Log::kvf(TAG, "cellular.bearer_up ip=%s", modem.localIP().toString().c_str());
   return true;
 }
 
@@ -681,7 +665,7 @@ bool Cellular::activateBearer() {
 bool Cellular::networkConnect() {
   radioConfigure();
 
-  Log::info(TAG, "Waiting for registration...");
+  Log::info(TAG, "cellular.registration_wait");
   JsonObject cfg        = Config::get();
   uint32_t   regTimeout = cfg["cellular"]["reg_timeout_ms"] | 180000;
   uint32_t   start      = millis();
@@ -692,7 +676,7 @@ bool Cellular::networkConnect() {
     if (r < 0) return false;  // REG_DENIED
     delay(1000);
     if (millis() - start > regTimeout) {
-      Log::error(TAG, "Registration timeout");
+      Log::error(TAG, "cellular.registration_timeout");
       return false;
     }
   }
@@ -711,7 +695,7 @@ bool Cellular::mqttConnect() {
   const char* password = cfg["mqtt"]["password"]  | "";
   const char* devName  = cfg["device"]["name"]    | "thesada-node";
 
-  Log::info(TAG, "Configuring MQTT...");
+  Log::info(TAG, "cellular.mqtt.configure");
 
   // Strong teardown: SMDISC alone is not enough after a warm SMCONN
   // failure - the SIM7080 keeps the URL slot half-locked and the next
@@ -732,7 +716,7 @@ bool Cellular::mqttConnect() {
     // cycle here does nothing because CNACT also gets ignored; only
     // a CFUN=1,1 soft reset clears it. After reboot we have to redo
     // CA upload and network registration before retrying SMCONF.
-    Log::warn(TAG, "SMSTATE no response - modem wedged");
+    Log::warn(TAG, "cellular.modem_wedged reason=smstate_no_response");
     if (!modemSoftReset()) return false;
     // Modem FS cleared by the power cycle; next CFSWFILE writes the
     // CA + (if mTLS) the client cert+key from a clean slate.
@@ -741,26 +725,20 @@ bool Cellular::mqttConnect() {
     writeCACert();
     if (!networkConnect()) return false;
   } else if (smState != 0) {
-    char dbg[64];
-    // TODO: migrate to structured logging
-    snprintf(dbg, sizeof(dbg), "SMSTATE=%d not idle, recycling bearer", smState);
-    Log::warn(TAG, dbg);
+    Log::kvfw(TAG, "cellular.mqtt.session_stale smstate=%d action=bearer_recycle", smState);
     modem.sendAT("+CNACT=0,0");
     modem.waitResponse(5000UL);
     delay(500);
     modem.sendAT("+CNACT=0,1");
     if (waitChunked(20000UL) != 1) {
-      Log::warn(TAG, "Bearer reactivation slow - continuing");
+      Log::warn(TAG, "cellular.bearer_reactivate_slow action=continue");
     }
   }
 
   modem.sendAT("+SMCONF=\"URL\",", broker, ",", port);
   if (modem.waitResponse() != 1) {
     String tail = drainModemTail();
-    char line[256];
-    // TODO: migrate to structured logging
-    snprintf(line, sizeof(line), "MQTT URL failed: %s", tail.c_str());
-    Log::error(TAG, line);
+    Log::kvfe(TAG, "cellular.mqtt.config_failed step=url tail=\"%s\"", tail.c_str());
     return false;
   }
 
@@ -777,7 +755,7 @@ bool Cellular::mqttConnect() {
   modem.waitResponse();
 
   modem.sendAT("+SMCONF=\"CLIENTID\",\"", devName, "\"");
-  if (modem.waitResponse() != 1) { Log::error(TAG, "MQTT ClientID failed"); return false; }
+  if (modem.waitResponse() != 1) { Log::error(TAG, "cellular.mqtt.config_failed step=client_id"); return false; }
 
   // mTLS detection: NVS holds a client cert AND we already wrote (or
   // can now write) the matching cert+key onto the modem FS. Skip the
@@ -789,17 +767,17 @@ bool Cellular::mqttConnect() {
     if (writeClientCert()) {
       _hasClientCertOnModem = true;
     } else {
-      Log::warn(TAG, "Client cert upload failed - falling back to user/pass");
+      Log::warn(TAG, "cellular.mqtt.mtls_cert_upload_failed fallback=password");
       wantMTLS = false;
     }
   }
 
   if (!wantMTLS) {
     modem.sendAT("+SMCONF=\"USERNAME\",\"", user, "\"");
-    if (modem.waitResponse() != 1) { Log::error(TAG, "MQTT Username failed"); return false; }
+    if (modem.waitResponse() != 1) { Log::error(TAG, "cellular.mqtt.config_failed step=username"); return false; }
 
     modem.sendAT("+SMCONF=\"PASSWORD\",\"", password, "\"");
-    if (modem.waitResponse() != 1) { Log::error(TAG, "MQTT Password failed"); return false; }
+    if (modem.waitResponse() != 1) { Log::error(TAG, "cellular.mqtt.config_failed step=password"); return false; }
   } else {
     // The modem retains SMCONF entries across SMDISC, so a previous
     // user/pass cycle leaves USERNAME/PASSWORD set. Brokers using
@@ -809,7 +787,7 @@ bool Cellular::mqttConnect() {
     modem.waitResponse();
     modem.sendAT("+SMCONF=\"PASSWORD\",\"\"");
     modem.waitResponse();
-    Log::info(TAG, "mTLS active - using client cert (no user/pass)");
+    Log::info(TAG, "cellular.mqtt.mtls_active auth=client_cert");
   }
 
   // TLS 1.2
@@ -828,10 +806,10 @@ bool Cellular::mqttConnect() {
     // separate cert/key files is what the modem actually wires through
     // to mbedtls for client auth.
     modem.sendAT("+CSSLCFG=\"CONVERT\",2,\"server-ca.crt\"");
-    if (modem.waitResponse() != 1) { Log::error(TAG, "CA convert failed"); return false; }
+    if (modem.waitResponse() != 1) { Log::error(TAG, "cellular.mqtt.tls_config_failed step=ca_convert"); return false; }
 
     modem.sendAT("+CSSLCFG=\"CONVERT\",1,\"client.crt\",\"client.key\"");
-    if (modem.waitResponse() != 1) { Log::error(TAG, "Client cert convert failed"); return false; }
+    if (modem.waitResponse() != 1) { Log::error(TAG, "cellular.mqtt.tls_config_failed step=client_convert"); return false; }
 
     // Optional SNI: AWS IoT + Cloudflare-fronted brokers need it to
     // route to the right backend. Mosquitto direct (no SNI required)
@@ -848,40 +826,37 @@ bool Cellular::mqttConnect() {
     // and bench-failed the handshake. The client-cert side is wired
     // by the prior CSSLCFG CONVERT 1 call referencing client.crt + key.
     modem.sendAT("+SMSSL=1,\"server-ca.crt\",\"client.crt\"");
-    if (modem.waitResponse() != 1) { Log::error(TAG, "mTLS SSL attach failed"); return false; }
+    if (modem.waitResponse() != 1) { Log::error(TAG, "cellular.mqtt.tls_config_failed step=mtls_attach"); return false; }
   } else if (_hasCACert) {
     modem.sendAT("+CSSLCFG=\"CONVERT\",2,\"server-ca.crt\"");
-    if (modem.waitResponse() != 1) { Log::error(TAG, "CA convert failed"); return false; }
+    if (modem.waitResponse() != 1) { Log::error(TAG, "cellular.mqtt.tls_config_failed step=ca_convert"); return false; }
 
     modem.sendAT("+SMSSL=1,\"server-ca.crt\",\"\"");
-    if (modem.waitResponse() != 1) { Log::error(TAG, "SSL attach failed"); return false; }
+    if (modem.waitResponse() != 1) { Log::error(TAG, "cellular.mqtt.tls_config_failed step=ssl_attach"); return false; }
   } else {
     modem.sendAT("+SMSSL=0,\"\",\"\"");
     modem.waitResponse();
-    Log::warn(TAG, "MQTT TLS without CA verification");
+    Log::warn(TAG, "cellular.mqtt.tls_unverified reason=no_ca");
   }
 
-  Log::info(TAG, "Connecting MQTT...");
+  Log::info(TAG, "cellular.mqtt.connect_start");
   modem.sendAT("+SMCONN");
   if (waitChunked(30000UL) != 1) {
     // SIM7080G emits the actual cause (CME/SSL error) hundreds of ms
     // to a few seconds after the bare ERROR; 5 s window catches the
     // full chatter so the log line carries the real reason.
     String tail = drainModemTail(5000UL);
-    char line[384];
-    // TODO: migrate to structured logging
-    snprintf(line, sizeof(line), "MQTT connect failed: %s", tail.c_str());
-    Log::error(TAG, line);
+    Log::kvfe(TAG, "cellular.mqtt.connect_failed tail=\"%s\"", tail.c_str());
     return false;
   }
 
-  Log::info(TAG, "MQTT connected");
+  Log::info(TAG, "cellular.mqtt.connected");
 
   // Re-issue every WiFi-side subscription on the cellular MQTT session
   //. Reconnect path benefits too - the modem drops subscriptions
   // on SMDISC so we have to repaint them on every fresh SMCONN.
   if (!smsubAll()) {
-    Log::warn(TAG, "smsubAll failed - inbound MQTT may be partial");
+    Log::warn(TAG, "cellular.mqtt.smsub_partial inbound=degraded");
   }
   return true;
 }
@@ -910,11 +885,8 @@ void Cellular::routeSmsubLine(char* line) {
   if (!payloadEnd || payloadEnd == p - 1) return;
   *payloadEnd = '\0';
 
-  char dmsg[160];
-  // TODO: migrate to structured logging
-  snprintf(dmsg, sizeof(dmsg), "RX %s (%u B)", topicStart,
+  Log::kvf(TAG, "cellular.mqtt.rx topic=%s bytes=%u", topicStart,
            (unsigned)(payloadEnd - payloadStart));
-  Log::info(TAG, dmsg);
 
   MQTTClient::dispatchInbound(topicStart, payloadStart,
                               (size_t)(payloadEnd - payloadStart));
@@ -991,7 +963,7 @@ int Cellular::cellAT(const char* cmd, const char* expect, uint32_t timeoutMs,
         line[lineLen++] = c;
       } else {
         // Line overflow - reset to avoid corrupt parses.
-        Log::warn(TAG, "cellAT line overflow - dropping");
+        Log::warn(TAG, "cellular.at_line_overflow src=cellat action=drop");
         lineLen = 0;
       }
     }
@@ -1069,7 +1041,7 @@ int Cellular::cellATWrite(const char* cmd, const uint8_t* payload,
       if (lineLen < sizeof(line) - 1) {
         line[lineLen++] = c;
       } else {
-        Log::warn(TAG, "cellATWrite line overflow - dropping");
+        Log::warn(TAG, "cellular.at_line_overflow src=cellatwrite action=drop");
         lineLen = 0;
       }
     }
@@ -1112,7 +1084,7 @@ int Cellular::cellATWrite(const char* cmd, const uint8_t* payload,
       if (lineLen < sizeof(line) - 1) {
         line[lineLen++] = c;
       } else {
-        Log::warn(TAG, "cellATWrite line overflow - dropping");
+        Log::warn(TAG, "cellular.at_line_overflow src=cellatwrite action=drop");
         lineLen = 0;
       }
     }
@@ -1193,13 +1165,13 @@ bool Cellular::powerOn() {
 
   ATGuard g(120000UL);
   if (!g.ok()) {
-    Log::error(TAG, "powerOn: AT bus stuck");
+    Log::error(TAG, "cellular.power_on_failed reason=at_bus_stuck");
     return false;
   }
 
   initPMU();
   if (!wakeModem()) {
-    Log::error(TAG, "Modem did not wake");
+    Log::error(TAG, "cellular.power_on_failed reason=wake_timeout");
     return false;
   }
   _modemAlive = true;
@@ -1244,7 +1216,7 @@ Cellular::ActStatus Cellular::tickActivation() {
   // (device stays responsive, keeps watching WiFi, retries later).
   if (s_actPhase != ActPhase::INIT && s_actDeadline != 0 &&
       (int32_t)(now - s_actDeadline) >= 0) {
-    Log::error(TAG, "Cellular activation timed out - hard-resetting modem");
+    Log::error(TAG, "cellular.activation_timeout action=hard_reset");
     hardReset();
     s_actPhase = ActPhase::INIT;
     return ActStatus::FAILED;
@@ -1252,7 +1224,7 @@ Cellular::ActStatus Cellular::tickActivation() {
 
   switch (s_actPhase) {
     case ActPhase::INIT: {
-      Log::info(TAG, "Starting cellular path...");
+      Log::info(TAG, "cellular.activation_start");
       // Wire the MQTTClient cert-cleared hook so cert.clear from any path
       // (Shell, MQTT CLI, WS) drops the modem-side cache + active session
       // and triggers a reconnect under the new auth mode. Idempotent.
@@ -1272,7 +1244,7 @@ Cellular::ActStatus Cellular::tickActivation() {
       // powerOn() takes its own (long) ATGuard internally; idempotent if
       // the modem is already alive (e.g. GNSS warmed it earlier).
       if (!powerOn()) {
-        Log::error(TAG, "Modem powerOn failed - aborting cellular bring-up");
+        Log::error(TAG, "cellular.activation_failed phase=power_on");
         s_actPhase = ActPhase::INIT;
         return ActStatus::FAILED;
       }
@@ -1283,7 +1255,7 @@ Cellular::ActStatus Cellular::tickActivation() {
     case ActPhase::SIM: {
       ATGuard g(120000UL);
       if (!g.ok()) {
-        Log::error(TAG, "Cellular SIM phase: AT bus stuck - aborting");
+        Log::error(TAG, "cellular.activation_failed phase=sim reason=at_bus_stuck");
         s_actPhase = ActPhase::INIT;
         return ActStatus::FAILED;
       }
@@ -1291,18 +1263,18 @@ Cellular::ActStatus Cellular::tickActivation() {
       const char* pin = cfg["cellular"]["sim_pin"] | "";
       if (strlen(pin) > 0 && modem.getSimStatus() == SIM_LOCKED) {
         if (!modem.simUnlock(pin)) {
-          Log::error(TAG, "SIM unlock failed");
+          Log::error(TAG, "cellular.sim_unlock_failed");
           s_actPhase = ActPhase::INIT;
           return ActStatus::FAILED;
         }
-        Log::info(TAG, "SIM unlocked");
+        Log::info(TAG, "cellular.sim_unlocked");
       }
       if (modem.getSimStatus() != SIM_READY) {
-        Log::error(TAG, "SIM not ready - cellular unavailable");
+        Log::error(TAG, "cellular.sim_not_ready");
         s_actPhase = ActPhase::INIT;
         return ActStatus::FAILED;
       }
-      Log::info(TAG, "SIM ready");
+      Log::info(TAG, "cellular.sim_ready");
       writeCACert();
       s_actPhase = ActPhase::RADIO_CFG;
       return ActStatus::PENDING;
@@ -1311,7 +1283,7 @@ Cellular::ActStatus Cellular::tickActivation() {
     case ActPhase::RADIO_CFG: {
       ATGuard g(120000UL);
       if (!g.ok()) {
-        Log::warn(TAG, "Cellular radio config: AT bus busy - retrying");
+        Log::warn(TAG, "cellular.radio_cfg_deferred reason=at_bus_busy");
         return ActStatus::PENDING;
       }
       radioConfigure();
@@ -1342,7 +1314,7 @@ Cellular::ActStatus Cellular::tickActivation() {
       JsonObject cfg        = Config::get();
       uint32_t   regTimeout = cfg["cellular"]["reg_timeout_ms"] | 180000;
       if (r < 0 || (millis() - s_regPollStart) > regTimeout) {
-        Log::warn(TAG, "Registration failed - re-walking radio config");
+        Log::warn(TAG, "cellular.registration_failed action=radio_reconfig");
         s_actPhase = ActPhase::RADIO_CFG;
       }
       return ActStatus::PENDING;
@@ -1352,7 +1324,7 @@ Cellular::ActStatus Cellular::tickActivation() {
       ATGuard g(60000UL);
       if (!g.ok()) return ActStatus::PENDING;
       if (!activateBearer()) {
-        Log::warn(TAG, "Bearer activation failed - re-walking radio config");
+        Log::warn(TAG, "cellular.bearer_failed action=radio_reconfig");
         s_actPhase = ActPhase::RADIO_CFG;
         return ActStatus::PENDING;
       }
@@ -1424,7 +1396,7 @@ void Cellular::loop() {
     // Another task holds the bus past the 30 s budget - skip this tick
     // and try next loop. Health probe is best-effort; a stuck guard will
     // recover when the holder releases.
-    Log::warn(TAG, "Health probe skipped - AT bus busy");
+    Log::warn(TAG, "cellular.health_probe_skipped reason=at_bus_busy");
     return;
   }
   esp_task_wdt_reset();
@@ -1437,7 +1409,7 @@ void Cellular::loop() {
     }
     _mqttConnected = false;
     while (!networkConnect()) {
-      Log::warn(TAG, "Retry network in 10s");
+      Log::warn(TAG, "cellular.network_retry wait_s=10");
       // Release the AT bus + pump shell during the sleep so restart /
       // cell.* / config.* commands stay reachable while we hammer
       // re-registration. Without this the main loop is frozen until
@@ -1542,7 +1514,7 @@ bool Cellular::gpsAcquireFix(uint32_t timeoutMs,
 
   ATGuard g(timeoutMs + 10000UL);
   if (!g.ok()) {
-    Log::warn(TAG, "GPS fix skipped - AT bus busy");
+    Log::warn(TAG, "cellular.gps_fix_skipped reason=at_bus_busy");
     return false;
   }
 
@@ -1697,7 +1669,7 @@ bool Cellular::publish(const char* topic, const char* payload, bool retain) {
 
   ATGuard g;
   if (!g.ok()) {
-    Log::warn(TAG, "Publish skipped - AT bus busy");
+    Log::warn(TAG, "cellular.publish_skipped reason=at_bus_busy");
     return false;
   }
   _lastSmpubMs = millis();
@@ -1716,7 +1688,8 @@ bool Cellular::publish(const char* topic, const char* payload, bool retain) {
   int rc = cellATWrite(cmd, (const uint8_t*)payload, len, 5000UL, 8000UL);
   if (rc == 1) return true;
 
-  Log::warn(TAG, rc == 0 ? "SMPUB timeout" : "SMPUB failed");
+  Log::warn(TAG, rc == 0 ? "cellular.smpub_failed reason=timeout"
+                         : "cellular.smpub_failed reason=error");
   _mqttConnected = false;
   return false;
 }
@@ -1734,7 +1707,7 @@ bool Cellular::publish(const char* topic, const char* payload, bool retain) {
 bool Cellular::smsub(const char* topic) {
   ATGuard g;
   if (!g.ok()) {
-    Log::warn(TAG, "SMSUB skipped - AT bus busy");
+    Log::warn(TAG, "cellular.smsub_skipped reason=at_bus_busy");
     return false;
   }
   esp_task_wdt_reset();
@@ -1742,10 +1715,7 @@ bool Cellular::smsub(const char* topic) {
   int res = modem.waitResponse(3000UL);
   esp_task_wdt_reset();
   if (res != 1) {
-    char wmsg[80];
-    // TODO: migrate to structured logging
-    snprintf(wmsg, sizeof(wmsg), "SMSUB failed for %s", topic);
-    Log::warn(TAG, wmsg);
+    Log::kvfw(TAG, "cellular.smsub_failed topic=%s", topic);
     return false;
   }
   return true;
@@ -1768,16 +1738,13 @@ bool Cellular::smsubAll() {
   int  count = 0;
   MQTTClient::forEachSubscription([&](const char* topic) {
     if (count >= MAX_SUBS) {
-      Log::warn(TAG, "SMSUB cap reached - extra subs not registered on cellular");
+      Log::kvfw(TAG, "cellular.smsub_cap_reached max=%d", MAX_SUBS);
       return;
     }
     if (!smsub(topic)) allOk = false;
     count++;
   });
-  char msg[80];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "SMSUB %d topic(s) on cellular MQTT", count);
-  Log::info(TAG, msg);
+  Log::kvf(TAG, "cellular.smsub_done topics=%d", count);
   return allOk;
 }
 
@@ -1813,7 +1780,7 @@ void Cellular::pumpInbound() {
       // Diag: log every line so we can see exactly what reaches pumpInbound.
       if (lineLen > 0) {
         char dmsg[160];
-        // TODO: migrate to structured logging
+        // Raw serial trace - kept free-text on purpose (kv would obscure it).
         snprintf(dmsg, sizeof(dmsg), "rx: %s", line);
         Log::info(TAG, dmsg);
       }
@@ -1828,7 +1795,7 @@ void Cellular::pumpInbound() {
       line[lineLen++] = c;
     } else {
       // Line overflow - reset, drop the rest. Logged once.
-      Log::warn(TAG, "pumpInbound line overflow - dropping");
+      Log::warn(TAG, "cellular.at_line_overflow src=pump_inbound action=drop");
       lineLen = 0;
     }
   }
@@ -1857,7 +1824,7 @@ bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
                         size_t rangeStart, size_t rangeEndInclusive) {
   if (httpStatus) *httpStatus = 0;
   if (!_modemAlive) {
-    Log::warn(TAG, "httpsGet: modem not alive");
+    Log::warn(TAG, "cellular.https_get_skipped reason=modem_not_alive");
     return false;
   }
 
@@ -1868,7 +1835,7 @@ bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
   // bus forever.
   ATGuard g(15UL * 60UL * 1000UL);
   if (!g.ok()) {
-    Log::warn(TAG, "httpsGet: AT bus busy");
+    Log::warn(TAG, "cellular.https_get_skipped reason=at_bus_busy");
     return false;
   }
 
@@ -1880,21 +1847,16 @@ bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
   // arduino-esp32 default policy), leaving the loop stack free.
   auto* clientPtr = new (std::nothrow) TinyGsmClientSecure(modem, 0);
   if (!clientPtr) {
-    Log::error(TAG, "httpsGet: heap allocation failed");
+    Log::error(TAG, "cellular.https_get_failed reason=alloc");
     return false;
   }
   std::unique_ptr<TinyGsmClientSecure> clientOwner(clientPtr);
   TinyGsmClientSecure& client = *clientPtr;
   client.setTimeout(30000);
 
-  {
-    char msg[200];
-    // TODO: migrate to structured logging
-    snprintf(msg, sizeof(msg), "httpsGet: connect %s:%u", host, port);
-    Log::info(TAG, msg);
-  }
+  Log::kvf(TAG, "cellular.https_get_connect host=%s port=%u", host, port);
   if (!client.connect(host, port, 30)) {
-    Log::error(TAG, "httpsGet: connect failed");
+    Log::error(TAG, "cellular.https_get_failed reason=connect");
     return false;
   }
 
@@ -1918,7 +1880,7 @@ bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
     "\r\n",
     path, host, rangeHdr);
   if (reqLen <= 0 || reqLen >= (int)sizeof(req)) {
-    Log::error(TAG, "httpsGet: request buffer overflow");
+    Log::error(TAG, "cellular.https_get_failed reason=request_overflow");
     client.stop();
     return false;
   }
@@ -1959,7 +1921,7 @@ bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
       // Header phase: read line-by-line. Bail if connection drops before
       // headers complete (server hangup mid-response).
       if (!client.connected() && !client.available()) {
-        Log::warn(TAG, "httpsGet: disconnected before headers");
+        Log::warn(TAG, "cellular.https_get_disconnected stage=headers");
         break;
       }
       if (!client.available()) { delay(10); continue; }
@@ -2010,7 +1972,7 @@ bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
       bodyBytes += n;
       lastByte = millis();
       if (writeCallback && !writeCallback(chunk, n)) {
-        Log::warn(TAG, "httpsGet: callback aborted transfer");
+        Log::warn(TAG, "cellular.https_get_aborted reason=callback");
         client.stop();
         if (httpStatus) *httpStatus = status;
         return false;
@@ -2020,13 +1982,9 @@ bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
     // No bytes this iteration. Decide between wait and exit.
     if (millis() - lastByte > kBodyIdleTimeoutMs) {
       if (contentLen > 0 && bodyBytes < (size_t)contentLen) {
-        char msg[120];
-        // TODO: migrate to structured logging
-        snprintf(msg, sizeof(msg),
-                 "httpsGet: body stall %u/%d bytes after %u ms idle - aborting",
-                 (unsigned)bodyBytes, contentLen,
-                 (unsigned)(millis() - lastByte));
-        Log::error(TAG, msg);
+        Log::kvfe(TAG, "cellular.https_get_stall bytes=%u expected=%d idle_ms=%u action=abort",
+                  (unsigned)bodyBytes, contentLen,
+                  (unsigned)(millis() - lastByte));
       }
       break;
     }
@@ -2036,17 +1994,11 @@ bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
   client.stop();
 
   if (status == 0) {
-    Log::error(TAG, "httpsGet: no status line received");
+    Log::error(TAG, "cellular.https_get_failed reason=no_status_line");
     return false;
   }
-  {
-    char msg[120];
-    // TODO: migrate to structured logging
-    snprintf(msg, sizeof(msg),
-             "httpsGet: done status=%d body=%u bytes (content-length header=%d)",
-             status, (unsigned)bodyBytes, contentLen);
-    Log::info(TAG, msg);
-  }
+  Log::kvf(TAG, "cellular.https_get_done status=%d body_bytes=%u content_length=%d",
+           status, (unsigned)bodyBytes, contentLen);
   // Treat short body (got fewer bytes than Content-Length declared) as a
   // transport failure so the OTA caller does not run SHA on a truncated
   // stream and report a hash mismatch. Status code stays correct.
@@ -2086,7 +2038,7 @@ void Cellular::dataLinkDown() {
   if (!_modemAlive) return;
   ATGuard g(15000UL);
   if (!g.ok()) {
-    Log::warn(TAG, "dataLinkDown: AT bus stuck - skipping teardown");
+    Log::warn(TAG, "cellular.data_link_down_skipped reason=at_bus_stuck");
     return;
   }
   modem.sendAT("+SMDISC");
@@ -2096,7 +2048,7 @@ void Cellular::dataLinkDown() {
   _started       = false;
   _mqttConnected = false;
   _publishGate   = false;
-  Log::info(TAG, "Cellular data context closed (modem still registered)");
+  Log::info(TAG, "cellular.data_link_down modem=registered");
 }
 
 // Emit a human-readable summary of the cellular link: operator, modem IP,

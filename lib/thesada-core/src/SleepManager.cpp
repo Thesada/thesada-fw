@@ -65,11 +65,8 @@ void SleepManager::begin() {
   _sleepUs      = (uint64_t)sleepS * 1000000ULL;
   _wakeDeadline = millis() + (wakeS * 1000);
 
-  char msg[80];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Enabled - awake %lus, sleep %lus (boot #%lu)",
+  Log::kvf(TAG, "sleep.enabled awake_s=%lu sleep_s=%lu boot=%lu",
            (unsigned long)wakeS, (unsigned long)sleepS, (unsigned long)_rtc.bootCount);
-  Log::info(TAG, msg);
 }
 
 // Enter deep sleep when the wake deadline has passed
@@ -102,7 +99,7 @@ void SleepManager::setLastOtaCheck(time_t t) {
 
 // Flush MQTT, disconnect WiFi, and enter deep sleep
 void SleepManager::gracefulShutdown() {
-  Log::info(TAG, "Going to sleep...");
+  Log::info(TAG, "sleep.shutdown_start");
 
   // Publish sleep status and flush the MQTT queue.
   if (MQTTClient::connected()) {
@@ -126,7 +123,7 @@ void SleepManager::gracefulShutdown() {
   // Configure wake source: RTC timer.
   esp_sleep_enable_timer_wakeup(_sleepUs);
 
-  Log::info(TAG, "Sleeping now");
+  Log::info(TAG, "sleep.enter");
   delay(100);  // let serial flush
 
   esp_deep_sleep_start();

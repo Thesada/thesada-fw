@@ -17,7 +17,7 @@ static const char* TAG = "Battery";
 // Load battery config and publish initial state if PMU is available
 void BatteryModule::begin() {
   if (!PowerManager::isPmuOk()) {
-    Log::error(TAG, "PMU not available - battery monitoring disabled");
+    Log::error(TAG, "battery.disabled reason=pmu_unavailable");
     return;
   }
 
@@ -25,11 +25,8 @@ void BatteryModule::begin() {
   _intervalMs    = (uint32_t)(cfg["battery"]["interval_s"] | 60) * 1000;
   _lowPct        = cfg["battery"]["low_pct"] | 20;
 
-  char msg[64];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Ready - every %lus, low alert at %d%%",
+  Log::kvf(TAG, "battery.ready interval_s=%lu low_alert_pct=%d",
            (unsigned long)(_intervalMs / 1000), _lowPct);
-  Log::info(TAG, msg);
 
   // Register under the unified `sensors` CLI. Use `sensors battery`.
   SensorRegistry::add("battery", "voltage, percent, charging state (PMU)",
@@ -105,13 +102,10 @@ void BatteryModule::readAndPublish() {
 
   // Log summary
   if (present) {
-    char log[64];
-    // TODO: migrate to structured logging
-    snprintf(log, sizeof(log), "%.2fV  %d%%  %s",
+    Log::kvf(TAG, "battery.reading volts=%.2f pct=%d state=%s",
              voltage, percent, charging ? "charging" : "discharging");
-    Log::info(TAG, log);
   } else {
-    Log::warn(TAG, "Battery not detected");
+    Log::warn(TAG, "battery.not_detected");
   }
 }
 

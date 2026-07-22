@@ -59,10 +59,7 @@ void SHT31Module::begin() {
   Wire.beginTransmission(_addr);
   uint8_t err = Wire.endTransmission();
   if (err != 0) {
-    char msg[64];
-    // TODO: migrate to structured logging
-    snprintf(msg, sizeof(msg), "no device at 0x%02X (SDA=%d SCL=%d) - sensor absent", _addr, sda, scl);
-    Log::info(TAG, msg);
+    Log::kvf(TAG, "sht31.absent addr=0x%02X sda=%d scl=%d", _addr, sda, scl);
     return;
   }
 
@@ -79,10 +76,7 @@ void SHT31Module::begin() {
       static_cast<SHT31Module*>(ctx)->sensorRead(out);
     }, this, true);
 
-  char msg[64];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Ready - SDA=%d SCL=%d addr=0x%02X interval=%lus", sda, scl, _addr, iv);
-  Log::info(TAG, msg);
+  Log::kvf(TAG, "sht31.ready sda=%d scl=%d addr=0x%02X interval_s=%lu", sda, scl, _addr, iv);
 
   // First reading immediately
   readAndPublish();
@@ -170,14 +164,14 @@ void SHT31Module::publishHaDiscovery() {
   disc(uid, "SHT31 Humidity", st, "%", "humidity", "measurement");
 
   _haPublished = true;
-  Log::info(TAG, "HA discovery published");
+  Log::info(TAG, "sht31.ha_discovery_published");
 }
 
 // Read sensor and publish to MQTT + EventBus
 void SHT31Module::readAndPublish() {
   float temp, humid;
   if (!sht31Read(_addr, temp, humid)) {
-    Log::warn(TAG, "Read failed");
+    Log::warn(TAG, "sht31.read_failed");
     return;
   }
 
@@ -213,10 +207,7 @@ void SHT31Module::readAndPublish() {
   s["humidity"] = roundf(humid * 10.0f) / 10.0f;
   EventBus::publish("temperature", doc.as<JsonObject>());
 
-  char msg[64];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "%.1f%s  %.1f%%", displayTemp, unit, humid);
-  Log::info(TAG, msg);
+  Log::kvf(TAG, "sht31.reading temp=%.1f unit=%s humidity=%.1f", displayTemp, unit, humid);
 }
 
 // SensorRegistry read callback. Outputs two lines on success, one on error.

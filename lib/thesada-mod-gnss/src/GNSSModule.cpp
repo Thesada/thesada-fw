@@ -23,13 +23,10 @@ void GNSSModule::begin() {
   _warmFixMs          = (uint32_t)(cfg["gnss"]["warm_fix_s"]      | 10) * 1000UL;
   _publishWithoutFix  = cfg["gnss"]["publish_without_fix"] | false;
 
-  char msg[96];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Ready - interval %lus, cold fix <=%lus, warm fix <=%lus",
+  Log::kvf(TAG, "gnss.ready interval_s=%lu cold_fix_s=%lu warm_fix_s=%lu",
            (unsigned long)(_intervalMs / 1000),
            (unsigned long)(_coldFixMs / 1000),
            (unsigned long)(_warmFixMs / 1000));
-  Log::info(TAG, msg);
 }
 
 // Acquire one fix per interval via the atomic enable/wait/disable/CFUN=1
@@ -46,7 +43,7 @@ void GNSSModule::loop() {
   // brings up PMU + wakeModem so this GNSS read can proceed.
   if (!Cellular::isModemAlive()) {
     if (!Cellular::powerOn()) {
-      Log::warn(TAG, "Modem powerOn failed - GNSS read deferred");
+      Log::warn(TAG, "gnss.read_deferred reason=modem_power_on_failed");
       return;
     }
   }
@@ -72,7 +69,7 @@ void GNSSModule::readAndPublish() {
     _satsUsed   = uSat;
     _lastFixMs  = millis();
   } else if (!_publishWithoutFix) {
-    Log::warn(TAG, "no fix in this window");
+    Log::warn(TAG, "gnss.no_fix action=skip_publish");
     return;
   }
 
@@ -130,13 +127,10 @@ void GNSSModule::readAndPublish() {
   EventBus::publish("gnss", doc.as<JsonObject>());
 
   if (_hasFix) {
-    char log[96];
-    // TODO: migrate to structured logging
-    snprintf(log, sizeof(log), "fix lat=%.6f lon=%.6f alt=%.1fm sats=%d/%d",
+    Log::kvf(TAG, "gnss.fix lat=%.6f lon=%.6f alt_m=%.1f sats_used=%d sats_view=%d",
              _lat, _lon, _alt, _satsUsed, _satsInView);
-    Log::info(TAG, log);
   } else {
-    Log::warn(TAG, "no fix yet");
+    Log::warn(TAG, "gnss.no_fix");
   }
 }
 

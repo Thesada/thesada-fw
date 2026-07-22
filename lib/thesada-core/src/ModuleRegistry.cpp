@@ -37,16 +37,12 @@ void ModuleRegistry::beginAll() {
     bool en = cfg[m->configKey()]["enabled"] | m->coreModule();
     _entries[i].enabled = en;
     if (!en) {
-      char msg[48];
-      // TODO: migrate to structured logging
-      snprintf(msg, sizeof(msg), "Skip [%d]: %s (disabled)", _entries[i].priority, m->name());
-      Log::info("Registry", msg);
+      Log::kvf("Registry", "registry.module_skip priority=%d name=%s reason=disabled",
+               _entries[i].priority, m->name());
       continue;
     }
-    char msg[48];
-    // TODO: migrate to structured logging
-    snprintf(msg, sizeof(msg), "Init [%d]: %s", _entries[i].priority, m->name());
-    Log::info("Registry", msg);
+    Log::kvf("Registry", "registry.module_init priority=%d name=%s",
+             _entries[i].priority, m->name());
     m->begin();
     // Feed MQTT keepalive between module inits. Module begin() can take
     // seconds (TFT init, Lua script load, SD mount) and the total init

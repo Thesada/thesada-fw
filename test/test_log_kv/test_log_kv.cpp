@@ -65,6 +65,17 @@ void test_null_fmt_yields_empty(void) {
   TEST_ASSERT_EQUAL_STRING("", buf);
 }
 
+// Credential-bearing config paths must be flagged for redaction.
+void test_sensitive_path_detection(void) {
+  TEST_ASSERT_TRUE(logPathIsSensitive("web.password"));
+  TEST_ASSERT_TRUE(logPathIsSensitive("telegram.bot_token"));
+  TEST_ASSERT_TRUE(logPathIsSensitive("lora.mesh_psk"));
+  TEST_ASSERT_TRUE(logPathIsSensitive("device.secret_ref"));
+  TEST_ASSERT_FALSE(logPathIsSensitive("mqtt.port"));
+  TEST_ASSERT_FALSE(logPathIsSensitive("ota.check_interval"));
+  TEST_ASSERT_FALSE(logPathIsSensitive(nullptr));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_format_fits);
@@ -72,5 +83,6 @@ int main(int, char**) {
   RUN_TEST(test_boundary_exact_fit);
   RUN_TEST(test_degenerate_buffers);
   RUN_TEST(test_null_fmt_yields_empty);
+  RUN_TEST(test_sensitive_path_detection);
   return UNITY_END();
 }

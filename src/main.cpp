@@ -67,12 +67,8 @@ static void logBootCause() {
   int rtc1 = -1;
 #endif
 
-  char line[160];
-  // TODO: migrate to structured logging
-  snprintf(line, sizeof(line),
-    "reset=%s (%d) rtc_core0=%d rtc_core1=%d brownout_total=%lu",
-    reasonStr, (int)reason, rtc0, rtc1, (unsigned long)brownouts);
-  Log::info("Boot", line);
+  Log::kvf("Boot", "boot.reset_info reason=%s code=%d rtc_core0=%d rtc_core1=%d brownout_total=%lu",
+           reasonStr, (int)reason, rtc0, rtc1, (unsigned long)brownouts);
 }
 
 // Return true if WiFi (or the AP fallback) reports a usable link
@@ -119,7 +115,7 @@ void setup() {
 #endif
   esp_task_wdt_add(NULL);
 
-  Log::info("Boot", "thesada-fw v" FIRMWARE_VERSION " (" __DATE__ " " __TIME__ ")");
+  Log::info("Boot", "boot.start fw=thesada-fw version=" FIRMWARE_VERSION " built=\"" __DATE__ " " __TIME__ "\"");
   logBootCause();
 
   // Quiet the IDF VFS layer's "file does not exist" ERROR logs. Every
@@ -137,7 +133,7 @@ void setup() {
     _mqttEnabled      = cfg["mqtt"]["enabled"]      | true;
     _otaEnabled       = cfg["ota"]["enabled"]       | true;
     _heartbeatEnabled = cfg["heartbeat"]["enabled"] | true;
-    if (!_wifiEnabled) Log::info("Boot", "wifi.enabled=false - WiFi skipped, cellular is primary transport");
+    if (!_wifiEnabled) Log::info("Boot", "boot.wifi_disabled primary_transport=cellular");
   }
 
   // Bring WiFi up. CellularModule registers later via PRIORITY_NETWORK
@@ -171,7 +167,7 @@ void setup() {
 
   SleepManager::begin();
 
-  Log::info("Boot", "Ready. Type 'help' for commands.");
+  Log::info("Boot", "boot.ready hint=help");
 }
 
 void loop() {

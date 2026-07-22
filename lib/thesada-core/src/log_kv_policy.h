@@ -6,6 +6,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stddef.h>
+#include <string.h>
 
 // Format into out[cap]; out is always NUL-terminated within cap, even on
 // vsnprintf encoding error. Returns true when the full string fit.
@@ -23,4 +24,15 @@ inline bool logKvFormat(char* out, size_t cap, const char* fmt, ...) {
   bool fit = logKvFormatV(out, cap, fmt, ap);
   va_end(ap);
   return fit;
+}
+
+// True when a config path names a credential whose value must never be
+// logged (invariant: never log secrets/credentials/tokens).
+inline bool logPathIsSensitive(const char* path) {
+  if (!path) return false;
+  static const char* kNeedles[] = { "password", "token", "secret", "psk" };
+  for (const char* n : kNeedles) {
+    if (strstr(path, n) != nullptr) return true;
+  }
+  return false;
 }

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "Config.h"
 #include "Log.h"
+#include "log_kv_policy.h"
 #include <LittleFS.h>
 #include <cmath>
 #include <climits>
@@ -20,10 +21,7 @@ void Config::load() {
   // clean empty doc so get() returns defaults, not garbage.
   if (err) {
     _doc.clear();
-    char msg[64];
-    // TODO: migrate to structured logging
-    snprintf(msg, sizeof(msg), "config.json parse failed (%s) - using defaults", err.c_str());
-    Log::error(TAG, msg);
+    Log::kvfe(TAG, "config.parse_failed err=%s action=use_defaults", err.c_str());
   }
 }
 
@@ -36,28 +34,22 @@ void Config::load() {
 // replace() genuinely restores it.
 bool Config::save() {
   File f = LittleFS.open("/config.json.tmp", "w");
-  if (!f) { Log::error(TAG, "Failed to open config.json.tmp for writing"); return false; }
+  if (!f) { Log::error(TAG, "config.save_failed reason=tmp_open"); return false; }
   size_t written  = serializeJson(_doc, f);
   size_t expected = measureJson(_doc);
   f.close();
   if (written < expected) {
-    char msg[64];
-    // TODO: migrate to structured logging
-    snprintf(msg, sizeof(msg), "Short write to config.json.tmp: %u/%u bytes",
-             (unsigned)written, (unsigned)expected);
-    Log::error(TAG, msg);
+    Log::kvfe(TAG, "config.save_failed reason=short_write written=%u expected=%u",
+              (unsigned)written, (unsigned)expected);
     LittleFS.remove("/config.json.tmp");
     return false;
   }
   if (!LittleFS.rename("/config.json.tmp", "/config.json")) {
-    Log::error(TAG, "Rename config.json.tmp over config.json failed");
+    Log::error(TAG, "config.save_failed reason=rename");
     LittleFS.remove("/config.json.tmp");
     return false;
   }
-  char msg[48];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Saved %u bytes to /config.json", (unsigned)written);
-  Log::info(TAG, msg);
+  Log::kvf(TAG, "config.saved path=/config.json bytes=%u", (unsigned)written);
   return true;
 }
 
@@ -68,18 +60,15 @@ void Config::replace(const char* json) {
   _doc.clear();
   DeserializationError err = deserializeJson(_doc, json);
   if (err) {
-    char msg[64];
-    // TODO: migrate to structured logging
-    snprintf(msg, sizeof(msg), "Replace failed: %s", err.c_str());
-    Log::error(TAG, msg);
+    Log::kvfe(TAG, "config.replace_failed err=%s action=rollback", err.c_str());
     load();  // rollback to file on disk
     return;
   }
   if (!save()) {
-    Log::error(TAG, "Config replace parsed but failed to persist");
+    Log::error(TAG, "config.replace_failed reason=persist");
     return;
   }
-  Log::info(TAG, "Config replaced via MQTT");
+  Log::info(TAG, "config.replaced source=mqtt");
 }
 
 // Set one value by dot-path (e.g. "telegram.cooldown_s"), preserving
@@ -135,10 +124,12 @@ bool Config::set(const char* path, const char* value) {
     load();
     return false;
   }
-  char msg[128];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "Set %s = %s", path, value);
-  Log::info(TAG, msg);
+  if (logPathIsSensitive(path)) {
+    Log::kvf(TAG, "config.set path=%s value=<redacted> value_len=%u",
+             path, (unsigned)strlen(value));
+  } else {
+    Log::kvf(TAG, "config.set path=%s value=%s", path, value);
+  }
   return true;
 }
 

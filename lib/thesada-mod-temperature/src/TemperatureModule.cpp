@@ -42,11 +42,8 @@ void TemperatureModule::begin() {
   discoverSensors(_autoDiscover);
   if (_autoDiscover) saveDiscovered();
 
-  char msg[64];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "temp.ready sensors=%d buses=%d",
+  Log::kvf(TAG, "temp.ready sensors=%d buses=%d",
            (int)_sensorList.size(), (int)_buses.size());
-  Log::info(TAG, msg);
 
   SensorRegistry::add("temperature", "DS18B20 1-wire probes",
     [](ShellOutput out, void* ctx) {
@@ -94,10 +91,7 @@ void TemperatureModule::loadConfigSensors() {
     _sensorList.push_back(sensor);
   }
 
-  char msg[64];
-  // TODO: migrate to structured logging
-  snprintf(msg, sizeof(msg), "temp.config_loaded sensors=%d", (int)_sensorList.size());
-  Log::info(TAG, msg);
+  Log::kvf(TAG, "temp.config_loaded sensors=%d", (int)_sensorList.size());
 }
 
 // Create a OneWire + Dallas driver for one GPIO and walk it once.
@@ -118,11 +112,8 @@ void TemperatureModule::discoverSensors(bool addNew) {
     DallasTemperature* dt = _buses[b].sensors;
     int found = dt->getDeviceCount();
 
-    char msg[64];
-    // TODO: migrate to structured logging
-    snprintf(msg, sizeof(msg), "temp.bus_scan bus=%u gpio=%u found=%d",
+    Log::kvf(TAG, "temp.bus_scan bus=%u gpio=%u found=%d",
              (unsigned)b, (unsigned)_buses[b].pin, found);
-    Log::info(TAG, msg);
 
     for (int i = 0; i < found; i++) {
       DeviceAddress addr;
@@ -151,10 +142,7 @@ void TemperatureModule::discoverSensors(bool addNew) {
       sensor.busIdx = (uint8_t)b;
       _sensorList.push_back(sensor);
 
-      char log[64];
-      // TODO: migrate to structured logging
-      snprintf(log, sizeof(log), "temp.sensor_new bus=%u addr=%s", (unsigned)b, addrStr);
-      Log::info(TAG, log);
+      Log::kvf(TAG, "temp.sensor_new bus=%u addr=%s", (unsigned)b, addrStr);
     }
   }
 }
@@ -323,11 +311,8 @@ float TemperatureModule::readSensorC(TempSensor& s) {
 
   if (_maxDeltaC > 0.0f && s.lastTemp != DEVICE_DISCONNECTED_C &&
       fabsf(temp - s.lastTemp) > _maxDeltaC) {
-    char log[96];
-    // TODO: migrate to structured logging
-    snprintf(log, sizeof(log), "temp.read_rejected addr=%s last=%.2f got=%.2f reason=implausible",
-             s.addressStr, s.lastTemp, temp);
-    Log::warn(TAG, log);
+    Log::kvfw(TAG, "temp.read_rejected addr=%s last=%.2f got=%.2f reason=implausible",
+              s.addressStr, s.lastTemp, temp);
     return DEVICE_DISCONNECTED_C;
   }
   return temp;
@@ -352,10 +337,7 @@ void TemperatureModule::readAndPublish() {
     float temp = readSensorC(s);
 
     if (temp == DEVICE_DISCONNECTED_C) {
-      char log[64];
-      // TODO: migrate to structured logging
-      snprintf(log, sizeof(log), "temp.sensor_disconnected addr=%s", s.addressStr);
-      Log::warn(TAG, log);
+      Log::kvfw(TAG, "temp.sensor_disconnected addr=%s", s.addressStr);
       // Still include sensor with last known value so HA discovery works
       if (s.lastTemp != DEVICE_DISCONNECTED_C) {
         float fallbackDisplay = _useFahrenheit ? (s.lastTemp * 9.0f / 5.0f + 32.0f) : s.lastTemp;

@@ -19,11 +19,11 @@ bool SensorRegistry::add(const char* name, const char* desc,
                          SensorReadFn read, void* ctx, bool enabled) {
   if (!name || !read) return false;
   if (find(name) != nullptr) {
-    Log::warn(TAG, "duplicate sensor registration ignored");
+    Log::kvfw(TAG, "sensors.register_ignored reason=duplicate name=%s", name);
     return false;
   }
   if (_count >= MAX_SENSORS) {
-    Log::warn(TAG, "sensor table full - bump MAX_SENSORS");
+    Log::kvfw(TAG, "sensors.register_failed reason=table_full name=%s hint=bump_max_sensors", name);
     return false;
   }
   _entries[_count++] = { name, desc, read, ctx, enabled };
