@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
-#define FIRMWARE_VERSION "26.07.2"  // CalVer YY.0M.MICRO; bump on each release
+#define FIRMWARE_VERSION "26.07.3"  // CalVer YY.0M.MICRO; bump on each release
 
 // ── Memory tuning defaults ──────────────────────────────────────────────────
 #define LOG_RING_SIZE       50    // log replay lines for WS terminal
