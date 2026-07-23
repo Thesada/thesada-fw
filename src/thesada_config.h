@@ -60,8 +60,9 @@
 
 // ── Board pinout ─────────────────────────────────────────────────────────────
 // Board is set via platformio.ini build_flags (-DBOARD_S3_BARE for bare S3
-// devkit, otherwise defaults to LILYGO T-SIM7080G-S3).
-#ifndef BOARD_S3_BARE
+// devkit, -DBOARD_S3_CARRIER for the sensor carrier, otherwise defaults to
+// LILYGO T-SIM7080G-S3).
+#if !defined(BOARD_S3_BARE) && !defined(BOARD_S3_CARRIER)
   #define BOARD_LILYGO_T_SIM7080_S3
 #endif
 
@@ -77,6 +78,20 @@
   #ifndef ENABLE_SHT31
     #define ENABLE_SHT31
   #endif
+  #undef BOARD_LILYGO_T_SIM7080_S3
+#endif
+
+// Prototype sensor carrier on a bare ESP32-S3 devkit - ADS1115 + DS18B20 are
+// wired, but no LILYGO modem/PMU/SD. Same 8MB/USB-CDC geometry as
+// BOARD_S3_BARE (set in platformio.ini) but keeps the two sensor modules the
+// carrier actually populates; SHT31 is absent.
+#ifdef BOARD_S3_CARRIER
+  #undef ENABLE_CELLULAR
+  #undef ENABLE_PMU
+  #undef ENABLE_BATTERY
+  #undef ENABLE_SD
+  #undef ENABLE_SHT31
+  // ENABLE_ADS1115 + ENABLE_TEMPERATURE kept from the base defines above.
   #undef BOARD_LILYGO_T_SIM7080_S3
 #endif
 

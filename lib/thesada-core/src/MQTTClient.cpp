@@ -1818,6 +1818,8 @@ void MQTTClient::publishDeviceInfo() {
   const char* board =
 #if defined(BOARD_OWB_RESCUE)
     "owb-rescue";
+#elif defined(BOARD_S3_CARRIER)
+    "s3-carrier";
 #elif defined(BOARD_S3_BARE)
     "s3-bare";
 #else
