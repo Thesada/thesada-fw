@@ -50,6 +50,7 @@ jobs:
           pio run -e esp32-owb-debug
           pio run -e esp32-s3-debug
           pio run -e esp32-s3-debug-rescue
+          pio run -e esp32-s3-carrier
 
           # Keep OWB as the default firmware.bin for backwards compat
           cp build/boards/firmware-owb.bin build/firmware.bin
