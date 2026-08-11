@@ -135,6 +135,10 @@ jobs:
       - name: Run static analysis
         run: ./scripts/static-check.sh
 
+      # No LittleFS.open() on an unreviewed non-literal path.
+      - name: Check path safety
+        run: ./scripts/check-path-safety.sh
+
   invariant-ledger:
     # Server-side mirror of scripts/hooks/pre-commit: refuses a push or PR
     # that touches load-bearing source without updating docs/invariants.md.

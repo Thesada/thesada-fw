@@ -580,6 +580,9 @@ void ScriptEngine::begin() {
   Shell::registerCommand("lua.load", "Execute a Lua file from LittleFS",
       [](int argc, char** argv, ShellOutput out) {
         if (argc < 2) { out("Usage: lua.load <path>"); return; }
+        // argv reaches here from serial, WS, HTTP and the MQTT CLI alike, so
+        // it gets the same path policy as every other path-taking command.
+        if (!Shell::pathSafe(argv[1])) { out("Invalid path"); return; }
         extern lua_State* gL;
         if (!gL) { out("Lua state not initialized"); return; }
         if (!LittleFS.exists(argv[1])) {
