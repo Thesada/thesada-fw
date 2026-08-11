@@ -1,8 +1,16 @@
 # thesada-fw
 
-Modular ESP32 firmware for property monitoring nodes. Built from scratch in C++17 on the Arduino framework using PlatformIO. Targets the ESP32-S3 family - primary board is the LILYGO T-SIM7080G-S3 with WiFi + LTE-M/NB-IoT fallback. The node stays connected and publishing whether the access point is up or the cell tower is the only thing reachable.
+Know when your wood boiler runs dry or your well pump quits, on properties where WiFi does not reach.
 
-**Currently deployed:** monitoring an outdoor wood boiler (temperature, pump current, Telegram alerts) and indoor climate (SHT31). Running 24/7 in the field.
+![Monitoring node wired in at the boiler, sensors clamped to the supply line](docs/img/field-install.png)
+
+A node sits on the equipment and watches it. Temperature on the lines, current draw on the pump. When something goes wrong it messages your phone. When the WiFi is out of range, which out here it usually is, it falls back to the cell network and keeps reporting.
+
+![Telegram alert from the boiler node](docs/img/telegram-alert.png)
+
+Currently deployed on an outdoor wood boiler, reporting temperature, pump current and battery, plus indoor climate on a second sensor. Running 24/7 in the field.
+
+Underneath: modular ESP32 firmware, C++17 on Arduino via PlatformIO, targeting the ESP32-S3 family. Primary board is the LILYGO T-SIM7080G-S3, which is where the LTE-M/NB-IoT fallback comes from.
 
 Full documentation: [thesada.io/firmware](https://thesada.io/firmware/)
 
@@ -11,75 +19,68 @@ Full documentation: [thesada.io/firmware](https://thesada.io/firmware/)
 ## Features
 
 **Connectivity**
-- WiFi multi-SSID with RSSI ranking, configurable retries per SSID (wifi.retries, default 2), and automatic LTE-M/NB-IoT fallback (SIM7080G)
-- Fallback AP with captive portal when no WiFi network in range (configurable password + timeout)
-- TLS MQTT over both WiFi (PubSubClient) and cellular (modem-native AT commands)
-- MQTT connection watchdog (10 min timeout, force reconnect on half-open TCP sockets)
-- TCP keepalive on MQTT socket (30s idle / 10s interval / 3 probes - detects NAT timeouts)
-- CA cert loaded from filesystem - no hardcoded certificates
-- TLS heap guard - skips cert upgrade when free heap < 40KB (prevents OOM on constrained boards)
-- NTP sync with ISO 8601 timestamps in all log output
+- WiFi across multiple SSIDs, ranked by signal. When none of them answer, LTE-M/NB-IoT takes over.
+- No network in range at all? It raises its own AP with a captive portal so you can point it at one.
+- TLS MQTT over both paths. On cellular that runs through the modem's own AT stack rather than a socket library, which is most of why the cellular module is the size it is.
+- A watchdog forces a reconnect after 10 minutes of silence. Half-open TCP sockets do not announce themselves, and NAT timeouts were eating connections, so there is also a keepalive at 30s idle / 10s interval / 3 probes.
+- CA cert is read off the filesystem, so rotating it is a file push rather than a reflash. There is a baked-in root bundle underneath as a floor, for the case where someone flashes firmware without the data partition.
+- Cert upgrade is skipped below 40 KB free heap, because a TLS allocation on a constrained board takes the whole node down with it.
 
-**Sensors & power**
-- DS18B20 temperature (OneWire, multi-sensor, auto-discovery, retry on disconnect, last-known-value fallback)
-- SHT31 temperature + humidity (I2C, raw driver, no external library) [ENABLE_SHT31]
-- ADS1115 RMS current sensing (30 samples over 2x 60Hz cycles, outputs amps + watts for SCT-013-030)
-- Configurable temperature unit (C/F) - reflected in MQTT, dashboard, and HA discovery
-- AXP2101 PMU management (battery voltage/percent/charge state, solar charging, VBUS limits) [ENABLE_PMU]
-- Heartbeat LED: AXP2101 CHGLED or GPIO pin (active-low supported via negative pin number)
-- Battery monitoring with configurable low-battery alerts [ENABLE_BATTERY]
-- Configurable charge current (0-1000mA) and cutoff voltage (4.0-4.4V)
-- Deep sleep with RTC memory persistence (boot count, OTA check time)
+**Sensors and power**
+- DS18B20 temperature over OneWire. Multi-sensor, auto-discovered, falls back to the last known value when one drops off the bus.
+- SHT31 temperature and humidity, driven directly, no external library.
+- ADS1115 RMS current. 30 samples across two 60 Hz cycles, reported in amps and watts for the SCT-013-030 clamp. This is the pump-is-running signal.
+- Celsius or Fahrenheit, and the choice follows through to MQTT, the dashboard and Home Assistant.
+- AXP2101 battery and solar charging: voltage, percent, charge state, configurable charge current and cutoff.
+- Deep sleep, with boot count and last OTA check surviving in RTC memory.
 
 **Data**
-- SD card CSV logging with per-boot files and configurable log rotation (SD handling fully in SDModule)
-- MQTT publish queue with ring buffer and minimum send interval
-- MQTT CLI: full shell access over MQTT (`cli/#` - topic is command, payload is args, response on `cli/response`)
-- MQTT remote config: set single key (`cli/config.set`) or push full config (`cli/fs.write` + `cli/config.reload`)
-- MQTT file ops: `fs.write` (truncate), `fs.append`, `fs.cat` with chunked reads (offset/length for large files)
-- Home Assistant MQTT auto-discovery (per-sensor topics, availability via LWT, WiFi diagnostics)
-- Lua 5.3 scripting engine - hot-reloadable event rules without recompiling
-- Lua bindings: MQTT.subscribe, JSON.decode, EventBus, Config, Node, Telegram
+- MQTT publish queue with a ring buffer and a minimum send interval.
+- Full shell over MQTT. The topic is the command, the payload is the arguments, the answer comes back on `cli/response`.
+- Remote config: set one key, or push a whole `config.json` and reload it.
+- File operations over MQTT, including chunked reads with offset and length so a large file does not have to arrive in one piece.
+- Home Assistant auto-discovery, per sensor, with availability driven off the LWT.
+- Lua 5.3 on board. Rules are hot-reloadable, so changing alert logic does not mean a reflash.
+- SD card CSV logging, one file per boot, rotated.
+- Heap and PSRAM published every 5 minutes, each with its own HA entity. Config and script hashes ride along in device info so you can spot drift. Every Telegram alert is tagged with the heap at send time, which is what made a slow leak visible.
 
 **Web interface**
-- Live sensor dashboard (temperature, current, battery %) - no login required for read-only data
-- Admin panel (auth-gated): config editor, OTA upload, file browser, WebSocket terminal
-- LiteServer SSID dropdown with scan results and signal strength (+ manual entry fallback)
-- WebSocket terminal streams live firmware logs and accepts shell commands (replays last 50 lines on connect)
-- REST API: `POST /api/cmd` runs any shell command with JSON response
+- Live sensor dashboard, no login for read-only data.
+- Admin panel behind auth: config editor, OTA upload, file browser, terminal.
+- The terminal is a real WebSocket shell. It replays the last 50 log lines when you connect, which matters when you are trying to catch something intermittent.
 
-**Shell CLI**
-- 35+ commands across serial, WebSocket, HTTP, and MQTT - same handler, zero duplication
-- Commands: filesystem, config, network diagnostics, Lua exec, OTA trigger, selftest, battery, sensors, module status
-- Debug CLI: `ota.status`, `boot.info`, `partitions`, `chip.info`, `sdkconfig`, `net.mqtt` (subscription table + RX ring of recent topics) for remote-debug sessions without serial access
+**Shell**
+- 35+ commands, reachable over serial, WebSocket, HTTP and MQTT. One handler each, no duplicated implementations.
+- Filesystem, config, network diagnostics, Lua, OTA, selftest, sensors, module status. Plus a debug set for remote sessions with no serial access: `boot.info`, `partitions`, `chip.info`, `net.mqtt` for the subscription table and recent traffic.
 
 **OTA**
-- Push: upload `.bin` via web dashboard or curl
-- Pull: JSON manifest with SHA256 verification, periodic check + MQTT trigger
-- Watchdog-safe download loop: `yield()` + `esp_task_wdt_reset()` after every chunk + short socket/handshake timeouts keep fetchManifest and applyUpdate from stalling past the task watchdog on flaky wireless links
-- `ota.check [--force] [url]` shell command: accessible over MQTT CLI (`<prefix>/cli/ota.check`), serial, WebSocket, HTTP. `--force` bypasses version check for dev iteration and stuck-device recovery. Deferred execution so the CLI response publishes before the reboot
-- PSRAM routing: when `BOARD_HAS_PSRAM` is set, large allocations (CA cert, heap-hungry buffers) go to external PSRAM to keep the internal heap free for TLS context allocation
-
-**Telemetry**
-- Heap + PSRAM telemetry: free / min free / max alloc block / psram free published to MQTT every 5 min with HA auto-discovery for each metric
-- Config + script SHA256 hashes in device info for drift detection
-- Every Telegram alert tagged with `[heap=N]` for post-mortem correlation
+- Push a `.bin` from the dashboard or curl it up.
+- Or pull: JSON manifest, SHA256 checked before it is applied, on a timer or triggered over MQTT.
+- The download loop yields and pets the task watchdog after every chunk. Flaky links used to stall it long enough to trip the watchdog mid-update.
 
 **Security**
-- Bearer token auth: `POST /api/login` returns a 1-hour token (max 4 concurrent, auto-evict oldest)
-- HTTP Basic Auth fallback on all admin endpoints (backwards compatible with curl/scripts)
-- Per-IP rate limiting (5 failed logins - 30 s lockout)
-- WebSocket auth via pre-granted IP tokens (prevents unauthenticated shell access)
-- Sensor dashboard and `/api/state` public (read-only); all admin endpoints auth-gated
+- Bearer tokens from `POST /api/login`, one hour, four concurrent, oldest evicted.
+- Basic auth still works on admin endpoints for curl and scripts.
+- Per-IP rate limiting, 5 failed logins then a 30 second lockout. WebSocket access needs a pre-granted token, so the terminal is not an unauthenticated shell.
 
-**Alerting (Lua-driven)**
-- Alert logic lives in Lua scripts (hot-reloadable, no recompile)
-- Telegram.send(chat_id, msg) and Telegram.broadcast(msg) Lua bindings
-- Sustain counters (alert after N readings OR T minutes, whichever is less)
-- Cooldown timers (prevent repeat alerts)
-- Node.setTimeout(ms, fn) for delayed actions (e.g. boot alerts after WiFi ready)
-- Three output channels: MQTT, direct Telegram Bot API (multi-recipient), HTTP webhook
-- HTTPS requests capped at 10s to prevent MQTT keepalive starvation
+**Alerting**
+- Alert logic lives in Lua, not in the firmware. Edit the rule, reload, done.
+- Sustain counters, so a single bad reading does not page you. Cooldowns, so a real fault does not page you forty times.
+- Telegram to one recipient or many, MQTT, or an HTTP webhook.
+- `Node.setTimeout(ms, fn)` for delayed actions, which is how boot alerts wait for the network to come up.
+
+## Known limitations and ugly corners
+
+Honest list. Some of these are on the way out, some have been sitting there a while.
+
+- **No firmware signing.** The SHA256 check proves the download arrived intact, not that it came from me. Anyone who controls the manifest origin can push a build. Secure boot is off.
+- **The cellular reconnect path is hairy.** Roughly 1500 lines of state machine, and LTE and GNSS have to time-share one radio, so the recovery layers stack up: soft reset, re-register, then a power cycle. It works, and I do not love reading it. PRs welcome.
+- **Some payloads truncate silently at 256 bytes.** A few buffers just stop copying and nothing says so. On the list.
+- **Rollback is enabled but the app never marks itself valid.** Whether the Arduino core does it for us is unverified. Until someone checks, the first self-reboot after an update is a small question mark.
+- **Telegram delivery failures are log-only.** If the bot token gets rotated out from under it, the node keeps thinking it sent the alert.
+- **No well pump install yet.** Current sensing is the same mechanism either way and the boiler node has been running on it for a season, but the pump case is a build I have not finished writing up.
+
+Deeper per-subsystem writeups, including the detection and recovery paths for each failure: [docs/failure-modes/](docs/failure-modes/).
 
 ---
 
@@ -98,7 +99,7 @@ Full documentation: [thesada.io/firmware](https://thesada.io/firmware/)
 +---------------------------------------------------------+
 ```
 
-Modules self-register via `MODULE_REGISTER(Class, Priority)` at the bottom of each .cpp file - main.cpp has zero module includes and just calls `ModuleRegistry::beginAll()` / `loopAll()`. Priorities control init order: POWER(10), NETWORK(20), SERVICE(30), SCRIPT(40), SENSOR(50), OUTPUT(60). Modules communicate via EventBus - never direct calls. Lua bindings are also self-registering: modules call `ScriptEngine::addBindings()` in their `begin()`, so ScriptEngine has no module includes either.
+Modules self-register via `MODULE_REGISTER(Class, Priority)` at the bottom of each .cpp file, so main.cpp has zero module includes and just calls `ModuleRegistry::beginAll()` / `loopAll()`. Priorities control init order: POWER(10), NETWORK(20), SERVICE(30), SCRIPT(40), SENSOR(50), OUTPUT(60). Modules communicate via EventBus, never direct calls. Lua bindings are also self-registering: modules call `ScriptEngine::addBindings()` in their `begin()`, so ScriptEngine has no module includes either.
 
 Config is split: `thesada_config.h` for compile-time module enables, `config.json` on LittleFS for all runtime values.
 
@@ -120,7 +121,7 @@ Minimal build (core only) saves ~313 KB flash. Full build with all modules: 1.4 
 | ESP32-S3 bare devkit | `esp32-s3-debug` | USB CDC serial, SHT31 enabled (`BOARD_S3_BARE`) |
 | ESP32-S3 bare devkit | `esp32-s3-debug-rescue` | Rescue twin for lab validation |
 
-Rescue builds strip all optional modules except PMU via `BOARD_OWB_RESCUE` - used for OTA recovery on weak links where the full binary fails mid-download. Bare-S3 builds (`BOARD_S3_BARE`) drop the LILYGO-specific hardware (cellular, PMU, battery, SD) and switch the default sensor to SHT31 for desk testing.
+Rescue builds strip all optional modules except PMU via `BOARD_OWB_RESCUE`. That build exists for OTA recovery on weak links, where the full binary fails mid-download. Bare-S3 builds (`BOARD_S3_BARE`) drop the LILYGO-specific hardware (cellular, PMU, battery, SD) and switch the default sensor to SHT31 for desk testing.
 
 ---
 
@@ -167,7 +168,7 @@ thesada-fw/
   platformio.ini              # board environments + library deps
 ```
 
-Each `thesada-mod-*` directory is a standalone PlatformIO library with its own `library.json` (`libCompatMode: off`). All includes use angle brackets (`#include <Log.h>`) - no relative paths. Modules that wrap a static class (PowerManager, HttpServer, ScriptEngine) have thin `*Module` wrappers that handle the MODULE_REGISTER glue.
+Each `thesada-mod-*` directory is a standalone PlatformIO library with its own `library.json` (`libCompatMode: off`). All includes use angle brackets, `#include <Log.h>`, never relative paths. Modules that wrap a static class (PowerManager, HttpServer, ScriptEngine) have thin `*Module` wrappers that handle the MODULE_REGISTER glue.
 
 ---
 
