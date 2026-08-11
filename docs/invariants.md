@@ -21,13 +21,25 @@ Single source in `lib/thesada-core/src/Shell.cpp` (declaration in
 `_pathSafe` helper. MQTT binary handlers (`fs.write`, `fs.append`,
 `fs.cat` chunked) and every Shell `fs.*` handler call it directly.
 
-How enforced: every new handler that accepts a path must call
-`Shell::pathSafe()` before the FS call. Reviewers grep for new
-`LittleFS.open` outside the allow-listed locations.
+How enforced: `scripts/check-path-safety.sh`, run by the
+`static-analysis` CI job. It fails the build on any
+`LittleFS.open()` whose first argument is not a string literal unless
+that exact call is in the script's `ALLOWED` list with a comment naming
+the guard that makes it safe. Literal paths are safe by construction and
+ignored, which keeps the list to the 5 dynamic sites rather than all 28
+opens. Moving code does not break it; adding or changing a dynamic call
+does. This replaces "reviewers grep for it", which is what let
+`lua.load` ship without a check.
+
+Known gap this closed: `lua.load` (`ScriptEngine.cpp`) opened `argv[1]`
+with no `pathSafe()` call, reachable from serial, WS, HTTP and the MQTT
+CLI - every other path-taking command had one. Guarded 2026-08-10.
 
 Source: `lib/thesada-core/src/Shell.h`, `Shell.cpp`,
 `lib/thesada-core/src/MQTTClient.cpp` (cli binary handlers),
-`lib/thesada-mod-httpserver/src/HttpServer.cpp` (`_pathSafe`).
+`lib/thesada-mod-httpserver/src/HttpServer.cpp` (`_pathSafe`),
+`lib/thesada-mod-scriptengine/src/ScriptEngine.cpp` (`lua.load`),
+`scripts/check-path-safety.sh`.
 
 ### fs.* command routing goes through `Shell::resolveFS` / `Shell::stripPrefix`
 

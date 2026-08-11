@@ -22,7 +22,8 @@
 
 set -eu
 
-SENSITIVE_REGEX='^(lib/thesada-core/src/(OTAUpdate|MQTTClient|Shell|Config)\.cpp|lib/thesada-mod-httpserver/src/[^/]+\.cpp|lib/thesada-mod-cellular/src/Cellular\.cpp)$'
+# ScriptEngine registers lua.load, a path-taking shell command.
+SENSITIVE_REGEX='^(lib/thesada-core/src/(OTAUpdate|MQTTClient|Shell|Config)\.cpp|lib/thesada-mod-httpserver/src/[^/]+\.cpp|lib/thesada-mod-cellular/src/Cellular\.cpp|lib/thesada-mod-scriptengine/src/ScriptEngine\.cpp)$'
 
 files="$(cat)"
 
