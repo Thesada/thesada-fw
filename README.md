@@ -61,7 +61,7 @@ Full documentation: [thesada.io/firmware](https://thesada.io/firmware/)
 **Security**
 - Bearer tokens from `POST /api/login`, one hour, four concurrent, oldest evicted.
 - Basic auth still works on admin endpoints for curl and scripts.
-- Per-IP rate limiting, 5 failed logins then a 30 second lockout. WebSocket access needs a pre-granted token, so the terminal is not an unauthenticated shell.
+- Per-IP rate limiting, 5 failed logins then a 30-second lockout. WebSocket access needs a pre-granted token, so the terminal is not an unauthenticated shell.
 
 **Alerting**
 - Alert logic lives in Lua, not in the firmware. Edit the rule, reload, done.
