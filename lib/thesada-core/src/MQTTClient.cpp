@@ -134,8 +134,12 @@ static bool validateClientCertKey(const char* cert, const char* key) {
 
 // Raw char* (not Arduino String) so heap_caps_malloc(MALLOC_CAP_SPIRAM)
 // can route it to PSRAM, keeping ~2 KB off the internal heap.
-static char*     _caCert    = nullptr;
-static size_t    _caCertLen = 0;
+// Heap buffer for a LittleFS /ca.crt, freed by nobody and owned here.
+static char*       _caHeap    = nullptr;
+// What setCACert is handed: either _caHeap or the .rodata bundle.
+static const char* _caCert    = nullptr;
+static size_t      _caCertLen = 0;
+static bool        _tlsRefused = false;
 #else
 WiFiClient       MQTTClient::_wifiClient;
 #endif
@@ -289,23 +293,25 @@ void MQTTClient::begin() {
   _wifiClient.setTimeout(10);
   _wifiClient.setHandshakeTimeout(10);  // ssl handshake, always seconds
 
-  // Load CA cert from LittleFS; fall back to baked PROGMEM bundle; last
-  // resort setInsecure. Prefer PSRAM when available (see _caCert comment).
+  // Load CA cert from LittleFS, else point straight at the baked bundle.
+  // The bundle needs no copy: it is .rodata with static lifetime and
+  // setCACert keeps the pointer, so this path cannot fail on low heap.
   if (LittleFS.exists("/ca.crt")) {
     File cf = LittleFS.open("/ca.crt", "r");
     if (cf) {
       size_t sz = cf.size();
       if (sz > 0) {
 #if defined(BOARD_HAS_PSRAM)
-        _caCert = (char*)heap_caps_malloc(sz + 1, MALLOC_CAP_SPIRAM);
+        _caHeap = (char*)heap_caps_malloc(sz + 1, MALLOC_CAP_SPIRAM);
         const char* heapTag = "PSRAM";
 #else
-        _caCert = (char*)malloc(sz + 1);
+        _caHeap = (char*)malloc(sz + 1);
         const char* heapTag = "heap";
 #endif
-        if (_caCert) {
-          size_t readBytes = cf.readBytes(_caCert, sz);
-          _caCert[readBytes] = '\0';
+        if (_caHeap) {
+          size_t readBytes = cf.readBytes(_caHeap, sz);
+          _caHeap[readBytes] = '\0';
+          _caCert    = _caHeap;
           _caCertLen = readBytes;
           Log::kvf(TAG, "mqtt.ca_loaded path=/ca.crt bytes=%u heap=%s",
                    (unsigned)readBytes, heapTag);
@@ -316,30 +322,28 @@ void MQTTClient::begin() {
       cf.close();
     }
   }
+  // Same roots as OTA. Reached when LittleFS has no /ca.crt, and also when
+  // reading it failed - a low-heap boot lands on verified TLS, not on none.
   if (!_caCert || _caCertLen == 0) {
-    // Same roots as OTA; a stripped LittleFS must not silently go insecure.
-    // setInsecure below is a last resort for a misbuilt PROGMEM bundle.
     size_t pmLen = strlen_P(OTA_CA_PROGMEM);
     if (pmLen > 0) {
-#if defined(BOARD_HAS_PSRAM)
-      _caCert = (char*)heap_caps_malloc(pmLen + 1, MALLOC_CAP_SPIRAM);
-      const char* heapTag = "PSRAM";
-#else
-      _caCert = (char*)malloc(pmLen + 1);
-      const char* heapTag = "heap";
-#endif
-      if (_caCert) {
-        memcpy_P(_caCert, OTA_CA_PROGMEM, pmLen);
-        _caCert[pmLen] = '\0';
-        _caCertLen = pmLen;
-        Log::kvfw(TAG, "mqtt.ca_fallback source=progmem bytes=%u heap=%s",
-                  (unsigned)pmLen, heapTag);
-      }
+      _caCert    = OTA_CA_PROGMEM;
+      _caCertLen = pmLen;
+      Log::kvfw(TAG, "mqtt.ca_fallback source=progmem bytes=%u", (unsigned)pmLen);
     }
   }
   if (!_caCert || _caCertLen == 0) {
-    Log::kvfw(TAG, "mqtt.tls_insecure reason=no_ca");
-    _wifiClient.setInsecure();
+    // Only an empty baked bundle reaches here, which is a build fault, so
+    // it is opt-in rather than automatic. Mirrors ota.allow_insecure.
+    bool allowInsecure = cfg["mqtt"]["allow_insecure"] | false;
+    if (allowInsecure) {
+      Log::kvfw(TAG, "mqtt.tls_insecure reason=no_ca allow_insecure=set");
+      _wifiClient.setInsecure();
+    } else {
+      Log::error(TAG, "mqtt.tls_refused reason=no_ca allow_insecure=unset");
+      _tlsRefused = true;
+      return;
+    }
   } else {
     _wifiClient.setCACert(_caCert);
   }
@@ -543,6 +547,9 @@ void MQTTClient::rollbackIfUncommitted() {
 // Sets LWT so the broker publishes "offline" on disconnect.
 // in: none (reads Config + NVS cert namespace). out: none.
 void MQTTClient::connect() {
+  // begin() refused to configure TLS. Connecting anyway would hand the CLI
+  // an unverified channel, which is the thing the refusal exists to stop.
+  if (_tlsRefused) return;
   if (!WiFiManager::connected()) return;
 
   JsonObject  cfg      = Config::get();

@@ -154,3 +154,9 @@ HU6+4WMBzzuqQhFkoJ2UOQIReVx7Hfpkue4WQrO/isIJxOzksU0CMQDpKmFHjFJKS04YcPbWRNZu
 9YO6bVi9JNlWSOrvxKJGgYhqOkbRqZtNyWHa0V1Xahg=
 -----END CERTIFICATE-----
 )PEM";
+
+// An empty bundle would leave MQTT and OTA with no roots at all.
+// Catch it here rather than at 3am on a node in a field.
+static_assert(sizeof(OTA_CA_PROGMEM) > 1,
+              "OTA_CA_PROGMEM is empty: MQTT and OTA would have no CA roots");
+
