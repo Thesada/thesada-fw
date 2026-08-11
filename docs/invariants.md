@@ -146,14 +146,33 @@ bound of real time - across reboots, NTP or not. A certificate the floored
 clock rejects (e.g. `NotBefore` ahead of a stale floor) fails closed and
 retries until NTP corrects. The clock is never moved backwards.
 
+No-CA is also fail-closed, matching OTA. The CA comes from `/ca.crt` if
+LittleFS has it, otherwise from the baked `OTA_CA_PROGMEM` bundle, which
+is handed to `setCACert` **by pointer**: it is `.rodata` with static
+lifetime, so that path allocates nothing and cannot fail on low heap.
+That matters because it used to: both the `/ca.crt` read and the PROGMEM
+copy went through `malloc`, and either one failing dropped through to
+`setInsecure()`. A memory-pressured node therefore downgraded itself to
+an unverified channel, and `runCli` has no auth of its own, so that
+channel carries a shell. Fixed 2026-08-10.
+
+With the bundle path infallible, the only way to reach no-CA is an empty
+bundle, which is a build fault. So it is caught at build time by a
+`static_assert` in `ota_ca_progmem.h`, and at runtime it needs an
+explicit `mqtt.allow_insecure` opt-in, mirroring `ota.allow_insecure`.
+Without the opt-in `begin()` sets `_tlsRefused` and `connect()` returns
+early, so no unverified connection is ever established.
+
 How enforced: decision logic is pure (`clock_floor_policy.h`,
 host-tested in `test/test_clock_floor`). Do not reintroduce a
-clock-conditional `setInsecure()` in the connect path; the only remaining
-`setInsecure()` in MQTTClient is the `begin()`-time last resort for a
-missing CA bundle, which logs loudly.
+clock-conditional `setInsecure()` in the connect path. The one remaining
+`setInsecure()` in MQTTClient is opt-in only. Ownership is in the types:
+`_caHeap` is the owned buffer, `_caCert` is a `const char*` view that may
+point at `.rodata`, so it must never be passed to `free()`.
 
 Source: `lib/thesada-core/src/clock_floor_policy.h`,
-`lib/thesada-core/src/MQTTClient.cpp` begin()/connect()/loop().
+`lib/thesada-core/src/MQTTClient.cpp` begin()/connect()/loop(),
+`lib/thesada-core/src/ota_ca_progmem.h`.
 
 ---
 
