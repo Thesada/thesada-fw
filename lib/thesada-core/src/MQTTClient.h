@@ -204,7 +204,7 @@ public:
   static uint16_t      _bufferOut;
 
   // in:  cmd string, payload buffer (may be nullptr), payload length
-  // out: publishes to <prefix>/cli/response
+  // out: publishes to <prefix>/cli_response
   static void          runCli(const char* cmd, const char* payload, size_t plen);
 
   static uint32_t      _lastSuccessMs;      // millis() of last successful publish or MQTT loop

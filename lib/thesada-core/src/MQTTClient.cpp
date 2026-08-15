@@ -5,6 +5,7 @@
 #include "Config.h"
 #include "Secret.h"
 #include "cli_payload.h"
+#include "cli_topics.h"
 #include "mqtt_rollback_policy.h"
 #include "clock_floor_policy.h"
 #include "EventBus.h"
@@ -366,8 +367,11 @@ void MQTTClient::begin() {
   {
     JsonObject  cfg    = Config::get();
     const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-    char cliTopic[64];
-    snprintf(cliTopic, sizeof(cliTopic), "%s/cli/#", prefix);
+    char cliTopic[CLI_TOPIC_CAP];
+    if (!cliInputSubscription(cliTopic, sizeof(cliTopic), prefix)) {
+      Log::kvf("MQTT", "mqtt.cli_topic_truncated prefix=%s", prefix);
+      return;
+    }
 
     MQTTClient::subscribe(cliTopic, [](const char* topic, const char* payload) {
       // Defer CLI command to the Shell ring - executing inside the
@@ -381,8 +385,9 @@ void MQTTClient::begin() {
       // same backpressure, single drain path.
       JsonObject  cfg    = Config::get();
       const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-      char cliPrefix[64];
-      snprintf(cliPrefix, sizeof(cliPrefix), "%s/cli/", prefix);
+      char cliPrefix[CLI_TOPIC_CAP];
+      // A truncated prefix would match short and slice the wrong command out.
+      if (!cliInputPrefix(cliPrefix, sizeof(cliPrefix), prefix)) return;
       size_t prefixLen = strlen(cliPrefix);
       if (strncmp(topic, cliPrefix, prefixLen) != 0) return;
       const char* cmd = topic + prefixLen;
@@ -1102,6 +1107,26 @@ void MQTTClient::onMessage(char* topic, uint8_t* payload, unsigned int length) {
 
 // ---------------------------------------------------------------------------
 
+// Publish one CLI response. The topic sits outside the command wildcard, so
+// unlike the old one it does not echo back as an inbound URC.
+// The platform reads both topics, so it must be deployed before firmware
+// carrying this change or those devices go mute on CLI.
+// in: prefix, resp, out-buffer size. out: none.
+static void publishCliResponse(const char* prefix, JsonDocument& resp,
+                               size_t bufSz) {
+  if (bufSz == 0) bufSz = 4096;
+  char topic[CLI_TOPIC_CAP];
+  if (!cliResponseTopic(topic, sizeof(topic), prefix)) {
+    Log::kvf("MQTT", "mqtt.cli_topic_truncated prefix=%s", prefix);
+    return;
+  }
+  char* rp = (char*)malloc(bufSz);
+  if (!rp) return;
+  serializeJson(resp, rp, bufSz);
+  MQTTClient::publish(topic, rp);
+  free(rp);
+}
+
 // Dispatch a CLI command from the Shell deferred ring. cmd was extracted
 // from the topic; payload is heap-owned by the std::function capture.
 // Binary-protocol commands (fs.write, fs.cat chunked, cert.set) are
@@ -1175,11 +1200,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
         if (!Shell::pathSafe(path)) {
           resp["ok"] = false;
           resp["output"][0] = "Invalid path";
-          char respTopic[64];
-          snprintf(respTopic, sizeof(respTopic), "%s/cli/response", prefix);
-          size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
-          char* rp = (char*)malloc(bufSz);
-          if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
+          publishCliResponse(prefix, resp, _bufferOut);
           goto cleanup;
         }
 
@@ -1201,11 +1222,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
           resp["output"][0] = "Failed to open file";
         }
       }
-      char respTopic[64];
-      snprintf(respTopic, sizeof(respTopic), "%s/cli/response", prefix);
-      size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
-      char* rp = (char*)malloc(bufSz);
-      if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
+      publishCliResponse(prefix, resp, _bufferOut);
       goto cleanup;
     }
 
@@ -1221,11 +1238,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
         if (hasReqId) resp["req_id"] = reqId;
         resp["ok"] = false;
         resp["output"][0] = "Args too long";
-        char respTopic[64];
-        snprintf(respTopic, sizeof(respTopic), "%s/cli/response", prefix);
-        size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
-        char* rp = (char*)malloc(bufSz);
-        if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
+        publishCliResponse(prefix, resp, _bufferOut);
         goto cleanup;
       }
       strncpy(pbuf, payload, min(plen, sizeof(pbuf) - 1));
@@ -1250,11 +1263,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
         if (!Shell::pathSafe(path)) {  // same attack surface as fs.write
           resp["ok"] = false;
           resp["output"][0] = "Invalid path";
-          char respTopic[64];
-          snprintf(respTopic, sizeof(respTopic), "%s/cli/response", prefix);
-          size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
-          char* rp = (char*)malloc(bufSz);
-          if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
+          publishCliResponse(prefix, resp, _bufferOut);
           goto cleanup;
         }
 
@@ -1294,11 +1303,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
           f.close();
         }
 
-        char respTopic[64];
-        snprintf(respTopic, sizeof(respTopic), "%s/cli/response", prefix);
-        size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
-        char* rp = (char*)malloc(bufSz);
-        if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
+        publishCliResponse(prefix, resp, _bufferOut);
         goto cleanup;
       }
       // No offset/length: fall through to Shell::execute.
@@ -1363,11 +1368,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
         }
       }
 
-      char respTopic[64];
-      snprintf(respTopic, sizeof(respTopic), "%s/cli/response", prefix);
-      size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
-      char* rp = (char*)malloc(bufSz);
-      if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
+      publishCliResponse(prefix, resp, _bufferOut);
       goto cleanup;
     }
 
@@ -1408,11 +1409,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
         }
       }
 
-      char respTopic[64];
-      snprintf(respTopic, sizeof(respTopic), "%s/cli/response", prefix);
-      size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
-      char* rp = (char*)malloc(bufSz);
-      if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
+      publishCliResponse(prefix, resp, _bufferOut);
       goto cleanup;
     }
 
@@ -1441,11 +1438,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
       if (hasReqId) resp["req_id"] = reqId;
       resp["ok"] = false;
       resp["output"][0] = "Command line too long for shell - use chunked variant";
-      char respTopic[64];
-      snprintf(respTopic, sizeof(respTopic), "%s/cli/response", prefix);
-      size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
-      char* rp = (char*)malloc(bufSz);
-      if (rp) { serializeJson(resp, rp, bufSz); MQTTClient::publish(respTopic, rp); free(rp); }
+      publishCliResponse(prefix, resp, _bufferOut);
       goto cleanup;
     }
 
@@ -1475,14 +1468,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
       // Re-read prefix: config.reload mid-command invalidates the old pool.
       JsonObject cfgAfter = Config::get();
       const char* pfxAfter = cfgAfter["mqtt"]["topic_prefix"] | "thesada/node";
-      char respTopic[64];
-      snprintf(respTopic, sizeof(respTopic), "%s/cli/response", pfxAfter);
-      char* rp = (char*)malloc(bufSz);
-      if (rp) {
-        serializeJson(resp, rp, bufSz);
-        MQTTClient::publish(respTopic, rp);
-        free(rp);
-      }
+      publishCliResponse(pfxAfter, resp, bufSz);
     };
 
     JsonArray output = startPage();
@@ -1517,14 +1503,17 @@ void MQTTClient::reinitSubscriptions() {
 
   JsonObject  cfg    = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-  char cliTopic[64];
-  snprintf(cliTopic, sizeof(cliTopic), "%s/cli/#", prefix);
+  char cliTopic[CLI_TOPIC_CAP];
+  if (!cliInputSubscription(cliTopic, sizeof(cliTopic), prefix)) {
+    Log::kvf("MQTT", "mqtt.cli_topic_truncated prefix=%s", prefix);
+    return;
+  }
 
   MQTTClient::subscribe(cliTopic, [](const char* topic, const char* payload) {
     JsonObject  cfgInner    = Config::get();
     const char* prefixInner = cfgInner["mqtt"]["topic_prefix"] | "thesada/node";
-    char cliPrefixInner[64];
-    snprintf(cliPrefixInner, sizeof(cliPrefixInner), "%s/cli/", prefixInner);
+    char cliPrefixInner[CLI_TOPIC_CAP];
+    if (!cliInputPrefix(cliPrefixInner, sizeof(cliPrefixInner), prefixInner)) return;
     size_t prefixLen = strlen(cliPrefixInner);
     if (strncmp(topic, cliPrefixInner, prefixLen) != 0) return;
     const char* cmd = topic + prefixLen;

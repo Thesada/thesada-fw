@@ -36,7 +36,7 @@ Full documentation: [thesada.io/firmware](https://thesada.io/firmware/)
 
 **Data**
 - MQTT publish queue with a ring buffer and a minimum send interval.
-- Full shell over MQTT. The topic is the command, the payload is the arguments, the answer comes back on `cli/response`.
+- Full shell over MQTT. The topic is the command, the payload is the arguments, the answer comes back on `cli_response`.
 - Remote config: set one key, or push a whole `config.json` and reload it.
 - File operations over MQTT, including chunked reads with offset and length so a large file does not have to arrive in one piece.
 - Home Assistant auto-discovery, per sensor, with availability driven off the LWT.
