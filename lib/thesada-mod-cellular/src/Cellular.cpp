@@ -1651,16 +1651,12 @@ void Cellular::sampleSignalQuality() {
 // margin; ATGuard is acquired after the delay so other callers do
 // not stall behind a sleeping one.
 bool Cellular::publish(const char* topic, const char* payload, bool retain) {
-  if (!_started) {
-    Log::kvfw(TAG, "cellular.publish_drop reason=not_registered topic=%s", topic);
-    return false;
-  }
-  if (!_mqttConnected) {
-    Log::kvfw(TAG, "cellular.publish_drop reason=session_down topic=%s", topic);
-    return false;
-  }
-  if (!_publishGate) {
-    Log::kvfw(TAG, "cellular.publish_drop reason=gate_closed topic=%s", topic);
+  if (!connected()) {
+    const char* reason = !_started       ? "modem_not_started"
+                       : !_mqttConnected ? "session_down"
+                       : !_publishGate   ? "gate_closed"
+                                         : "unknown";
+    Log::kvfw(TAG, "cellular.publish_skipped reason=%s topic=%s", reason, topic);
     return false;
   }
 
