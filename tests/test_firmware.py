@@ -332,7 +332,7 @@ class HttpShell:
 
 class MqttShell:
     """Shell interface over MQTT CLI - publishes to <prefix>/cli/<cmd>,
-    reads response from <prefix>/cli/response.
+    reads response from <prefix>/cli_response.
 
     Requires: paho-mqtt (pip install paho-mqtt) or mosquitto_pub/sub on PATH.
     """
@@ -345,7 +345,7 @@ class MqttShell:
         self.password = password
         self.prefix  = prefix
         self.use_tls = use_tls
-        self._resp_topic = f"{prefix}/cli/response"
+        self._resp_topic = f"{prefix}/cli_response"
 
         print(f"{DIM}Testing MQTT CLI via {broker}:{port} prefix={prefix} ...{RESET}")
 

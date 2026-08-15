@@ -546,12 +546,36 @@ config-hash producer (e.g. a `cli/info` handler) must use the file.
 
 Source: `lib/thesada-core/src/MQTTClient.cpp::publishDeviceInfo`.
 
-### `cli/response` echoes caller-supplied `req_id` when payload is JSON
+### CLI responses publish outside the command wildcard
+
+The device subscribes to `<prefix>/cli/#` for commands and publishes every
+response to `<prefix>/cli_response`, which that wildcard cannot match. The
+pre-split topic `<prefix>/cli/response` did match, so the broker forwarded
+every response the device had just published back to it; over cellular that
+echo arrives as a URC larger than the modem line buffer and is dropped with
+an overflow warning, wasting AT-bus cycles and risking a real concurrent URC
+in the same window.
+
+The firmware publishes on the new topic only - it does not dual-publish. The
+platform reads both, so it must be deployed before firmware carrying this
+change or those devices go mute on CLI.
+
+How enforced: every CLI topic is built by `lib/thesada-core/src/cli_topics.h`;
+no topic literal is assembled at a call site. `test_cli_topics` asserts the
+response topic does not match the input subscription, and that command topics
+still do. Every builder reports truncation and callers must check it - a
+truncated subscription kills CLI, and a truncated input prefix matches short
+and slices the wrong command out of the topic.
+
+Source: `lib/thesada-core/src/cli_topics.h`,
+`lib/thesada-core/src/MQTTClient.cpp::publishCliResponse`.
+
+### `cli_response` echoes caller-supplied `req_id` when payload is JSON
 
 When the `cli/<cmd>` payload parses as a JSON object with a top-level
 `req_id` (string or number), every response message published to
-`cli/response` for that command carries the same `req_id` verbatim.
-Multiple in-flight CLI commands share the single `cli/response` topic
+`cli_response` for that command carries the same `req_id` verbatim.
+Multiple in-flight CLI commands share the single `cli_response` topic
 and the broker delivers them in publish order; without correlation
 the consumer cannot match a response to its request, and a response
 arriving within milliseconds of the next request is mis-routed.
@@ -568,7 +592,7 @@ publish site. Every `resp["cmd"] = cmd` is paired with
 
 Source: `lib/thesada-core/src/MQTTClient.cpp::runCli`.
 
-### `cli/response` paginates oversized command output
+### `cli_response` paginates oversized command output
 
 The general shell path in `runCli` measures the running serialized
 JSON size as it collects output lines; when the next line would
@@ -796,7 +820,7 @@ The secret fields (each `wifi.networks[].password`, `mqtt.password`,
 first, the config.json plaintext second, empty last. NVS is not reachable
 via `config.dump` or `fs.cat` (both LittleFS-only), so a platform-managed
 device provisions the value into NVS and blanks the config.json field -
-`config.dump` then leaks nothing on `cli/response`. A standalone firmware
+`config.dump` then leaks nothing on `cli_response`. A standalone firmware
 user with no platform keeps the config.json plaintext path; that fallback
 is permanent, not a deprecation.
 

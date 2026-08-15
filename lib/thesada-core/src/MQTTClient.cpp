@@ -368,7 +368,10 @@ void MQTTClient::begin() {
     JsonObject  cfg    = Config::get();
     const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
     char cliTopic[CLI_TOPIC_CAP];
-    cliInputSubscription(cliTopic, sizeof(cliTopic), prefix);
+    if (!cliInputSubscription(cliTopic, sizeof(cliTopic), prefix)) {
+      Log::kvf("MQTT", "mqtt.cli_topic_truncated prefix=%s", prefix);
+      return;
+    }
 
     MQTTClient::subscribe(cliTopic, [](const char* topic, const char* payload) {
       // Defer CLI command to the Shell ring - executing inside the
@@ -383,7 +386,8 @@ void MQTTClient::begin() {
       JsonObject  cfg    = Config::get();
       const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
       char cliPrefix[CLI_TOPIC_CAP];
-      cliInputPrefix(cliPrefix, sizeof(cliPrefix), prefix);
+      // A truncated prefix would match short and slice the wrong command out.
+      if (!cliInputPrefix(cliPrefix, sizeof(cliPrefix), prefix)) return;
       size_t prefixLen = strlen(cliPrefix);
       if (strncmp(topic, cliPrefix, prefixLen) != 0) return;
       const char* cmd = topic + prefixLen;
@@ -1103,13 +1107,19 @@ void MQTTClient::onMessage(char* topic, uint8_t* payload, unsigned int length) {
 
 // ---------------------------------------------------------------------------
 
-// Publish one CLI response. Serializes once into the configured out-buffer.
+// Publish one CLI response. The topic sits outside the command wildcard, so
+// unlike the old one it does not echo back as an inbound URC.
+// The platform reads both topics, so it must be deployed before firmware
+// carrying this change or those devices go mute on CLI.
 // in: prefix, resp, out-buffer size. out: none.
 static void publishCliResponse(const char* prefix, JsonDocument& resp,
                                size_t bufSz) {
   if (bufSz == 0) bufSz = 4096;
   char topic[CLI_TOPIC_CAP];
-  if (!cliResponseTopic(topic, sizeof(topic), prefix)) return;
+  if (!cliResponseTopic(topic, sizeof(topic), prefix)) {
+    Log::kvf("MQTT", "mqtt.cli_topic_truncated prefix=%s", prefix);
+    return;
+  }
   char* rp = (char*)malloc(bufSz);
   if (!rp) return;
   serializeJson(resp, rp, bufSz);
@@ -1494,13 +1504,16 @@ void MQTTClient::reinitSubscriptions() {
   JsonObject  cfg    = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
   char cliTopic[CLI_TOPIC_CAP];
-  cliInputSubscription(cliTopic, sizeof(cliTopic), prefix);
+  if (!cliInputSubscription(cliTopic, sizeof(cliTopic), prefix)) {
+    Log::kvf("MQTT", "mqtt.cli_topic_truncated prefix=%s", prefix);
+    return;
+  }
 
   MQTTClient::subscribe(cliTopic, [](const char* topic, const char* payload) {
     JsonObject  cfgInner    = Config::get();
     const char* prefixInner = cfgInner["mqtt"]["topic_prefix"] | "thesada/node";
     char cliPrefixInner[CLI_TOPIC_CAP];
-    cliInputPrefix(cliPrefixInner, sizeof(cliPrefixInner), prefixInner);
+    if (!cliInputPrefix(cliPrefixInner, sizeof(cliPrefixInner), prefixInner)) return;
     size_t prefixLen = strlen(cliPrefixInner);
     if (strncmp(topic, cliPrefixInner, prefixLen) != 0) return;
     const char* cmd = topic + prefixLen;
