@@ -22,4 +22,4 @@ Patches welcome. This is a one-person project running real hardware in a cold pl
 
 **Good first issues** are tagged in the issue tracker. If none are open, the "Known limitations and ugly corners" list in the [README](README.md) is a standing menu, and the truncation and Telegram-delivery items are the most self-contained of them.
 
-No CLA, no template to fill in. GPL-3.0-only, same as the rest.
+No CLA, no document to sign, no account to make. Contributions are GPL-3.0-only, same as the rest. What I do ask for is a sign-off: `git commit -s` appends a `Signed-off-by` line asserting you wrote the patch, or otherwise have the right to send it under that licence. CI checks every non-merge commit in the PR for one. If you forget, `git rebase --signoff origin/dev` fixes the whole branch in one go.
