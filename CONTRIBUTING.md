@@ -4,7 +4,7 @@ Patches welcome. This is a one-person project running real hardware in a cold pl
 
 **Before you start on something big**, open an issue and say what you have in mind. I would rather talk for ten minutes than have you spend a weekend on something I already tried.
 
-**Claim the issue first.** Comment on it and wait for me to assign it to you. I assign whoever asks first, and I write the scope into the issue when I do. A PR against an issue that is already assigned to someone else gets closed however good the code is, and that has already happened once and wasted somebody's evening. Unclaimed bugs are fair game for a drive-by patch. Claimed ones are not.
+**Claim the issue first.** Comment on it and wait for me to assign it to you. I assign whoever asks first, and I write the scope into the issue when I do. A PR against an issue that is already assigned to someone else gets closed however good the code is, and that has already happened once and wasted somebody's evening. Unclaimed bugs are fair game for a drive-by patch. Claimed ones are not. That covers agents as well as people: machine-generated patches are welcome, but whatever opens the PR has to claim the issue and answer on it, and one that will not hold a conversation does not get assigned.
 
 **Branches.** `dev` is where work lands and it is the default branch, so branch off `dev` and target `dev`. `main` is release-only: it moves when a version ships. If you open against `main` I will just retarget it, no drama.
 
