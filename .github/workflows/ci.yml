@@ -118,6 +118,35 @@ jobs:
       - name: Run native unit tests
         run: pio test -e native
 
+  coverage:
+    # Line coverage over the same pure units the native tests exercise, floored
+    # per file in scripts/coverage-floors.txt. Separate job from native-tests so
+    # the fast unit run is not slowed by the instrumented build.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO and gcovr
+        run: pip install --upgrade platformio gcovr
+
+      - name: Run coverage gate
+        run: ./scripts/check-coverage.sh
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: build/coverage/
+
   static-analysis:
     # cppcheck over the pure security units (scripts/static-check.sh). Fast,
     # gates the release alongside the native unit tests.
@@ -227,7 +256,7 @@ jobs:
           fi
 
   release:
-    needs: [build, lua-tests, native-tests, static-analysis, invariant-ledger]
+    needs: [build, lua-tests, native-tests, coverage, static-analysis, invariant-ledger]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
