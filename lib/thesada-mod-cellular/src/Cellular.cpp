@@ -1651,7 +1651,14 @@ void Cellular::sampleSignalQuality() {
 // margin; ATGuard is acquired after the delay so other callers do
 // not stall behind a sleeping one.
 bool Cellular::publish(const char* topic, const char* payload, bool retain) {
-  if (!connected()) return false;
+  if (!connected()) {
+    const char* reason = !_started       ? "modem_not_started"
+                       : !_mqttConnected ? "session_down"
+                       : !_publishGate   ? "gate_closed"
+                                         : "unknown";
+    Log::kvfw(TAG, "cellular.publish_skipped reason=%s topic=%s", reason, topic);
+    return false;
+  }
 
   // Rate-limit before AT-bus acquire so concurrent callers wait for the
   // mutex, not for a sleeping publisher. Each successful publish updates
