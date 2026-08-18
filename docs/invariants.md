@@ -16,8 +16,10 @@ edit.
 ### All external file paths pass through `Shell::pathSafe()` before any `LittleFS.open()`
 
 Policy: leading `/` required, reject `..`, reject `//`, reject empty.
-Single source in `lib/thesada-core/src/Shell.cpp` (declaration in
-`Shell.h`). HTTP `/api/file` delegates via the HttpServer-local
+Single source is the pure unit `pathSafePolicy()` in
+`lib/thesada-core/src/path_safety_policy.h`; `Shell::pathSafe` is the
+Arduino-side wrapper that every transport calls, and it does nothing but
+delegate. HTTP `/api/file` delegates via the HttpServer-local
 `_pathSafe` helper. MQTT binary handlers (`fs.write`, `fs.append`,
 `fs.cat` chunked) and every Shell `fs.*` handler call it directly.
 
@@ -35,7 +37,11 @@ Known gap this closed: `lua.load` (`ScriptEngine.cpp`) opened `argv[1]`
 with no `pathSafe()` call, reachable from serial, WS, HTTP and the MQTT
 CLI - every other path-taking command had one. Guarded 2026-08-10.
 
-Source: `lib/thesada-core/src/Shell.h`, `Shell.cpp`,
+Also unit-tested host-side: `test/test_path_safety/` covers traversal,
+empty segments, relative paths and the deliberate false positive on a
+filename containing `..`. Coverage floored in `scripts/coverage-floors.txt`.
+
+Source: `lib/thesada-core/src/path_safety_policy.h`, `Shell.h`, `Shell.cpp`,
 `lib/thesada-core/src/MQTTClient.cpp` (cli binary handlers),
 `lib/thesada-mod-httpserver/src/HttpServer.cpp` (`_pathSafe`),
 `lib/thesada-mod-scriptengine/src/ScriptEngine.cpp` (`lua.load`),

@@ -12,6 +12,7 @@
 #include "OTAUpdate.h"
 #include "SensorRegistry.h"
 #include "Net.h"
+#include "path_safety_policy.h"
 #include <thesada_config.h>
 #include <mbedtls/platform_util.h>
 #include <esp_ota_ops.h>
@@ -404,11 +405,7 @@ void Shell::printRegisteredDf(ShellOutput out) {
 // MQTT CLI binary handlers) shares one policy. See Shell::pathSafe in Shell.h.
 // in:  null-terminated path. out: true if safe.
 bool Shell::pathSafe(const char* path) {
-  if (!path || !*path) return false;
-  if (path[0] != '/') return false;
-  if (strstr(path, "..") != nullptr) return false;
-  if (strstr(path, "//") != nullptr) return false;
-  return true;
+  return pathSafePolicy(path);
 }
 
 static void cmd_ls(int argc, char** argv, ShellOutput out) {
