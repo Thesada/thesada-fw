@@ -195,6 +195,37 @@ jobs:
         if: steps.bypass.outputs.found == 'true'
         run: echo "INVARIANT_OK trailer found in commit range - skipping ledger check."
 
+  # Every non-merge commit in a PR must carry Signed-off-by. PR-only: the
+  # squash commit on dev/main is written by the merge box, not a contributor.
+  dco:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Check sign-off
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          missing=0
+          for sha in $(git rev-list --no-merges "$BASE_SHA..$HEAD_SHA"); do
+            if ! git log -1 --format=%B "$sha" \
+                | grep -qiE '^Signed-off-by: .+ <.+@.+>[[:space:]]*$'; then
+              echo "missing Signed-off-by: $sha $(git log -1 --format=%s "$sha")" >&2
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "" >&2
+            echo "Fix the whole branch with: git rebase --signoff $BASE_REF" >&2
+            exit 1
+          fi
+
   release:
     needs: [build, lua-tests, native-tests, static-analysis, invariant-ledger]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
