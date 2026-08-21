@@ -66,7 +66,6 @@ MODULE_GATES = {
     "SHT31":             ("sht31",       False),
     "TelegramModule":    ("telegram",    False),
     "HttpServer":        ("web",         False),
-    "LiteServer":        ("web",         False),
     "ScriptEngine":      ("lua",         False),
     "PowerManager":      ("power",       True),
 }

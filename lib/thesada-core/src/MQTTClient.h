@@ -13,6 +13,7 @@
 #include <time.h>
 #include <vector>
 #include <thesada_config.h>
+#include "cli_authz_policy.h"
 
 #ifndef MQTT_QUEUE_SIZE
   #define MQTT_QUEUE_SIZE 8
@@ -98,9 +99,16 @@ public:
 
   // Dispatch an inbound MQTT message into the registered subscription callbacks.
   // Wildcard / exact match logic identical to the WiFi PubSubClient onMessage path.
+  // Tagged with the fallback session's auth mode, so a CLI command arriving
+  // here is judged on how THAT session authenticated.
   // in:  topic / payload / length
   // out: none
   static void dispatchInbound(const char* topic, const char* payload, size_t length);
+
+  // How the fallback transport's own broker session authenticated. Its own
+  // session and its own credential, live at the same time as the WiFi one.
+  // in:  active  true = that session presented this device's client cert
+  static void setFallbackSessionMTLS(bool active);
 
   // Iterate active subscription topics.
   // in:  fn  called with each topic string
@@ -204,8 +212,10 @@ public:
   static uint16_t      _bufferOut;
 
   // in:  cmd string, payload buffer (may be nullptr), payload length
+  // in:  auth  how the delivering session authenticated, frozen at dispatch
   // out: publishes to <prefix>/cli_response
-  static void          runCli(const char* cmd, const char* payload, size_t plen);
+  static void          runCli(const char* cmd, const char* payload, size_t plen,
+                              CliAuthMode auth);
 
   static uint32_t      _lastSuccessMs;      // millis() of last successful publish or MQTT loop
   static uint32_t      _connectedSinceMs;   // millis() when current connection was established

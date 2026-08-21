@@ -38,7 +38,6 @@
 
 // ── Optional core services ──────────────────────────────────────────────────
 #define ENABLE_WEBSERVER     // Web UI, REST API, dashboard, OTA upload
-// #define ENABLE_LITESERVER // Lightweight HTTP (OTA + config, for heap-limited boards)
 #define ENABLE_SCRIPTENGINE  // Lua scripting (alerts.lua, rules.lua)
 
 // ── Dependency warnings ──────────────────────────────────────────────────────
@@ -53,9 +52,6 @@
 #endif
 #if defined(ENABLE_GNSS) && !defined(ENABLE_CELLULAR)
   #error "ENABLE_GNSS requires ENABLE_CELLULAR (shares the SIM7080 modem core)"
-#endif
-#if defined(ENABLE_WEBSERVER) && defined(ENABLE_LITESERVER)
-  #error "ENABLE_WEBSERVER and ENABLE_LITESERVER are mutually exclusive"
 #endif
 
 // ── Board pinout ─────────────────────────────────────────────────────────────
@@ -95,6 +91,16 @@
   #undef BOARD_LILYGO_T_SIM7080_S3
 #endif
 
+// ── Device identity ──────────────────────────────────────────────────────────
+// First-boot device_id + Ed25519 keypair (Identity.cpp). Costs ~97 KB of
+// flash for libsodium, so the rescue block below turns it off: a rescue image
+// exists to be small on a weak link, and identity already in NVS is untouched
+// by a firmware that does not read it. Defined here, ahead of the override
+// block, so the #undef is not re-defaulted afterwards.
+#ifndef ENABLE_IDENTITY
+  #define ENABLE_IDENTITY
+#endif
+
 // OWB rescue build - minimal firmware for remote unbricking via OTA on a
 // weak link. Keeps PMU (mandatory for VBUS accept) + core (WiFi/MQTT/OTA).
 // Strips every optional module to shrink the binary so it has a fighting
@@ -109,9 +115,9 @@
   #undef ENABLE_CELLULAR
   #undef ENABLE_TELEGRAM
   #undef ENABLE_WEBSERVER
-  #undef ENABLE_LITESERVER
   #undef ENABLE_SCRIPTENGINE
   #undef ENABLE_PWM
+  #undef ENABLE_IDENTITY
   // ENABLE_PMU stays - AXP2101 must be initialized or board rejects VBUS
 #endif
 
@@ -120,6 +126,12 @@
 // MQTT_TLS controls whether WiFiClientSecure is compiled in.
 // Set to false only for local unencrypted testing brokers.
 #define MQTT_TLS  true
+
+// mTLS listener port. A session only counts as mTLS when it landed here;
+// the app pins the same value in THESADA_MQTT_DEVICE_MTLS_PORT.
+#ifndef MQTT_MTLS_PORT
+  #define MQTT_MTLS_PORT 8884
+#endif
 
 // ── Phase 3 heap safeguards ───────────────────────────────────
 // Preventive reboot when free heap stays below the floor for the hold

@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include <thesada_config.h>
+#include <Identity.h>
 #ifdef ENABLE_SHT31
 
 #include "SHT31Module.h"
@@ -126,7 +127,7 @@ void SHT31Module::publishHaDiscovery() {
   }
   const char* prefix  = cfg["mqtt"]["topic_prefix"] | "thesada/node";
   const char* devName = cfg["device"]["friendly_name"] | cfg["device"]["name"] | "Thesada Node";
-  const char* devId   = cfg["device"]["name"] | "thesada_node";
+  const char* devId   = Identity::nodeName();
   const char* unit    = cfg["temperature"]["unit"] | "C";
   const char* haUnit  = (unit[0] == 'F' || unit[0] == 'f') ? "\xC2\xB0""F" : "\xC2\xB0""C";
 

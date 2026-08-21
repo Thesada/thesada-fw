@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include <thesada_config.h>
+#include <Identity.h>
 #ifdef ENABLE_CELLULAR
 
 #include "Cellular.h"
@@ -693,9 +694,13 @@ bool Cellular::mqttConnect() {
   int         port     = cfg["mqtt"]["port"]      | 8883;
   const char* user     = cfg["mqtt"]["user"]      | "";
   const char* password = cfg["mqtt"]["password"]  | "";
-  const char* devName  = cfg["device"]["name"]    | "thesada-node";
+  const char* devName  = Identity::nodeName();
 
   Log::info(TAG, "cellular.mqtt.configure");
+
+  // The session about to be torn down below takes its auth verdict with it.
+  // Every exit from here that is not a live SMCONN must leave it at password.
+  MQTTClient::setFallbackSessionMTLS(false);
 
   // Strong teardown: SMDISC alone is not enough after a warm SMCONN
   // failure - the SIM7080 keeps the URL slot half-locked and the next
@@ -762,7 +767,10 @@ bool Cellular::mqttConnect() {
   // upload if the cache flag says it is already there from a prior
   // session - the modem FS persists across SMDISC, just not across
   // a hardware power cycle (handled by hardReset / modemSoftReset).
-  bool wantMTLS = MQTTClient::hasClientCert() && _hasCACert;
+  // Same rule as the WiFi session: mTLS only on the mTLS listener, so a
+  // session dialled to any other port authenticates and is judged password.
+  bool wantMTLS = MQTTClient::hasClientCert() && _hasCACert &&
+                  port == MQTT_MTLS_PORT;
   if (wantMTLS && !_hasClientCertOnModem) {
     if (writeClientCert()) {
       _hasClientCertOnModem = true;
@@ -851,6 +859,9 @@ bool Cellular::mqttConnect() {
   }
 
   Log::info(TAG, "cellular.mqtt.connected");
+
+  // This session's own credential decides what its CLI commands may run.
+  MQTTClient::setFallbackSessionMTLS(wantMTLS);
 
   // Re-issue every WiFi-side subscription on the cellular MQTT session
   //. Reconnect path benefits too - the modem drops subscriptions

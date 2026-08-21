@@ -13,6 +13,7 @@
 #include <soc/soc_caps.h>
 #include "thesada_config.h"
 #include <Config.h>
+#include <Identity.h>
 #include <ModuleRegistry.h>
 #include <WiFiManager.h>
 #include <MQTTClient.h>
@@ -126,6 +127,10 @@ void setup() {
   esp_log_level_set("vfs_api", ESP_LOG_NONE);
 
   Config::load();
+
+  // Before any transport: a factory-fresh unit must have an identity to
+  // announce itself with, and it must survive a firmware reflash.
+  if (!Identity::begin()) Log::warn("Boot", "boot.identity_unavailable");
 
   {
     JsonObject cfg    = Config::get();

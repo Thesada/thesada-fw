@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "Shell.h"
+#include "Identity.h"
 #include "Config.h"
 #include "Secret.h"
 #include "Console.h"
@@ -562,6 +563,46 @@ static void cmd_df(int argc, char** argv, ShellOutput out) {
   Shell::printRegisteredDf(out);
 }
 
+// Report identity without ever touching the private key - the public half and
+// the id are the only things any caller needs.
+static void cmd_identity_info(int argc, char** argv, ShellOutput out) {
+  (void)argc; (void)argv;
+  char line[128];
+  const char* id  = Identity::deviceId();
+  const char* pub = Identity::publicKeyHex();
+  snprintf(line, sizeof(line), "device_id: %s", *id ? id : "(none)");
+  out(line);
+  snprintf(line, sizeof(line), "pubkey: %s", *pub ? pub : "(none)");
+  out(line);
+  snprintf(line, sizeof(line), "node_name: %s", Identity::nodeName());
+  out(line);
+  snprintf(line, sizeof(line), "factory-provisioned: %s",
+           Identity::hasClientCert() ? "true" : "false");
+  out(line);
+  if (!Identity::canMint()) out("minting: off (rescue build, read-only)");
+}
+
+// Destroys the keypair. The next boot mints a new one, so anything that
+// trusted the old public key must re-pair.
+static void cmd_identity_reset(int argc, char** argv, ShellOutput out) {
+  if (argc < 2 || strcmp(argv[1], "--yes") != 0) {
+    out("Usage: identity.reset --yes  (DESTROYS the device keypair)");
+    return;
+  }
+  // A build that cannot mint would erase into nothing and leave the unit on
+  // the shared fallback name.
+  if (!Identity::canMint()) {
+    out("identity: this build cannot mint - reset would leave no identity");
+    return;
+  }
+  bool ok = Identity::erase();
+  out(ok ? "identity erased - rebooting to regenerate"
+         : "identity erase FAILED");
+  if (!ok) return;
+  delay(200);
+  esp_restart();
+}
+
 // Reformat LittleFS - destroys every file. Requires `fs.format --yes` so
 // a stray `fs.format` press over MQTT cannot wipe a device. Use case:
 // recover from a corrupt / zombie-dirent state when targeted fs.rm
@@ -569,9 +610,6 @@ static void cmd_df(int argc, char** argv, ShellOutput out) {
 // of the firmware (Lua state, MQTT subs, OTA timers) starts fresh
 // against the empty filesystem instead of crashing on stale handles.
 // Caller is responsible for re-uploading config.json + ca.crt + scripts.
-//
-// In:  argv[1] must be "--yes"
-// Out: status line, then reboot
 static void cmd_format(int argc, char** argv, ShellOutput out) {
   if (argc < 2 || strcmp(argv[1], "--yes") != 0) {
     out("Usage: fs.format --yes  (DESTROYS every file on LittleFS)");
@@ -1770,6 +1808,16 @@ static void cmd_chip_info(int argc, char** argv, ShellOutput out) {
            model, (unsigned)info.revision, (unsigned)info.cores);
   out(line);
 
+  const char* id  = Identity::deviceId();
+  const char* pub = Identity::publicKeyHex();
+  snprintf(line, sizeof(line), "device_id: %s", *id ? id : "(none)");
+  out(line);
+  snprintf(line, sizeof(line), "pubkey: %s", *pub ? pub : "(none)");
+  out(line);
+  snprintf(line, sizeof(line), "factory-provisioned: %s",
+           Identity::hasClientCert() ? "true" : "false");
+  out(line);
+
   uint32_t flashSize = 0;
   esp_flash_get_size(NULL, &flashSize);
   snprintf(line, sizeof(line), "flash: %lu bytes (%.2f MB)",
@@ -1894,7 +1942,7 @@ static void cmd_version(int argc, char** argv, ShellOutput out) {
   out(line);
 
   JsonObject cfg = Config::get();
-  const char* devName   = cfg["device"]["name"]        | "";
+  const char* devName   = Identity::nodeName();
   const char* topicPref = cfg["mqtt"]["topic_prefix"]  | "";
   snprintf(line, sizeof(line), "device: %s  topic: %s",
            devName[0]   ? devName   : "?",
@@ -2122,6 +2170,8 @@ void Shell::registerBuiltins() {
   registerCommand("boot.info",     "Last reset reason + uptime",    cmd_boot_info);
   registerCommand("partitions",    "Full partition table dump",     cmd_partitions);
   registerCommand("chip.info",     "Chip revision, flash, PSRAM",   cmd_chip_info);
+  registerCommand("identity.info",  "Device id and public key",      cmd_identity_info);
+  registerCommand("identity.reset", "Wipe device keypair (identity.reset --yes)", cmd_identity_reset);
   registerCommand("sdkconfig",     "Selected CONFIG_* relevant to OTA/boot", cmd_sdkconfig);
 
   // Module
