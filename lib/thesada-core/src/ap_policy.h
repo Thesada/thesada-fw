@@ -27,6 +27,15 @@ inline bool apPasswordUsable(const char* pass) {
   return strlen(pass) >= AP_PASS_MIN_LEN;
 }
 
+// Classify a resolved AP passphrase for status output - never the value.
+// in: resolved passphrase (Secret then config). out: static state string.
+inline const char* apPasswordState(const char* pass) {
+  if (!pass || !*pass) return "absent";
+  if (strcmp(pass, AP_PASS_PLACEHOLDER) == 0) return "default";
+  if (strlen(pass) < AP_PASS_MIN_LEN) return "too-short";
+  return "set";
+}
+
 // Should the fallback AP be started at all?
 //
 // Refusing is deliberate, and it is the fail-closed direction. An open or

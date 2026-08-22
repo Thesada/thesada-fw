@@ -258,6 +258,41 @@ void MQTTClient::setFallbackPublishing(bool active) {
 
 // ---------------------------------------------------------------------------
 
+// Shared inbound CLI dispatch for both subscribe registrations (begin and
+// reinitSubscriptions) - one copy or the two drift. Defers to the Shell ring:
+// executing inside the PubSubClient callback blocks keepalive and causes
+// disconnects on slow operations (LittleFS writes, config reload, etc).
+// in: raw topic + payload from the broker callback. out: none.
+static void cliInboundHandler(const char* topic, const char* payload) {
+  JsonObject  cfg    = Config::get();
+  const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+  char cliPrefix[CLI_TOPIC_CAP];
+  // A truncated prefix would match short and slice the wrong command out.
+  if (!cliInputPrefix(cliPrefix, sizeof(cliPrefix), prefix)) return;
+  size_t prefixLen = strlen(cliPrefix);
+  if (strncmp(topic, cliPrefix, prefixLen) != 0) return;
+  const char* cmd = topic + prefixLen;
+  if (strlen(cmd) == 0 || strcmp(cmd, "response") == 0) return;
+
+  // Copy cmd + payload onto the heap so the lambda owns them past the
+  // lifetime of this callback. std::string capture handles destruction
+  // when the slot's DeferredFn is reset on drain.
+  std::string cmdCopy(cmd);
+  size_t plen = payload ? strlen(payload) : 0;
+  std::string payloadCopy(payload ? payload : "", plen);
+
+  // Frozen here, not read at drain time: the transport can fail over
+  // between the two and the gate must judge the session that spoke.
+  CliAuthMode auth = _inboundAuth;
+  bool ok = Shell::enqueueDeferred(
+    [cmdCopy = std::move(cmdCopy), payloadCopy = std::move(payloadCopy), auth]() {
+      MQTTClient::runCli(cmdCopy.c_str(),
+                         payloadCopy.empty() ? nullptr : payloadCopy.c_str(),
+                         payloadCopy.size(), auth);
+    });
+  if (!ok) Log::warn("MQTT", "mqtt.cli_dropped reason=busy");
+}
+
 // Initialize MQTT: load config, TLS certs, set up subscriptions, connect.
 // in: none (reads Config, LittleFS /ca.crt, NVS cert namespace).
 // out: none.
@@ -403,44 +438,13 @@ void MQTTClient::begin() {
       return;
     }
 
-    MQTTClient::subscribe(cliTopic, [](const char* topic, const char* payload) {
-      // Defer CLI command to the Shell ring - executing inside the
-      // PubSubClient callback blocks keepalive and causes disconnects on
-      // slow operations (LittleFS writes, config reload, etc). The
-      // generic shell-line path goes through Shell::enqueue;
-      // binary-payload commands (fs.write, fs.cat chunked, cert.set) and
-      // the response-shape contract (one cli/response message per
-      // command, JSON array of output lines) need their own handler so
-      // they go through Shell::enqueueDeferred. Same ring,
-      // same backpressure, single drain path.
-      JsonObject  cfg    = Config::get();
-      const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-      char cliPrefix[CLI_TOPIC_CAP];
-      // A truncated prefix would match short and slice the wrong command out.
-      if (!cliInputPrefix(cliPrefix, sizeof(cliPrefix), prefix)) return;
-      size_t prefixLen = strlen(cliPrefix);
-      if (strncmp(topic, cliPrefix, prefixLen) != 0) return;
-      const char* cmd = topic + prefixLen;
-      if (strlen(cmd) == 0 || strcmp(cmd, "response") == 0) return;
-
-      // Copy cmd + payload onto the heap so the lambda owns them past the
-      // lifetime of this callback. std::string capture handles destruction
-      // when the slot's DeferredFn is reset on drain.
-      std::string cmdCopy(cmd);
-      size_t plen = payload ? strlen(payload) : 0;
-      std::string payloadCopy(payload ? payload : "", plen);
-
-      // Frozen here, not read at drain time: the transport can fail over
-      // between the two and the gate must judge the session that spoke.
-      CliAuthMode auth = _inboundAuth;
-      bool ok = Shell::enqueueDeferred(
-        [cmdCopy = std::move(cmdCopy), payloadCopy = std::move(payloadCopy), auth]() {
-          MQTTClient::runCli(cmdCopy.c_str(),
-                             payloadCopy.empty() ? nullptr : payloadCopy.c_str(),
-                             payloadCopy.size(), auth);
-        });
-      if (!ok) Log::warn("MQTT", "mqtt.cli_dropped reason=busy");
-    });
+    // The generic shell-line path goes through Shell::enqueue;
+    // binary-payload commands (fs.write, fs.cat chunked, cert.set) and
+    // the response-shape contract (one cli/response message per command,
+    // JSON array of output lines) need their own handler, so inbound CLI
+    // goes through cliInboundHandler onto the same ring, same
+    // backpressure, single drain path.
+    MQTTClient::subscribe(cliTopic, cliInboundHandler);
   }
 
 
@@ -634,8 +638,13 @@ void MQTTClient::connect() {
   if (hasClientCert()) {
     if (!_clientCert) _clientCert = (char*)malloc(CERT_MAX_LEN);
     if (!_clientKey)  _clientKey  = (char*)malloc(CERT_MAX_LEN);
-    if (_clientCert && _clientKey &&
-        loadClientCert(_clientCert, _clientKey, CERT_MAX_LEN)) {
+    if (!_clientCert || !_clientKey) {
+      // Heap pressure says nothing about the cert: keep the last broken
+      // verdict so a full heap cannot open cert.clear to a password session.
+      free(_clientCert); _clientCert = nullptr;
+      free(_clientKey);  _clientKey  = nullptr;
+      Log::warn(TAG, "mqtt.mtls_load_oom fallback=password");
+    } else if (loadClientCert(_clientCert, _clientKey, CERT_MAX_LEN)) {
       if (validateClientCertKey(_clientCert, _clientKey)) {
         _storedCertBroken = false;
         // A usable cert is not enough. mTLS follows the listener this session
@@ -654,8 +663,8 @@ void MQTTClient::connect() {
         Log::kvfw(TAG, "mqtt.mtls_cert_invalid fallback=password");
       }
     } else {
-      // Free both on any failure (malloc partial or NVS miss) - a stranded
-      // 4 KB buffer starves the next connect attempt. free(nullptr) is safe.
+      // NVS rows exist but will not load: that is a broken pair. Free the
+      // buffers - a stranded 4 KB pair starves the next connect attempt.
       free(_clientCert); _clientCert = nullptr;
       free(_clientKey);  _clientKey  = nullptr;
       _storedCertBroken = true;
@@ -1586,31 +1595,7 @@ void MQTTClient::reinitSubscriptions() {
     return;
   }
 
-  MQTTClient::subscribe(cliTopic, [](const char* topic, const char* payload) {
-    JsonObject  cfgInner    = Config::get();
-    const char* prefixInner = cfgInner["mqtt"]["topic_prefix"] | "thesada/node";
-    char cliPrefixInner[CLI_TOPIC_CAP];
-    if (!cliInputPrefix(cliPrefixInner, sizeof(cliPrefixInner), prefixInner)) return;
-    size_t prefixLen = strlen(cliPrefixInner);
-    if (strncmp(topic, cliPrefixInner, prefixLen) != 0) return;
-    const char* cmd = topic + prefixLen;
-    if (strlen(cmd) == 0 || strcmp(cmd, "response") == 0) return;
-
-    std::string cmdCopy(cmd);
-    size_t plen = payload ? strlen(payload) : 0;
-    std::string payloadCopy(payload ? payload : "", plen);
-
-    // Frozen here, not read at drain time: the transport can fail over
-    // between the two and the gate must judge the session that spoke.
-    CliAuthMode auth = _inboundAuth;
-    bool ok = Shell::enqueueDeferred(
-      [cmdCopy = std::move(cmdCopy), payloadCopy = std::move(payloadCopy), auth]() {
-        MQTTClient::runCli(cmdCopy.c_str(),
-                           payloadCopy.empty() ? nullptr : payloadCopy.c_str(),
-                           payloadCopy.size(), auth);
-      });
-    if (!ok) Log::warn("MQTT", "mqtt.cli_dropped reason=busy");
-  });
+  MQTTClient::subscribe(cliTopic, cliInboundHandler);
 
   OTAUpdate::begin();
 
@@ -1642,7 +1627,16 @@ void MQTTClient::publishDiscovery() {
 
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
   const char* devName = cfg["device"]["friendly_name"] | cfg["device"]["name"] | "Thesada Node";
-  const char* devId = Identity::nodeName();
+  // The persistent id keys HA identity, never nodeName(): device.name is an
+  // operator label, and editing it would re-key uniq_id and the retained
+  // config topics, leaving the old entities orphaned beside new duplicates.
+  // Migration: units that published discovery under a device.name keep those
+  // retained topics until they are cleared broker-side.
+  const char* devId = Identity::deviceId();
+  if (!devId || !*devId) {
+    Log::warn(TAG, "mqtt.ha_discovery_skipped reason=identity_unavailable");
+    return;
+  }
 
   char availTopic[64];
   snprintf(availTopic, sizeof(availTopic), "%s/status", prefix);

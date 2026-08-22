@@ -51,6 +51,11 @@ const char* Identity::nodeName() {
   return FALLBACK_NAME;
 }
 
+bool Identity::nodeNameUnique() {
+  JsonObject cfg = Config::get();
+  return identityNodeNameUnique(cfg["device"]["name"] | "", _deviceId);
+}
+
 // out: true only when id and public key are both present and the id still has
 // the shape this firmware generates.
 static bool loadExisting() {
@@ -80,13 +85,17 @@ static bool loadExisting() {
 bool Identity::erase() {
   nvs_handle_t h;
   if (nvs_open(IDENT_NS, NVS_READWRITE, &h) != ESP_OK) return false;
-  nvs_erase_all(h);
-  esp_err_t e = nvs_commit(h);
+  // Clear the in-RAM copy only once NVS is actually empty. Dropping it on a
+  // failed erase strands the unit on the fallback name while the old keypair
+  // is still on flash.
+  esp_err_t e = nvs_erase_all(h);
+  if (e == ESP_OK) e = nvs_commit(h);
   nvs_close(h);
+  if (e != ESP_OK) return false;
   _deviceId[0] = '\0';
   _pubHex[0]   = '\0';
   _ready       = false;
-  return e == ESP_OK;
+  return true;
 }
 
 #ifdef ENABLE_IDENTITY

@@ -277,15 +277,38 @@ treated as absent for the same reason.
 The id uses all six MAC bytes, not a suffix: Espressif assigns sequentially,
 so a short suffix collides across OUIs.
 
-`Identity::nodeName()` is `device.name` when set, otherwise the generated id,
-and the shared literal `thesada-node` only when identity is compiled out. It is
+`Identity::nodeName()` is `device.name` when set, otherwise the generated id.
+The shared literal `thesada-node` remains only while no identity exists in
+NVS: a build that cannot mint (rescue), or a boot whose mint failed
+(`identity.mac_read_failed` / `identity.sodium_init_failed` /
+`identity.keygen_failed` / `identity.persist_failed`), stays on the literal
+until the next successful mint. It is
 unique per unit only while `device.name` is unset: the label ships as a fixed
 string in the config image, so a fleet flashed from one image answers to one
-name. The MQTT clientId and the Home Assistant discovery device id read it -
-two units answering to one clientId evict each other from the broker. The
-fallback AP name does not: `startFallbackAP` calls `apSsidFor(...,
-Identity::deviceId(), name)`, and `ap_policy.h` prefers the device id, dropping
-back to the node name only when the id is empty.
+name. The MQTT clientId reads it, and two units answering to one clientId evict
+each other from the broker, so no broker path may run on the literal.
+`identityNodeNameUnique(device.name, device_id)` is the gate: `setup()` clears
+`_mqttEnabled` (`boot.mqtt_disabled reason=node_name_not_unique`) and
+`Cellular::mqttConnect` refuses before configuring the modem session
+(`cellular.mqtt.refused`). The cellular recovery loop returns on that refusal
+rather than retrying, because it cannot clear without a reboot. `Shell` still
+starts either way - serial is the recovery route.
+
+Home Assistant discovery does not read the node name. `MQTTClient::publishDiscovery`
+and `SHT31Module::publishHaDiscovery` key `dev.ids`, `uniq_id` and the retained
+`homeassistant/.../config` topic on `Identity::deviceId()`, so renaming a device
+cannot orphan its entities; both skip discovery when the id is empty. Migration:
+a unit that already published discovery under a `device.name` keeps those
+retained topics until they are cleared broker-side.
+
+The fallback AP name does not read it either: `startFallbackAP` calls
+`apSsidFor(..., Identity::deviceId(), name)`, and `ap_policy.h` prefers the
+device id, dropping back to the node name only when the id is empty.
+
+`erase()` clears the in-RAM id and key only after `nvs_erase_all` AND
+`nvs_commit` both return `ESP_OK`. A failed erase that dropped the RAM copy
+would strand the unit on the fallback name while the old keypair is still on
+flash.
 
 The keypair exists to prove possession during claiming: the device signs a
 challenge, and the holder of the public key can verify it. Claiming does not
@@ -328,14 +351,12 @@ Any valid port is writable from either row on purpose. Pairing writes
 the value would break one of them. The control is the derived mode, not the
 writable value: see the next invariant for what makes a session mTLS.
 
-The value rule is on both rows for a different reason. Authorization is
-asymmetric; validity is not. `mqtt.port 8884}` strands the device whoever sent it, and a
-paired device on its own cert is the one nobody can reach afterwards.
-
-The password row is exactly what the pair and recovery flows publish
-while a device is on the shared credential. The value rule is
-load-bearing: `config.set` stores what it is handed, and
-`mqtt.port 8884}` saved as a string strands the device at next reload.
+The value rule sits on both rows for a different reason: authorization is
+asymmetric, validity is not. `config.set` stores what it is handed, and
+`mqtt.port 8884}` saved as a string strands the device at next reload -
+whoever sent it, and a paired device on its own cert is the one nobody can
+reach afterwards. The password row is exactly what the pair and recovery
+flows publish while a device is on the shared credential.
 
 The mode is a property of the session that carried the command, and it is
 frozen at dispatch, before the Shell deferred ring. Each transport owns its
@@ -351,15 +372,25 @@ wide open. Password is the default in every ambiguous case.
 Not device authentication. A leaked per-device cert still gets the full
 surface - the CLI carries no signature and no replay protection.
 
-`secret.set` stays on the password row only because pairing pushes
-`web.password` through it before mTLS is live.
+`secret.set` stays on the password row because pairing pushes the whole
+scalar secret set (`mqtt.password`, `telegram.bot_token`, `web.password`,
+`wifi.ap_password`) plus per-SSID wifi passwords through it before mTLS is
+live. The gate holds the field to exactly that provisioning set
+(`cliAuthzSecretFieldAllowed`, backed by `secret_keymap.h`) - a containment
+line, not a defence: a holder of the armed pairing credential can still
+rewrite the web console and fallback-AP passphrases, because pairing must.
+That residual is why the password listener retires with portal-based
+enrollment rather than being hardened further.
 
 `MQTT_TLS` undefined means no per-device identity exists, so the gate is
 a no-op. That build is the local plaintext-broker escape hatch.
 
 How enforced: `cliAuthzAllowed()` in `MQTTClient::runCli`, after envelope
 unwrap, before every handler including the binary special cases. The mode
-is a parameter, not a global read at drain time. Serial and HTTP are
+is a parameter, not a global read at drain time. Command names case-fold
+exactly as `Shell::execute` dispatches them - a gate stricter than the
+dispatcher in a different casing is how `CONFIG.SET` once slipped the
+port-value rule. Serial and HTTP are
 ungated by design - serial implies physical access, HTTP has
 `web_auth_policy`.
 
@@ -402,9 +433,8 @@ handshake actually presented the cert. It is the port the device dialled plus
 a cert that parses, not a broker-confirmed identity.
 
 `MQTT_MTLS_PORT` defaults to 8884 and is `#ifndef`-guarded so a build flag can
-override it per env. The app pins the same number twice, `mqttPortMTLS` in
-`pkg/web/admin_pair.go` and `THESADA_MQTT_DEVICE_MTLS_PORT` in
-`pkg/config/config.go`. All of them move together or paired devices stop being
+override it per env. The broker listener and whatever pairs devices against it
+pin the same number; all of them move together or paired devices stop being
 judged as paired.
 
 Source: `src/thesada_config.h`, `lib/thesada-core/src/MQTTClient.cpp::connect`,
@@ -427,7 +457,10 @@ The permission is conditional on a fact the firmware already computes:
 | absent, or only one half stored | denied |
 
 "Broken" is exactly the state that logs `mqtt.mtls_cert_invalid` or
-`mqtt.mtls_load_failed`. Absent is deliberately not broken: there is nothing
+`mqtt.mtls_load_failed`. A failed buffer allocation logs
+`mqtt.mtls_load_oom` and leaves the last verdict standing - heap pressure
+says nothing about the cert, and must not open `cert.clear` to a password
+session while a good cert sits in NVS. Absent is deliberately not broken: there is nothing
 to recover and nothing to clear, so the permission would buy the operator
 nothing while widening what a shared-credential holder reaches. A half-stored
 pair is the same call, and `cert.set` re-pushes the missing half from the
@@ -1156,11 +1189,11 @@ credentials), WiFiManager (CONNECTED/SCANNING/ALL_FAILED), OTA phases
 plus failure exits with `reason=`), LoRa init->ready. New state
 machines and transition writes follow the same convention.
 
-Coverage: as of 2026-07-20 every Log::info/warn/error call site in
+Coverage: as of 2026-08-20 every Log::info/warn/error call site in
 src/ and lib/ emits a dotted `module.event key=value` line (prefixes:
 boot, wifi, mqtt, ota, cellular, web (HttpServer),
-telegram, script, lora, temp, gnss, sd, config, sht31, pwm, ads,
-battery, power, sleep, shell, sensors, registry, heartbeat).
+telegram, script, lora, temp, gnss, sd, config, identity, sht31, pwm,
+ads, battery, power, sleep, shell, sensors, registry, heartbeat).
 Deliberate free-text exceptions: the Lua `Log.*` script bindings
 (relay user-authored text), the `Sensors` JSON state dump in
 HttpServer::printState, raw AT/serial traces inside

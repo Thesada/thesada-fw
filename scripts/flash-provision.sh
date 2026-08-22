@@ -110,8 +110,11 @@ def secret_state(sh, key):
 
 
 def write_private(path, data, mode="w"):
+    # The open mode only applies on create. A rerun over an existing artifact
+    # would otherwise write the passphrase into whatever mode it already had.
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, mode) as fh:
+        os.fchmod(fh.fileno(), 0o600)
         fh.write(data)
 
 
@@ -122,11 +125,16 @@ if not port:
 
 sh = DeviceShell(port, command_mode=True)
 try:
-    device_id = field(sh.cmd("identity.info"), "device_id:")
+    info = sh.cmd("identity.info")
+    device_id = field(info, "device_id:")
     if not device_id or device_id == "(none)":
         fail("device has no identity - boot a non-rescue image once, then retry")
+    ssid_reported = field(info, "ap_ssid:")
 
-    seeded = secret_state(sh, AP_FIELD) == "nvs"
+    # A config-backed passphrase is a seeded unit too. Reading only "nvs" as
+    # seeded rotates a valid fallback-AP credential without --force.
+    secret_source = secret_state(sh, AP_FIELD)
+    seeded = secret_source in ("nvs", "config")
     dev_dir = os.path.join(out_dir, device_id)
     creds = os.path.join(dev_dir, "ap-credentials.txt")
     have_artifact = os.path.exists(creds)
@@ -135,10 +143,10 @@ try:
         print(f"flash-provision: {device_id} already provisioned, artifact in {dev_dir}")
         sys.exit(0)
     if seeded and not have_artifact and not force:
-        fail(f"{device_id} holds a passphrase but {creds} is missing. NVS is "
-             "write-only, so it cannot be read back - re-run with --force to rotate")
+        fail(f"{device_id} holds a passphrase ({secret_source}) but {creds} is "
+             "missing. It cannot be read back - re-run with --force to rotate")
 
-    ssid = f"{device_id}-setup"
+    ssid = ssid_reported or f"{device_id}-setup"
     password = "".join(secrets.choice(ALPHABET) for _ in range(PASS_LEN))
 
     out = sh.cmd(f"secret.set {AP_FIELD} {password}", wait=2.0)

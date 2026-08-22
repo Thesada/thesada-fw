@@ -14,6 +14,7 @@
 #include "SensorRegistry.h"
 #include "Net.h"
 #include "path_safety_policy.h"
+#include "ap_policy.h"
 #include <thesada_config.h>
 #include <mbedtls/platform_util.h>
 #include <esp_ota_ops.h>
@@ -565,6 +566,9 @@ static void cmd_df(int argc, char** argv, ShellOutput out) {
 
 // Report identity without ever touching the private key - the public half and
 // the id are the only things any caller needs.
+// In:  none
+// Out: device_id, pubkey, node_name, factory-provisioned, ap_password state
+//      (never the value), ap_ssid, minting note on rescue builds
 static void cmd_identity_info(int argc, char** argv, ShellOutput out) {
   (void)argc; (void)argv;
   char line[128];
@@ -579,6 +583,21 @@ static void cmd_identity_info(int argc, char** argv, ShellOutput out) {
   snprintf(line, sizeof(line), "factory-provisioned: %s",
            Identity::hasClientCert() ? "true" : "false");
   out(line);
+  {
+    // Same resolution startFallbackAP uses: Secret first, then config.
+    JsonObject cfg = Config::get();
+    char pwBuf[Secret::MAX_LEN];
+    const char* pw = Secret::resolve("ap_password",
+                                     cfg["wifi"]["ap_password"] | "",
+                                     pwBuf, sizeof(pwBuf));
+    snprintf(line, sizeof(line), "ap_password: %s", apPasswordState(pw));
+    out(line);
+    char ssid[32];
+    if (apSsidFor(ssid, sizeof(ssid), id, Identity::nodeName())) {
+      snprintf(line, sizeof(line), "ap_ssid: %s", ssid);
+      out(line);
+    }
+  }
   if (!Identity::canMint()) out("minting: off (rescue build, read-only)");
 }
 
@@ -610,6 +629,9 @@ static void cmd_identity_reset(int argc, char** argv, ShellOutput out) {
 // of the firmware (Lua state, MQTT subs, OTA timers) starts fresh
 // against the empty filesystem instead of crashing on stale handles.
 // Caller is responsible for re-uploading config.json + ca.crt + scripts.
+//
+// In:  argv[1] must be "--yes"
+// Out: status line, then reboot
 static void cmd_format(int argc, char** argv, ShellOutput out) {
   if (argc < 2 || strcmp(argv[1], "--yes") != 0) {
     out("Usage: fs.format --yes  (DESTROYS every file on LittleFS)");

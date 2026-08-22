@@ -83,8 +83,18 @@ void test_ssid_degenerate_inputs(void) {
   TEST_ASSERT_FALSE(apSsidFor(ssid, sizeof(ssid), nullptr, nullptr));
 }
 
+// identity.info reports the state word, never the value.
+void test_password_state_words(void) {
+  TEST_ASSERT_EQUAL_STRING("absent",    apPasswordState(nullptr));
+  TEST_ASSERT_EQUAL_STRING("absent",    apPasswordState(""));
+  TEST_ASSERT_EQUAL_STRING("default",   apPasswordState(AP_PASS_PLACEHOLDER));
+  TEST_ASSERT_EQUAL_STRING("too-short", apPasswordState("short7c"));
+  TEST_ASSERT_EQUAL_STRING("set",       apPasswordState("a-real-passphrase"));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
+  RUN_TEST(test_password_state_words);
   RUN_TEST(test_accepts_a_real_passphrase);
   RUN_TEST(test_rejects_the_shipped_placeholder);
   RUN_TEST(test_rejects_absent_or_short);

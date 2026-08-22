@@ -134,8 +134,8 @@ void test_password_cmd_null_and_unknown(void) {
   TEST_ASSERT_FALSE(cliAuthzPasswordCmdAllowed(nullptr, false));
   TEST_ASSERT_FALSE(cliAuthzPasswordCmdAllowed("", false));
   TEST_ASSERT_FALSE(cliAuthzPasswordCmdAllowed("nosuchcommand", false));
-  // Exact match only - no case folding, no prefixes.
-  TEST_ASSERT_FALSE(cliAuthzPasswordCmdAllowed("Restart", false));
+  // Case folds with the dispatcher; prefixes and extensions never match.
+  TEST_ASSERT_TRUE(cliAuthzPasswordCmdAllowed("Restart", false));
   TEST_ASSERT_FALSE(cliAuthzPasswordCmdAllowed("restart2", false));
   TEST_ASSERT_FALSE(cliAuthzPasswordCmdAllowed("cert.se", false));
 }
@@ -295,9 +295,9 @@ void test_broken_cert_widens_nothing_else(void) {
                                     "--yes", true));
   TEST_ASSERT_FALSE(cliAuthzAllowed(CLI_AUTH_PASSWORD, "config.set",
                                     "mqtt.broker_url mqtts://attacker", true));
-  // Still exact match only, broken cert or not.
+  // Extensions never match; case folds with the dispatcher.
   TEST_ASSERT_FALSE(cliAuthzPasswordCmdAllowed("cert.clear2", true));
-  TEST_ASSERT_FALSE(cliAuthzPasswordCmdAllowed("Cert.clear", true));
+  TEST_ASSERT_TRUE(cliAuthzPasswordCmdAllowed("Cert.clear", true));
   TEST_ASSERT_FALSE(cliAuthzPasswordCmdAllowed(nullptr, true));
 }
 
@@ -324,6 +324,46 @@ void test_password_admits_the_recovery_flow(void) {
   TEST_ASSERT_TRUE(cliAuthzAllowed(CLI_AUTH_PASSWORD, "cert.clear", "{}",
                                    true));
   TEST_ASSERT_TRUE(cliAuthzAllowed(CLI_AUTH_PASSWORD, "restart", "{}", true));
+}
+
+// Shell::execute dispatches case-insensitively, so the gate must judge the
+// same spelling the dispatcher accepts - "CONFIG.SET" is config.set.
+void test_gate_matches_commands_case_insensitively(void) {
+  TEST_ASSERT_FALSE(cliAuthzAllowed(CLI_AUTH_MTLS, "CONFIG.SET",
+                                    "mqtt.port 8884}", false));
+  TEST_ASSERT_FALSE(cliAuthzAllowed(CLI_AUTH_PASSWORD, "CONFIG.SET",
+                                    "mqtt.broker_url evil", false));
+  TEST_ASSERT_TRUE(cliAuthzAllowed(CLI_AUTH_PASSWORD, "RESTART", "{}", false));
+  TEST_ASSERT_TRUE(cliAuthzAllowed(CLI_AUTH_PASSWORD, "Cert.Clear", "{}", true));
+  TEST_ASSERT_FALSE(cliAuthzAllowed(CLI_AUTH_PASSWORD, "SECRET.SET",
+                                    "ota.url evil", false));
+}
+
+// secret.set is field-gated to what pairing provisions - the keymap set.
+// Junk fields die at the gate instead of reaching the handler.
+void test_secret_set_holds_the_field_to_the_provisioning_set(void) {
+  TEST_ASSERT_TRUE(cliAuthzSecretFieldAllowed("mqtt.password hunter2"));
+  TEST_ASSERT_TRUE(cliAuthzSecretFieldAllowed("telegram.bot_token t"));
+  TEST_ASSERT_TRUE(cliAuthzSecretFieldAllowed("web.password w"));
+  TEST_ASSERT_TRUE(cliAuthzSecretFieldAllowed("wifi.ap_password a"));
+  TEST_ASSERT_TRUE(cliAuthzSecretFieldAllowed("wifi.password:Barn x"));
+  TEST_ASSERT_FALSE(cliAuthzSecretFieldAllowed("wifi.password x"));
+  TEST_ASSERT_FALSE(cliAuthzSecretFieldAllowed("mqtt.username x"));
+  TEST_ASSERT_FALSE(cliAuthzSecretFieldAllowed("ota.url x"));
+  TEST_ASSERT_FALSE(cliAuthzSecretFieldAllowed("anything.else x"));
+  // No args: the handler answers its usage line and writes nothing.
+  TEST_ASSERT_TRUE(cliAuthzSecretFieldAllowed(nullptr));
+  TEST_ASSERT_TRUE(cliAuthzSecretFieldAllowed(""));
+}
+
+void test_gate_wires_the_secret_field_rule(void) {
+  TEST_ASSERT_TRUE(cliAuthzAllowed(CLI_AUTH_PASSWORD, "secret.set",
+                                   "web.password w", false));
+  TEST_ASSERT_FALSE(cliAuthzAllowed(CLI_AUTH_PASSWORD, "secret.set",
+                                    "not.a_field w", false));
+  // mTLS sessions are not field-gated - full surface by design.
+  TEST_ASSERT_TRUE(cliAuthzAllowed(CLI_AUTH_MTLS, "secret.set",
+                                   "not.a_field w", false));
 }
 
 int main(int, char**) {
@@ -360,5 +400,8 @@ int main(int, char**) {
   RUN_TEST(test_no_cert_stored_is_not_broken);
   RUN_TEST(test_mtls_cert_clear_regardless_of_cert_health);
   RUN_TEST(test_password_admits_the_recovery_flow);
+  RUN_TEST(test_gate_matches_commands_case_insensitively);
+  RUN_TEST(test_secret_set_holds_the_field_to_the_provisioning_set);
+  RUN_TEST(test_gate_wires_the_secret_field_rule);
   return UNITY_END();
 }

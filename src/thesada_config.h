@@ -127,8 +127,8 @@
 // Set to false only for local unencrypted testing brokers.
 #define MQTT_TLS  true
 
-// mTLS listener port. A session only counts as mTLS when it landed here;
-// the app pins the same value in THESADA_MQTT_DEVICE_MTLS_PORT.
+// mTLS listener port. A session only counts as mTLS when it landed here.
+// Change it only together with the broker listener it names.
 #ifndef MQTT_MTLS_PORT
   #define MQTT_MTLS_PORT 8884
 #endif

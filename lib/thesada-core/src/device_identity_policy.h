@@ -61,6 +61,16 @@ inline bool identityDeviceIdValid(const char* id) {
   return n == IDENTITY_ID_HEX_LEN;
 }
 
+// Is the name that reaches the MQTT clientId unique to this unit? The
+// operator label counts when set; otherwise only a minted device_id does. With
+// neither, nodeName() falls to the shared literal and two units evict each
+// other from the broker.
+// in: config device.name, stored device id. out: true when unique per unit.
+inline bool identityNodeNameUnique(const char* configuredName, const char* deviceId) {
+  if (configuredName && *configuredName) return true;
+  return deviceId && *deviceId;
+}
+
 // An all-zero key is what an erased or half-written NVS read looks like, and
 // it must never be treated as a generated keypair.
 inline bool identityKeyMaterialPresent(const uint8_t* key, size_t len) {

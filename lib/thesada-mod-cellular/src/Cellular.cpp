@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include <thesada_config.h>
-#include <Identity.h>
 #ifdef ENABLE_CELLULAR
 
 #include "Cellular.h"
+#include <Identity.h>
 #include <Config.h>
 #include <Log.h>
 #include <LittleFS.h>
@@ -695,6 +695,13 @@ bool Cellular::mqttConnect() {
   const char* user     = cfg["mqtt"]["user"]      | "";
   const char* password = cfg["mqtt"]["password"]  | "";
   const char* devName  = Identity::nodeName();
+
+  // Same rule as the WiFi path in main: the shared literal as clientId evicts
+  // a sibling off the broker. Refuse before the modem session is configured.
+  if (!Identity::nodeNameUnique()) {
+    Log::error(TAG, "cellular.mqtt.refused reason=node_name_not_unique");
+    return false;
+  }
 
   Log::info(TAG, "cellular.mqtt.configure");
 
@@ -1429,6 +1436,9 @@ void Cellular::loop() {
       g.pause(10000UL);
     }
     while (!mqttConnect()) {
+      // A refusal on the name rule never clears by retrying: recovery is a
+      // serial identity.reset or a device.name, both of which reboot us.
+      if (!Identity::nodeNameUnique()) return;
       mqttBackoffWait(&g);
     }
     mqttBackoffReset();

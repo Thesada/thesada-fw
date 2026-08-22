@@ -59,7 +59,7 @@ void test_device_id_differs_per_mac(void) {
   TEST_ASSERT_TRUE(strcmp(a, b) != 0);
 }
 
-// Same MAC, same id, every boot - the idempotence the issue requires.
+// Same MAC, same id, every boot - regeneration would orphan the pairing.
 void test_device_id_is_stable(void) {
   char a[IDENTITY_ID_CAP], b[IDENTITY_ID_CAP];
   identityDeviceIdFromMac(kMac, a, sizeof(a));
@@ -136,6 +136,26 @@ void test_key_material_degenerate_inputs(void) {
   TEST_ASSERT_FALSE(identityKeyMaterialPresent(k, 0));
 }
 
+// --- identityNodeNameUnique -------------------------------------------------
+
+// The operator label alone is enough: it is what nodeName() returns.
+void test_node_name_unique_with_configured_name(void) {
+  TEST_ASSERT_TRUE(identityNodeNameUnique("attic-node", ""));
+  TEST_ASSERT_TRUE(identityNodeNameUnique("attic-node", "thesada-dcb4d91acd28"));
+}
+
+void test_node_name_unique_with_device_id_only(void) {
+  TEST_ASSERT_TRUE(identityNodeNameUnique("", "thesada-dcb4d91acd28"));
+}
+
+// Neither set is the shared-literal case every broker path must refuse.
+void test_node_name_not_unique_when_both_absent(void) {
+  TEST_ASSERT_FALSE(identityNodeNameUnique("", ""));
+  TEST_ASSERT_FALSE(identityNodeNameUnique(nullptr, nullptr));
+  TEST_ASSERT_FALSE(identityNodeNameUnique(nullptr, ""));
+  TEST_ASSERT_FALSE(identityNodeNameUnique("", nullptr));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_hex_encodes_lowercase);
@@ -154,5 +174,8 @@ int main(int, char**) {
   RUN_TEST(test_key_material_rejects_all_zero);
   RUN_TEST(test_key_material_accepts_any_nonzero);
   RUN_TEST(test_key_material_degenerate_inputs);
+  RUN_TEST(test_node_name_unique_with_configured_name);
+  RUN_TEST(test_node_name_unique_with_device_id_only);
+  RUN_TEST(test_node_name_not_unique_when_both_absent);
   return UNITY_END();
 }
