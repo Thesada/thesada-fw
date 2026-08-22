@@ -6,6 +6,8 @@
 #include "Secret.h"
 #include "cli_payload.h"
 #include "cli_topics.h"
+#include "cli_authz_policy.h"
+#include "Identity.h"
 #include "mqtt_rollback_policy.h"
 #include "clock_floor_policy.h"
 #include "EventBus.h"
@@ -67,6 +69,29 @@ static constexpr uint32_t RB_STALE_WINDOW_S = 6UL * 3600UL;
 // drop when the cert is cleared. nullptr when unused.
 static std::function<void()> _onCertClearedHook = nullptr;
 
+// Auth mode of the fallback transport's broker session. Its own session, its
+// own credential: the WiFi flag says nothing about how it authenticated.
+static bool _fallbackMtls = false;
+
+// Did the stored client cert fail to load or validate at the last connect
+// attempt? Absent cert is not broken - there is nothing to recover.
+static bool _storedCertBroken = false;
+
+// Auth of the session delivering the message being dispatched right now, read
+// by the CLI subscription before it hands work to the deferred ring.
+static CliAuthMode _inboundAuth = CLI_AUTH_PASSWORD;
+
+// in: whether that session presented a client cert. out: the CLI auth mode.
+// Without TLS no per-device identity can exist, so the gate is a no-op.
+static CliAuthMode cliAuthModeFor(bool mtls) {
+#ifdef MQTT_TLS
+  return mtls ? CLI_AUTH_MTLS : CLI_AUTH_PASSWORD;
+#else
+  (void)mtls;
+  return CLI_AUTH_MTLS;
+#endif
+}
+
 static const char* TAG = "MQTT";
 
 #ifdef MQTT_TLS
@@ -86,6 +111,10 @@ static bool      _mtlsWasActive = false;  // tracks whether last connect() used 
 // fails with the previous buffer bytes as the "hostname". Copy once into
 // this buffer on each read.
 static char      _brokerHost[96] = {0};
+
+// Port last handed to setServer, i.e. the one the session actually uses.
+// mqtt.port in Config can already hold a value no connect has applied yet.
+static uint16_t  _brokerPort = 0;
 
 // Validate a PEM cert + key pair via mbedtls. Prevents feeding a bad
 // buffer into WiFiClientSecure::setCertificate which would stick in the
@@ -229,6 +258,41 @@ void MQTTClient::setFallbackPublishing(bool active) {
 
 // ---------------------------------------------------------------------------
 
+// Shared inbound CLI dispatch for both subscribe registrations (begin and
+// reinitSubscriptions) - one copy or the two drift. Defers to the Shell ring:
+// executing inside the PubSubClient callback blocks keepalive and causes
+// disconnects on slow operations (LittleFS writes, config reload, etc).
+// in: raw topic + payload from the broker callback. out: none.
+static void cliInboundHandler(const char* topic, const char* payload) {
+  JsonObject  cfg    = Config::get();
+  const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+  char cliPrefix[CLI_TOPIC_CAP];
+  // A truncated prefix would match short and slice the wrong command out.
+  if (!cliInputPrefix(cliPrefix, sizeof(cliPrefix), prefix)) return;
+  size_t prefixLen = strlen(cliPrefix);
+  if (strncmp(topic, cliPrefix, prefixLen) != 0) return;
+  const char* cmd = topic + prefixLen;
+  if (strlen(cmd) == 0 || strcmp(cmd, "response") == 0) return;
+
+  // Copy cmd + payload onto the heap so the lambda owns them past the
+  // lifetime of this callback. std::string capture handles destruction
+  // when the slot's DeferredFn is reset on drain.
+  std::string cmdCopy(cmd);
+  size_t plen = payload ? strlen(payload) : 0;
+  std::string payloadCopy(payload ? payload : "", plen);
+
+  // Frozen here, not read at drain time: the transport can fail over
+  // between the two and the gate must judge the session that spoke.
+  CliAuthMode auth = _inboundAuth;
+  bool ok = Shell::enqueueDeferred(
+    [cmdCopy = std::move(cmdCopy), payloadCopy = std::move(payloadCopy), auth]() {
+      MQTTClient::runCli(cmdCopy.c_str(),
+                         payloadCopy.empty() ? nullptr : payloadCopy.c_str(),
+                         payloadCopy.size(), auth);
+    });
+  if (!ok) Log::warn("MQTT", "mqtt.cli_dropped reason=busy");
+}
+
 // Initialize MQTT: load config, TLS certs, set up subscriptions, connect.
 // in: none (reads Config, LittleFS /ca.crt, NVS cert namespace).
 // out: none.
@@ -261,6 +325,7 @@ void MQTTClient::begin() {
   // Copy into persistent buffer - see _brokerHost comment above.
   strncpy(_brokerHost, host, sizeof(_brokerHost) - 1);
   _brokerHost[sizeof(_brokerHost) - 1] = '\0';
+  _brokerPort = port;
   _client.setServer(_brokerHost, port);
   _client.setKeepAlive(60);
   _client.setBufferSize(_bufferIn);
@@ -373,41 +438,13 @@ void MQTTClient::begin() {
       return;
     }
 
-    MQTTClient::subscribe(cliTopic, [](const char* topic, const char* payload) {
-      // Defer CLI command to the Shell ring - executing inside the
-      // PubSubClient callback blocks keepalive and causes disconnects on
-      // slow operations (LittleFS writes, config reload, etc). The
-      // generic shell-line path goes through Shell::enqueue;
-      // binary-payload commands (fs.write, fs.cat chunked, cert.set) and
-      // the response-shape contract (one cli/response message per
-      // command, JSON array of output lines) need their own handler so
-      // they go through Shell::enqueueDeferred. Same ring,
-      // same backpressure, single drain path.
-      JsonObject  cfg    = Config::get();
-      const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-      char cliPrefix[CLI_TOPIC_CAP];
-      // A truncated prefix would match short and slice the wrong command out.
-      if (!cliInputPrefix(cliPrefix, sizeof(cliPrefix), prefix)) return;
-      size_t prefixLen = strlen(cliPrefix);
-      if (strncmp(topic, cliPrefix, prefixLen) != 0) return;
-      const char* cmd = topic + prefixLen;
-      if (strlen(cmd) == 0 || strcmp(cmd, "response") == 0) return;
-
-      // Copy cmd + payload onto the heap so the lambda owns them past the
-      // lifetime of this callback. std::string capture handles destruction
-      // when the slot's DeferredFn is reset on drain.
-      std::string cmdCopy(cmd);
-      size_t plen = payload ? strlen(payload) : 0;
-      std::string payloadCopy(payload ? payload : "", plen);
-
-      bool ok = Shell::enqueueDeferred(
-        [cmdCopy = std::move(cmdCopy), payloadCopy = std::move(payloadCopy)]() {
-          MQTTClient::runCli(cmdCopy.c_str(),
-                             payloadCopy.empty() ? nullptr : payloadCopy.c_str(),
-                             payloadCopy.size());
-        });
-      if (!ok) Log::warn("MQTT", "mqtt.cli_dropped reason=busy");
-    });
+    // The generic shell-line path goes through Shell::enqueue;
+    // binary-payload commands (fs.write, fs.cat chunked, cert.set) and
+    // the response-shape contract (one cli/response message per command,
+    // JSON array of output lines) need their own handler, so inbound CLI
+    // goes through cliInboundHandler onto the same ring, same
+    // backpressure, single drain path.
+    MQTTClient::subscribe(cliTopic, cliInboundHandler);
   }
 
 
@@ -552,13 +589,17 @@ void MQTTClient::rollbackIfUncommitted() {
 // Sets LWT so the broker publishes "offline" on disconnect.
 // in: none (reads Config + NVS cert namespace). out: none.
 void MQTTClient::connect() {
+  // Cleared before the early returns, not after: assigning it further down
+  // left the previous session's verdict standing on every path that bails out.
+  _mtlsActive = false;
+
   // begin() refused to configure TLS. Connecting anyway would hand the CLI
   // an unverified channel, which is the thing the refusal exists to stop.
   if (_tlsRefused) return;
   if (!WiFiManager::connected()) return;
 
   JsonObject  cfg      = Config::get();
-  const char* clientId = cfg["device"]["name"]   | "thesada-node";
+  const char* clientId = Identity::nodeName();
   const char* user     = cfg["mqtt"]["user"]      | "";
   char        passwordBuf[Secret::MAX_LEN];
   const char* password = Secret::resolve("mqtt_password", cfg["mqtt"]["password"] | "",
@@ -594,27 +635,44 @@ void MQTTClient::connect() {
   // stay live across handshake. Validate via mbedtls before setCertificate:
   // there is no clear-cert API, so a bad pointer breaks every future
   // reconnect until restart.
-  _mtlsActive = false;
   if (hasClientCert()) {
     if (!_clientCert) _clientCert = (char*)malloc(CERT_MAX_LEN);
     if (!_clientKey)  _clientKey  = (char*)malloc(CERT_MAX_LEN);
-    if (_clientCert && _clientKey &&
-        loadClientCert(_clientCert, _clientKey, CERT_MAX_LEN)) {
+    if (!_clientCert || !_clientKey) {
+      // Heap pressure says nothing about the cert: keep the last broken
+      // verdict so a full heap cannot open cert.clear to a password session.
+      free(_clientCert); _clientCert = nullptr;
+      free(_clientKey);  _clientKey  = nullptr;
+      Log::warn(TAG, "mqtt.mtls_load_oom fallback=password");
+    } else if (loadClientCert(_clientCert, _clientKey, CERT_MAX_LEN)) {
       if (validateClientCertKey(_clientCert, _clientKey)) {
-        _wifiClient.setCertificate(_clientCert);
-        _wifiClient.setPrivateKey(_clientKey);
-        _mtlsActive = true;
-        Log::info(TAG, "mqtt.mtls_cert_loaded source=nvs");
+        _storedCertBroken = false;
+        // A usable cert is not enough. mTLS follows the listener this session
+        // actually dials, so a session on any other port stays password.
+        if (_brokerPort == MQTT_MTLS_PORT) {
+          _wifiClient.setCertificate(_clientCert);
+          _wifiClient.setPrivateKey(_clientKey);
+          _mtlsActive = true;
+          Log::info(TAG, "mqtt.mtls_cert_loaded source=nvs");
+        } else {
+          Log::kvfw(TAG, "mqtt.mtls_port_mismatch port=%u mtls_port=%u fallback=password",
+                    (unsigned)_brokerPort, (unsigned)MQTT_MTLS_PORT);
+        }
       } else {
+        _storedCertBroken = true;
         Log::kvfw(TAG, "mqtt.mtls_cert_invalid fallback=password");
       }
     } else {
-      // Free both on any failure (malloc partial or NVS miss) - a stranded
-      // 4 KB buffer starves the next connect attempt. free(nullptr) is safe.
+      // NVS rows exist but will not load: that is a broken pair. Free the
+      // buffers - a stranded 4 KB pair starves the next connect attempt.
       free(_clientCert); _clientCert = nullptr;
       free(_clientKey);  _clientKey  = nullptr;
+      _storedCertBroken = true;
       Log::warn(TAG, "mqtt.mtls_load_failed fallback=password");
     }
+  } else {
+    // Nothing stored cannot be broken, so cert.clear stays mTLS-only here.
+    _storedCertBroken = false;
   }
   // When dropping from mTLS to password auth, pass nullptr to evict the
   // stale setCertificate pointer - it lingers and breaks future connect()s.
@@ -834,6 +892,7 @@ void MQTTClient::loop() {
     // Refresh persistent buffer; re-parsed pool invalidates prior pointer.
     strncpy(_brokerHost, host, sizeof(_brokerHost) - 1);
     _brokerHost[sizeof(_brokerHost) - 1] = '\0';
+    _brokerPort = port;
     _client.setServer(_brokerHost, port);
     _retryInterval = RETRY_MIN_MS;
     connect();
@@ -1074,8 +1133,16 @@ void MQTTClient::matchAndDispatch(const char* topic, const char* payload) {
 // Public entry for Cellular::pumpInbound: routes +SMSUB URCs through the
 // same callbacks as the WiFi path.
 void MQTTClient::dispatchInbound(const char* topic, const char* payload, size_t length) {
+  _inboundAuth = cliAuthModeFor(_fallbackMtls);
   matchAndDispatch(topic, payload);
   (void)length;  // payload is null-terminated by caller
+}
+
+void MQTTClient::setFallbackSessionMTLS(bool active) {
+  if (_fallbackMtls == active) return;
+  _fallbackMtls = active;
+  Log::kvf(TAG, "mqtt.session_auth transport=fallback mode=%s",
+           active ? "mtls" : "password");
 }
 
 // Cellular bring-up uses this to replay AT+SMSUB for every WiFi-side entry.
@@ -1101,6 +1168,7 @@ void MQTTClient::onMessage(char* topic, uint8_t* payload, unsigned int length) {
   memcpy(payloadBuf, payload, length);
   payloadBuf[length] = '\0';
 
+  _inboundAuth = cliAuthModeFor(_mtlsActive);
   matchAndDispatch(topic, payloadBuf);
   free(payloadBuf);
 }
@@ -1132,7 +1200,8 @@ static void publishCliResponse(const char* prefix, JsonDocument& resp,
 // Binary-protocol commands (fs.write, fs.cat chunked, cert.set) are
 // handled as special cases before the Shell::execute fallthrough.
 // in: cmd, payload (may be null), plen. out: none.
-void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
+void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
+                        CliAuthMode auth) {
   if (!cmd || strlen(cmd) == 0) return;
 
   JsonObject cfg = Config::get();
@@ -1166,6 +1235,23 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen) {
       // literal arg to Shell parsers.
       reqIdOnlyPayload = hasReqId && (obj.size() == 1 ||
                                       (argsStr && plen == 0));
+    }
+  }
+
+  // Authorization gate - see docs/invariants.md. Runs before every handler.
+  {
+    // req_id-only envelope carries no args - must not fall back to raw JSON.
+    const char* authPayload = reqIdOnlyPayload ? nullptr : payload;
+    if (!cliAuthzAllowed(auth, cmd, authPayload, _storedCertBroken)) {
+      Log::kvfw(TAG, "mqtt.cli_denied cmd=%s auth=%s", cmd,
+                auth == CLI_AUTH_MTLS ? "mtls" : "password");
+      JsonDocument resp;
+      resp["cmd"] = cmd;
+      if (hasReqId) resp["req_id"] = reqId;
+      resp["ok"] = false;
+      resp["output"][0] = "Denied: not permitted on this connection";
+      publishCliResponse(prefix, resp, _bufferOut);
+      return;
     }
   }
 
@@ -1509,28 +1595,7 @@ void MQTTClient::reinitSubscriptions() {
     return;
   }
 
-  MQTTClient::subscribe(cliTopic, [](const char* topic, const char* payload) {
-    JsonObject  cfgInner    = Config::get();
-    const char* prefixInner = cfgInner["mqtt"]["topic_prefix"] | "thesada/node";
-    char cliPrefixInner[CLI_TOPIC_CAP];
-    if (!cliInputPrefix(cliPrefixInner, sizeof(cliPrefixInner), prefixInner)) return;
-    size_t prefixLen = strlen(cliPrefixInner);
-    if (strncmp(topic, cliPrefixInner, prefixLen) != 0) return;
-    const char* cmd = topic + prefixLen;
-    if (strlen(cmd) == 0 || strcmp(cmd, "response") == 0) return;
-
-    std::string cmdCopy(cmd);
-    size_t plen = payload ? strlen(payload) : 0;
-    std::string payloadCopy(payload ? payload : "", plen);
-
-    bool ok = Shell::enqueueDeferred(
-      [cmdCopy = std::move(cmdCopy), payloadCopy = std::move(payloadCopy)]() {
-        MQTTClient::runCli(cmdCopy.c_str(),
-                           payloadCopy.empty() ? nullptr : payloadCopy.c_str(),
-                           payloadCopy.size());
-      });
-    if (!ok) Log::warn("MQTT", "mqtt.cli_dropped reason=busy");
-  });
+  MQTTClient::subscribe(cliTopic, cliInboundHandler);
 
   OTAUpdate::begin();
 
@@ -1562,7 +1627,16 @@ void MQTTClient::publishDiscovery() {
 
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
   const char* devName = cfg["device"]["friendly_name"] | cfg["device"]["name"] | "Thesada Node";
-  const char* devId = cfg["device"]["name"] | "thesada_node";
+  // The persistent id keys HA identity, never nodeName(): device.name is an
+  // operator label, and editing it would re-key uniq_id and the retained
+  // config topics, leaving the old entities orphaned beside new duplicates.
+  // Migration: units that published discovery under a device.name keep those
+  // retained topics until they are cleared broker-side.
+  const char* devId = Identity::deviceId();
+  if (!devId || !*devId) {
+    Log::warn(TAG, "mqtt.ha_discovery_skipped reason=identity_unavailable");
+    return;
+  }
 
   char availTopic[64];
   snprintf(availTopic, sizeof(availTopic), "%s/status", prefix);
@@ -1986,6 +2060,10 @@ bool MQTTClient::storeClientCert(const char* certPEM, const char* keyPEM) {
     }
   }
   prefs.end();
+  // A fresh pair supersedes whatever verdict the last load reached. Leaving a
+  // stale "broken" here keeps cert.clear open to a password session against a
+  // cert that is now fine; the next connect recomputes it either way.
+  if (ok) _storedCertBroken = false;
   return ok;
 }
 
@@ -2010,6 +2088,8 @@ bool MQTTClient::clearClientCert() {
   prefs.remove(CERT_KEY_CERT);
   prefs.remove(CERT_KEY_KEY);
   prefs.end();
+  // The broken cert is gone, so the recovery permission it granted goes too.
+  _storedCertBroken = false;
   if (_onCertClearedHook) _onCertClearedHook();
   return true;
 }

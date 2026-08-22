@@ -7,6 +7,7 @@
 #ifdef ENABLE_SHT31
 
 #include "SHT31Module.h"
+#include <Identity.h>
 #include <Config.h>
 #include <EventBus.h>
 #include <MQTTClient.h>
@@ -126,7 +127,17 @@ void SHT31Module::publishHaDiscovery() {
   }
   const char* prefix  = cfg["mqtt"]["topic_prefix"] | "thesada/node";
   const char* devName = cfg["device"]["friendly_name"] | cfg["device"]["name"] | "Thesada Node";
-  const char* devId   = cfg["device"]["name"] | "thesada_node";
+  // The persistent id, not nodeName(): an operator editing device.name would
+  // otherwise re-key uniq_id and the retained config topics, orphaning the old
+  // HA entities and creating duplicates beside them.
+  const char* devId   = Identity::deviceId();
+  if (!devId || !*devId) {
+    // Minting only happens in Identity::begin(), so this cannot clear without
+    // a reboot. Suppress rather than re-warn on every tick.
+    _haPublished = true;
+    Log::warn(TAG, "sht31.ha_discovery_skipped reason=identity_unavailable");
+    return;
+  }
   const char* unit    = cfg["temperature"]["unit"] | "C";
   const char* haUnit  = (unit[0] == 'F' || unit[0] == 'f') ? "\xC2\xB0""F" : "\xC2\xB0""C";
 

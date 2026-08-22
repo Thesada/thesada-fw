@@ -1,6 +1,6 @@
 {
   "device": {
-    "name":           "thesada-node",
+    "name":           "",
     "friendly_name":  "Thesada Node",
     "heartbeat_s":    -1,
     "heartbeat_pin":  -1,

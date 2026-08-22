@@ -89,7 +89,7 @@ Deeper per-subsystem writeups, including the detection and recovery paths for ea
 ```
 +-- Optional modules (ENABLE_*) -------------------------+
 |  Temperature  SHT31  ADS1115  Battery  SD  PowerManager |
-|  HttpServer  LiteServer  ScriptEngine  Cellular         |
+|  HttpServer  ScriptEngine  Cellular                     |
 |  Telegram  PWM                                          |
 +---------------------------------------------------------+
 |  Core (always compiled)                                 |
@@ -105,7 +105,7 @@ Config is split: `thesada_config.h` for compile-time module enables, `config.jso
 
 **Core (always compiled):** Config, EventBus, Log, Shell, ModuleRegistry, WiFiManager, MQTTClient, OTAUpdate, SleepManager, HeartbeatLED
 
-**Optional modules (ENABLE_* guards):** Temperature, SHT31, ADS1115, Battery, PMU, SD, Cellular, Telegram, HttpServer, LiteServer, ScriptEngine, PWM, PowerManager
+**Optional modules (ENABLE_* guards):** Temperature, SHT31, ADS1115, Battery, PMU, SD, Cellular, Telegram, HttpServer, ScriptEngine, PWM, PowerManager
 
 Minimal build (core only) saves ~313 KB flash. Full build with all modules: 1.4 MB. Release includes both `firmware.bin` (full) and `firmware_minimal.bin` (core only).
 
@@ -137,6 +137,15 @@ pio run -e esp32-owb --target upload      # or esp32-s3-debug for bare-S3
 pio run -e esp32-owb --target uploadfs
 ```
 
+The fallback AP will not start without a real passphrase, so flash a new board
+through the provisioning wrapper instead - it uploads, seeds a random per-device
+passphrase over the serial shell and writes the join QR payload to a gitignored
+0600 file:
+
+```bash
+./scripts/flash-provision.sh --env esp32-owb --port /dev/cu.usbmodem1101
+```
+
 ---
 
 ## Structure
@@ -160,6 +169,7 @@ thesada-fw/
     thesada-mod-telegram/
   scripts/
     add_framework_libs.py     # PlatformIO framework lib discovery
+    flash-provision.sh        # flash + seed the per-device fallback-AP passphrase
     ota_upload.py             # push OTA to a device over HTTP
     deploy-ota.sh             # deploy to self-hosted OTA server (gitignored)
   examples/                   # config.json.example and Lua script examples

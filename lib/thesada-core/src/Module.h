@@ -30,7 +30,7 @@ public:
 enum ModulePriority : uint8_t {
     PRIORITY_POWER    = 10,   // PowerManager
     PRIORITY_NETWORK  = 20,   // Cellular
-    PRIORITY_SERVICE  = 30,   // HttpServer/LiteServer, Display, TFT, Telegram
+    PRIORITY_SERVICE  = 30,   // HttpServer, Display, TFT, Telegram
     PRIORITY_SCRIPT   = 40,   // ScriptEngine (creates Lua state, calls all registrars)
     PRIORITY_SENSOR   = 50,   // Temperature, ADS1115, Battery
     PRIORITY_OUTPUT   = 60,   // SD, PWM
