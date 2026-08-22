@@ -136,24 +136,17 @@ void test_key_material_degenerate_inputs(void) {
   TEST_ASSERT_FALSE(identityKeyMaterialPresent(k, 0));
 }
 
-// --- identityNodeNameUnique -------------------------------------------------
+// --- identityBrokerNameUsable -----------------------------------------------
 
-// The operator label alone is enough: it is what nodeName() returns.
-void test_node_name_unique_with_configured_name(void) {
-  TEST_ASSERT_TRUE(identityNodeNameUnique("attic-node", ""));
-  TEST_ASSERT_TRUE(identityNodeNameUnique("attic-node", "thesada-dcb4d91acd28"));
+void test_broker_name_usable_with_minted_id(void) {
+  TEST_ASSERT_TRUE(identityBrokerNameUsable("thesada-dcb4d91acd28"));
 }
 
-void test_node_name_unique_with_device_id_only(void) {
-  TEST_ASSERT_TRUE(identityNodeNameUnique("", "thesada-dcb4d91acd28"));
-}
-
-// Neither set is the shared-literal case every broker path must refuse.
-void test_node_name_not_unique_when_both_absent(void) {
-  TEST_ASSERT_FALSE(identityNodeNameUnique("", ""));
-  TEST_ASSERT_FALSE(identityNodeNameUnique(nullptr, nullptr));
-  TEST_ASSERT_FALSE(identityNodeNameUnique(nullptr, ""));
-  TEST_ASSERT_FALSE(identityNodeNameUnique("", nullptr));
+// An operator label is NOT proof of a unique unit: it ships as a fixed string
+// in the config image, so a whole fleet would carry the same one.
+void test_broker_name_not_usable_without_minted_id(void) {
+  TEST_ASSERT_FALSE(identityBrokerNameUsable(""));
+  TEST_ASSERT_FALSE(identityBrokerNameUsable(nullptr));
 }
 
 int main(int, char**) {
@@ -174,8 +167,7 @@ int main(int, char**) {
   RUN_TEST(test_key_material_rejects_all_zero);
   RUN_TEST(test_key_material_accepts_any_nonzero);
   RUN_TEST(test_key_material_degenerate_inputs);
-  RUN_TEST(test_node_name_unique_with_configured_name);
-  RUN_TEST(test_node_name_unique_with_device_id_only);
-  RUN_TEST(test_node_name_not_unique_when_both_absent);
+  RUN_TEST(test_broker_name_usable_with_minted_id);
+  RUN_TEST(test_broker_name_not_usable_without_minted_id);
   return UNITY_END();
 }

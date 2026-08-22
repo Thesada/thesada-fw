@@ -51,9 +51,8 @@ const char* Identity::nodeName() {
   return FALLBACK_NAME;
 }
 
-bool Identity::nodeNameUnique() {
-  JsonObject cfg = Config::get();
-  return identityNodeNameUnique(cfg["device"]["name"] | "", _deviceId);
+bool Identity::brokerNameUsable() {
+  return identityBrokerNameUsable(_deviceId);
 }
 
 // out: true only when id and public key are both present and the id still has

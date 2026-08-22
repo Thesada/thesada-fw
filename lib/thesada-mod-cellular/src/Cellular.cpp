@@ -698,7 +698,7 @@ bool Cellular::mqttConnect() {
 
   // Same rule as the WiFi path in main: the shared literal as clientId evicts
   // a sibling off the broker. Refuse before the modem session is configured.
-  if (!Identity::nodeNameUnique()) {
+  if (!Identity::brokerNameUsable()) {
     Log::error(TAG, "cellular.mqtt.refused reason=node_name_not_unique");
     return false;
   }
@@ -1438,7 +1438,7 @@ void Cellular::loop() {
     while (!mqttConnect()) {
       // A refusal on the name rule never clears by retrying: recovery is a
       // serial identity.reset or a device.name, both of which reboot us.
-      if (!Identity::nodeNameUnique()) return;
+      if (!Identity::brokerNameUsable()) return;
       mqttBackoffWait(&g);
     }
     mqttBackoffReset();

@@ -287,12 +287,18 @@ unique per unit only while `device.name` is unset: the label ships as a fixed
 string in the config image, so a fleet flashed from one image answers to one
 name. The MQTT clientId reads it, and two units answering to one clientId evict
 each other from the broker, so no broker path may run on the literal.
-`identityNodeNameUnique(device.name, device_id)` is the gate: `setup()` clears
+`identityBrokerNameUsable(device_id)` is the gate: `setup()` clears
 `_mqttEnabled` (`boot.mqtt_disabled reason=node_name_not_unique`) and
 `Cellular::mqttConnect` refuses before configuring the modem session
 (`cellular.mqtt.refused`). The cellular recovery loop returns on that refusal
 rather than retrying, because it cannot clear without a reboot. `Shell` still
 starts either way - serial is the recovery route.
+
+The gate reads the minted id only. A set `device.name` is not proof of a unique
+unit: the label ships as a fixed string in the config image, so a fleet flashed
+from one image would all pass while sharing one clientId. Two units given the
+same label deliberately still collide - that remains the operator rule above,
+not something the firmware can detect.
 
 Home Assistant discovery does not read the node name. `MQTTClient::publishDiscovery`
 and `SHT31Module::publishHaDiscovery` key `dev.ids`, `uniq_id` and the retained
@@ -464,8 +470,9 @@ session while a good cert sits in NVS. Absent is deliberately not broken: there 
 to recover and nothing to clear, so the permission would buy the operator
 nothing while widening what a shared-credential holder reaches. A half-stored
 pair is the same call, and `cert.set` re-pushes the missing half from the
-password row anyway. The flag drops back to false inside `clearClientCert()`,
-so the permission ends with the cert that granted it.
+password row anyway. The flag drops back to false inside `clearClientCert()`
+and on any successful `storeClientCert()`, so the permission ends with the cert
+that granted it rather than outliving a repair until the next connect.
 
 The fact is an explicit parameter of `cliAuthzAllowed`, not a global read from
 inside the policy header, and it is a snapshot from the last `connect()`

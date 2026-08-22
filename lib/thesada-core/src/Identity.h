@@ -43,10 +43,10 @@ class Identity {
   // two units answering to one MQTT clientId evict each other.
   static const char* nodeName();
 
-  // Does nodeName() resolve to something unique to this unit? False means it
-  // is the shared literal, and every transport that uses it as an MQTT
-  // clientId must stay down rather than evict a sibling.
-  static bool nodeNameUnique();
+  // Is nodeName() safe to use as an MQTT clientId? False means it is the
+  // shared literal, and every broker transport must stay down rather than
+  // evict a sibling.
+  static bool brokerNameUsable();
 
   // Can this build create or use a keypair? Rescue images drop the ~97 KB of
   // libsodium, so they read the stored id and key but never mint or sign.

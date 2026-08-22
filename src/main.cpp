@@ -141,10 +141,10 @@ void setup() {
     if (!_wifiEnabled) Log::info("Boot", "boot.wifi_disabled primary_transport=cellular");
   }
 
-  // Without a unique name the MQTT clientId is the shared literal, and two
-  // units on it evict each other from the broker. Stay off every broker path;
-  // Shell still comes up below, which is the recovery route.
-  if (_mqttEnabled && !Identity::nodeNameUnique()) {
+  // Without a minted identity the MQTT clientId is the shared literal, and
+  // two units on it evict each other from the broker. Stay off every broker
+  // path; Shell still comes up below, which is the recovery route.
+  if (_mqttEnabled && !Identity::brokerNameUsable()) {
     _mqttEnabled = false;
     Log::error("Boot", "boot.mqtt_disabled reason=node_name_not_unique");
   }

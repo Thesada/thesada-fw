@@ -2060,6 +2060,10 @@ bool MQTTClient::storeClientCert(const char* certPEM, const char* keyPEM) {
     }
   }
   prefs.end();
+  // A fresh pair supersedes whatever verdict the last load reached. Leaving a
+  // stale "broken" here keeps cert.clear open to a password session against a
+  // cert that is now fine; the next connect recomputes it either way.
+  if (ok) _storedCertBroken = false;
   return ok;
 }
 
