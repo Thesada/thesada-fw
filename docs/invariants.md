@@ -4,10 +4,11 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-07-20 (structured-logging phase 3: every remaining free-text
-Log:: prose call converted to dotted `module.event key=value` events;
-formatting core unchanged in log_kv_policy.h). Bump the date on every
-edit.
+Dated 2026-08-20 (MQTT CLI authorization gate; the mTLS verdict is bound
+to the mTLS listener port; `cert.clear` recovery on a broken stored cert;
+first-boot device identity; fallback AP refuses a default or absent
+passphrase and the recovery window that leaves; LiteServer module
+removed). Bump the date on every edit.
 
 ---
 
@@ -196,6 +197,296 @@ Source: `lib/thesada-core/src/clock_floor_policy.h`,
 
 ## mTLS client identity
 
+### The fallback AP refuses to start without a real passphrase
+
+The soft AP is not a first-boot feature. `WiFiManager` raises it on any WiFi
+failure for the device's entire service life, so it is a permanent surface, and
+the portal behind it writes WiFi credentials. An open or publicly-keyed AP is
+therefore an unauthenticated console, not a degraded fallback.
+
+| Rule | Why |
+|---|---|
+| refuse to start when the passphrase is absent, under 8 chars, or the shipped placeholder | the placeholder is exactly 8 characters, so a length-only gate admits it and the AP comes up keyed by a value that is in the repository |
+| never silently drop to an open AP | the previous behaviour did exactly this, and no log distinguished it from a protected one |
+| SSID is built from `Identity::deviceId()`, not the operator label | the label ships as a fixed string, so every unit would broadcast the same SSID and a per-device join QR is ambiguous with two units in range |
+| the passphrase is seeded per device at flash time and never rotates | it is the recovery token for a WiFi outage; rotating it would require the device reachable during the outage being recovered from |
+| the passphrase is never derived from the MAC | the AP BSSID is the STA MAC plus one and is broadcast, so anything derived from it is computable by anyone in range |
+
+Refusing is the fail-closed direction and it is deliberate: a unit whose
+passphrase was never seeded must announce that loudly rather than come up
+looking provisioned.
+
+The refusal only works because there is a way to seed one.
+`scripts/flash-provision.sh` is that way: it wraps `pio run -t upload`,
+generates the passphrase itself, pushes it with `secret.set wifi.ap_password`
+over the serial shell, and writes the join artifact to a gitignored 0600 file.
+The passphrase never crosses argv or stdout, and NVS is write-only, so that
+file is the only copy. A unit already holding one is left alone; `--force`
+rotates.
+
+Source: `lib/thesada-core/src/ap_policy.h`, `test/test_ap_policy/`,
+`lib/thesada-core/src/WiFiManager.cpp::startFallbackAP`,
+`scripts/flash-provision.sh`.
+
+### A unit fielded without a seeded passphrase has one remote window left
+
+The refusal above is the right default and it lands hardest on units flashed
+before there was a way to seed one. Previously a missing `wifi.ap_password`
+still raised an open AP, so an operator whose WiFi had changed could join the
+fallback and re-enter credentials. That unit now raises nothing, and the WiFi
+it was provisioned for is the only way to reach it.
+
+| Way in | Requires | Open while |
+|---|---|---|
+| `secret.set wifi.ap_password <value>` over the MQTT cli | the unit still talking to the broker | the unit is online |
+| `secret.set wifi.ap_password <value>` over the serial shell | the USB port, so physical access | always |
+| `scripts/flash-provision.sh` | a serial port - it drives `DeviceShell(port)` | always |
+
+Row one is the whole remote window. `secret.set` sits on the password row of
+the cli authorization table above, so it reaches a device that never paired,
+and `startFallbackAP` resolves the value on the next raise, so no restart is
+needed. Once WiFi drops, rows two and three both mean somebody standing at
+the hardware with the enclosure open.
+
+Operational rule: seed `wifi.ap_password` while the unit is reachable, not
+when the AP is wanted. `wifi.ap_refused` logs only at the moment the fallback
+was needed, which is already the outage; `secret.info` reports presence ahead
+of time but needs a cert session over MQTT.
+
+Source: `lib/thesada-core/src/WiFiManager.cpp::startFallbackAP`,
+`lib/thesada-core/src/Shell.cpp` (`secret.set`, `secret.info`),
+`scripts/flash-provision.sh`.
+
+### Device identity lives in its own NVS namespace and never leaves it
+
+First boot derives `device_id` from the full six-byte factory MAC and mints
+an Ed25519 keypair. Both live in `thesada-ident`, not `thesada-secrets`.
+
+| Item | Rule |
+|---|---|
+| namespace | `thesada-ident` (15-char NVS limit, cannot grow) |
+| private key | read only inside `Identity::sign`, zeroized before return |
+| CLI reach | none - `secretNvsKeyFor` maps no field to this namespace, so no `secret.*` command can address it |
+| `chip.info` | exposes `device_id` and the public key only |
+
+Write order in `generate()` is secret key, public key, then id. `loadExisting()`
+gates on the id, so a write interrupted midway reads back as absent and
+regenerates rather than yielding a half identity. An all-zero key read is
+treated as absent for the same reason.
+
+The id uses all six MAC bytes, not a suffix: Espressif assigns sequentially,
+so a short suffix collides across OUIs.
+
+`Identity::nodeName()` is `device.name` when set, otherwise the generated id.
+The shared literal `thesada-node` remains only while no identity exists in
+NVS: a build that cannot mint (rescue), or a boot whose mint failed
+(`identity.mac_read_failed` / `identity.sodium_init_failed` /
+`identity.keygen_failed` / `identity.persist_failed`), stays on the literal
+until the next successful mint. It is
+unique per unit only while `device.name` is unset: the label ships as a fixed
+string in the config image, so a fleet flashed from one image answers to one
+name. The MQTT clientId reads it, and two units answering to one clientId evict
+each other from the broker, so no broker path may run on the literal.
+`identityBrokerNameUsable(device_id)` is the gate: `setup()` clears
+`_mqttEnabled` (`boot.mqtt_disabled reason=node_name_not_unique`) and
+`Cellular::mqttConnect` refuses before configuring the modem session
+(`cellular.mqtt.refused`). The cellular recovery loop returns on that refusal
+rather than retrying, because it cannot clear without a reboot. `Shell` still
+starts either way - serial is the recovery route.
+
+The gate reads the minted id only. A set `device.name` is not proof of a unique
+unit: the label ships as a fixed string in the config image, so a fleet flashed
+from one image would all pass while sharing one clientId. Two units given the
+same label deliberately still collide - that remains the operator rule above,
+not something the firmware can detect.
+
+Home Assistant discovery does not read the node name. `MQTTClient::publishDiscovery`
+and `SHT31Module::publishHaDiscovery` key `dev.ids`, `uniq_id` and the retained
+`homeassistant/.../config` topic on `Identity::deviceId()`, so renaming a device
+cannot orphan its entities; both skip discovery when the id is empty. Migration:
+a unit that already published discovery under a `device.name` keeps those
+retained topics until they are cleared broker-side.
+
+The fallback AP name does not read it either: `startFallbackAP` calls
+`apSsidFor(..., Identity::deviceId(), name)`, and `ap_policy.h` prefers the
+device id, dropping back to the node name only when the id is empty.
+
+`erase()` clears the in-RAM id and key only after `nvs_erase_all` AND
+`nvs_commit` both return `ESP_OK`. A failed erase that dropped the RAM copy
+would strand the unit on the fallback name while the old keypair is still on
+flash.
+
+The keypair exists to prove possession during claiming: the device signs a
+challenge, and the holder of the public key can verify it. Claiming does not
+go over MQTT - a factory-fresh device has no broker credential at all, so the
+cert is delivered over the device's own access point and the device never
+contacts the broker until it already holds one.
+
+Caveat, flash encryption: with it enabled on S3 the NVS partition is bound to
+the chip, so identity cannot be read out or transplanted - but a chip swap or
+an eFuse key loss makes it unrecoverable, and the unit must be re-paired.
+`ENABLE_IDENTITY` is off in rescue builds, which saves ~97 KB of libsodium.
+The flag cuts minting only: `Identity::begin()` reads what NVS holds on every
+image, rescue included, because a rescue image that could not read its own id
+would fall back to the shared literal and re-create the clientId eviction on
+the unbricking path. `Identity::canMint()` is false there, so `generate()` and
+`sign()` are the parts that go away. `identity.reset` is registered on every
+build and refuses at runtime instead: it checks `canMint()` and answers "this
+build cannot mint - reset would leave no identity", because erasing into a
+build that cannot re-mint drops the unit onto the shared fallback name.
+
+Source: `lib/thesada-core/src/device_identity_policy.h`,
+`lib/thesada-core/src/Identity.cpp`, `test/test_device_identity/`.
+
+### MQTT CLI commands are authorized against the session's auth mode
+
+`runCli` dispatches straight to `Shell`, so broker publish rights on a
+device's topic tree mean command execution. The shared onboarding
+credential sits in every device's flash, so it names no device.
+
+| Session auth | Reaches |
+|---|---|
+| client cert, on the mTLS listener | full command surface |
+| password (shared credential) | `cert.set`, `cert.apply`, `cert.info`, `secret.set`, `restart`, `version`, `chip.info`, `heap` |
+| password, stored cert broken | the above plus `cert.clear` |
+| password, `config.set` | key `mqtt.port` only |
+| either, `config.set mqtt.port` | value must parse as 1..65535 |
+
+Any valid port is writable from either row on purpose. Pairing writes
+`8884` and recovery writes `8883`, both on the shared credential, so pinning
+the value would break one of them. The control is the derived mode, not the
+writable value: see the next invariant for what makes a session mTLS.
+
+The value rule sits on both rows for a different reason: authorization is
+asymmetric, validity is not. `config.set` stores what it is handed, and
+`mqtt.port 8884}` saved as a string strands the device at next reload -
+whoever sent it, and a paired device on its own cert is the one nobody can
+reach afterwards. The password row is exactly what the pair and recovery
+flows publish while a device is on the shared credential.
+
+The mode is a property of the session that carried the command, and it is
+frozen at dispatch, before the Shell deferred ring. Each transport owns its
+own answer: the WiFi session's is `_mtlsActive`, recomputed from scratch on
+every `connect()` attempt ahead of the early returns; the fallback
+transport's arrives through `MQTTClient::setFallbackSessionMTLS` and is set
+on every `Cellular::mqttConnect` outcome. One flag cannot serve both - the
+two sessions hold different credentials and stay live at the same time, so a
+device that failed over from WiFi mTLS to a cellular password session would
+otherwise carry the mTLS verdict onto the password path and leave the gate
+wide open. Password is the default in every ambiguous case.
+
+Not device authentication. A leaked per-device cert still gets the full
+surface - the CLI carries no signature and no replay protection.
+
+`secret.set` stays on the password row because pairing pushes the whole
+scalar secret set (`mqtt.password`, `telegram.bot_token`, `web.password`,
+`wifi.ap_password`) plus per-SSID wifi passwords through it before mTLS is
+live. The gate holds the field to exactly that provisioning set
+(`cliAuthzSecretFieldAllowed`, backed by `secret_keymap.h`) - a containment
+line, not a defence: a holder of the armed pairing credential can still
+rewrite the web console and fallback-AP passphrases, because pairing must.
+That residual is why the password listener retires with portal-based
+enrollment rather than being hardened further.
+
+`MQTT_TLS` undefined means no per-device identity exists, so the gate is
+a no-op. That build is the local plaintext-broker escape hatch.
+
+How enforced: `cliAuthzAllowed()` in `MQTTClient::runCli`, after envelope
+unwrap, before every handler including the binary special cases. The mode
+is a parameter, not a global read at drain time. Command names case-fold
+exactly as `Shell::execute` dispatches them - a gate stricter than the
+dispatcher in a different casing is how `CONFIG.SET` once slipped the
+port-value rule. Serial and HTTP are
+ungated by design - serial implies physical access, HTTP has
+`web_auth_policy`.
+
+Source: `lib/thesada-core/src/cli_authz_policy.h`, `test/test_cli_authz/`,
+floor in `scripts/coverage-floors.txt`.
+
+### A session only counts as mTLS when it dialled `MQTT_MTLS_PORT`
+
+`_mtlsActive` used to mean "a client cert was found in NVS and parsed". That
+is a statement about flash, not about the session. `mqtt.port` is the one
+config key a password session may write, so such a session could point the
+device at the broker's password listener, let it reconnect and authenticate
+with the shared credential, and still be judged `CLI_AUTH_MTLS` because the
+cert had loaded. Full command surface on a shared credential.
+
+The verdict is now the conjunction of three terms:
+
+| Term | Meaning |
+|---|---|
+| cert loads | both halves present in NVS and read back |
+| cert validates | `validateClientCertKey` parses both and matches the pair |
+| `_brokerPort == MQTT_MTLS_PORT` | the port last handed to `setServer`, which is the one this session dials |
+
+`_brokerPort` is written at both `setServer` call sites (`begin()` and the
+deferred reinit reconnect), never read out of `Config` at some other moment,
+so a reconnect on a changed port re-evaluates the verdict along with
+everything else `connect()` recomputes. On a non-matching port the client
+material is not attached either, so the session really is password auth and
+sends user/pass. The cellular session applies the same term to `wantMTLS`
+before `setFallbackSessionMTLS`, taken from the port it hands to
+`SMCONF="URL"`.
+
+The check is positive and fail-closed: `== MQTT_MTLS_PORT`, never
+`!= password_port`. Some deployments run a plaintext listener, and "not the
+password port" would read a plaintext password session as mTLS.
+
+What it guarantees: a password session cannot use the one key it may write to
+promote itself to an mTLS session. What it does not: it is no proof that a
+handshake actually presented the cert. It is the port the device dialled plus
+a cert that parses, not a broker-confirmed identity.
+
+`MQTT_MTLS_PORT` defaults to 8884 and is `#ifndef`-guarded so a build flag can
+override it per env. The broker listener and whatever pairs devices against it
+pin the same number; all of them move together or paired devices stop being
+judged as paired.
+
+Source: `src/thesada_config.h`, `lib/thesada-core/src/MQTTClient.cpp::connect`,
+`lib/thesada-mod-cellular/src/Cellular.cpp::mqttConnect`.
+
+### `cert.clear` opens to a password session only on a broken stored cert
+
+The delete and recovery flow publishes `cert.clear` at a device that is on the
+shared credential, and the password row denied it - the one path it exists
+for. Putting it on the row unconditionally is worse than the bug: the shared
+credential sits in every device's flash, so one holder could wipe certs
+fleet-wide and push the whole fleet back onto the credential being retired.
+
+The permission is conditional on a fact the firmware already computes:
+
+| Stored cert state | `cert.clear` from a password session |
+|---|---|
+| loads and validates | denied |
+| complete pair, will not load or will not validate | allowed |
+| absent, or only one half stored | denied |
+
+"Broken" is exactly the state that logs `mqtt.mtls_cert_invalid` or
+`mqtt.mtls_load_failed`. A failed buffer allocation logs
+`mqtt.mtls_load_oom` and leaves the last verdict standing - heap pressure
+says nothing about the cert, and must not open `cert.clear` to a password
+session while a good cert sits in NVS. Absent is deliberately not broken: there is nothing
+to recover and nothing to clear, so the permission would buy the operator
+nothing while widening what a shared-credential holder reaches. A half-stored
+pair is the same call, and `cert.set` re-pushes the missing half from the
+password row anyway. The flag drops back to false inside `clearClientCert()`
+and on any successful `storeClientCert()`, so the permission ends with the cert
+that granted it rather than outliving a repair until the next connect.
+
+The fact is an explicit parameter of `cliAuthzAllowed`, not a global read from
+inside the policy header, and it is a snapshot from the last `connect()`
+attempt rather than re-derived per command - re-parsing a PEM pair on every
+inbound CLI message is not worth the heap. Two consequences: a device whose
+WiFi `connect()` has not run carries `false` and is denied on the cellular
+session, which is the fail-closed direction; and a cert the broker revoked
+still parses locally, so it is not broken here and `cert.clear` stays
+mTLS-only for it.
+
+Source: `lib/thesada-core/src/cli_authz_policy.h::cliAuthzPasswordCmdAllowed`,
+`lib/thesada-core/src/MQTTClient.cpp` (`_storedCertBroken`),
+`test/test_cli_authz/`.
+
 ### Private key material in heap is zeroed before `free()`
 
 Use `mbedtls_platform_zeroize(buf, len)` (not `memset` - the compiler
@@ -314,9 +605,9 @@ staged and the boot partition switched. The upload callback therefore
 checks `_checkAuth` itself at chunk 0 and records the verdict in
 `req->_tempObject` (heap marker, freed by the request destructor;
 NULL = unauthorized); no chunk touches `Update.begin/write/end` without
-it. Arduino WebServer (LiteServer) has the same callback ordering, so
-`handleOtaUpload` gates at `UPLOAD_FILE_START` via `_otaAuthorized` and
-`handleOtaDone` re-checks with the 401-sending `checkAuth()`.
+it. The rule is about callback ordering rather than one server: any
+upload API that streams chunks before a completion handler runs must
+authenticate at the first chunk, not at the end.
 
 How enforced: both upload callbacks bail before their first `Update`
 call when the auth marker is absent. Any new firmware-accepting
@@ -324,8 +615,7 @@ endpoint (HTTP or otherwise) authenticates before the first byte
 reaches `Update`, not in a completion handler.
 
 Source: `lib/thesada-mod-httpserver/src/HttpServer.cpp` (`/ota` upload
-lambda), `lib/thesada-mod-liteserver/src/LiteServer.cpp::handleOtaUpload`,
-`handleOtaDone`.
+lambda).
 
 ### Bearer token comparison is constant-time
 
@@ -741,15 +1031,14 @@ and `LittleFS.rename()`s over the original (lfs rename atomically
 replaces the destination). On any failure the tmp is removed and the
 original is untouched.
 
-How enforced: the writers are `Config::save()`, `Shell.cpp::
-shellConfigWrite` (config.set / config.del / config.save), and
-`LiteServer.cpp::atomicConfigWrite` (web config editor + WiFi
-provisioning). Any new code path that persists config routes through
-one of these three, never a direct `LittleFS.open("/config.json", "w")`.
+How enforced: the writers are `Config::save()` and `Shell.cpp::
+shellConfigWrite` (config.set / config.del / config.save). Any new code
+path that persists config routes through one of these, never a direct
+`LittleFS.open("/config.json", "w")`. This applies to the provisioning
+portal too: it writes WiFi credentials through `Config::save()`.
 
 Source: `lib/thesada-core/src/Config.cpp::save`,
-`lib/thesada-core/src/Shell.cpp::shellConfigWrite`,
-`lib/thesada-mod-liteserver/src/LiteServer.cpp::atomicConfigWrite`.
+`lib/thesada-core/src/Shell.cpp::shellConfigWrite`.
 
 ### Dashboard / shell HTML output is escaped via the browser's serializer
 
@@ -859,8 +1148,7 @@ Source: `lib/thesada-core/src/Secret.h`, `Secret.cpp`;
 handler); `lib/thesada-core/src/Shell.cpp` (`secret.*`);
 `lib/thesada-core/src/WiFiManager.cpp`,
 `lib/thesada-mod-telegram/src/TelegramModule.cpp`,
-`lib/thesada-mod-httpserver/src/HttpServer.cpp`,
-`lib/thesada-mod-liteserver/src/LiteServer.cpp`.
+`lib/thesada-mod-httpserver/src/HttpServer.cpp`.
 
 ---
 
@@ -908,11 +1196,11 @@ credentials), WiFiManager (CONNECTED/SCANNING/ALL_FAILED), OTA phases
 plus failure exits with `reason=`), LoRa init->ready. New state
 machines and transition writes follow the same convention.
 
-Coverage: as of 2026-07-20 every Log::info/warn/error call site in
+Coverage: as of 2026-08-20 every Log::info/warn/error call site in
 src/ and lib/ emits a dotted `module.event key=value` line (prefixes:
-boot, wifi, mqtt, ota, cellular, web (HttpServer + LiteServer),
-telegram, script, lora, temp, gnss, sd, config, sht31, pwm, ads,
-battery, power, sleep, shell, sensors, registry, heartbeat).
+boot, wifi, mqtt, ota, cellular, web (HttpServer),
+telegram, script, lora, temp, gnss, sd, config, identity, sht31, pwm,
+ads, battery, power, sleep, shell, sensors, registry, heartbeat).
 Deliberate free-text exceptions: the Lua `Log.*` script bindings
 (relay user-authored text), the `Sensors` JSON state dump in
 HttpServer::printState, raw AT/serial traces inside

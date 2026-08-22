@@ -6,9 +6,12 @@
 # adversarial-input units - a drop means a branch stopped being exercised.
 #
 # path                                        floor
+lib/thesada-core/src/ap_policy.h                95
+lib/thesada-core/src/cli_authz_policy.h         95
 lib/thesada-core/src/cli_payload.h              90
 lib/thesada-core/src/cli_topics.h               95
 lib/thesada-core/src/clock_floor_policy.h       95
+lib/thesada-core/src/device_identity_policy.h    95
 lib/thesada-core/src/log_kv_policy.h            95
 lib/thesada-core/src/lora_dedup_policy.h        95
 lib/thesada-core/src/meshtastic_frame.h         95

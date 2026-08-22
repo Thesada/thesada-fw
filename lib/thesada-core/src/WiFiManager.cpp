@@ -8,6 +8,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "WiFiManager.h"
+#include "Identity.h"
+#include "ap_policy.h"
 #include "Config.h"
 #include "Secret.h"
 #include "Log.h"
@@ -205,21 +207,32 @@ void WiFiManager::startFallbackAP() {
   if (_apActive) return;
 
   JsonObject  cfg      = Config::get();
-  const char* name     = cfg["device"]["name"]        | "thesada-node";
+  const char* name     = Identity::nodeName();
   char        apPassBuf[Secret::MAX_LEN];
   const char* apPass   = Secret::resolve("ap_password", cfg["wifi"]["ap_password"] | "",
                                          apPassBuf, sizeof(apPassBuf));
   _apTimeoutMs         = (uint32_t)(cfg["wifi"]["ap_timeout_s"] | 300) * 1000UL;
 
+  // Refuse rather than degrade. The portal behind this AP writes WiFi
+  // credentials, and the AP is raised on any WiFi failure for the device's
+  // whole life - an open one is an unauthenticated console, not a fallback.
+  if (!apMayStart(apPass)) {
+    Log::kvfw(TAG, "wifi.ap_refused reason=%s hint=\"seed via secret.set wifi.ap_password\"",
+              (!apPass || !*apPass) ? "no_password" : "default_or_short_password");
+    return;
+  }
+
   char apSSID[32];
-  snprintf(apSSID, sizeof(apSSID), "%s-setup", name);
+  // Device id, not the operator label: the label ships as a fixed string, so
+  // every unit would broadcast the same SSID and a per-device join QR would be
+  // ambiguous with two units in range.
+  if (!apSsidFor(apSSID, sizeof(apSSID), Identity::deviceId(), name)) {
+    Log::kvfw(TAG, "wifi.ap_refused reason=ssid_truncated");
+    return;
+  }
 
   WiFi.mode(WIFI_AP);
-  if (strlen(apPass) >= 8) {
-    WiFi.softAP(apSSID, apPass);
-  } else {
-    WiFi.softAP(apSSID);
-  }
+  WiFi.softAP(apSSID, apPass);
   _apActive    = true;
   _apStartTime = millis();
 

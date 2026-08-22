@@ -13,6 +13,7 @@
 #include <soc/soc_caps.h>
 #include "thesada_config.h"
 #include <Config.h>
+#include <Identity.h>
 #include <ModuleRegistry.h>
 #include <WiFiManager.h>
 #include <MQTTClient.h>
@@ -127,6 +128,10 @@ void setup() {
 
   Config::load();
 
+  // Before any transport: a factory-fresh unit must have an identity to
+  // announce itself with, and it must survive a firmware reflash.
+  if (!Identity::begin()) Log::warn("Boot", "boot.identity_unavailable");
+
   {
     JsonObject cfg    = Config::get();
     _wifiEnabled      = cfg["wifi"]["enabled"]      | true;
@@ -134,6 +139,14 @@ void setup() {
     _otaEnabled       = cfg["ota"]["enabled"]       | true;
     _heartbeatEnabled = cfg["heartbeat"]["enabled"] | true;
     if (!_wifiEnabled) Log::info("Boot", "boot.wifi_disabled primary_transport=cellular");
+  }
+
+  // Without a minted identity the MQTT clientId is the shared literal, and
+  // two units on it evict each other from the broker. Stay off every broker
+  // path; Shell still comes up below, which is the recovery route.
+  if (_mqttEnabled && !Identity::brokerNameUsable()) {
+    _mqttEnabled = false;
+    Log::error("Boot", "boot.mqtt_disabled reason=node_name_not_unique");
   }
 
   // Bring WiFi up. CellularModule registers later via PRIORITY_NETWORK

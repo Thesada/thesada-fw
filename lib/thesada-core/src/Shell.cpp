@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "Shell.h"
+#include "Identity.h"
 #include "Config.h"
 #include "Secret.h"
 #include "Console.h"
@@ -13,6 +14,7 @@
 #include "SensorRegistry.h"
 #include "Net.h"
 #include "path_safety_policy.h"
+#include "ap_policy.h"
 #include <thesada_config.h>
 #include <mbedtls/platform_util.h>
 #include <esp_ota_ops.h>
@@ -560,6 +562,64 @@ static void cmd_df(int argc, char** argv, ShellOutput out) {
   }
 
   Shell::printRegisteredDf(out);
+}
+
+// Report identity without ever touching the private key - the public half and
+// the id are the only things any caller needs.
+// In:  none
+// Out: device_id, pubkey, node_name, factory-provisioned, ap_password state
+//      (never the value), ap_ssid, minting note on rescue builds
+static void cmd_identity_info(int argc, char** argv, ShellOutput out) {
+  (void)argc; (void)argv;
+  char line[128];
+  const char* id  = Identity::deviceId();
+  const char* pub = Identity::publicKeyHex();
+  snprintf(line, sizeof(line), "device_id: %s", *id ? id : "(none)");
+  out(line);
+  snprintf(line, sizeof(line), "pubkey: %s", *pub ? pub : "(none)");
+  out(line);
+  snprintf(line, sizeof(line), "node_name: %s", Identity::nodeName());
+  out(line);
+  snprintf(line, sizeof(line), "factory-provisioned: %s",
+           Identity::hasClientCert() ? "true" : "false");
+  out(line);
+  {
+    // Same resolution startFallbackAP uses: Secret first, then config.
+    JsonObject cfg = Config::get();
+    char pwBuf[Secret::MAX_LEN];
+    const char* pw = Secret::resolve("ap_password",
+                                     cfg["wifi"]["ap_password"] | "",
+                                     pwBuf, sizeof(pwBuf));
+    snprintf(line, sizeof(line), "ap_password: %s", apPasswordState(pw));
+    out(line);
+    char ssid[32];
+    if (apSsidFor(ssid, sizeof(ssid), id, Identity::nodeName())) {
+      snprintf(line, sizeof(line), "ap_ssid: %s", ssid);
+      out(line);
+    }
+  }
+  if (!Identity::canMint()) out("minting: off (rescue build, read-only)");
+}
+
+// Destroys the keypair. The next boot mints a new one, so anything that
+// trusted the old public key must re-pair.
+static void cmd_identity_reset(int argc, char** argv, ShellOutput out) {
+  if (argc < 2 || strcmp(argv[1], "--yes") != 0) {
+    out("Usage: identity.reset --yes  (DESTROYS the device keypair)");
+    return;
+  }
+  // A build that cannot mint would erase into nothing and leave the unit on
+  // the shared fallback name.
+  if (!Identity::canMint()) {
+    out("identity: this build cannot mint - reset would leave no identity");
+    return;
+  }
+  bool ok = Identity::erase();
+  out(ok ? "identity erased - rebooting to regenerate"
+         : "identity erase FAILED");
+  if (!ok) return;
+  delay(200);
+  esp_restart();
 }
 
 // Reformat LittleFS - destroys every file. Requires `fs.format --yes` so
@@ -1770,6 +1830,16 @@ static void cmd_chip_info(int argc, char** argv, ShellOutput out) {
            model, (unsigned)info.revision, (unsigned)info.cores);
   out(line);
 
+  const char* id  = Identity::deviceId();
+  const char* pub = Identity::publicKeyHex();
+  snprintf(line, sizeof(line), "device_id: %s", *id ? id : "(none)");
+  out(line);
+  snprintf(line, sizeof(line), "pubkey: %s", *pub ? pub : "(none)");
+  out(line);
+  snprintf(line, sizeof(line), "factory-provisioned: %s",
+           Identity::hasClientCert() ? "true" : "false");
+  out(line);
+
   uint32_t flashSize = 0;
   esp_flash_get_size(NULL, &flashSize);
   snprintf(line, sizeof(line), "flash: %lu bytes (%.2f MB)",
@@ -1894,7 +1964,7 @@ static void cmd_version(int argc, char** argv, ShellOutput out) {
   out(line);
 
   JsonObject cfg = Config::get();
-  const char* devName   = cfg["device"]["name"]        | "";
+  const char* devName   = Identity::nodeName();
   const char* topicPref = cfg["mqtt"]["topic_prefix"]  | "";
   snprintf(line, sizeof(line), "device: %s  topic: %s",
            devName[0]   ? devName   : "?",
@@ -2122,6 +2192,8 @@ void Shell::registerBuiltins() {
   registerCommand("boot.info",     "Last reset reason + uptime",    cmd_boot_info);
   registerCommand("partitions",    "Full partition table dump",     cmd_partitions);
   registerCommand("chip.info",     "Chip revision, flash, PSRAM",   cmd_chip_info);
+  registerCommand("identity.info",  "Device id and public key",      cmd_identity_info);
+  registerCommand("identity.reset", "Wipe device keypair (identity.reset --yes)", cmd_identity_reset);
   registerCommand("sdkconfig",     "Selected CONFIG_* relevant to OTA/boot", cmd_sdkconfig);
 
   // Module
