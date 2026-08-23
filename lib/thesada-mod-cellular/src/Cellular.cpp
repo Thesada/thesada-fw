@@ -6,6 +6,7 @@
 #ifdef ENABLE_CELLULAR
 
 #include "Cellular.h"
+#include <Identity.h>
 #include <Config.h>
 #include <Log.h>
 #include <LittleFS.h>
@@ -693,9 +694,20 @@ bool Cellular::mqttConnect() {
   int         port     = cfg["mqtt"]["port"]      | 8883;
   const char* user     = cfg["mqtt"]["user"]      | "";
   const char* password = cfg["mqtt"]["password"]  | "";
-  const char* devName  = cfg["device"]["name"]    | "thesada-node";
+  const char* devName  = Identity::nodeName();
+
+  // Same rule as the WiFi path in main: the shared literal as clientId evicts
+  // a sibling off the broker. Refuse before the modem session is configured.
+  if (!Identity::brokerNameUsable()) {
+    Log::error(TAG, "cellular.mqtt.refused reason=node_name_not_unique");
+    return false;
+  }
 
   Log::info(TAG, "cellular.mqtt.configure");
+
+  // The session about to be torn down below takes its auth verdict with it.
+  // Every exit from here that is not a live SMCONN must leave it at password.
+  MQTTClient::setFallbackSessionMTLS(false);
 
   // Strong teardown: SMDISC alone is not enough after a warm SMCONN
   // failure - the SIM7080 keeps the URL slot half-locked and the next
@@ -762,7 +774,10 @@ bool Cellular::mqttConnect() {
   // upload if the cache flag says it is already there from a prior
   // session - the modem FS persists across SMDISC, just not across
   // a hardware power cycle (handled by hardReset / modemSoftReset).
-  bool wantMTLS = MQTTClient::hasClientCert() && _hasCACert;
+  // Same rule as the WiFi session: mTLS only on the mTLS listener, so a
+  // session dialled to any other port authenticates and is judged password.
+  bool wantMTLS = MQTTClient::hasClientCert() && _hasCACert &&
+                  port == MQTT_MTLS_PORT;
   if (wantMTLS && !_hasClientCertOnModem) {
     if (writeClientCert()) {
       _hasClientCertOnModem = true;
@@ -851,6 +866,9 @@ bool Cellular::mqttConnect() {
   }
 
   Log::info(TAG, "cellular.mqtt.connected");
+
+  // This session's own credential decides what its CLI commands may run.
+  MQTTClient::setFallbackSessionMTLS(wantMTLS);
 
   // Re-issue every WiFi-side subscription on the cellular MQTT session
   //. Reconnect path benefits too - the modem drops subscriptions
@@ -1418,6 +1436,9 @@ void Cellular::loop() {
       g.pause(10000UL);
     }
     while (!mqttConnect()) {
+      // A refusal on the name rule never clears by retrying: recovery is a
+      // serial identity.reset or a device.name, both of which reboot us.
+      if (!Identity::brokerNameUsable()) return;
       mqttBackoffWait(&g);
     }
     mqttBackoffReset();
