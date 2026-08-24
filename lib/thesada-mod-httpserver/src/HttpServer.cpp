@@ -39,6 +39,16 @@ static JsonDocument _stateDoc;
 // Deferred restart flag - set by /api/restart, acted on in loop().
 static bool _restartPending = false;
 
+// Set once server.begin() has actually bound. See netifUp() below.
+static bool _serverStarted = false;
+
+// ESPAsyncWebServer binds an lwIP socket, and lwIP only exists once WiFi has
+// started in some mode. With wifi.enabled=false nothing ever starts it, so
+// server.begin() asserts in tcpip_api_call and panics the boot.
+static bool netifUp() {
+  return WiFi.getMode() != WIFI_MODE_NULL;
+}
+
 // Buffer for POST /api/config body (written after auth check).
 static String _cfgBodyBuf;
 // Buffer for POST /api/file body.
@@ -254,7 +264,14 @@ void HttpServer::begin() {
   subscribeToEvents();
   setupRoutes();
 
+  // Routes are registered either way; only the bind waits. The fallback AP
+  // brings a netif up later, and loop() picks it up then.
+  if (!netifUp()) {
+    Log::warn(TAG, "web.server_deferred reason=no_netif");
+    return;
+  }
   server.begin();
+  _serverStarted = true;
   Log::info(TAG, "web.server_started port=80");
 }
 
@@ -278,6 +295,12 @@ void HttpServer::printState() {
 
 // Clean up WS clients and handle deferred restart requests
 void HttpServer::loop() {
+  if (!_serverStarted) {
+    if (!netifUp()) return;
+    server.begin();
+    _serverStarted = true;
+    Log::info(TAG, "web.server_started port=80 deferred=true");
+  }
   _ws.cleanupClients();  // required by ESPAsyncWebServer 3.x to drain the WS send queue
   if (_restartPending) {
     Log::info(TAG, "web.restart reason=api_request");

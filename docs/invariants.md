@@ -4,11 +4,11 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-08-20 (MQTT CLI authorization gate; the mTLS verdict is bound
+Dated 2026-08-23 (MQTT CLI authorization gate; the mTLS verdict is bound
 to the mTLS listener port; `cert.clear` recovery on a broken stored cert;
 first-boot device identity; fallback AP refuses a default or absent
 passphrase and the recovery window that leaves; LiteServer module
-removed). Bump the date on every edit.
+removed; the HTTP bind waits for a netif). Bump the date on every edit.
 
 ---
 
@@ -537,6 +537,33 @@ Source: `lib/thesada-core/src/MQTTClient.cpp::connect`.
 ---
 
 ## HTTP server
+
+### The server binds only once a netif exists
+
+`server.begin()` opens an lwIP socket, and lwIP is initialised by the WiFi
+start, not by us. With `wifi.enabled: false` nothing ever starts it, so the
+bind hits `assert failed: tcpip_api_call ... (Invalid mbox)` and panics.
+
+That panic lands inside `ModuleRegistry::beginAll()`, which is still `setup()`.
+`Shell::pumpConsole()` only runs from `loop()`, so the shell is registered and
+never pumped: the unit boot-loops with no serial way in, and reflashing is the
+only recovery. This is why the bind is guarded rather than left to fail loudly.
+
+| State | Behaviour |
+|---|---|
+| WiFi STA up | binds in `begin()` |
+| Fallback AP raised later | `begin()` defers, `loop()` binds when the AP netif appears |
+| `wifi.enabled: false` | `web.server_deferred reason=no_netif`, never binds, boot completes |
+
+Routes and the log handler are registered either way; only the bind waits.
+`web.server_started` in the log is the proof it bound - its absence next to a
+`registry.module_init ... HttpServer` line means the assert fired.
+
+How enforced: nothing may call an lwIP or socket API from `begin()` without
+checking `WiFi.getMode() != WIFI_MODE_NULL`. Cellular does not help here - the
+SIM7080 does modem-native TCP over AT and never creates an lwIP netif.
+
+Source: `lib/thesada-mod-httpserver/src/HttpServer.cpp::begin` / `::loop`.
 
 ### `/api/cmd` never executes shell commands inside the AsyncTCP callback
 
