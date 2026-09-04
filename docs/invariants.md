@@ -4,7 +4,11 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-08-23 (MQTT CLI authorization gate; the mTLS verdict is bound
+Dated 2026-09-03 (OTA verification and cert/key structural decisions extracted
+to `ota_verify_policy.h` and `cert_policy.h`, host-tested under a 95% coverage
+floor; `certKeyInputsUsable` newly requires PEM structure on the mTLS install
+path; the mbedtls pair check itself is unchanged and still untested. Prior:
+MQTT CLI authorization gate; the mTLS verdict is bound
 to the mTLS listener port; `cert.clear` recovery on a broken stored cert;
 first-boot device identity; fallback AP refuses a default or absent
 passphrase and the recovery window that leaves; LiteServer module
@@ -108,7 +112,9 @@ included) switches it to verified TLS - same override pattern as
 
 Source: `lib/thesada-core/src/OTAUpdate.cpp` `begin()`, `check()`,
 `configureSecureClient()`, `loadCaCert()`; `lib/thesada-core/src/MQTTClient.cpp`
-CA-load block; `lib/thesada-core/src/ota_ca_progmem.h`.
+CA-load block; `lib/thesada-core/src/ota_ca_progmem.h`. The refuse/insecure/
+verified decision itself is `otaTlsMode()` in
+`lib/thesada-core/src/ota_verify_policy.h` (host-tested).
 
 ### Every `OTAUpdate::check()` exit emits exactly one `<prefix>/status/ota` record
 
@@ -135,7 +141,10 @@ Incremental hash update during `Update.write`; mismatch -> `Update.abort()`
 without flipping the boot partition. Inactive flash partition stays
 invalidated cleanly.
 
-Source: `lib/thesada-core/src/OTAUpdate.cpp` flashFromCallback path.
+Source: `lib/thesada-core/src/OTAUpdate.cpp` flashFromCallback path. The digest
+compare is `otaShaMatches()` in `lib/thesada-core/src/ota_verify_policy.h`, which
+now gates digest length before comparing; the streaming `mbedtls_sha256`
+accumulation stays in OTAUpdate.cpp and is not host-tested.
 
 ### OTA-over-cellular shares the WiFi cert-verification gate
 
@@ -522,7 +531,12 @@ How enforced: every path that installs client mTLS material calls
 `mbedtls_pk_check_pair` and `mbedtls_pk_parse_key` take RNG callback
 args on mbedtls 3.x (pioarduino / IDF 5.x), the shorter forms on 2.x.
 
-Source: `lib/thesada-core/src/MQTTClient.cpp::validateClientCertKey`.
+Source: `lib/thesada-core/src/MQTTClient.cpp::validateClientCertKey`. It is now
+fronted by `certKeyInputsUsable()` in `lib/thesada-core/src/cert_policy.h`, a
+structural PEM pre-flight that is strictly more rejecting than the previous
+non-null/non-empty guard. **The pair check itself is unchanged and remains
+untested** - `cert_policy.h` covers structure and CN extraction only, not
+`mbedtls_pk_check_pair`.
 
 ### mTLS context reset between connect attempts
 

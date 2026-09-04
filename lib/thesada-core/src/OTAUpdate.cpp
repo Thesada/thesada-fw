@@ -30,6 +30,7 @@
 #include <esp_task_wdt.h>
 #include <functional>
 #include <mbedtls/sha256.h>
+#include "ota_verify_policy.h"
 
 #ifdef ENABLE_CELLULAR
 #include "Cellular.h"
@@ -373,11 +374,16 @@ void OTAUpdate::begin() {
   if (_enabled) {
     loadCaCert();
     bool allowInsecure = cfg["ota"]["allow_insecure"] | false;
-    if (_otaCaCert.isEmpty() && !allowInsecure) {
-      Log::error(TAG, "ota.disabled reason=no_ca allow_insecure=unset");
-      _enabled = false;
-    } else if (_otaCaCert.isEmpty() && allowInsecure) {
-      Log::kvfw(TAG, "ota.tls_insecure reason=allow_insecure_set");
+    switch (otaTlsMode(!_otaCaCert.isEmpty(), allowInsecure)) {
+      case OTA_TLS_REFUSED:
+        Log::error(TAG, "ota.disabled reason=no_ca allow_insecure=unset");
+        _enabled = false;
+        break;
+      case OTA_TLS_INSECURE:
+        Log::kvfw(TAG, "ota.tls_insecure reason=allow_insecure_set");
+        break;
+      case OTA_TLS_VERIFIED:
+        break;
     }
   }
 
@@ -550,7 +556,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
   Log::kvf(TAG, "ota.version_check remote=%s local=%s",
            remoteVersion.c_str(), FIRMWARE_VERSION);
 
-  if (!force && !isNewer(remoteVersion.c_str(), FIRMWARE_VERSION)) {
+  if (!otaShouldUpdate(remoteVersion.c_str(), FIRMWARE_VERSION, force)) {
     Log::kvf(TAG, "ota.phase_change from=fetch_manifest to=idle reason=up_to_date");
     // Publish so operators see the check completed and the device is on
     // the latest. Without this an up-to-date check looks identical to
@@ -608,9 +614,8 @@ bool OTAUpdate::fetchManifest(const char* url,
   String body;
   // Cap the manifest at 8 KB - real manifests are ~200 B; anything
   // larger is either a misconfig or a malicious upstream.
-  static constexpr size_t kManifestCap = 8 * 1024;
   auto cb = [&](const uint8_t* buf, size_t len) -> bool {
-    if (body.length() + len > kManifestCap) return false;
+    if (!otaManifestSizeOk(body.length(), len)) return false;
     body.concat(reinterpret_cast<const char*>(buf), len);
     return true;
   };
@@ -642,7 +647,7 @@ bool OTAUpdate::fetchManifest(const char* url,
   // WiFi path falls back to Content-Length from the binary GET if absent.
   size_t      sz = doc["size"]   | (size_t)0;
 
-  if (strlen(v) == 0 || strlen(u) == 0 || strlen(s) == 0) {
+  if (!otaManifestValid(v, u, s)) {
     Log::error(TAG, "ota.manifest_invalid missing=version_url_sha256");
     return false;
   }
@@ -760,7 +765,7 @@ bool OTAUpdate::applyUpdate(const String& binUrl, const String& expectedSha256,
   }
   computedHex[64] = '\0';
 
-  if (strcasecmp(computedHex, expectedSha256.c_str()) != 0) {
+  if (!otaShaMatches(computedHex, expectedSha256.c_str())) {
     Log::kvfe(TAG, "ota.phase_change from=verify to=idle reason=sha256_mismatch computed=%s", computedHex);
     Update.abort();
     return false;
@@ -780,13 +785,5 @@ bool OTAUpdate::applyUpdate(const String& binUrl, const String& expectedSha256,
 // ---------------------------------------------------------------------------
 
 bool OTAUpdate::isNewer(const char* remote, const char* local) {
-  int rMajor = 0, rMinor = 0, rPatch = 0;
-  int lMajor = 0, lMinor = 0, lPatch = 0;
-
-  sscanf(remote, "%d.%d.%d", &rMajor, &rMinor, &rPatch);
-  sscanf(local,  "%d.%d.%d", &lMajor, &lMinor, &lPatch);
-
-  if (rMajor != lMajor) return rMajor > lMajor;
-  if (rMinor != lMinor) return rMinor > lMinor;
-  return rPatch > lPatch;
+  return otaIsNewer(remote, local);
 }

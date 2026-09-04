@@ -1,6 +1,7 @@
 // thesada-fw - MQTTClient.cpp
 // SPDX-License-Identifier: GPL-3.0-only
 #include "MQTTClient.h"
+#include "cert_policy.h"
 #include <thesada_config.h>
 #include "Config.h"
 #include "Secret.h"
@@ -126,7 +127,9 @@ static uint16_t  _brokerPort = 0;
 // out: true if both parse AND the key is the private half of the cert's
 //      public key.
 static bool validateClientCertKey(const char* cert, const char* key) {
-  if (!cert || !key || !*cert || !*key) return false;
+  // Structural pre-flight before mbedtls sees attacker-influenced bytes:
+  // both present, and each actually shaped like what it claims to be.
+  if (!certKeyInputsUsable(cert, key)) return false;
 
   mbedtls_x509_crt crt;
   mbedtls_pk_context pk;
@@ -2137,13 +2140,7 @@ bool MQTTClient::getCertInfo(char* cn, char* serial, char* notBefore, char* notA
 
   char subj[256];
   mbedtls_x509_dn_gets(subj, sizeof(subj), &crt.subject);
-  const char* cnp = strstr(subj, "CN=");
-  if (cnp) {
-    cnp += 3;
-    size_t i = 0;
-    while (*cnp && *cnp != ',' && i < maxLen - 1) cn[i++] = *cnp++;
-    cn[i] = '\0';
-  } else {
+  if (!certExtractCn(subj, cn, maxLen)) {
     snprintf(cn, maxLen, "(no CN)");
   }
 
