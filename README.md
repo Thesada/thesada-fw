@@ -111,6 +111,10 @@ Minimal build (core only) saves ~313 KB flash. Full build with all modules: 1.4 
 
 ---
 
+## Examples
+
+Two modules exist only to be read: `lib/thesada-mod-example-temperature-mqtt/` (one DS18B20, published every interval, the sensor shape) and `lib/thesada-mod-example-remote-relay/` (a GPIO driven by `relay.set on|off|toggle` over serial, HTTP or MQTT, the actuator shape). Each is one header and one source file, and each is off in every build until you uncomment its `ENABLE_EXAMPLE_*` line in `src/thesada_config.h` and set `"enabled": true` in its `config.json` block. Copy one, rename it, and you have a module.
+
 ## Hardware
 
 | Board | PIO environment | Notes |

@@ -81,10 +81,12 @@
   },
 
   "lua": {
+    "enabled":      true,
     "reload_topic": ""
   },
 
   "temperature": {
+    "enabled":            true,
     "pin":                12,
     "interval_s":         60,
     "auto_discover":      true,
@@ -104,6 +106,7 @@
   },
 
   "ads1115": {
+    "enabled":      true,
     "line_voltage": 120,
     "i2c_sda":      1,
     "i2c_scl":      2,
@@ -142,13 +145,28 @@
   },
 
   "pwm": {
+    "enabled":      true,
     "pin":          16,
     "channel":      0,
     "frequency_hz": 25000,
     "resolution":   8
   },
 
+  "example_temperature_mqtt": {
+    "enabled":    false,
+    "pin":        12,
+    "interval_s": 60,
+    "name":       "example"
+  },
+
+  "example_remote_relay": {
+    "enabled":    false,
+    "pin":        4,
+    "active_low": false
+  },
+
   "telegram": {
+    "enabled":    false,
     "bot_token":  "",
     "chat_ids":   [],
     "cooldown_s": 300,
