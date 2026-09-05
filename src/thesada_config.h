@@ -40,6 +40,12 @@
 #define ENABLE_WEBSERVER     // Web UI, REST API, dashboard, OTA upload
 #define ENABLE_SCRIPTENGINE  // Lua scripting (alerts.lua, rules.lua)
 
+// ── Example modules ─────────────────────────────────────────────────────────
+// Minimal modules that show the pattern, not deployment hardware. Off in every
+// build unless you turn one on; see lib/thesada-mod-example-*/.
+// #define ENABLE_EXAMPLE_TEMPERATURE_MQTT  // one DS18B20, published every interval
+// #define ENABLE_EXAMPLE_REMOTE_RELAY      // a GPIO driven by `relay.set on|off|toggle`
+
 // ── Dependency warnings ──────────────────────────────────────────────────────
 #if defined(ENABLE_SCRIPTENGINE) && !defined(ENABLE_TELEGRAM)
   #warning "Lua Telegram.send() unavailable: ENABLE_TELEGRAM is off"
