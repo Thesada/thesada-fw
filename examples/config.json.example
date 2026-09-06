@@ -29,17 +29,6 @@
     "dns":                   "8.8.8.8"
   },
 
-  "eth": {
-    "static_ip": "",
-    "gateway":   "192.168.1.1",
-    "subnet":    "255.255.255.0",
-    "dns":       "8.8.8.8",
-    "phy_addr":  1,
-    "power_pin": 16,
-    "mdc":       23,
-    "mdio":      18
-  },
-
   "ntp": {
     "server":      "pool.ntp.org",
     "server2":     "time.cloudflare.com",
@@ -134,14 +123,6 @@
     "pin_data":    40,
     "pin_cs":      5,
     "max_file_kb": 1024
-  },
-
-  "display": {
-    "sda":             21,
-    "scl":             22,
-    "address":         60,
-    "rotation":        1,
-    "page_interval_s": 3
   },
 
   "pwm": {
