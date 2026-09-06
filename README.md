@@ -132,14 +132,17 @@ Rescue builds strip all optional modules except PMU via `BOARD_OWB_RESCUE`. That
 ## Quick start
 
 ```bash
-python3 scripts/check_deps.py        # verify PlatformIO + libraries
+make setup                           # PlatformIO, gcovr, cppcheck, Lua, git hooks
 cp examples/config.json.example data/config.json
 # edit data/config.json (WiFi, MQTT, sensor pins)
 # optionally copy example scripts:
 #   cp examples/scripts/rules.lua.example data/scripts/rules.lua
-pio run -e esp32-owb --target upload      # or esp32-s3-debug for bare-S3
-pio run -e esp32-owb --target uploadfs
+make flash ENV=esp32-owb             # or ENV=esp32-s3-debug for bare-S3
+make flashfs ENV=esp32-owb
 ```
+
+Bare `make` lists every target: build, test, lint, coverage, flash,
+monitor, provision. CI runs the same targets.
 
 The fallback AP will not start without a real passphrase, so flash a new board
 through the provisioning wrapper instead - it uploads, seeds a random per-device
