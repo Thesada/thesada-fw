@@ -1,8 +1,5 @@
-# clang-tidy over the pure policy headers, driven by scripts/tidy-check.sh.
-# Scope matches scripts/static-check.sh: adversarial-input units, no Arduino.
-# Dropped: internal-linkage (Unity test TUs), const-correctness and enum-size
-# (style), signed-bitwise and implicit-widening (uint8_t promotion in byte
-# packing, macro-sized arrays). Real exceptions carry a NOLINT with the reason.
+# Pure policy headers via scripts/tidy-check.sh. Dropped: Unity-TU linkage,
+# style checks, uint8_t byte-packing promotions. Exceptions carry a NOLINT.
 Checks: >
   -*,
   bugprone-*,

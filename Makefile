@@ -7,6 +7,7 @@ ENV  ?= esp32-owb
 PORT ?=
 LUA  ?= $(shell command -v lua5.3 || command -v lua)
 BOARD_ENVS := esp32-owb esp32-owb-rescue esp32-owb-debug esp32-s3-debug esp32-s3-debug-rescue esp32-s3-carrier
+BENCH_ENVS := $(filter-out esp32-owb esp32-owb-rescue,$(BOARD_ENVS))
 PORT_FLAG  := $(if $(PORT),--upload-port $(PORT),)
 
 ##@ General
@@ -20,7 +21,7 @@ help: ## Show this help
 ##@ Setup
 
 .PHONY: setup
-setup: setup-py setup-sys setup-hooks ## Everything a clean clone needs: Python tools, cppcheck, Lua, git hooks
+setup: setup-py setup-sys setup-hooks ## Everything a clean clone needs: Python tools, cppcheck, clang-tidy, Lua, git hooks
 
 .PHONY: setup-py
 setup-py: ## PlatformIO, intelhex and gcovr via pipx when present (NO_PIPX=1 forces pip)
@@ -65,7 +66,7 @@ dist: ## What a release ships: every env, the minimal build, build/boards/
 	cp build/firmware.json build/boards/firmware-owb.json
 	$(PIO) run -e esp32-owb-rescue
 	cp .pio/build/esp32-owb-rescue/firmware.bin build/boards/firmware-owb-rescue.bin
-	$(PIO) run -e esp32-owb-debug -e esp32-s3-debug -e esp32-s3-debug-rescue -e esp32-s3-carrier
+	$(PIO) run $(foreach e,$(BENCH_ENVS),-e $(e))
 	$(MAKE) build-minimal
 	cp build/boards/firmware-owb.bin build/firmware.bin
 	cp build/boards/firmware-owb.json build/firmware.json
