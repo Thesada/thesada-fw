@@ -1,10 +1,12 @@
 # thesada-fw. Bare `make` prints this list and changes nothing.
+# No fmt target: the repo has no .clang-format to run.
 .DEFAULT_GOAL := help
 SHELL := bash
 
 PIO  ?= pio
 ENV  ?= esp32-owb
 PORT ?=
+TEST ?=
 LUA  ?= $(shell command -v lua5.3 || command -v lua)
 BOARD_ENVS := esp32-owb esp32-owb-rescue esp32-owb-debug esp32-s3-debug esp32-s3-debug-rescue esp32-s3-carrier
 BENCH_ENVS := $(filter-out esp32-owb esp32-owb-rescue,$(BOARD_ENVS))
@@ -26,7 +28,8 @@ setup: setup-py setup-sys setup-hooks ## Everything a clean clone needs: Python 
 .PHONY: setup-py
 setup-py: ## PlatformIO, intelhex and gcovr via pipx when present (NO_PIPX=1 forces pip)
 	@if [ -z "$$NO_PIPX" ] && command -v pipx >/dev/null; then \
-	  pipx install platformio && pipx inject platformio intelhex && pipx install gcovr; \
+	  pipx install platformio && pipx upgrade platformio && pipx inject platformio intelhex \
+	    && pipx install gcovr && pipx upgrade gcovr; \
 	else \
 	  python3 -m pip install --upgrade platformio intelhex gcovr; \
 	fi
@@ -81,8 +84,8 @@ compiledb: ## compile_commands.json for ENV, for clang-tidy and editors
 test: test-native test-lua ## Host-side suites: native unit tests + Lua rules harness
 
 .PHONY: test-native
-test-native: ## Unity tests over the pure policy headers, no board
-	$(PIO) test -e native
+test-native: ## Unity tests over the pure policy headers, no board (TEST=test_rollback for one suite)
+	$(PIO) test -e native $(if $(TEST),-f $(TEST),)
 
 .PHONY: test-lua
 test-lua: ## Lua rules harness against the mocked bindings
