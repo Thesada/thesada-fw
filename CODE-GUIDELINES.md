@@ -411,9 +411,10 @@ are being removed.
 `framework = arduino` ships a precompiled IDF; there is no per-env
 sdkconfig to tune. A new board is an `[env:...]` in `platformio.ini`
 (extend `esp32-owb` or `esp32-s3-debug`), its own partition table if
-the flash size differs, a `pio run -e` line in the CI build job, and a
-row in the README supported-boards table. The `sdkconfig` shell command
-prints the CONFIG_* values the build actually carries.
+the flash size differs, a `pio run -e` line next to the other envs in
+the CI build (the Makefile `dist` target), and a row in the README
+boards table. The `sdkconfig` shell command prints the OTA/boot-relevant
+CONFIG_* subset the build carries.
 
 ---
 
