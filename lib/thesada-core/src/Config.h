@@ -4,6 +4,12 @@
 #pragma once
 #include <ArduinoJson.h>
 
+// Single-task invariant: every method reads or writes the one _doc with no
+// locking, and ArduinoJson is not thread-safe. Every caller must run on the
+// main loop task: module begin()/loop(), Shell handlers, MQTT callbacks all
+// do today. Do NOT call from an ISR or a secondary FreeRTOS task. If a second
+// task ever needs config, add a recursive mutex here first, as EventBus.h
+// says for the bus.
 class Config {
 public:
   static void load();

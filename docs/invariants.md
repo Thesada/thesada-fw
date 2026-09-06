@@ -4,7 +4,7 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-09-03 (OTA verification and cert/key structural decisions extracted
+Dated 2026-09-05 (Config.h carries the single-task note. Prior: OTA verification and cert/key structural decisions extracted
 to `ota_verify_policy.h` and `cert_policy.h`, host-tested under a 95% coverage
 floor; `certKeyInputsUsable` newly requires PEM structure on the mTLS install
 path; the mbedtls pair check itself is unchanged and still untested. Prior:
@@ -770,9 +770,10 @@ work is on its own task but does not touch Config / EventBus directly.
 
 When a new module runs on a dedicated FreeRTOS task (likely BLE),
 this invariant breaks. The fix at that point is a recursive mutex
-modelled on `ATGuard` in `Cellular.cpp`. Until then, headers document
-the constraint and reviewers reject any new task-spawning module that
-calls into these singletons.
+modelled on `ATGuard` in `Cellular.cpp`. Until then, both headers
+(`Config.h`, `EventBus.h`) carry the constraint above the class, and
+reviewers reject any new task-spawning module that calls into these
+singletons.
 
 Source: `lib/thesada-core/src/Config.cpp`,
 `lib/thesada-core/src/EventBus.cpp`,
