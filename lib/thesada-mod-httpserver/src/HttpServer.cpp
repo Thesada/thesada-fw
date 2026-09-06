@@ -194,7 +194,11 @@ static bool _defaultPassActive() {
 // routes stay up; only the authenticated surface is refused.
 // hasSideEffect marks a route whose safe-looking method still changes state,
 // so the cross-site Basic rule applies to it (GET /api/ws/token).
-static bool _checkAuth(AsyncWebServerRequest* req, bool hasSideEffect = false) {
+// guessed, when given, reports whether a credential was actually offered and
+// wrong - the login rate limiter must count only those.
+static bool _checkAuth(AsyncWebServerRequest* req, bool hasSideEffect = false,
+                       bool* guessed = nullptr) {
+  if (guessed) *guessed = false;
   JsonObject cfg = Config::get();
   const char* webUser = cfg["web"]["user"] | "admin";
   char passBuf[Secret::MAX_LEN];
@@ -210,11 +214,13 @@ static bool _checkAuth(AsyncWebServerRequest* req, bool hasSideEffect = false) {
     }
   }
 
-  bool bearerValid  = false;
-  bool basicOffered = false;
+  bool bearerValid   = false;
+  bool bearerOffered = false;
+  bool basicOffered  = false;
   if (req->hasHeader("Authorization")) {
     const String& authHeader = req->header("Authorization");
     if (authHeader.startsWith("Bearer ")) {
+      bearerOffered = true;
       bearerValid = _validateToken(authHeader.substring(7).c_str());
     } else if (authHeader.startsWith("Basic ")) {
       basicOffered = true;
@@ -237,7 +243,11 @@ static bool _checkAuth(AsyncWebServerRequest* req, bool hasSideEffect = false) {
   // Skip the Basic check when Bearer already verified (or a veto decides).
   const bool basicOk = !passIsDefault && !bearerValid && basicAllowed &&
                        req->authenticate(webUser, webPass);
-  return webAuthAllowed(passIsDefault, bearerValid, basicOk);
+  const bool allowed = webAuthAllowed(passIsDefault, bearerValid, basicOk);
+  if (guessed) {
+    *guessed = webAuthCountsAsGuess(allowed, basicAllowed, basicOffered || bearerOffered);
+  }
+  return allowed;
 }
 
 // IP-based WS pre-auth: GET /api/ws/token (auth-gated) marks the caller's IP as
@@ -397,8 +407,9 @@ void HttpServer::setupRoutes() {
     }
     // Side-effect GET: answers "are these cached credentials valid here" and
     // moves the rate-limit counter, so a cross-site caller gets no oracle.
-    if (!_checkAuth(req, /*hasSideEffect=*/true)) {
-      _rlFail(ip);
+    bool guessed = false;
+    if (!_checkAuth(req, /*hasSideEffect=*/true, &guessed)) {
+      if (guessed) _rlFail(ip);
       req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}");
       return;
     }
@@ -413,8 +424,9 @@ void HttpServer::setupRoutes() {
       req->send(429, "application/json", "{\"ok\":false,\"error\":\"Too many attempts - wait 30s\"}");
       return;
     }
-    if (!_checkAuth(req)) {
-      _rlFail(ip);
+    bool guessed = false;
+    if (!_checkAuth(req, /*hasSideEffect=*/false, &guessed)) {
+      if (guessed) _rlFail(ip);
       req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}");
       return;
     }

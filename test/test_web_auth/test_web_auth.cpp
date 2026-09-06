@@ -111,6 +111,27 @@ void test_near_miss_site_values_keep_basic(void) {
   TEST_ASSERT_TRUE(webAuthBasicAllowed(true, "Cross-Site"));
 }
 
+// --- webAuthCountsAsGuess -----------------------------------------------------
+
+void test_wrong_credential_is_a_guess(void) {
+  TEST_ASSERT_TRUE(webAuthCountsAsGuess(false, true, true));
+}
+
+// The cross-site refusal never reached the password check, so it says nothing
+// about whether the caller knows it - and a foreign page must not lock anyone out.
+void test_policy_refusal_is_not_a_guess(void) {
+  TEST_ASSERT_FALSE(webAuthCountsAsGuess(false, false, true));
+}
+
+// Nothing was attempted, so there is nothing to throttle.
+void test_anonymous_request_is_not_a_guess(void) {
+  TEST_ASSERT_FALSE(webAuthCountsAsGuess(false, true, false));
+}
+
+void test_success_is_never_a_guess(void) {
+  TEST_ASSERT_FALSE(webAuthCountsAsGuess(true, true, true));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_shipped_default_is_default);
@@ -129,5 +150,9 @@ int main(int, char**) {
   RUN_TEST(test_non_cross_site_values_keep_basic);
   RUN_TEST(test_absent_header_keeps_basic);
   RUN_TEST(test_near_miss_site_values_keep_basic);
+  RUN_TEST(test_wrong_credential_is_a_guess);
+  RUN_TEST(test_policy_refusal_is_not_a_guess);
+  RUN_TEST(test_anonymous_request_is_not_a_guess);
+  RUN_TEST(test_success_is_never_a_guess);
   return UNITY_END();
 }

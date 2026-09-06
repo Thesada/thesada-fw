@@ -32,6 +32,14 @@ inline bool webAuthMethodChangesState(const char* method) {
 // along that way. Refuse Basic for that one shape - curl sends no header.
 // stateChanging is the caller's verdict: the method, OR a route whose GET has
 // a side effect (/api/ws/token mints a WS grant, so it counts).
+// What the login rate limiter counts. A refusal by policy, or a request that
+// carried no credential at all, is not a guess - counting either lets a
+// foreign page lock the operator out of a device it cannot even read.
+inline bool webAuthCountsAsGuess(bool allowed, bool basicAllowed,
+                                 bool credentialOffered) {
+  return !allowed && basicAllowed && credentialOffered;
+}
+
 inline bool webAuthBasicAllowed(bool stateChanging, const char* secFetchSite) {
   if (!secFetchSite || !*secFetchSite) return true;
   if (!stateChanging) return true;

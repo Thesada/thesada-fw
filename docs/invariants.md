@@ -646,6 +646,12 @@ New routes inherit this for free - they must keep going through
 `_checkAuth`, never call `req->authenticate` directly. A new GET that
 changes state must pass `hasSideEffect=true`; the method cannot tell.
 
+The login rate limiter counts only a real guess (`webAuthCountsAsGuess`):
+a wrong credential that was actually offered. A cross-site refusal never
+reached the password check, and an anonymous request attempted nothing,
+so neither is counted - otherwise a foreign page could lock the operator
+out of their own device with five requests it cannot even read.
+
 Source: `lib/thesada-core/src/web_auth_policy.h`,
 `lib/thesada-mod-httpserver/src/HttpServer.cpp::_checkAuth`.
 
