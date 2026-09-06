@@ -4,7 +4,8 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-09-06 (certificate validity dates are not enforced by the
+Dated 2026-09-06 (wildcard fs.rm needs --yes and never takes config.json
+or ca.crt. Prior: certificate validity dates are not enforced by the
 shipped mbedtls build. Prior: shell.mode gates all three command transports. Prior:
 Basic auth is refused on cross-site state-changing requests, including the
 two side-effect GETs, and the login lockout counts only real credential
@@ -694,6 +695,29 @@ Source: `lib/thesada-core/src/ota_verify_policy.h::otaTlsMode`,
 `lib/thesada-core/src/OTAUpdate.cpp::configureSecureClient`,
 `lib/thesada-core/src/MQTTClient.cpp` (`_wifiClient`),
 `lib/thesada-core/src/clock_floor_policy.h::CLOCK_FLOOR_SANE_EPOCH`.
+### A wildcard `fs.rm` is gated and cannot take the two boot-critical files
+
+`fs.rm` accepts `*` and `?` in the last path segment only - a wildcard
+earlier in the path is refused rather than treated as a literal, which
+would delete a different set than the operator typed. A wildcard remove
+additionally requires `--yes`, and reports removed/failed/protected
+counts rather than going quiet.
+
+`/config.json` and `/ca.crt` at the LittleFS root are skipped by any
+wildcard, whatever the pattern: `fs.rm /* --yes` clears the root but
+leaves the device bootable and still able to verify TLS. An exact
+`fs.rm /config.json` still works - the veto is about a pattern reaching
+them by accident, not about making them undeletable.
+
+How enforced: `globMatch` / `globSplit` / `globRmProtected`
+(`glob_policy.h`, host-tested in `test/test_glob` under a 95% floor).
+`cmd_rm` routes to the glob path only when `globHasWildcard` says so, so
+the exact-path behaviour is unchanged. The matcher is iterative with a
+single backtrack point - no recursion, because this runs on the shell's
+4 KB stack.
+
+Source: `lib/thesada-core/src/glob_policy.h`,
+`lib/thesada-core/src/Shell.cpp` (`cmd_rm`, `_rmGlob`, `cmd_ls`).
 
 ### Auth-state TTLs compare rollover-safe, never `now < expiry`
 

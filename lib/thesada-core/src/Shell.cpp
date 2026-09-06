@@ -15,6 +15,7 @@
 #include "Net.h"
 #include "path_safety_policy.h"
 #include "ap_policy.h"
+#include "glob_policy.h"
 #include <thesada_config.h>
 #include <mbedtls/platform_util.h>
 #include <esp_ota_ops.h>
@@ -420,6 +421,20 @@ bool Shell::pathSafe(const char* path) {
 static void cmd_ls(int argc, char** argv, ShellOutput out) {
   const char* path = (argc > 1) ? argv[1] : "/";
   if (!Shell::pathSafe(path)) { out("Invalid path"); return; }
+
+  // A trailing pattern filters the listing; the directory walked is the part
+  // before it, so fs.ls /sd/logs/*.csv lists only the matches.
+  char globDir[96], globPat[64];
+  const char* filter = nullptr;
+  if (globHasWildcard(path)) {
+    if (!globSplit(path, globDir, sizeof(globDir), globPat, sizeof(globPat))) {
+      out("Wildcards are allowed in the last path segment only");
+      return;
+    }
+    filter = globPat;
+    path = globDir;
+  }
+
   FS* fs = resolveFS(path);
   const char* fsPath = stripPrefix(path);
 
@@ -441,6 +456,7 @@ static void cmd_ls(int argc, char** argv, ShellOutput out) {
   char line[160];
   File entry = dir.openNextFile();
   while (entry) {
+    if (filter && !globMatch(filter, entry.name())) { entry = dir.openNextFile(); continue; }
     if (entry.isDirectory()) {
       snprintf(line, sizeof(line), "  [DIR]  %s/%s/", base, entry.name());
     } else {
@@ -481,9 +497,51 @@ static void cmd_cat(int argc, char** argv, ShellOutput out) {
   f.close();
 }
 
+// Remove every entry in one directory matching pattern. Reports the count;
+// config.json and ca.crt at the LittleFS root are skipped, never matched away.
+static void _rmGlob(int argc, char** argv, ShellOutput out) {
+  char dir[96], pat[64];
+  if (!globSplit(argv[1], dir, sizeof(dir), pat, sizeof(pat))) {
+    out("Wildcards are allowed in the last path segment only");
+    return;
+  }
+  bool confirmed = false;
+  for (int i = 2; i < argc; i++) {
+    if (strcmp(argv[i], "--yes") == 0) confirmed = true;
+  }
+  if (!confirmed) {
+    out("Wildcard remove needs --yes  (fs.rm <path> --yes)");
+    return;
+  }
+
+  FS* fs = resolveFS(dir);
+  File d = fs->open(stripPrefix(dir));
+  if (!d || !d.isDirectory()) { out("Not a directory or not found"); return; }
+
+  int removed = 0, failed = 0, skipped = 0;
+  char full[160], msg[96];
+  File entry = d.openNextFile();
+  while (entry) {
+    const char* name = entry.name();
+    if (!entry.isDirectory() && globMatch(pat, name)) {
+      if (globRmProtected(dir, name)) {
+        skipped++;
+      } else {
+        snprintf(full, sizeof(full), "%s%s%s", dir,
+                 dir[strlen(dir) - 1] == '/' ? "" : "/", name);
+        if (fs->remove(stripPrefix(full))) removed++; else failed++;
+      }
+    }
+    entry = d.openNextFile();
+  }
+  snprintf(msg, sizeof(msg), "Removed %d, failed %d, protected %d", removed, failed, skipped);
+  out(msg);
+}
+
 static void cmd_rm(int argc, char** argv, ShellOutput out) {
   if (argc < 2) { out("Usage: rm <path>"); return; }
   if (!Shell::pathSafe(argv[1])) { out("Invalid path"); return; }
+  if (globHasWildcard(argv[1])) { _rmGlob(argc, argv, out); return; }
   FS* fs = resolveFS(argv[1]);
   const char* fsPath = stripPrefix(argv[1]);
 
@@ -2162,9 +2220,9 @@ void Shell::registerBuiltins() {
   registerCommand("selftest",      "Run self-test checks",          cmd_selftest);
 
   // Filesystem
-  registerCommand("fs.ls",         "List directory (fs.ls [path])", cmd_ls);
+  registerCommand("fs.ls",         "List directory (fs.ls [path], glob ok)", cmd_ls);
   registerCommand("fs.cat",        "Print file contents",           cmd_cat);
-  registerCommand("fs.rm",         "Remove a file",                 cmd_rm);
+  registerCommand("fs.rm",         "Remove a file (glob needs --yes)", cmd_rm);
   registerCommand("fs.write",      "Write content to file",         cmd_write);
   registerCommand("fs.append",     "Append content to file",        cmd_write);
   registerCommand("fs.mv",         "Rename/move a file",            cmd_mv);
