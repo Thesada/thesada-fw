@@ -8,7 +8,7 @@ Patches welcome. This is a one-person project running real hardware in a cold pl
 
 **Branches.** `dev` is where work lands and it is the default branch, so branch off `dev` and target `dev`. `main` is release-only: it moves when a version ships. If you open against `main` I will just retarget it, no drama.
 
-**Building.** `make setup` once (PlatformIO, cppcheck, Lua, git hooks), then `make build ENV=esp32-s3-debug` for a bare devkit or `ENV=esp32-owb` for the LILYGO board. Bare `make` lists every target. The devkit target needs no cellular hardware and is the easiest way in.
+**Building.** `make setup` once (PlatformIO, cppcheck, clang-tidy, Lua, git hooks), then `make build ENV=esp32-s3-debug` for a bare devkit or `ENV=esp32-owb` for the LILYGO board. Bare `make` lists every target. The devkit target needs no cellular hardware and is the easiest way in.
 
 **Tests.** `make test` runs the host-side unit tests and the Lua rules harness, no board needed. `make lint` and `make coverage` are the other two gates. CI calls the same targets and all of them need to pass.
 

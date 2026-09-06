@@ -31,10 +31,10 @@ setup-py: ## PlatformIO, intelhex and gcovr via pipx when present (NO_PIPX=1 for
 	fi
 
 .PHONY: setup-sys
-setup-sys: ## cppcheck and Lua via brew, or apt-get with sudo
-	@if command -v brew >/dev/null; then brew install cppcheck lua; \
-	elif command -v apt-get >/dev/null; then sudo apt-get update -qq && sudo apt-get install -y -qq cppcheck lua5.3; \
-	else echo "setup-sys: install cppcheck and Lua 5.3+ by hand"; exit 1; fi
+setup-sys: ## cppcheck, clang-tidy and Lua via brew, or apt-get with sudo
+	@if command -v brew >/dev/null; then brew install cppcheck llvm lua; \
+	elif command -v apt-get >/dev/null; then sudo apt-get update -qq && sudo apt-get install -y -qq cppcheck clang-tidy lua5.3; \
+	else echo "setup-sys: install cppcheck, clang-tidy and Lua 5.3+ by hand"; exit 1; fi
 
 .PHONY: setup-hooks
 setup-hooks: ## Link the git hooks: invariant ledger, commit-msg lint
@@ -93,9 +93,14 @@ coverage: ## Per-file line-coverage floors from scripts/coverage-floors.txt
 	./scripts/check-coverage.sh
 
 .PHONY: lint
-lint: ## cppcheck on the pure units + the LittleFS path-safety gate
+lint: ## cppcheck + clang-tidy on the pure units, then the LittleFS path-safety gate
 	./scripts/static-check.sh
+	./scripts/tidy-check.sh
 	./scripts/check-path-safety.sh
+
+.PHONY: tidy
+tidy: ## clang-tidy alone (.clang-tidy), via the native test units
+	./scripts/tidy-check.sh
 
 .PHONY: deps
 deps: ## Compare pinned libraries against the registries (network)

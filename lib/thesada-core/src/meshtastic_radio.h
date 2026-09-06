@@ -94,7 +94,7 @@ inline float slotFreqMhz(const Region& r, float bwKhz, const char* channelName,
   if (n == 0) return 0.0f;
   slotOut = (uint16_t)(djb2(channelName) % n);
   float step = r.spacing + bwKhz / 1000.0f;
-  return r.freqStart + (bwKhz / 2000.0f) + slotOut * step;
+  return r.freqStart + (bwKhz / 2000.0f) + (float)slotOut * step;
 }
 
 // Minimal base64 decode (standard alphabet, '=' padding, no whitespace).

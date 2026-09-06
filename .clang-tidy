@@ -1,0 +1,25 @@
+# clang-tidy over the pure policy headers, driven by scripts/tidy-check.sh.
+# Scope matches scripts/static-check.sh: adversarial-input units, no Arduino.
+# Dropped: internal-linkage (Unity test TUs), const-correctness and enum-size
+# (style), signed-bitwise and implicit-widening (uint8_t promotion in byte
+# packing, macro-sized arrays). Real exceptions carry a NOLINT with the reason.
+Checks: >
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  cert-*,
+  performance-*,
+  misc-*,
+  -misc-non-private-member-variables-in-classes,
+  -misc-use-anonymous-namespace,
+  -misc-include-cleaner,
+  -misc-use-internal-linkage,
+  -misc-const-correctness,
+  -performance-enum-size,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-signed-bitwise,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -cert-err58-cpp
+WarningsAsErrors: '*'
+HeaderFilterRegex: 'lib/thesada-core/src/.*'
+FormatStyle: none

@@ -113,8 +113,8 @@ jobs:
           path: build/coverage/
 
   static-analysis:
-    # cppcheck over the pure security units (scripts/static-check.sh). Fast,
-    # gates the release alongside the native unit tests.
+    # cppcheck and clang-tidy over the pure security units, then the
+    # path-safety gate. Gates the release alongside the native unit tests.
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -123,11 +123,17 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install cppcheck
-        run: make setup-sys
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
 
-      # cppcheck over the pure units, then the LittleFS path-safety gate:
-      # no LittleFS.open() on an unreviewed non-literal path.
+      # PlatformIO only fetches Unity here; clang-tidy compiles the native
+      # test units to reach the headers.
+      - name: Install PlatformIO, cppcheck, clang-tidy
+        run: make setup-py NO_PIPX=1 && make setup-sys
+
+      # cppcheck, clang-tidy, then no LittleFS.open() on an unreviewed
+      # non-literal path.
       - name: Run static analysis
         run: make lint
 

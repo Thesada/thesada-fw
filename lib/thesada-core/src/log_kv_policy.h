@@ -18,7 +18,7 @@ inline bool logKvFormatV(char* out, size_t cap, const char* fmt, va_list ap) {
   return (size_t)n < cap;
 }
 
-inline bool logKvFormat(char* out, size_t cap, const char* fmt, ...) {
+inline bool logKvFormat(char* out, size_t cap, const char* fmt, ...) {  // NOLINT(cert-dcl50-cpp): printf wrapper
   va_list ap;
   va_start(ap, fmt);
   bool fit = logKvFormatV(out, cap, fmt, ap);
