@@ -4,8 +4,10 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-09-06 (Basic auth is refused on cross-site state-changing
-requests, including the two side-effect GETs. Prior: Config.h carries the single-task note. Prior: OTA verification and cert/key structural decisions extracted
+Dated 2026-09-06 (shell.mode gates all three command transports. Prior:
+Basic auth is refused on cross-site state-changing requests, including the
+two side-effect GETs, and the login lockout counts only real credential
+guesses. Prior: Config.h carries the single-task note. Prior: OTA verification and cert/key structural decisions extracted
 to `ota_verify_policy.h` and `cert_policy.h`, host-tested under a 95% coverage
 floor; `certKeyInputsUsable` newly requires PEM structure on the mTLS install
 path; the mbedtls pair check itself is unchanged and still untested. Prior:
@@ -1348,9 +1350,48 @@ Source: `src/main.cpp` (`_wifiEnabled`/`_mqttEnabled`/`_otaEnabled`/
 The on-device recovery CLI (`Shell`) has no `enabled` gate at any tier. It is
 hard-mandatory so a bad config can never lock out the serial/MQTT recovery
 path. Reduced/headless command surface is a separate concern (`shell.mode`),
-not an on/off switch.
+not an on/off switch: `Shell` itself always exists and always runs, and the
+mode decides only which transports may reach it.
 
 Source: `src/main.cpp` (`Shell::begin()` called unconditionally).
+
+### `shell.mode` gates every transport into Shell, not just the two named ones
+
+Three code paths reach `Shell::execute`: the serial console
+(`Shell::pumpConsole`), the MQTT CLI (`cliInboundHandler` -> `runCli`), and
+HTTP - `POST /api/cmd` and the `/ws/serial` terminal both enqueue on the same
+ring. A mode that closed only the first two would leave the broadest remote
+surface open on a device the operator believes is headless, so every narrowing
+mode also closes the HTTP command surface; `full` is the only value that keeps
+it, and `/ws/serial` is closed at connect so a narrowed mode leaves neither an
+interactive session nor its log replay up. OTA is deliberately untouched in
+all modes: the periodic `manifest_url` poll is the recovery path when a mode
+change goes wrong, and it needs no subscription. (The `cmd/ota` push topic is
+separately broken at boot for every mode - see the tracker - so it is not the
+path to rely on.)
+
+An absent key parses to `full`, so a config written before the key existed
+behaves exactly as it did. A present value that is not a known name parses to
+`off` and says so - `shell.mode_unrecognised` for a misspelt string,
+`shell.mode_not_a_string` for a bool, number or object, which the config layer
+would otherwise hand over as an absent key. A hardening request the firmware
+cannot read exactly must not silently serve the full surface. The mode is resolved once on first use, not
+per command - it changes on reboot, which is also when a config push lands.
+
+How enforced: `shellModeResolve` / `shellModeParse` /
+`shellModeSerialAllowed` / `shellModeMqttAllowed` / `shellModeHttpAllowed`
+(`shell_mode_policy.h`,
+host-tested in `test/test_shell_mode` under a 95% floor). The MQTT gate skips
+the `cli/#` subscription at both registration sites AND guards
+`cliInboundHandler`, so a retained message cannot slip through a reinit. A new
+transport that reaches `Shell` must add its own gate here; the predicate list
+is the checklist.
+
+Source: `lib/thesada-core/src/shell_mode_policy.h`,
+`lib/thesada-core/src/Shell.cpp` (`mode`, `pumpConsole`),
+`lib/thesada-core/src/MQTTClient.cpp` (`cliInboundHandler`, `begin`,
+`reinitSubscriptions`),
+`lib/thesada-mod-httpserver/src/HttpServer.cpp` (`cmdHandler`, `_ws`).
 
 ---
 

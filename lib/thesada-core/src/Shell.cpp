@@ -196,6 +196,13 @@ void Shell::loop() {
 void Shell::pumpConsole() {
   static char  buf[Shell::DEFERRED_LINE_LEN];
   static int   pos = 0;
+  // Drained, not left to fill the driver buffer: the console still echoes
+  // nothing and the line never reaches execute().
+  if (!shellModeSerialAllowed(mode())) {
+    while (Serial.available()) Serial.read();
+    pos = 0;
+    return;
+  }
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
@@ -2201,8 +2208,28 @@ void Shell::registerBuiltins() {
   registerCommand("module.status", "Module status overview",        cmd_module_status);
 }
 
+ShellMode Shell::mode() {
+  static const ShellMode m = []() {
+    JsonVariantConst v = Config::get()["shell"]["mode"];
+    return shellModeResolve(!v.isNull(), v.is<const char*>() ? v.as<const char*>() : nullptr);
+  }();
+  return m;
+}
+
 void Shell::begin() {
   registerBuiltins();
 
-  Log::kvf("Shell", "shell.ready commands=%d", _commandCount);
+  JsonVariantConst modeVal = Config::get()["shell"]["mode"];
+  const char* raw = modeVal.is<const char*>() ? modeVal.as<const char*>() : nullptr;
+  if (!modeVal.isNull() && !raw) {
+    Log::kvfw("Shell", "shell.mode_not_a_string applied=off "
+                       "hint=\"full|serial-only|mqtt-only|off\"");
+  } else if (shellModeUnrecognised(raw)) {
+    Log::kvfw("Shell", "shell.mode_unrecognised value=%s applied=off "
+                       "hint=\"full|serial-only|mqtt-only|off\"", raw);
+  }
+  Log::kvf("Shell", "shell.ready commands=%d mode=%s serial=%d mqtt=%d",
+           _commandCount, raw ? raw : "full",
+           shellModeSerialAllowed(mode()) ? 1 : 0,
+           shellModeMqttAllowed(mode()) ? 1 : 0);
 }

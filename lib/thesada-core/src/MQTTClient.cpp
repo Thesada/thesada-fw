@@ -272,6 +272,9 @@ static void cliInboundHandler(const char* topic, const char* payload) {
   char cliPrefix[CLI_TOPIC_CAP];
   // A truncated prefix would match short and slice the wrong command out.
   if (!cliInputPrefix(cliPrefix, sizeof(cliPrefix), prefix)) return;
+  // The subscription is skipped in this mode; the guard also covers a
+  // retained message delivered before a reinit drops the topic.
+  if (!shellModeMqttAllowed(Shell::mode())) return;
   size_t prefixLen = strlen(cliPrefix);
   if (strncmp(topic, cliPrefix, prefixLen) != 0) return;
   const char* cmd = topic + prefixLen;
@@ -447,7 +450,11 @@ void MQTTClient::begin() {
     // JSON array of output lines) need their own handler, so inbound CLI
     // goes through cliInboundHandler onto the same ring, same
     // backpressure, single drain path.
-    MQTTClient::subscribe(cliTopic, cliInboundHandler);
+    if (shellModeMqttAllowed(Shell::mode())) {
+      MQTTClient::subscribe(cliTopic, cliInboundHandler);
+    } else {
+      Log::kvf("MQTT", "mqtt.cli_disabled reason=shell_mode");
+    }
   }
 
 
@@ -1598,7 +1605,9 @@ void MQTTClient::reinitSubscriptions() {
     return;
   }
 
-  MQTTClient::subscribe(cliTopic, cliInboundHandler);
+  if (shellModeMqttAllowed(Shell::mode())) {
+    MQTTClient::subscribe(cliTopic, cliInboundHandler);
+  }
 
   OTAUpdate::begin();
 
