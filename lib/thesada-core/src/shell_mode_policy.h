@@ -37,6 +37,15 @@ inline bool shellModeHttpAllowed(ShellMode m) {
   return m == SHELL_MODE_FULL;
 }
 
+// Resolve from the two facts the config layer can see. A key that is present
+// but not a string (a bool, a number, an object) is a hardening request we
+// cannot read, so it closes - only a genuinely absent key means full.
+inline ShellMode shellModeResolve(bool keyPresent, const char* stringValue) {
+  if (!keyPresent) return SHELL_MODE_FULL;
+  if (!stringValue) return SHELL_MODE_OFF;
+  return shellModeParse(stringValue);
+}
+
 // True when the parsed value did not come from a name we know, so the caller
 // can say so once at boot rather than leaving the operator guessing.
 inline bool shellModeUnrecognised(const char* s) {

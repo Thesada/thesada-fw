@@ -84,6 +84,26 @@ void test_off_closes_every_transport(void) {
   TEST_ASSERT_FALSE(shellModeHttpAllowed(SHELL_MODE_OFF));
 }
 
+// --- shellModeResolve ---------------------------------------------------------
+
+// No key at all is a config written before the mode existed.
+void test_missing_key_resolves_full(void) {
+  TEST_ASSERT_EQUAL(SHELL_MODE_FULL, shellModeResolve(false, nullptr));
+  TEST_ASSERT_EQUAL(SHELL_MODE_FULL, shellModeResolve(false, "off"));
+}
+
+// "mode": true / 0 / {} reaches the config layer as a non-string. Treating
+// that as absent would serve the whole surface to someone asking to close it.
+void test_present_non_string_resolves_off(void) {
+  TEST_ASSERT_EQUAL(SHELL_MODE_OFF, shellModeResolve(true, nullptr));
+}
+
+void test_present_string_parses_normally(void) {
+  TEST_ASSERT_EQUAL(SHELL_MODE_FULL,        shellModeResolve(true, "full"));
+  TEST_ASSERT_EQUAL(SHELL_MODE_SERIAL_ONLY, shellModeResolve(true, "serial-only"));
+  TEST_ASSERT_EQUAL(SHELL_MODE_OFF,         shellModeResolve(true, "nonsense"));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_each_mode_name_parses);
@@ -96,5 +116,8 @@ int main(int, char**) {
   RUN_TEST(test_only_a_typo_is_unrecognised);
   RUN_TEST(test_only_full_allows_the_http_surface);
   RUN_TEST(test_off_closes_every_transport);
+  RUN_TEST(test_missing_key_resolves_full);
+  RUN_TEST(test_present_non_string_resolves_off);
+  RUN_TEST(test_present_string_parses_normally);
   return UNITY_END();
 }

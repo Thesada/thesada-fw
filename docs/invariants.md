@@ -1363,17 +1363,24 @@ HTTP - `POST /api/cmd` and the `/ws/serial` terminal both enqueue on the same
 ring. A mode that closed only the first two would leave the broadest remote
 surface open on a device the operator believes is headless, so every narrowing
 mode also closes the HTTP command surface; `full` is the only value that keeps
-it. OTA is deliberately untouched in all modes - it has its own `cmd/ota`
-subscription and is the recovery path when a mode change goes wrong.
+it, and `/ws/serial` is closed at connect so a narrowed mode leaves neither an
+interactive session nor its log replay up. OTA is deliberately untouched in
+all modes: the periodic `manifest_url` poll is the recovery path when a mode
+change goes wrong, and it needs no subscription. (The `cmd/ota` push topic is
+separately broken at boot for every mode - see the tracker - so it is not the
+path to rely on.)
 
 An absent key parses to `full`, so a config written before the key existed
-behaves exactly as it did. A present but unrecognised value parses to `off`
-and logs `shell.mode_unrecognised`: a misspelt hardening request must not
-silently serve the full surface. The mode is resolved once on first use, not
+behaves exactly as it did. A present value that is not a known name parses to
+`off` and says so - `shell.mode_unrecognised` for a misspelt string,
+`shell.mode_not_a_string` for a bool, number or object, which the config layer
+would otherwise hand over as an absent key. A hardening request the firmware
+cannot read exactly must not silently serve the full surface. The mode is resolved once on first use, not
 per command - it changes on reboot, which is also when a config push lands.
 
-How enforced: `shellModeParse` / `shellModeSerialAllowed` /
-`shellModeMqttAllowed` / `shellModeHttpAllowed` (`shell_mode_policy.h`,
+How enforced: `shellModeResolve` / `shellModeParse` /
+`shellModeSerialAllowed` / `shellModeMqttAllowed` / `shellModeHttpAllowed`
+(`shell_mode_policy.h`,
 host-tested in `test/test_shell_mode` under a 95% floor). The MQTT gate skips
 the `cli/#` subscription at both registration sites AND guards
 `cliInboundHandler`, so a retained message cannot slip through a reinit. A new

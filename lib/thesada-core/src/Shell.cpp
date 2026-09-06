@@ -2209,16 +2209,22 @@ void Shell::registerBuiltins() {
 }
 
 ShellMode Shell::mode() {
-  static const ShellMode m =
-      shellModeParse(Config::get()["shell"]["mode"] | (const char*)nullptr);
+  static const ShellMode m = []() {
+    JsonVariantConst v = Config::get()["shell"]["mode"];
+    return shellModeResolve(!v.isNull(), v.is<const char*>() ? v.as<const char*>() : nullptr);
+  }();
   return m;
 }
 
 void Shell::begin() {
   registerBuiltins();
 
-  const char* raw = Config::get()["shell"]["mode"] | (const char*)nullptr;
-  if (shellModeUnrecognised(raw)) {
+  JsonVariantConst modeVal = Config::get()["shell"]["mode"];
+  const char* raw = modeVal.is<const char*>() ? modeVal.as<const char*>() : nullptr;
+  if (!modeVal.isNull() && !raw) {
+    Log::kvfw("Shell", "shell.mode_not_a_string applied=off "
+                       "hint=\"full|serial-only|mqtt-only|off\"");
+  } else if (shellModeUnrecognised(raw)) {
     Log::kvfw("Shell", "shell.mode_unrecognised value=%s applied=off "
                        "hint=\"full|serial-only|mqtt-only|off\"", raw);
   }

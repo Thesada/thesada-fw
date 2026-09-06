@@ -845,6 +845,13 @@ void HttpServer::setupRoutes() {
       // the new AsyncWebSocketClient via _switchClient, so
       // req->client()->_pcb is NULL and the old API null-derefs in
       // AsyncClient::getRemoteAddress().
+      // Before the grant is spent and before any log replay: a narrowed
+      // shell.mode must not leave an interactive session or its output up.
+      if (!shellModeHttpAllowed(Shell::mode())) {
+        Log::kvfw(TAG, "web.ws_rejected reason=shell_mode");
+        client->close();
+        return;
+      }
       String ip = client->remoteIP().toString();
       if (!_consumeWsAuth(ip)) {
         Log::warn(TAG, "web.ws_rejected reason=not_preauthorized");
