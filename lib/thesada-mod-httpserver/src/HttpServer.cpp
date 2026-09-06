@@ -168,6 +168,14 @@ static bool _validateToken(const char* token) {
   return found;
 }
 
+// One warn per minute per call site, so a probe flood cannot fill the ring.
+static bool _warnDue(uint32_t& lastMs) {
+  const uint32_t now = millis();
+  if (lastMs != 0 && now - lastMs <= 60000UL) return false;
+  lastMs = now;
+  return true;
+}
+
 // True while web.password is still the shipped default (or empty). Resolved
 // per call so secret.set / secret.clear web.password take effect immediately.
 static bool _defaultPassActive() {
@@ -184,7 +192,13 @@ static bool _defaultPassActive() {
 // While web.password is default/empty, nothing authenticates - not even a
 // Bearer token (see web_auth_policy.h). The dashboard and other public
 // routes stay up; only the authenticated surface is refused.
-static bool _checkAuth(AsyncWebServerRequest* req) {
+// hasSideEffect marks a route whose safe-looking method still changes state,
+// so the cross-site Basic rule applies to it (GET /api/ws/token).
+// guessed, when given, reports whether a credential was actually offered and
+// wrong - the login rate limiter must count only those.
+static bool _checkAuth(AsyncWebServerRequest* req, bool hasSideEffect = false,
+                       bool* guessed = nullptr) {
+  if (guessed) *guessed = false;
   JsonObject cfg = Config::get();
   const char* webUser = cfg["web"]["user"] | "admin";
   char passBuf[Secret::MAX_LEN];
@@ -193,27 +207,47 @@ static bool _checkAuth(AsyncWebServerRequest* req) {
 
   const bool passIsDefault = webAuthPassIsDefault(webPass);
   if (passIsDefault) {
-    // Throttled: one warn per minute, not one per probe.
     static uint32_t lastWarnMs = 0;
-    if (lastWarnMs == 0 || millis() - lastWarnMs > 60000UL) {
-      lastWarnMs = millis();
+    if (_warnDue(lastWarnMs)) {
       Log::warn(TAG, "web.admin_refused reason=default_password "
                      "hint=\"set via secret.set web.password or config.json\"");
     }
   }
 
-  bool bearerValid = false;
+  bool bearerValid   = false;
+  bool bearerOffered = false;
+  bool basicOffered  = false;
   if (req->hasHeader("Authorization")) {
-    String authHeader = req->header("Authorization");
+    const String& authHeader = req->header("Authorization");
     if (authHeader.startsWith("Bearer ")) {
-      String token = authHeader.substring(7);
-      bearerValid = _validateToken(token.c_str());
+      bearerOffered = true;
+      bearerValid = _validateToken(authHeader.substring(7).c_str());
+    } else if (authHeader.startsWith("Basic ")) {
+      basicOffered = true;
     }
   }
-  // Skip the Basic check when Bearer already verified (or the veto decides).
-  const bool basicOk = !passIsDefault && !bearerValid &&
+  // Cached Basic creds ride a cross-site request; Bearer cannot (see
+  // web_auth_policy.h). curl and pre-Sec-Fetch browsers send no header.
+  const bool stateChanging = hasSideEffect || webAuthMethodChangesState(req->methodToString());
+  const bool basicAllowed = webAuthBasicAllowed(
+      stateChanging,
+      req->hasHeader("Sec-Fetch-Site") ? req->header("Sec-Fetch-Site").c_str() : nullptr);
+  if (!basicAllowed && basicOffered && !bearerValid) {
+    static uint32_t lastCsrfWarnMs = 0;
+    if (_warnDue(lastCsrfWarnMs)) {
+      Log::kvfw(TAG, "web.basic_refused reason=cross_site method=%s url=%s",
+                req->methodToString(), req->url().c_str());
+    }
+  }
+
+  // Skip the Basic check when Bearer already verified (or a veto decides).
+  const bool basicOk = !passIsDefault && !bearerValid && basicAllowed &&
                        req->authenticate(webUser, webPass);
-  return webAuthAllowed(passIsDefault, bearerValid, basicOk);
+  const bool allowed = webAuthAllowed(passIsDefault, bearerValid, basicOk);
+  if (guessed) {
+    *guessed = webAuthCountsAsGuess(allowed, basicAllowed, basicOffered || bearerOffered);
+  }
+  return allowed;
 }
 
 // IP-based WS pre-auth: GET /api/ws/token (auth-gated) marks the caller's IP as
@@ -371,8 +405,11 @@ void HttpServer::setupRoutes() {
                 "Set it via 'secret.set web.password' on the serial console\"}");
       return;
     }
-    if (!_checkAuth(req)) {
-      _rlFail(ip);
+    // Side-effect GET: answers "are these cached credentials valid here" and
+    // moves the rate-limit counter, so a cross-site caller gets no oracle.
+    bool guessed = false;
+    if (!_checkAuth(req, /*hasSideEffect=*/true, &guessed)) {
+      if (guessed) _rlFail(ip);
       req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}");
       return;
     }
@@ -387,8 +424,9 @@ void HttpServer::setupRoutes() {
       req->send(429, "application/json", "{\"ok\":false,\"error\":\"Too many attempts - wait 30s\"}");
       return;
     }
-    if (!_checkAuth(req)) {
-      _rlFail(ip);
+    bool guessed = false;
+    if (!_checkAuth(req, /*hasSideEffect=*/false, &guessed)) {
+      if (guessed) _rlFail(ip);
       req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}");
       return;
     }
@@ -404,8 +442,10 @@ void HttpServer::setupRoutes() {
 
   // ── GET /api/ws/token - issue a short-lived WS token (auth required) ────────
   // Clients call this before opening /ws/serial, then pass ?token=<hex>.
+  // Side-effect GET: it mints a 30 s IP-bound WS grant, and /ws/serial reaches
+  // the shell, so a cross-site call must not ride cached Basic credentials.
   server.on("/api/ws/token", HTTP_GET, [](AsyncWebServerRequest* req) {
-    if (!_checkAuth(req)) {
+    if (!_checkAuth(req, /*hasSideEffect=*/true)) {
       req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}");
       return;
     }
