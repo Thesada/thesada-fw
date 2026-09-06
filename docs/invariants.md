@@ -4,7 +4,8 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-09-05 (Config.h carries the single-task note. Prior: OTA verification and cert/key structural decisions extracted
+Dated 2026-09-06 (Basic auth is refused on cross-site state-changing
+requests, including the two side-effect GETs. Prior: Config.h carries the single-task note. Prior: OTA verification and cert/key structural decisions extracted
 to `ota_verify_policy.h` and `cert_policy.h`, host-tested under a 95% coverage
 floor; `certKeyInputsUsable` newly requires PEM structure on the mTLS install
 path; the mbedtls pair check itself is unchanged and still untested. Prior:
@@ -611,6 +612,39 @@ How enforced: the veto is the pure predicate `webAuthPassIsDefault` /
 `webAuthAllowed` (`web_auth_policy.h`, host-tested in
 `test/test_web_auth`). New auth schemes must route through
 `webAuthAllowed`, never around it.
+
+Source: `lib/thesada-core/src/web_auth_policy.h`,
+`lib/thesada-mod-httpserver/src/HttpServer.cpp::_checkAuth`.
+
+### Basic auth is refused on a cross-site state-changing request
+
+Bearer tokens are read from a header the page must set, so a foreign
+page cannot mint one. Basic credentials are cached by the browser and
+replayed automatically, so a malicious LAN page can auto-submit a form
+at the device and reach `POST /api/restart` or `DELETE /api/file` with
+the operator's own credentials. When `Sec-Fetch-Site: cross-site`
+arrives on a state-changing request, Basic no longer counts; Bearer
+still does. Requests with no `Sec-Fetch-Site` at all - curl,
+`tests/test_firmware.py`, pre-2020 browsers - are untouched, which is
+the deliberate limit of the mitigation: it closes the browser-replay
+path, not scripted access.
+
+State-changing is the method OR a route that declares a side effect,
+because two GETs have one. `GET /api/ws/token` mints a 30 s IP-bound
+WS grant and `/ws/serial` reaches `Shell::enqueue`, so a cross-site
+call there is worse than any POST: WebSocket handshakes are not
+CORS-gated, so the attacker page opens the socket itself. `GET
+/api/auth/check` answers whether cached credentials are valid for this
+device, which is an enumeration oracle, and moves the rate-limit
+counter. Both pass `hasSideEffect=true`.
+
+How enforced: `webAuthBasicAllowed` / `webAuthMethodChangesState`
+(`web_auth_policy.h`, host-tested in `test/test_web_auth`), fed into
+the `basicOk` term of `_checkAuth`. An unknown or missing method counts
+as state-changing, so a new verb is refused rather than waved through.
+New routes inherit this for free - they must keep going through
+`_checkAuth`, never call `req->authenticate` directly. A new GET that
+changes state must pass `hasSideEffect=true`; the method cannot tell.
 
 Source: `lib/thesada-core/src/web_auth_policy.h`,
 `lib/thesada-mod-httpserver/src/HttpServer.cpp::_checkAuth`.
