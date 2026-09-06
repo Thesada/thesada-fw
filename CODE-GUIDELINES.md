@@ -317,9 +317,10 @@ test_pathsafe1
 
 ### Security-sensitive code: write the contract test even when nothing is broken
 
-Coverage gates target Shell input parsing, `pathSafe`, OTA verification,
-mbedtls cert validation. Start floor 60 %, raise as test infrastructure
-matures.
+Coverage is gated per file. `scripts/coverage-floors.txt` lists every
+pure policy header with its floor (90-95 %); `scripts/check-coverage.sh`
+enforces it in the `coverage` CI job, and a listed file that yields no
+coverage data fails the gate. New pure unit: add it to the floors file.
 
 ---
 
@@ -405,12 +406,15 @@ CYD / WT32-ETH01) support lives in a separate fork. New code does
 not need to compile on classic ESP32; existing classic-only paths
 are being removed.
 
-### Multi-board sdkconfig
+### Adding a board env
 
-Each board env has its own `sdkconfig.<env>` for IDF tuning (mbedtls
-record buffer sizes, etc). Common defaults in `sdkconfig.defaults`.
-Adding a new board env: write its sdkconfig + add to the deploy
-manifest list + document in the README supported-boards table.
+`framework = arduino` ships a precompiled IDF; there is no per-env
+sdkconfig to tune. A new board is an `[env:...]` in `platformio.ini`
+(extend `esp32-owb` or `esp32-s3-debug`), its own partition table if
+the flash size differs, a `pio run -e` line next to the other envs in
+the CI build (the Makefile `dist` target), and a row in the README
+boards table. The `sdkconfig` shell command prints the OTA/boot-relevant
+CONFIG_* subset the build carries.
 
 ---
 

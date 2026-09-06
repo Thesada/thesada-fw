@@ -124,6 +124,7 @@ Two modules exist only to be read: `lib/thesada-mod-example-temperature-mqtt/` (
 | LILYGO T-SIM7080G-S3 | `esp32-owb-rescue` | Stripped rescue build (~1070 KB) for remote recovery |
 | ESP32-S3 bare devkit | `esp32-s3-debug` | USB CDC serial, SHT31 enabled (`BOARD_S3_BARE`) |
 | ESP32-S3 bare devkit | `esp32-s3-debug-rescue` | Rescue twin for lab validation |
+| ESP32-S3 bare devkit + ADS1115 / DS18B20 | `esp32-s3-carrier` | Prototype sensor carrier (`BOARD_S3_CARRIER`), no modem/PMU/SD |
 
 Rescue builds strip all optional modules except PMU via `BOARD_OWB_RESCUE`. That build exists for OTA recovery on weak links, where the full binary fails mid-download. Bare-S3 builds (`BOARD_S3_BARE`) drop the LILYGO-specific hardware (cellular, PMU, battery, SD) and switch the default sensor to SHT31 for desk testing.
 
