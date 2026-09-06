@@ -66,8 +66,10 @@ inline bool otaIsNewer(const char* remote, const char* local) {
   if (!remote || !local) return false;
   int rMajor = 0, rMinor = 0, rPatch = 0;
   int lMajor = 0, lMinor = 0, lPatch = 0;
+  // NOLINTBEGIN(cert-err33-c,cert-err34-c,bugprone-unchecked-string-to-number-conversion): pinned above
   sscanf(remote, "%d.%d.%d", &rMajor, &rMinor, &rPatch);
   sscanf(local,  "%d.%d.%d", &lMajor, &lMinor, &lPatch);
+  // NOLINTEND(cert-err33-c,cert-err34-c,bugprone-unchecked-string-to-number-conversion)
   if (rMajor != lMajor) return rMajor > lMajor;
   if (rMinor != lMinor) return rMinor > lMinor;
   return rPatch > lPatch;

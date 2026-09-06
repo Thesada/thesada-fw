@@ -288,10 +288,13 @@ pio test -e native                    # all native suites
 pio test -e native -f test_rollback   # one suite
 ```
 
-Static analysis gates the same units: `scripts/static-check.sh` runs
-cppcheck over every `*_policy.h` / `*_payload.h` / `*_keymap.h`, and CI
-runs it in the `static-analysis` job. It catches the buffer-over-read
-class the on-device bench never exercises.
+Static analysis gates the same units. `scripts/static-check.sh` runs
+cppcheck over every `*_policy.h` / `*_payload.h` / `*_keymap.h`;
+`scripts/tidy-check.sh` runs clang-tidy (`.clang-tidy`: bugprone, cert,
+clang-analyzer, performance, misc) through the native test units so the
+host compiler sees the headers as `pio test` does. Both run under
+`make lint` and in the `static-analysis` CI job, warnings as errors. They
+catch the buffer-over-read class the on-device bench never exercises.
 
 To add a suite: create `test/test_<name>/test_<name>.cpp`, `#include` the
 pure header, write Unity `TEST_ASSERT_*` cases, and wire a `main()` that

@@ -132,7 +132,7 @@ Rescue builds strip all optional modules except PMU via `BOARD_OWB_RESCUE`. That
 ## Quick start
 
 ```bash
-make setup                           # PlatformIO, gcovr, cppcheck, Lua, git hooks
+make setup                           # PlatformIO, gcovr, cppcheck, clang-tidy, Lua, git hooks
 cp examples/config.json.example data/config.json
 # edit data/config.json (WiFi, MQTT, sensor pins)
 # optionally copy example scripts:
