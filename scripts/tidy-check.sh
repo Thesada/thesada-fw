@@ -6,8 +6,9 @@ set -euo pipefail
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
 TIDY="${CLANG_TIDY:-$(command -v clang-tidy || true)}"
-if [ -z "$TIDY" ] && [ -x /opt/homebrew/opt/llvm/bin/clang-tidy ]; then
-  TIDY=/opt/homebrew/opt/llvm/bin/clang-tidy
+if [ -z "$TIDY" ] && command -v brew >/dev/null; then
+  p="$(brew --prefix llvm 2>/dev/null)/bin/clang-tidy"
+  [ -x "$p" ] && TIDY="$p"
 fi
 [ -n "$TIDY" ] || { echo "tidy-check: clang-tidy not found - make setup-sys, or CLANG_TIDY=/path/to/clang-tidy"; exit 2; }
 
