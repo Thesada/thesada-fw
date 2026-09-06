@@ -1,0 +1,22 @@
+# Pure policy headers via scripts/tidy-check.sh. Dropped: Unity-TU linkage,
+# style checks, uint8_t byte-packing promotions. Exceptions carry a NOLINT.
+Checks: >
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  cert-*,
+  performance-*,
+  misc-*,
+  -misc-non-private-member-variables-in-classes,
+  -misc-use-anonymous-namespace,
+  -misc-include-cleaner,
+  -misc-use-internal-linkage,
+  -misc-const-correctness,
+  -performance-enum-size,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-signed-bitwise,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -cert-err58-cpp
+WarningsAsErrors: '*'
+HeaderFilterRegex: 'lib/thesada-core/src/.*'
+FormatStyle: none
