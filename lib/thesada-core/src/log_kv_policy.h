@@ -13,6 +13,8 @@
 inline bool logKvFormatV(char* out, size_t cap, const char* fmt, va_list ap) {
   if (!out || cap == 0) return false;
   if (!fmt) { out[0] = '\0'; return false; }
+  // Forwarded va_list, va_start'd by the caller; the linux analyser cannot see that.
+  // NOLINTNEXTLINE(clang-analyzer-valist.Uninitialized)
   int n = vsnprintf(out, cap, fmt, ap);
   if (n < 0) { out[0] = '\0'; return false; }
   return (size_t)n < cap;
