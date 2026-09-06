@@ -22,6 +22,9 @@ void ExampleRemoteRelay::begin() {
   JsonObject cfg = Config::get();
   _pin       = cfg["example_remote_relay"]["pin"]        | 4;
   _activeLow = cfg["example_remote_relay"]["active_low"] | false;
+  // Idle level first, then output mode: an active-low load would otherwise
+  // see the pin's power-on LOW as a pulse until set(false) runs.
+  digitalWrite(_pin, _activeLow ? HIGH : LOW);
   pinMode(_pin, OUTPUT);
   set(false);
 
@@ -58,7 +61,11 @@ void ExampleRemoteRelay::publishState() {
   JsonObject  cfg    = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
   char topic[96];
-  snprintf(topic, sizeof(topic), "%s/sensor/relay", prefix);
+  int n = snprintf(topic, sizeof(topic), "%s/sensor/relay", prefix);
+  if (n < 0 || n >= (int)sizeof(topic)) {
+    Log::kvfw(TAG, "example_relay.topic_too_long prefix_len=%u", (unsigned)strlen(prefix));
+    return;
+  }
   MQTTClient::publish(topic, _on ? "{\"on\":true}" : "{\"on\":false}");
 
   JsonDocument doc;

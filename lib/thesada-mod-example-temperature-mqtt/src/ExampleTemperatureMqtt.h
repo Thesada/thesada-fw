@@ -23,8 +23,12 @@ private:
 
   OneWire*           _wire    = nullptr;
   DallasTemperature* _sensors = nullptr;
-  uint32_t           _intervalMs = 60000;
-  uint32_t           _lastRead   = 0;
+  // 12-bit DS18B20 conversion takes up to 750 ms; wait a little longer.
+  static constexpr uint32_t kConversionMs = 800;
+
+  uint32_t           _intervalMs  = 60000;
+  uint32_t           _lastRead    = 0;
+  uint32_t           _requestedAt = 0;   // 0 = no conversion in flight
   float              _lastC      = 0.0f;   // set to the driver sentinel in begin()
   char               _name[32]   = "example";
 };
