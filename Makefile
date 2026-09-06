@@ -56,10 +56,11 @@ build-all: ## Compile every board env, the CI matrix
 
 .PHONY: build-minimal
 build-minimal: ## esp32-owb with every optional module off; proves core builds alone
-	cp src/thesada_config.h src/thesada_config.h.bak
-	sed -E 's,^#define (ENABLE_(TEMPERATURE|ADS1115|BATTERY|PMU|SD|CELLULAR|TELEGRAM|WEBSERVER|SCRIPTENGINE)),// #define \1,' src/thesada_config.h.bak > src/thesada_config.h
-	$(PIO) run -e esp32-owb; rc=$$?; mv src/thesada_config.h.bak src/thesada_config.h; exit $$rc
-	mkdir -p build && cp .pio/build/esp32-owb/firmware.bin build/firmware_minimal.bin
+	@set -e; cp src/thesada_config.h src/thesada_config.h.bak; \
+	  trap 'mv -f src/thesada_config.h.bak src/thesada_config.h' EXIT; \
+	  sed -E 's,^([[:space:]]*)#define (ENABLE_(TEMPERATURE|ADS1115|BATTERY|PMU|SD|CELLULAR|TELEGRAM|WEBSERVER|SCRIPTENGINE|IDENTITY)),\1// #define \2,' src/thesada_config.h.bak > src/thesada_config.h; \
+	  $(PIO) run -e esp32-owb; \
+	  mkdir -p build && cp .pio/build/esp32-owb/firmware.bin build/firmware_minimal.bin
 
 .PHONY: dist
 dist: ## What a release ships: every env, the minimal build, build/boards/
