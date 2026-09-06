@@ -23,3 +23,4 @@ lib/thesada-core/src/mqtt_rollback_policy.h     95
 lib/thesada-core/src/secret_keymap.h            95
 lib/thesada-core/src/ttl_policy.h               95
 lib/thesada-core/src/web_auth_policy.h          95
+lib/thesada-core/src/shell_mode_policy.h        95

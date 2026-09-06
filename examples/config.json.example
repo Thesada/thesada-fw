@@ -13,6 +13,10 @@
     "password": "changeme"
   },
 
+  "shell": {
+    "mode": "full"
+  },
+
   "wifi": {
     "networks": [
       { "ssid": "primary-ssid",   "password": "primary-password" },

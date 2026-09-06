@@ -585,6 +585,11 @@ void HttpServer::setupRoutes() {
       return;
     }
     String cmdStr = doc["cmd"].as<String>();
+    if (!shellModeHttpAllowed(Shell::mode())) {
+      req->send(403, "application/json",
+                "{\"ok\":false,\"error\":\"shell.mode closes the HTTP command surface\"}");
+      return;
+    }
 
     // Dispatch through the Shell deferred ring so the actual Shell::execute
     // runs on the main-loop task instead of inside the AsyncTCP onRequest
@@ -882,6 +887,10 @@ void HttpServer::setupRoutes() {
         // disconnect mid-execute degrades to a no-op (the AsyncWebSocket
         // returns nullptr for the closed id) instead of UAF on a stale
         // AsyncWebSocketClient* pointer captured here.
+        if (!shellModeHttpAllowed(Shell::mode())) {
+          client->text("[shell.mode closes the HTTP command surface]");
+          return;
+        }
         uint32_t cid = client->id();
         if (!Shell::enqueue(cmd.c_str(), [cid](const char* line) {
               AsyncWebSocketClient* c = _ws.client(cid);
