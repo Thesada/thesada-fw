@@ -4,7 +4,8 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-09-06 (shell.mode gates all three command transports. Prior:
+Dated 2026-09-06 (certificate validity dates are not enforced by the
+shipped mbedtls build. Prior: shell.mode gates all three command transports. Prior:
 Basic auth is refused on cross-site state-changing requests, including the
 two side-effect GETs, and the login lockout counts only real credential
 guesses. Prior: Config.h carries the single-task note. Prior: OTA verification and cert/key structural decisions extracted
@@ -656,6 +657,43 @@ out of their own device with five requests it cannot even read.
 
 Source: `lib/thesada-core/src/web_auth_policy.h`,
 `lib/thesada-mod-httpserver/src/HttpServer.cpp::_checkAuth`.
+
+### Certificate validity dates are not enforced, at any clock value
+
+`notBefore` and `notAfter` are never checked on this firmware. Not
+"skipped when the clock is floored" - the check is compiled out
+entirely, so an expired or not-yet-valid certificate is accepted on
+every TLS client the device opens: the OTA manifest and binary fetch,
+and the MQTT broker connection, both through `WiFiClientSecure`.
+
+The chain: `CONFIG_MBEDTLS_HAVE_TIME_DATE` is unset in the sdkconfig of
+every arduino-esp32 variant we ship against; `mbedtls/esp_config.h`
+turns that into `#undef MBEDTLS_HAVE_TIME_DATE`; and in
+`x509_crt.c` the `MBEDTLS_X509_BADCERT_EXPIRED` and
+`..._BADCERT_FUTURE` flags are only ever set inside
+`#if defined(MBEDTLS_HAVE_TIME_DATE)`. Upstream's own
+`mbedtls_config.h` does define it - IDF overrides that through
+`MBEDTLS_CONFIG_FILE`, and arduino-esp32 ships mbedtls precompiled, so
+the sdkconfig is what governs. This is the IDF default, not a change
+we made.
+
+What still holds: the chain of trust to the pinned CA (`setCACert`,
+`otaTlsMode` -> `OTA_TLS_VERIFIED` whenever `/ca.crt` is present) and
+the OTA payload SHA256 from the manifest. What does not: expiry, and
+with no CRL or OCSP either, certificate rotation is an operational
+control rather than something the fleet enforces.
+
+Do not write code that treats an expiry date as a security boundary,
+and do not "fix" this by enabling the option: `CLOCK_FLOOR_SANE_EPOCH`
+is 2023-11-14, so a device that has not reached NTP would read every
+certificate issued since then as not-yet-valid and refuse both OTA and
+MQTT. Any real fix is gated on a confirmed NTP sync and must fail open
+while unsynced.
+
+Source: `lib/thesada-core/src/ota_verify_policy.h::otaTlsMode`,
+`lib/thesada-core/src/OTAUpdate.cpp::configureSecureClient`,
+`lib/thesada-core/src/MQTTClient.cpp` (`_wifiClient`),
+`lib/thesada-core/src/clock_floor_policy.h::CLOCK_FLOOR_SANE_EPOCH`.
 
 ### Auth-state TTLs compare rollover-safe, never `now < expiry`
 
