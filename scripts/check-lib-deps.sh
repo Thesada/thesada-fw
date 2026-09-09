@@ -28,22 +28,40 @@ cd "$(cd "$(dirname "$0")/.." && pwd)"
 INI=platformio.ini
 fail=0
 
-# A lib_deps entry for a LOCAL library is a bare indented token drawn only
-# from [A-Za-z0-9_.-]. Whitelisting that charset rather than blacklisting
-# separators keeps external deps (owner/pkg @ ver, URLs), ini keys, section
-# headers, build flags and PlatformIO's ${env.*} interpolation all out.
+# Collect only the continuation lines of a `lib_deps =` assignment. Scoping
+# matters: an indented bare token under some other multiline key would
+# otherwise read as a listed library, and a missing lib_deps entry would pass
+# the gate silently - the exact failure this script exists to catch.
+#
+# Within that block, a LOCAL library is a bare token drawn only from
+# [A-Za-z0-9_.-]. Whitelisting that charset rather than blacklisting
+# separators keeps external deps (owner/pkg @ ver, URLs) and PlatformIO's
+# ${env.*} interpolation out. There are several lib_deps blocks ([env] plus
+# the native envs); every one of them counts.
 declare -a DEPS=()
+in_deps=0
 while IFS= read -r raw || [ -n "$raw" ]; do
-  [[ "$raw" == [[:space:]]* ]] || continue
   line="${raw%%;*}"
-  line="${line#"${line%%[![:space:]]*}"}"
-  line="${line%"${line##*[![:space:]]}"}"
-  [ -n "$line" ] || continue
-  case "$line" in
-    -*)                     continue ;;
-    *[!A-Za-z0-9_.-]*)      continue ;;
+  trimmed="${line#"${line%%[![:space:]]*}"}"
+  trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+
+  # Blank lines carry no structure, inside a block or out.
+  [ -n "$trimmed" ] || continue
+
+  # Unindented: a section header or a new key. Only `lib_deps` opens a block.
+  if [[ "$raw" != [[:space:]]* ]]; then
+    key="${trimmed%%=*}"
+    key="${key%"${key##*[![:space:]]}"}"
+    if [ "$key" = "lib_deps" ]; then in_deps=1; else in_deps=0; fi
+    continue
+  fi
+
+  [ "$in_deps" -eq 1 ] || continue
+  case "$trimmed" in
+    -*)                continue ;;
+    *[!A-Za-z0-9_.-]*) continue ;;
   esac
-  DEPS+=("$line")
+  DEPS+=("$trimmed")
 done < "$INI"
 
 listed() {
@@ -74,6 +92,13 @@ for name in ${DEPS+"${DEPS[@]}"}; do
     fail=1
   fi
 done
+
+# A run that inspected nothing must not report success: that is the same
+# vacuous green this gate exists to remove.
+if [ "$count" -eq 0 ]; then
+  echo "check-lib-deps: found no lib/*/library.json - wrong directory or broken checkout"
+  exit 1
+fi
 
 if [ "$fail" -ne 0 ]; then
   echo "check-lib-deps: FAILED"
