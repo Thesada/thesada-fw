@@ -394,25 +394,8 @@ void OTAUpdate::begin() {
 
   // On-demand checks come from the `ota.check` shell command (serial or
   // the cli/ MQTT path, both via triggerCheck) and from publishing to
-  // ota.cmd_topic. This block wires up the optional ota.cmd_topic sub.
-  const char* customTopic = cfg["ota"]["cmd_topic"] | "";
-  if (strlen(customTopic) == 0) goto skip_ota_sub;
-  {
-    char topic[96];
-    strncpy(topic, customTopic, sizeof(topic) - 1);
-    topic[sizeof(topic) - 1] = '\0';
-
-    MQTTClient::subscribe(topic, [](const char* topic, const char* payload) {
-      Log::info(TAG, "ota.trigger source=mqtt");
-      _checkRequested = true;
-      if (payload && strlen(payload) > 8) {
-        _pendingManifestUrl = payload;
-      } else {
-        _pendingManifestUrl = "";
-      }
-    });
-  }
-  skip_ota_sub:
+  // ota.cmd_topic.
+  registerCommandTopic();
 
   // Run first check ~30s after boot to let things settle. Guard the
   // unsigned subtraction: a sub-30s interval would set _lastCheck in the
@@ -421,6 +404,37 @@ void OTAUpdate::begin() {
   _lastCheck = (_checkIntervalMs > settleMs)
                  ? millis() - (_checkIntervalMs - settleMs)
                  : millis();
+}
+
+// ---------------------------------------------------------------------------
+
+// Subscribe the optional ota.cmd_topic. Split out of begin() because
+// MQTTClient::begin() resets the subscription table, and on the boot path it
+// runs after OTAUpdate::begin() (heap order, main.cpp) - so MQTT re-registers
+// the topic itself once its own table is clean.
+void OTAUpdate::registerCommandTopic() {
+  JsonObject cfg = Config::get();
+  // Re-check the config gate, not the _enabled flag: this now runs from
+  // MQTTClient::begin() too, and a device with ota.enabled=false must not
+  // gain a remote trigger that the old single call site never gave it.
+  if (!(cfg["ota"]["enabled"] | true)) return;
+
+  const char* customTopic = cfg["ota"]["cmd_topic"] | "";
+  if (strlen(customTopic) == 0) return;
+
+  char topic[96];
+  strncpy(topic, customTopic, sizeof(topic) - 1);
+  topic[sizeof(topic) - 1] = '\0';
+
+  MQTTClient::subscribe(topic, [](const char* topic, const char* payload) {
+    Log::info(TAG, "ota.trigger source=mqtt");
+    _checkRequested = true;
+    if (payload && strlen(payload) > 8) {
+      _pendingManifestUrl = payload;
+    } else {
+      _pendingManifestUrl = "";
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------

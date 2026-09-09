@@ -1296,14 +1296,15 @@ static void cmd_mqtt(int argc, char** argv, ShellOutput out) {
   snprintf(line, sizeof(line), "  transport: %s", viaCellular ? "cellular" : "WiFi");
   out(line);
 
-  snprintf(line, sizeof(line), "  subs: %u/%u", (unsigned)MQTTClient::_subCount, (unsigned)MQTT_MAX_SUBS);
+  snprintf(line, sizeof(line), "  subs: %u/%u",
+           (unsigned)MQTTClient::_subs.count(), (unsigned)MQTT_MAX_SUBS);
   out(line);
-  for (uint8_t i = 0; i < MQTTClient::_subCount; i++) {
-    snprintf(line, sizeof(line), "  [%u] %s %s",
-             (unsigned)i,
-             MQTTClient::_subs[i].topic,
-             MQTTClient::_subs[i].active ? "active" : "inactive");
-    out(line);
+  {
+    unsigned i = 0;
+    MQTTClient::_subs.forEachActive([&](const char* topic) {
+      snprintf(line, sizeof(line), "  [%u] %s", i++, topic);
+      out(line);
+    });
   }
 
   // RX ring - last N topics received at onMessage. If a topic was published
