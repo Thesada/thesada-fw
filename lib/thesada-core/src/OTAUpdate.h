@@ -10,6 +10,10 @@ public:
   // out: none
   static void begin();
 
+  // Register the optional ota.cmd_topic MQTT subscription. begin() calls it;
+  // MQTTClient::begin() calls it again after resetting its table.
+  static void registerCommandTopic();
+
   // in:  none
   // out: none
   static void loop();

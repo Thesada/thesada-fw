@@ -960,6 +960,34 @@ Source: `lib/thesada-mod-scriptengine/src/ScriptEngine.cpp`
 
 ## MQTT
 
+### The subscription table's `active` flags and its slot count clear together
+
+`MqttSubTable::reset()` is the only way to empty the table, and it clears both.
+Clearing `active` alone leaves the count high: the freed slots stay skipped by
+dispatch, and the next `subscribe()` writes past them. That is what happened:
+`MQTTClient::begin()` cleared the flags only, so the `ota.cmd_topic` subscription
+that `OTAUpdate::begin()` had registered in slot 0 was stranded inactive for the
+whole boot, and publishing to it did nothing until a `mqtt.topic_prefix` change
+forced a `reinitSubscriptions()`.
+
+Registration order is fixed by heap, not preference: `main.cpp` runs
+`OTAUpdate::begin()` before `MQTTClient::begin()` so the boot manifest fetch gets
+a contiguous heap. MQTT therefore inherits a non-empty table, resets it, and
+calls `OTAUpdate::registerCommandTopic()` to put the topic back - before the CLI
+block, which can return early on a truncated prefix. That function re-reads
+`ota.enabled` rather than the `_enabled` flag, so the second call site cannot
+hand a remote OTA trigger to a device whose config has OTA switched off.
+
+How enforced: the table is a type with no public way to clear one field
+(`mqtt_sub_table.h`, host-tested in `test/test_mqtt_sub_table` under a 95%
+floor). Anything that empties the table calls `reset()`. `mqtt.diag` prints
+`subs: n/max` and the active topics, which is where a stranded subscription
+shows.
+
+Source: `lib/thesada-core/src/mqtt_sub_table.h`,
+`lib/thesada-core/src/MQTTClient.cpp` `begin()` / `reinitSubscriptions()`,
+`lib/thesada-core/src/OTAUpdate.cpp::registerCommandTopic`.
+
 ### Cellular MQTT subscriptions mirror the WiFi-side `MQTTClient` registry
 
 `MQTTClient::subscribe` writes to a single subscription table. WiFi
@@ -1428,9 +1456,9 @@ mode also closes the HTTP command surface; `full` is the only value that keeps
 it, and `/ws/serial` is closed at connect so a narrowed mode leaves neither an
 interactive session nor its log replay up. OTA is deliberately untouched in
 all modes: the periodic `manifest_url` poll is the recovery path when a mode
-change goes wrong, and it needs no subscription. (The `cmd/ota` push topic is
-separately broken at boot for every mode - see the tracker - so it is not the
-path to rely on.)
+change goes wrong, and it needs no subscription and no broker. The `ota.cmd_topic`
+push works from boot again now that the subscription-table reset is fixed, but
+it needs both, so it is a convenience and not the path to rely on.
 
 An absent key parses to `full`, so a config written before the key existed
 behaves exactly as it did. A present value that is not a known name parses to

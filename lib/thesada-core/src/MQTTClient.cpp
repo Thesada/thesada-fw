@@ -192,8 +192,7 @@ time_t           MQTTClient::_lastPublishTime = 0;
 uint16_t         MQTTClient::_bufferIn       = 4096;
 uint16_t         MQTTClient::_bufferOut      = 4096;
 
-MQTTSubscription MQTTClient::_subs[MQTT_MAX_SUBS];
-uint8_t          MQTTClient::_subCount = 0;
+MQTTSubTable     MQTTClient::_subs;
 uint32_t         MQTTClient::_lastSuccessMs    = 0;
 uint32_t         MQTTClient::_connectedSinceMs = 0;
 uint32_t         MQTTClient::_lastHeapPublishMs = 0;
@@ -421,9 +420,10 @@ void MQTTClient::begin() {
   }
 #endif
 
-  for (int i = 0; i < MQTT_MAX_SUBS; i++) {
-    _subs[i].active = false;
-  }
+  // Empty table, then put OTA back: main.cpp registers it before MQTT for
+  // heap reasons, so without this ota.cmd_topic is dead for the whole boot.
+  _subs.reset();
+  OTAUpdate::registerCommandTopic();
 
   EventBus::subscribe("alert", [](JsonObject data) {
     JsonObject  cfg    = Config::get();
@@ -456,7 +456,6 @@ void MQTTClient::begin() {
       Log::kvf("MQTT", "mqtt.cli_disabled reason=shell_mode");
     }
   }
-
 
   connect();
 }
@@ -1080,20 +1079,13 @@ void MQTTClient::publishRetainedSet(bool force) {
 // ---------------------------------------------------------------------------
 
 void MQTTClient::subscribe(const char* topic, MQTTCallback callback) {
-  if (_subCount >= MQTT_MAX_SUBS) {
+  if (!_subs.add(topic, callback)) {
     Log::kvfe(TAG, "mqtt.sub_rejected reason=max_subs max=%d", MQTT_MAX_SUBS);
     return;
   }
 
-  MQTTSubscription& sub = _subs[_subCount];
-  strncpy(sub.topic, topic, sizeof(sub.topic) - 1);
-  sub.topic[sizeof(sub.topic) - 1] = '\0';
-  sub.callback = callback;
-  sub.active = true;
-  _subCount++;
-
   Log::kvf(TAG, "mqtt.sub_registered topic=%s count=%d max=%d",
-           topic, _subCount, MQTT_MAX_SUBS);
+           topic, _subs.count(), MQTT_MAX_SUBS);
 
   // Feed keepalive during bulk Lua subscription (>10 s): without this the
   // broker or HAProxy drops the idle TCP connection.
@@ -1117,27 +1109,7 @@ void MQTTClient::matchAndDispatch(const char* topic, const char* payload) {
   _rxRingHead = (_rxRingHead + 1) % RX_RING_SIZE;
   if (_rxRingCount < RX_RING_SIZE) _rxRingCount++;
 
-  for (uint8_t i = 0; i < _subCount; i++) {
-    if (!_subs[i].active) continue;
-    size_t slen = strlen(_subs[i].topic);
-    if (slen >= 2 && _subs[i].topic[slen - 1] == '#' && _subs[i].topic[slen - 2] == '/') {  // trailing /#
-      if (strncmp(_subs[i].topic, topic, slen - 1) == 0) {
-        _subs[i].callback(topic, payload);
-      }
-    }
-    // /+ matches only one level (no further '/').
-    else if (slen >= 2 && _subs[i].topic[slen - 1] == '+' && _subs[i].topic[slen - 2] == '/') {
-      if (strncmp(_subs[i].topic, topic, slen - 1) == 0) {
-        const char* rest = topic + (slen - 1);
-        if (*rest != '\0' && strchr(rest, '/') == nullptr) {
-          _subs[i].callback(topic, payload);
-        }
-      }
-    }
-    else if (strcmp(_subs[i].topic, topic) == 0) {
-      _subs[i].callback(topic, payload);
-    }
-  }
+  _subs.dispatch(topic, payload);
 }
 
 // Public entry for Cellular::pumpInbound: routes +SMSUB URCs through the
@@ -1157,9 +1129,7 @@ void MQTTClient::setFallbackSessionMTLS(bool active) {
 
 // Cellular bring-up uses this to replay AT+SMSUB for every WiFi-side entry.
 void MQTTClient::forEachSubscription(std::function<void(const char*)> fn) {
-  for (uint8_t i = 0; i < _subCount; i++) {
-    if (_subs[i].active) fn(_subs[i].topic);
-  }
+  _subs.forEachActive(fn);
 }
 
 void MQTTClient::setSubscribeForwarder(std::function<void(const char*)> fn) {
@@ -1594,8 +1564,7 @@ cleanup:
 // Called after config.reload when mqtt.topic_prefix changed. Does not
 // re-register EventBus handlers or reload TLS certs.
 void MQTTClient::reinitSubscriptions() {
-  for (int i = 0; i < MQTT_MAX_SUBS; i++) _subs[i].active = false;
-  _subCount = 0;
+  _subs.reset();
 
   JsonObject  cfg    = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
@@ -1620,11 +1589,10 @@ void MQTTClient::reinitSubscriptions() {
 }
 
 void MQTTClient::resubscribeAll() {
-  for (uint8_t i = 0; i < _subCount; i++) {
-    if (!_subs[i].active) continue;
-    _client.subscribe(_subs[i].topic);
-    Log::kvf(TAG, "mqtt.sub_resubscribed topic=%s", _subs[i].topic);
-  }
+  _subs.forEachActive([](const char* topic) {
+    _client.subscribe(topic);
+    Log::kvf(TAG, "mqtt.sub_resubscribed topic=%s", topic);
+  });
 }
 
 // ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@
 #include <vector>
 #include <thesada_config.h>
 #include "cli_authz_policy.h"
+#include "mqtt_sub_table.h"
 
 #ifndef MQTT_QUEUE_SIZE
   #define MQTT_QUEUE_SIZE 8
@@ -31,11 +32,7 @@ struct MQTTMessage {
 
 using MQTTCallback = std::function<void(const char* topic, const char* payload)>;
 
-struct MQTTSubscription {
-  char topic[96];
-  MQTTCallback callback;
-  bool active;
-};
+using MQTTSubTable = MqttSubTable<MQTTCallback, MQTT_MAX_SUBS>;
 
 class MQTTClient {
 public:
@@ -194,8 +191,7 @@ public:
   static uint8_t       _queueTail;
   static uint8_t       _queueCount;
 
-  static MQTTSubscription _subs[MQTT_MAX_SUBS];
-  static uint8_t          _subCount;
+  static MQTTSubTable  _subs;
 
   static uint32_t      _lastAttempt;
   static uint32_t      _retryInterval;
