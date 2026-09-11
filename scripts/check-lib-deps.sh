@@ -28,6 +28,32 @@ cd "$(cd "$(dirname "$0")/.." && pwd)"
 INI=platformio.ini
 fail=0
 
+# PlatformIO accepts `lib_deps = A, B` as well as one value per line, and the
+# value may sit on the assignment line itself; split on comma before filtering
+# or an inline list reads as one malformed token and every module it names is
+# reported missing.
+add_dep() {
+  local v="$1"
+  v="${v#"${v%%[![:space:]]*}"}"
+  v="${v%"${v##*[![:space:]]}"}"
+  [ -n "$v" ] || return 0
+  case "$v" in
+    -*)                return 0 ;;
+    *[!A-Za-z0-9_.-]*) return 0 ;;
+  esac
+  DEPS+=("$v")
+}
+
+add_deps_from() {
+  local rest="$1" part
+  while [ "$rest" != "${rest#*,}" ]; do
+    part="${rest%%,*}"
+    add_dep "$part"
+    rest="${rest#*,}"
+  done
+  add_dep "$rest"
+}
+
 # Collect only the continuation lines of a `lib_deps =` assignment. Scoping
 # matters: an indented bare token under some other multiline key would
 # otherwise read as a listed library, and a missing lib_deps entry would pass
@@ -52,16 +78,17 @@ while IFS= read -r raw || [ -n "$raw" ]; do
   if [[ "$raw" != [[:space:]]* ]]; then
     key="${trimmed%%=*}"
     key="${key%"${key##*[![:space:]]}"}"
-    if [ "$key" = "lib_deps" ]; then in_deps=1; else in_deps=0; fi
+    if [ "$key" = "lib_deps" ]; then
+      in_deps=1
+      case "$trimmed" in *=*) add_deps_from "${trimmed#*=}" ;; esac
+    else
+      in_deps=0
+    fi
     continue
   fi
 
   [ "$in_deps" -eq 1 ] || continue
-  case "$trimmed" in
-    -*)                continue ;;
-    *[!A-Za-z0-9_.-]*) continue ;;
-  esac
-  DEPS+=("$trimmed")
+  add_deps_from "$trimmed"
 done < "$INI"
 
 listed() {
