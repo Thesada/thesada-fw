@@ -98,10 +98,11 @@ coverage: ## Per-file line-coverage floors from scripts/coverage-floors.txt
 	./scripts/check-coverage.sh
 
 .PHONY: lint
-lint: ## cppcheck + clang-tidy on the pure units, then the LittleFS path-safety gate
+lint: ## cppcheck + clang-tidy on the pure units, then the path-safety and lib-deps gates
 	./scripts/static-check.sh
 	./scripts/tidy-check.sh
 	./scripts/check-path-safety.sh
+	./scripts/check-lib-deps.sh
 
 .PHONY: tidy
 tidy: ## clang-tidy alone (.clang-tidy), via the native test units

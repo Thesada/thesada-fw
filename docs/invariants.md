@@ -1391,6 +1391,30 @@ call sites in `CellularModule.cpp`, `Cellular.cpp`, `MQTTClient.cpp`,
 
 ## Module activation
 
+### A module is only compiled in if its library is listed in `lib_deps`
+
+`ENABLE_*` decides whether a module's code survives the preprocessor, but only
+after PlatformIO has decided to compile the file at all. It compiles a local
+library under `lib/` only when that library is named in `platformio.ini`
+`lib_deps`. A directory that is missing from that list never enters the
+dependency graph, never produces an object file, and never links - so its
+`MODULE_REGISTER` never runs and its `ENABLE_*` flag does nothing whatsoever.
+
+The failure is silent in both directions a reader would check. The build
+succeeds, because a library that is never built cannot fail to build, so the
+whole env matrix stays green. And the module is simply absent at runtime rather
+than disabled, so `module.status` does not list it either. Someone follows the
+README, uncomments the flag, flashes, and gets no behaviour and nothing to
+debug.
+
+How enforced: `scripts/check-lib-deps.sh`, run by `make lint` and therefore by
+CI. It fails when a `lib/<name>/` carrying a `library.json` is absent from
+`lib_deps`, and when a local `lib_deps` entry has no directory behind it. The
+check reads the wiring rather than trusting a green build, because a green
+build is exactly what this defect produces.
+
+Source: `platformio.ini` (`[env] lib_deps`), `scripts/check-lib-deps.sh`.
+
 ### A compiled-in module stays dark unless its config gate allows it
 
 Compile-time presence (`ENABLE_*`) only puts a module in the binary. It does
