@@ -79,18 +79,39 @@ void test_calver_orders_correctly(void) {
   TEST_ASSERT_FALSE(otaIsNewer("26.08.2", "26.09.1"));
 }
 
-// Documents the sscanf weakness deliberately: garbage parses as 0.0.0, so it is
-// never "newer" and the !force path refuses it. Safe direction, but not a
-// rejection - if this ever flips to true, the guard has been lost.
+// Malformed remote never counts as newer.
 void test_malformed_remote_is_not_newer(void) {
   TEST_ASSERT_FALSE(otaIsNewer("garbage", "1.0.0"));
   TEST_ASSERT_FALSE(otaIsNewer("", "1.0.0"));
+  TEST_ASSERT_FALSE(otaIsNewer("1.2", "1.0.0"));
+  TEST_ASSERT_FALSE(otaIsNewer("1.2.3x", "1.0.0"));
+  TEST_ASSERT_FALSE(otaIsNewer("-1.0.0", "0.0.0"));
 }
 
-// ...and the same weakness the other way: a malformed LOCAL reads 0.0.0, so any
-// real remote looks newer. Only reachable if FIRMWARE_VERSION is malformed.
-void test_malformed_local_makes_remote_look_newer(void) {
-  TEST_ASSERT_TRUE(otaIsNewer("1.0.0", "garbage"));
+// Malformed local also refuses (safe): previously sscanf zeroed it and any
+// real remote looked newer.
+void test_malformed_local_is_not_newer(void) {
+  TEST_ASSERT_FALSE(otaIsNewer("1.0.0", "garbage"));
+  TEST_ASSERT_FALSE(otaIsNewer("1.0.0", ""));
+  TEST_ASSERT_FALSE(otaIsNewer("1.0.0", "1.2"));
+  TEST_ASSERT_FALSE(otaIsNewer("1.0.0", "1.2.3x"));
+  TEST_ASSERT_FALSE(otaIsNewer("1.0.0", "-1.0.0"));
+  TEST_ASSERT_FALSE(otaIsNewer("1.0.0", "2147483648.0.0"));
+}
+
+void test_strict_version_parse(void) {
+  int maj = -1, min = -1, pat = -1;
+  TEST_ASSERT_TRUE(otaParseVersion("26.08.2", &maj, &min, &pat));
+  TEST_ASSERT_EQUAL(26, maj);
+  TEST_ASSERT_EQUAL(8, min);
+  TEST_ASSERT_EQUAL(2, pat);
+  TEST_ASSERT_FALSE(otaParseVersion("1.2", &maj, &min, &pat));
+  TEST_ASSERT_FALSE(otaParseVersion("1.2.3x", &maj, &min, &pat));
+  TEST_ASSERT_FALSE(otaParseVersion("-1.0.0", &maj, &min, &pat));
+  TEST_ASSERT_FALSE(otaParseVersion("", &maj, &min, &pat));
+  TEST_ASSERT_FALSE(otaParseVersion("1..2", &maj, &min, &pat));
+  // Overflow beyond INT_MAX
+  TEST_ASSERT_FALSE(otaParseVersion("2147483648.0.0", &maj, &min, &pat));
 }
 
 void test_null_versions_are_not_newer(void) {
@@ -103,6 +124,9 @@ void test_force_bypasses_version_gate(void) {
   TEST_ASSERT_TRUE(otaShouldUpdate("1.0.0", "1.0.0", true));
   TEST_ASSERT_FALSE(otaShouldUpdate("1.0.0", "1.0.0", false));
   TEST_ASSERT_TRUE(otaShouldUpdate("1.0.1", "1.0.0", false));
+  // force still wins when the local string would fail a strict parse
+  TEST_ASSERT_TRUE(otaShouldUpdate("1.0.0", "garbage", true));
+  TEST_ASSERT_FALSE(otaShouldUpdate("1.0.0", "garbage", false));
 }
 
 // ---- Digest compare ------------------------------------------------------
@@ -142,7 +166,8 @@ int main(int, char**) {
   RUN_TEST(test_same_and_older_are_not_newer);
   RUN_TEST(test_calver_orders_correctly);
   RUN_TEST(test_malformed_remote_is_not_newer);
-  RUN_TEST(test_malformed_local_makes_remote_look_newer);
+  RUN_TEST(test_malformed_local_is_not_newer);
+  RUN_TEST(test_strict_version_parse);
   RUN_TEST(test_null_versions_are_not_newer);
   RUN_TEST(test_force_bypasses_version_gate);
   RUN_TEST(test_matching_digest_accepts_either_case);

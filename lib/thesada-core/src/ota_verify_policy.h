@@ -8,12 +8,13 @@
 // OTAUpdate.cpp and are NOT covered by this unit.
 //
 // NOT byte-for-byte with the inline code it replaced. Deliberate differences,
-// all strictly more rejecting: null guards throughout, and otaShaMatches gates
-// digest LENGTH before comparing where the original relied on strcasecmp alone.
+// all strictly more rejecting: null guards throughout, otaShaMatches gates
+// digest LENGTH before comparing, and otaIsNewer requires a strict N.N.N on
+// both sides (the old sscanf path treated unparseable fields as 0).
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
+#include <limits.h>
 #include <stddef.h>
-#include <stdio.h>
 #include <string.h>
 #include <strings.h>  // strcasecmp is POSIX, not <string.h>
 
@@ -55,21 +56,47 @@ inline bool otaManifestSizeOk(size_t haveLen, size_t incomingLen) {
   return haveLen + incomingLen <= OTA_MANIFEST_CAP;
 }
 
-// Semver-ish compare over major.minor.patch.
-//
-// NOTE: mirrors the original exactly, including its weakness - the sscanf
-// return is not checked, so an unparseable version reads as 0.0.0 rather than
-// being rejected. Safe for the !force path (0.0.0 is never newer, so a
-// malformed manifest is refused); `force` bypasses this predicate entirely.
-// Pinned by tests rather than silently changed.
+// Leading zeros are fine (CalVer uses 08). Advances *pp past the digits.
+// Rejects overflow beyond INT_MAX.
+// in: *pp at field start, out dest. out: true and *pp advanced; else false.
+inline bool otaParseVersionField(const char** pp, int* out) {
+  if (!pp || !*pp || !out) return false;
+  const char* p = *pp;
+  if (*p < '0' || *p > '9') return false;
+  long long v = 0;
+  while (*p >= '0' && *p <= '9') {
+    v = v * 10 + (*p - '0');
+    if (v > INT_MAX) return false;
+    p++;
+  }
+  *out = (int)v;
+  *pp = p;
+  return true;
+}
+
+// Exactly three unsigned fields. Leading zeros OK; no sign, no trailing junk.
+// in: version string + three outs. out: true only for a full N.N.N.
+inline bool otaParseVersion(const char* s, int* major, int* minor, int* patch) {
+  if (!s || !major || !minor || !patch) return false;
+  const char* p = s;
+  if (!otaParseVersionField(&p, major)) return false;
+  if (*p++ != '.') return false;
+  if (!otaParseVersionField(&p, minor)) return false;
+  if (*p++ != '.') return false;
+  if (!otaParseVersionField(&p, patch)) return false;
+  return *p == '\0';
+}
+
+// Semver-ish compare over major.minor.patch. Either side must parse as a
+// strict N.N.N or the result is false (not newer) - a malformed local no
+// longer makes every remote look newer. `force` still bypasses via
+// otaShouldUpdate.
 inline bool otaIsNewer(const char* remote, const char* local) {
   if (!remote || !local) return false;
   int rMajor = 0, rMinor = 0, rPatch = 0;
   int lMajor = 0, lMinor = 0, lPatch = 0;
-  // NOLINTBEGIN(cert-err33-c,cert-err34-c,bugprone-unchecked-string-to-number-conversion): pinned above
-  sscanf(remote, "%d.%d.%d", &rMajor, &rMinor, &rPatch);
-  sscanf(local,  "%d.%d.%d", &lMajor, &lMinor, &lPatch);
-  // NOLINTEND(cert-err33-c,cert-err34-c,bugprone-unchecked-string-to-number-conversion)
+  if (!otaParseVersion(remote, &rMajor, &rMinor, &rPatch)) return false;
+  if (!otaParseVersion(local, &lMajor, &lMinor, &lPatch)) return false;
   if (rMajor != lMajor) return rMajor > lMajor;
   if (rMinor != lMinor) return rMinor > lMinor;
   return rPatch > lPatch;
