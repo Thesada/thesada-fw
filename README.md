@@ -2,6 +2,14 @@
 
 Know when your wood boiler runs dry or your well pump quits, on properties where WiFi does not reach.
 
+![Remote MQTT shell: chip.info, heap, fs.ls, partitions, config.set](docs/img/mqtt-shell.svg)
+
+Full shell over MQTT — publish a command topic, get the answer back on `cli_response`. No serial cable on site. ([cast](docs/img/mqtt-shell.cast))
+
+![Serial boot through boot.ready, then help / version / chip.info / heap / fs.ls / partitions](docs/img/boot-shell.svg)
+
+Same shell on the wire after boot. ([cast](docs/img/boot-shell.cast))
+
 ![Monitoring node wired in at the boiler, sensors clamped to the supply line](docs/img/field-install.png)
 
 A node sits on the equipment and watches it. Temperature on the lines, current draw on the pump. When something goes wrong it messages your phone. When the WiFi is out of range, which out here it usually is, it falls back to the cell network and keeps reporting.
