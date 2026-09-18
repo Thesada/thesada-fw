@@ -1,23 +1,6 @@
 #!/bin/sh
-# thesada-fw commit-message lint.
-#
-# thesada-fw is a public repo. Commit messages are mirrored to GitHub and
-# show up verbatim in `git log` and in auto-generated release notes, so
-# private references must never land in one. This scans a single commit
-# message for the recurring offenders:
-#
-#   - internal issue-tracker refs    #<digits>
-#   - internal hostnames             (use example.com in public text)
-#   - RFC1918 IP addresses           10/172.16-31/192.168
-#
-# Merge commits are skipped - their `#<n>` is a GitHub PR number, which is
-# public and legitimate.
-#
-# in:  $1 - path to the commit message file (as passed to a commit-msg hook)
-# out: exit 0 clean, exit 1 with the offending lines on a hit.
-#
-# Bypass (genuine false positive only - leaves a trail in the message):
-#     MSG_OK=1 git commit ...
+# Public commit-msg lint: strip Cursor trailers; reject private refs.
+# Bypass: MSG_OK=1 git commit ...
 set -eu
 
 msg_file="${1:?usage: check-commit-msg.sh <commit-msg-file>}"
@@ -27,24 +10,32 @@ if [ "${MSG_OK:-}" = "1" ]; then
   exit 0
 fi
 
-# Merge commits carry a public GitHub PR number - not ours to police.
 first_line=$(head -n1 "$msg_file")
 case "$first_line" in
   "Merge "*) exit 0 ;;
 esac
 
-# Drop comment lines (the git template's `#` block) so they cannot
-# false-positive as tracker refs. Real refs appear inline, not at col 0.
+# Strip Cursor Agent --trailer injections (land before this hook).
+tmp_strip=$(mktemp)
+grep -vE '^[[:space:]]*(Co-authored-by:[[:space:]]*Cursor[[:space:]]*<cursoragent@cursor\.com>|Made-with:[[:space:]]*Cursor|Made with \[Cursor\])' \
+  "$msg_file" >"$tmp_strip" || true
+if [ -s "$tmp_strip" ]; then
+  awk 'NF{p=1} p{print}' "$tmp_strip" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' >"$msg_file" || cp "$tmp_strip" "$msg_file"
+fi
+rm -f "$tmp_strip"
+
 body=$(grep -v '^#' "$msg_file" || true)
 
 fail=0
 report() {
-  # in: $1 label, $2 matching lines
   [ -z "$2" ] && return 0
   echo "commit-msg lint: $1" >&2
   printf '%s\n' "$2" | sed 's/^/    /' >&2
   fail=1
 }
+
+report "Cursor attribution trailer - remove Co-authored-by/Made-with Cursor lines" \
+  "$(printf '%s\n' "$body" | grep -nEi 'Co-authored-by:[[:space:]]*Cursor|Made-with:[[:space:]]*Cursor|Made with \[Cursor\]|cursoragent@cursor\.com' || true)"
 
 report "internal issue-tracker ref (#NN) - drop it or describe the change instead" \
   "$(printf '%s\n' "$body" | grep -nE '#[0-9]+' || true)"
