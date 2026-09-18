@@ -4,7 +4,8 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-09-06 (wildcard fs.rm needs --yes and never takes config.json
+Dated 2026-09-17 (OTA version compare rejects anything that is not N.N.N.
+Prior: 2026-09-06 wildcard fs.rm needs --yes and never takes config.json
 or ca.crt. Prior: certificate validity dates are not enforced by the
 shipped mbedtls build. Prior: shell.mode gates all three command transports. Prior:
 Basic auth is refused on cross-site state-changing requests, including the
@@ -150,6 +151,19 @@ Source: `lib/thesada-core/src/OTAUpdate.cpp` flashFromCallback path. The digest
 compare is `otaShaMatches()` in `lib/thesada-core/src/ota_verify_policy.h`, which
 now gates digest length before comparing; the streaming `mbedtls_sha256`
 accumulation stays in OTAUpdate.cpp and is not host-tested.
+
+### OTA version compare rejects anything that is not `N.N.N`
+
+`otaIsNewer` parses both sides with a strict digit-only three-field parser
+(`otaParseVersion`). Partial (`1.2`), signed (`-1.0.0`), trailing junk
+(`1.2.3x`), empty, or overflow fields make the predicate return false.
+A malformed local no longer makes every remote look newer. `force` still
+bypasses via `otaShouldUpdate`.
+
+How enforced: host tests in `test/test_ota_verify`. Coverage floor 95% on
+`ota_verify_policy.h`.
+
+Source: `lib/thesada-core/src/ota_verify_policy.h`.
 
 ### OTA-over-cellular shares the WiFi cert-verification gate
 
