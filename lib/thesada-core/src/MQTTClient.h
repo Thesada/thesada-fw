@@ -107,6 +107,11 @@ public:
   // in:  active  true = that session presented this device's client cert
   static void setFallbackSessionMTLS(bool active);
 
+  // Whether the fallback transport's broker session checked the server
+  // certificate. Independent of the WiFi session's own check, and
+  // independent of client-cert mTLS. in: verified  true = CA was checked.
+  static void setFallbackTlsVerified(bool verified);
+
   // Iterate active subscription topics.
   // in:  fn  called with each topic string
   // out: none

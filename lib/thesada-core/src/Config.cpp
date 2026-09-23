@@ -53,22 +53,24 @@ bool Config::save() {
   return true;
 }
 
-// Replace whole config with new JSON. On parse failure the cleared doc
-// is rolled back to the on-disk file so a bad MQTT payload cannot wipe
-// live config. in: JSON string.
-void Config::replace(const char* json) {
+// Replace whole config with new JSON. On parse or persist failure the
+// cleared doc is rolled back to the on-disk file so a bad MQTT payload
+// cannot wipe live config. in: JSON string. out: false if nothing was written.
+bool Config::replace(const char* json) {
   _doc.clear();
   DeserializationError err = deserializeJson(_doc, json);
   if (err) {
     Log::kvfe(TAG, "config.replace_failed err=%s action=rollback", err.c_str());
-    load();  // rollback to file on disk
-    return;
+    load();
+    return false;
   }
   if (!save()) {
     Log::error(TAG, "config.replace_failed reason=persist");
-    return;
+    load();
+    return false;
   }
   Log::info(TAG, "config.replaced source=mqtt");
+  return true;
 }
 
 // Set one value by dot-path (e.g. "telegram.cooldown_s"), preserving

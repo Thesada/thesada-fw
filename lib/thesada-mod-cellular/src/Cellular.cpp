@@ -255,6 +255,7 @@ void Cellular::invalidateClientCert() {
     modem.sendAT("+SMDISC");
     modem.waitResponse(5000UL);
     _mqttConnected = false;
+    MQTTClient::setFallbackTlsVerified(false);
   }
 }
 
@@ -272,6 +273,7 @@ bool Cellular::hardReset() {
   _modemAlive    = ok;
   _started       = false;
   _mqttConnected = false;
+  MQTTClient::setFallbackTlsVerified(false);
   // Modem FS does not survive a DC3 power cycle - any prior cert
   // upload is gone, force a re-upload on the next mqttConnect.
   _hasClientCertOnModem = false;
@@ -708,6 +710,7 @@ bool Cellular::mqttConnect() {
   // The session about to be torn down below takes its auth verdict with it.
   // Every exit from here that is not a live SMCONN must leave it at password.
   MQTTClient::setFallbackSessionMTLS(false);
+  MQTTClient::setFallbackTlsVerified(false);
 
   // Strong teardown: SMDISC alone is not enough after a warm SMCONN
   // failure - the SIM7080 keeps the URL slot half-locked and the next
@@ -853,6 +856,7 @@ bool Cellular::mqttConnect() {
     modem.waitResponse();
     Log::warn(TAG, "cellular.mqtt.tls_unverified reason=no_ca");
   }
+  bool serverVerified = wantMTLS || _hasCACert;
 
   Log::info(TAG, "cellular.mqtt.connect_start");
   modem.sendAT("+SMCONN");
@@ -869,6 +873,7 @@ bool Cellular::mqttConnect() {
 
   // This session's own credential decides what its CLI commands may run.
   MQTTClient::setFallbackSessionMTLS(wantMTLS);
+  MQTTClient::setFallbackTlsVerified(serverVerified);
 
   // Re-issue every WiFi-side subscription on the cellular MQTT session
   //. Reconnect path benefits too - the modem drops subscriptions
@@ -1426,6 +1431,7 @@ void Cellular::loop() {
       Log::kvfw(TAG, "cellular.mqtt.state_change from=connected to=disconnected reason=network_lost");
     }
     _mqttConnected = false;
+    MQTTClient::setFallbackTlsVerified(false);
     while (!networkConnect()) {
       Log::warn(TAG, "cellular.network_retry wait_s=10");
       // Release the AT bus + pump shell during the sleep so restart /
@@ -1456,6 +1462,7 @@ void Cellular::loop() {
       Log::kvfw(TAG, "cellular.mqtt.state_change from=connected to=disconnected reason=mqtt_dropped");
     }
     _mqttConnected = false;
+    MQTTClient::setFallbackTlsVerified(false);
     if (mqttConnect()) {
       _mqttConnected = true;
       mqttBackoffReset();
@@ -1719,6 +1726,7 @@ bool Cellular::publish(const char* topic, const char* payload, bool retain) {
   Log::warn(TAG, rc == 0 ? "cellular.smpub_failed reason=timeout"
                          : "cellular.smpub_failed reason=error");
   _mqttConnected = false;
+  MQTTClient::setFallbackTlsVerified(false);
   return false;
 }
 
@@ -2075,6 +2083,7 @@ void Cellular::dataLinkDown() {
   modem.waitResponse(5000UL);
   _started       = false;
   _mqttConnected = false;
+  MQTTClient::setFallbackTlsVerified(false);
   _publishGate   = false;
   Log::info(TAG, "cellular.data_link_down modem=registered");
 }

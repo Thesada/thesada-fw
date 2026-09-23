@@ -14,7 +14,8 @@ class Config {
 public:
   static void load();
   static bool save();   // false if the on-disk write failed (open or short write)
-  static void replace(const char* json);
+  // false on parse or persist failure. Either failure reloads the on-disk file.
+  static bool replace(const char* json);
   static bool set(const char* path, const char* value);
   static JsonObject get();
 private:
