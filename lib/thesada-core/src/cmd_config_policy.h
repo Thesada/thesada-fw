@@ -103,6 +103,8 @@ static inline bool cmdConfigNumber(CmdConfigScan& p) {
 
 static inline bool cmdConfigValue(CmdConfigScan& p);
 
+// Depth is capped by CMD_CONFIG_MAX_DEPTH. The cycle is the JSON walk.
+// NOLINTNEXTLINE(misc-no-recursion)
 static inline bool cmdConfigContainer(CmdConfigScan& p, char open, char close) {
   if (++p.depth > CMD_CONFIG_MAX_DEPTH) return false;
   p.i++;
@@ -135,6 +137,7 @@ static inline bool cmdConfigContainer(CmdConfigScan& p, char open, char close) {
   }
 }
 
+// NOLINTNEXTLINE(misc-no-recursion)
 static inline bool cmdConfigValue(CmdConfigScan& p) {
   if (!cmdConfigSkipWs(p)) return false;
   char c = p.s[p.i];

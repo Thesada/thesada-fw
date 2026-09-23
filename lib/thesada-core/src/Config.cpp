@@ -11,7 +11,18 @@ static const char* TAG = "Config";
 
 JsonDocument Config::_doc;
 
+// Prefix already written by replace(). save() writes this, not the boot
+// value holdTopicPrefix puts back into the live doc.
+static char _diskTopicPrefix[96];
+static bool _topicPrefixHeld = false;
+
+static void clearHeldTopicPrefix() {
+  _topicPrefixHeld = false;
+  _diskTopicPrefix[0] = '\0';
+}
+
 void Config::load() {
+  clearHeldTopicPrefix();
   if (!LittleFS.begin()) return;
   File f = LittleFS.open("/config.json", "r");
   if (!f) return;
@@ -33,8 +44,26 @@ void Config::load() {
 // destroys the last good config and the load() rollback in set()/
 // replace() genuinely restores it.
 bool Config::save() {
+  char livePrefix[96];
+  bool swapped = false;
+  if (_topicPrefixHeld) {
+    const char* live = _doc["mqtt"]["topic_prefix"] | "";
+    size_t n = strlen(live);
+    if (n < sizeof(livePrefix)) {
+      memcpy(livePrefix, live, n + 1);
+      _doc["mqtt"]["topic_prefix"] = _diskTopicPrefix;
+      swapped = true;
+    }
+  }
+  auto restoreLivePrefix = [&]() {
+    if (swapped) _doc["mqtt"]["topic_prefix"] = livePrefix;
+  };
   File f = LittleFS.open("/config.json.tmp", "w");
-  if (!f) { Log::error(TAG, "config.save_failed reason=tmp_open"); return false; }
+  if (!f) {
+    Log::error(TAG, "config.save_failed reason=tmp_open");
+    restoreLivePrefix();
+    return false;
+  }
   size_t written  = serializeJson(_doc, f);
   size_t expected = measureJson(_doc);
   f.close();
@@ -42,14 +71,17 @@ bool Config::save() {
     Log::kvfe(TAG, "config.save_failed reason=short_write written=%u expected=%u",
               (unsigned)written, (unsigned)expected);
     LittleFS.remove("/config.json.tmp");
+    restoreLivePrefix();
     return false;
   }
   if (!LittleFS.rename("/config.json.tmp", "/config.json")) {
     Log::error(TAG, "config.save_failed reason=rename");
     LittleFS.remove("/config.json.tmp");
+    restoreLivePrefix();
     return false;
   }
   Log::kvf(TAG, "config.saved path=/config.json bytes=%u", (unsigned)written);
+  restoreLivePrefix();
   return true;
 }
 
@@ -57,6 +89,7 @@ bool Config::save() {
 // cleared doc is rolled back to the on-disk file so a bad MQTT payload
 // cannot wipe live config. in: JSON string. out: false if nothing was written.
 bool Config::replace(const char* json) {
+  clearHeldTopicPrefix();
   _doc.clear();
   DeserializationError err = deserializeJson(_doc, json);
   if (err) {
@@ -73,11 +106,27 @@ bool Config::replace(const char* json) {
   return true;
 }
 
+// in: boot prefix. out: none. A string that does not fit is left unchanged.
+void Config::holdTopicPrefix(const char* prefix) {
+  if (!prefix) return;
+  const char* disk = _doc["mqtt"]["topic_prefix"] | "";
+  size_t diskLen = strlen(disk);
+  size_t liveLen = strlen(prefix);
+  if (diskLen >= sizeof(_diskTopicPrefix) || liveLen >= sizeof(_diskTopicPrefix)) {
+    Log::warn(TAG, "config.topic_prefix_hold_skipped reason=length");
+    return;
+  }
+  memcpy(_diskTopicPrefix, disk, diskLen + 1);
+  _topicPrefixHeld = true;
+  _doc["mqtt"]["topic_prefix"] = prefix;
+}
+
 // Set one value by dot-path (e.g. "telegram.cooldown_s"), preserving
 // JSON type (bool/int/double/string). in: dot-path, value string.
 // out: false if a parent key is missing or not an object, value is
 // null, or the persist fails (in which case _doc is rolled back).
 bool Config::set(const char* path, const char* value) {
+  if (path && strcmp(path, "mqtt.topic_prefix") == 0) clearHeldTopicPrefix();
   char buf[128];
   // Reject empty/over-long paths (truncation would rewrite a different
   // key) and a null value (the strcmp/strtod below would deref it).

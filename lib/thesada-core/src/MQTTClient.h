@@ -46,6 +46,9 @@ public:
   static bool rollbackDecision(const char* lg, bool haveLg,
                                const char* rbCfg, const char* cur);
   static void reinitSubscriptions();
+  // Disconnect and reconnect from the current broker settings. Does not
+  // clear the subscription table.
+  static void reconnectWithCurrentConfig();
   static void loop();
   static void tick();  // lightweight keepalive - call during long init phases
   static void publish(const char* topic, const char* payload);

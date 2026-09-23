@@ -4,9 +4,11 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-09-22 (`cmd/config` accepts a JSON document on a CA-verified TLS
-session only, including a password session, and refuses a blob that drops
-`mqtt.broker`. It is not gated by `shell.mode`. Prior: 2026-09-17 OTA version compare rejects anything that is not N.N.N.
+Dated 2026-09-23 (`cmd/config` keeps a pushed `topic_prefix` at the boot
+value until restart, and reconnects broker changes without clearing
+subscriptions. Prior: 2026-09-22 `cmd/config` accepts a JSON document on a
+CA-verified TLS session only, including a password session, and refuses a
+blob that drops `mqtt.broker`. It is not gated by `shell.mode`. Prior: 2026-09-17 OTA version compare rejects anything that is not N.N.N.
 Prior: 2026-09-06 wildcard fs.rm needs --yes and never takes config.json
 or ca.crt. Prior: certificate validity dates are not enforced by the
 shipped mbedtls build. Prior: shell.mode gates all three command transports. Prior:
@@ -1532,23 +1534,28 @@ payload is applied only when the broker session verified the server
 certificate. A password on that session is enough. `mqtt.allow_insecure`
 encrypts without that check and is refused. The body must be a JSON object
 that still contains a non-empty `mqtt.broker`. A change to the
-connection-critical mqtt keys reuses the existing reinit and last-good
-rollback. Anything else is written and left for the next restart.
+connection-critical mqtt keys reconnects without clearing the subscription
+table, so callbacks registered after boot stay. The last-good rollback
+still covers a broker the device cannot reach. `topic_prefix` is saved and
+stays at the boot value until restart. Anything else is written and left
+for the next restart.
 
 How enforced: `cmdConfigVerdict` (`cmd_config_policy.h`, host-tested in
 `test/test_cmd_config`) refuses an unverified session, a non-object, and a
 document with no non-empty `mqtt.broker`. WiFi sets the session bit only in
 the `setCACert` path. Cellular sets its own bit from the SMSSL choice, and
 `dispatchInbound` uses that bit rather than the WiFi one. `Config::replace`
-reloads the on-disk file when the write fails, and the apply does not reinit
-unless that write succeeded. `reinitSubscriptions` disconnects before it
-touches the subscription table, and a CLI topic that does not fit does not
-skip `cmd/config` or the reconnect.
+reloads the on-disk file when the write fails, and the apply does not
+reconnect unless that write succeeded. The reconnect leaves the
+subscription table in place. A later save still writes the prefix already
+on disk. `cmd/config` is registered after the OTA and CLI topics so those
+stay inside the cellular four-topic replay. A prefix that does not fit the
+CLI topic still subscribes `cmd/config`.
 
 Source: `lib/thesada-core/src/cmd_config_policy.h`,
-`lib/thesada-core/src/Config.cpp` (`replace`),
+`lib/thesada-core/src/Config.cpp` (`replace`, `holdTopicPrefix`, `save`),
 `lib/thesada-core/src/MQTTClient.cpp` (`mqttApplyCmdConfig`, `begin`,
-`reinitSubscriptions`, `setFallbackTlsVerified`),
+`reconnectWithCurrentConfig`, `reinitSubscriptions`, `setFallbackTlsVerified`),
 `lib/thesada-mod-cellular/src/Cellular.cpp` (`mqttConnect`).
 
 ---

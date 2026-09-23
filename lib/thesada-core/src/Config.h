@@ -16,6 +16,10 @@ public:
   static bool save();   // false if the on-disk write failed (open or short write)
   // false on parse or persist failure. Either failure reloads the on-disk file.
   static bool replace(const char* json);
+  // Put the boot prefix back in the live doc after a replace. Later saves
+  // still write the prefix that is already on disk.
+  // in: boot prefix, full string. out: none. A prefix that does not fit is left alone.
+  static void holdTopicPrefix(const char* prefix);
   static bool set(const char* path, const char* value);
   static JsonObject get();
 private:

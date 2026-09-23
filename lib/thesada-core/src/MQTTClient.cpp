@@ -345,7 +345,9 @@ static void cmdConfigInbound(const char* topic, const char* payload) {
 static void mqttSubscribeCmdConfig() {
   JsonObject cfg = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-  char topic[CLI_TOPIC_CAP];
+  // Wider than CLI_TOPIC_CAP. A prefix that does not fit /cli/# can still
+  // fit /cmd/config, and that topic has to stay subscribed.
+  char topic[128];
   if (!cliTopicJoin(topic, sizeof(topic), prefix, "/cmd/config")) {
     Log::kvf(TAG, "mqtt.cmd_config_topic_truncated prefix=%s", prefix);
     return;
@@ -356,9 +358,9 @@ static void mqttSubscribeCmdConfig() {
 static size_t mqttCriticalJson(char* out, size_t maxLen);
 
 // Apply a staged document. Refuses a blob that drops mqtt.broker so a push
-// cannot remove the only way back. Connection-critical mqtt keys that do
-// change go through the existing reinit, and the last-good rollback covers
-// a broker the device then cannot reach.
+// cannot remove the only way back. Broker, port, user, and password changes
+// reconnect without rebuilding subscriptions. topic_prefix is written to
+// disk and kept at the boot value until restart.
 // in: JSON object text. out: none.
 static void mqttApplyCmdConfig(const char* json) {
   JsonDocument doc;
@@ -371,22 +373,39 @@ static void mqttApplyCmdConfig(const char* json) {
     Log::warn(TAG, "mqtt.cmd_config_refused reason=broker");
     return;
   }
+  char prefixLive[96];
+  bool prefixFits = false;
+  {
+    const char* prefix = Config::get()["mqtt"]["topic_prefix"] | "thesada/node";
+    size_t n = strlen(prefix);
+    if (n < sizeof(prefixLive)) {
+      memcpy(prefixLive, prefix, n + 1);
+      prefixFits = true;
+    }
+  }
   char before[LG_MAX_LEN];
   size_t nb = mqttCriticalJson(before, sizeof(before));
   if (!Config::replace(json)) {
     Log::warn(TAG, "mqtt.cmd_config_refused reason=persist");
     return;
   }
+  const char* prefixNow = Config::get()["mqtt"]["topic_prefix"] | "thesada/node";
+  if (!prefixFits) {
+    Log::warn(TAG, "mqtt.cmd_config_prefix_unheld reason=length");
+  } else if (strcmp(prefixLive, prefixNow) != 0) {
+    Config::holdTopicPrefix(prefixLive);
+    Log::info(TAG, "mqtt.cmd_config_prefix_deferred");
+  }
   char after[LG_MAX_LEN];
   size_t na = mqttCriticalJson(after, sizeof(after));
   if (nb == 0 || na == 0) {
     Log::info(TAG, "mqtt.cmd_config_reinit reason=snapshot");
-    MQTTClient::reinitSubscriptions();
+    MQTTClient::reconnectWithCurrentConfig();
     return;
   }
   if (strcmp(before, after) != 0) {
     Log::info(TAG, "mqtt.cmd_config_reinit reason=connection_keys");
-    MQTTClient::reinitSubscriptions();
+    MQTTClient::reconnectWithCurrentConfig();
     return;
   }
   Log::info(TAG, "mqtt.cmd_config_applied");
@@ -521,7 +540,6 @@ void MQTTClient::begin() {
   // heap reasons, so without this ota.cmd_topic is dead for the whole boot.
   _subs.reset();
   OTAUpdate::registerCommandTopic();
-  mqttSubscribeCmdConfig();
 
   EventBus::subscribe("alert", [](JsonObject data) {
     JsonObject  cfg    = Config::get();
@@ -539,6 +557,7 @@ void MQTTClient::begin() {
     char cliTopic[CLI_TOPIC_CAP];
     if (!cliInputSubscription(cliTopic, sizeof(cliTopic), prefix)) {
       Log::kvf("MQTT", "mqtt.cli_topic_truncated prefix=%s", prefix);
+      mqttSubscribeCmdConfig();
       return;
     }
 
@@ -555,6 +574,9 @@ void MQTTClient::begin() {
     }
   }
 
+  // After OTA and the CLI topic. Cellular replays only the first four
+  // registrations, and those two have to stay inside that budget.
+  mqttSubscribeCmdConfig();
   connect();
 }
 
@@ -1671,13 +1693,24 @@ cleanup:
 
 // ---------------------------------------------------------------------------
 
+// Disconnect and let the loop reconnect from the current broker, port,
+// user, and password. The subscription table stays, including Lua callbacks.
+// in: none. out: none.
+void MQTTClient::reconnectWithCurrentConfig() {
+  if (_client.connected()) {
+    _client.disconnect();
+    _connectedSinceMs = 0;
+    Log::kvf(TAG, "mqtt.state_change from=connected to=disconnected reason=cfg_reconnect");
+  }
+  _reinitPending = true;
+}
+
 // Re-register core subscriptions (cli/#, OTA, cmd/config) under the current prefix.
 // Called after config.reload when mqtt.topic_prefix changed. Does not
 // re-register EventBus handlers or reload TLS certs.
 void MQTTClient::reinitSubscriptions() {
   // Drop the session before subscribe(). subscribe() pumps the client
-  // while it is still connected, and a cmd/config apply calls this from
-  // inside MQTTClient::loop. The reconnect resubscribes from the table.
+  // while it is still connected. The reconnect resubscribes from the table.
   if (_client.connected()) {
     _client.disconnect();
     _connectedSinceMs = 0;
