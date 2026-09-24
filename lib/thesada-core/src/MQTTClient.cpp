@@ -10,6 +10,7 @@
 #include "cli_authz_policy.h"
 #include "Identity.h"
 #include "mqtt_rollback_policy.h"
+#include "cmd_config_policy.h"
 #include "clock_floor_policy.h"
 #include "EventBus.h"
 #include "WiFiManager.h"
@@ -73,6 +74,11 @@ static std::function<void()> _onCertClearedHook = nullptr;
 // Auth mode of the fallback transport's broker session. Its own session, its
 // own credential: the WiFi flag says nothing about how it authenticated.
 static bool _fallbackMtls = false;
+static bool _fallbackTlsVerified = false;
+// Set for the duration of one inbound dispatch. WiFi and cellular each
+// write their own session's verdict so a verified WiFi CA cannot bless
+// an unverified cellular push.
+static bool _dispatchTlsVerified = false;
 
 // Did the stored client cert fail to load or validate at the last connect
 // attempt? Absent cert is not broken - there is nothing to recover.
@@ -176,6 +182,9 @@ static bool        _tlsRefused = false;
 #else
 WiFiClient       MQTTClient::_wifiClient;
 #endif
+// True only after setCACert. allow_insecure encrypts without checking the
+// broker, and that session must not accept a config push.
+static bool _tlsVerified = false;
 PubSubClient MQTTClient::_client(_wifiClient);
 
 MQTTMessage      MQTTClient::_queue[MQTT_QUEUE_SIZE];
@@ -298,6 +307,131 @@ static void cliInboundHandler(const char* topic, const char* payload) {
   if (!ok) Log::warn("MQTT", "mqtt.cli_dropped reason=busy");
 }
 
+// Staged cmd/config body. Copied out of the client callback, applied on the
+// next loop tick so LittleFS and Config::replace never run inside PubSubClient.
+static char _cmdConfigBuf[CMD_CONFIG_MAX];
+static bool _cmdConfigPending = false;
+
+// Copy a verified-TLS JSON object into the staging buffer.
+// in: topic (unused), payload. out: none.
+static void cmdConfigInbound(const char* topic, const char* payload) {
+  (void)topic;
+  size_t n = payload ? strlen(payload) : 0;
+  switch (cmdConfigVerdict(_dispatchTlsVerified, payload, n)) {
+    case CMD_CONFIG_OK:
+      break;
+    case CMD_CONFIG_REFUSE_TLS:
+      Log::warn(TAG, "mqtt.cmd_config_refused reason=tls");
+      return;
+    case CMD_CONFIG_REFUSE_BROKER:
+      Log::warn(TAG, "mqtt.cmd_config_refused reason=broker");
+      return;
+    case CMD_CONFIG_REFUSE_SHAPE:
+      Log::warn(TAG, "mqtt.cmd_config_refused reason=shape");
+      return;
+  }
+  if (_cmdConfigPending) {
+    Log::warn(TAG, "mqtt.cmd_config_refused reason=busy");
+    return;
+  }
+  memcpy(_cmdConfigBuf, payload, n);
+  _cmdConfigBuf[n] = '\0';
+  _cmdConfigPending = true;
+}
+
+// Subscribe <prefix>/cmd/config. Independent of shell.mode, same idea as
+// the OTA command topic: a headless device can still be reconfigured.
+// in: none (reads topic_prefix). out: none.
+static void mqttSubscribeCmdConfig() {
+  JsonObject cfg = Config::get();
+  const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+  // Wider than CLI_TOPIC_CAP. A prefix that does not fit /cli/# can still
+  // fit /cmd/config, and that topic has to stay subscribed.
+  char topic[Config::TOPIC_PREFIX_CAP];
+  if (!cliTopicJoin(topic, sizeof(topic), prefix, "/cmd/config")) {
+    Log::kvf(TAG, "mqtt.cmd_config_topic_truncated prefix=%s", prefix);
+    return;
+  }
+  MQTTClient::subscribe(topic, cmdConfigInbound);
+}
+
+static size_t mqttCriticalJson(char* out, size_t maxLen);
+
+// Apply a staged document. Refuses a blob that drops mqtt.broker so a push
+// cannot remove the only way back. Broker, port, user, and password changes
+// reconnect without rebuilding subscriptions. topic_prefix is written to
+// disk and kept at the boot value until restart.
+// in: JSON object text. out: none.
+static void mqttApplyCmdConfig(const char* json) {
+  JsonDocument doc;
+  if (deserializeJson(doc, json) || !doc.is<JsonObject>()) {
+    Log::warn(TAG, "mqtt.cmd_config_refused reason=json");
+    return;
+  }
+  const char* broker = doc["mqtt"]["broker"] | "";
+  if (!broker[0]) {
+    Log::warn(TAG, "mqtt.cmd_config_refused reason=broker");
+    return;
+  }
+  char prefixLive[Config::TOPIC_PREFIX_CAP];
+  bool prefixFits = false;
+  {
+    const char* prefix = Config::get()["mqtt"]["topic_prefix"] | "thesada/node";
+    size_t n = strlen(prefix);
+    if (n < sizeof(prefixLive)) {
+      memcpy(prefixLive, prefix, n + 1);
+      prefixFits = true;
+    }
+  }
+  JsonVariantConst incomingVar = doc["mqtt"]["topic_prefix"];
+  if (!incomingVar.isUnbound() && !incomingVar.is<const char*>()) {
+    Log::warn(TAG, "mqtt.cmd_config_refused reason=prefix_type");
+    return;
+  }
+  const char* incoming = incomingVar.is<const char*>()
+                             ? incomingVar.as<const char*>()
+                             : "thesada/node";
+  if (!incoming) {
+    Log::warn(TAG, "mqtt.cmd_config_refused reason=prefix_type");
+    return;
+  }
+  // The subscribe buffer is TOPIC_PREFIX_CAP, and "/cmd/config" has to fit
+  // in it with the prefix. A shorter check would save a prefix that can
+  // never be subscribed after restart.
+  if (!prefixFits ||
+      strlen(incoming) + strlen("/cmd/config") >= Config::TOPIC_PREFIX_CAP) {
+    Log::warn(TAG, "mqtt.cmd_config_refused reason=prefix_length");
+    return;
+  }
+  char before[LG_MAX_LEN];
+  size_t nb = mqttCriticalJson(before, sizeof(before));
+  if (!Config::replace(json)) {
+    Log::warn(TAG, "mqtt.cmd_config_refused reason=persist");
+    return;
+  }
+  const char* prefixNow = Config::get()["mqtt"]["topic_prefix"] | "thesada/node";
+  if (strcmp(prefixLive, prefixNow) != 0) {
+    if (!Config::holdTopicPrefix(prefixLive)) {
+      Log::error(TAG, "mqtt.cmd_config_prefix_unheld");
+    } else {
+      Log::info(TAG, "mqtt.cmd_config_prefix_deferred");
+    }
+  }
+  char after[LG_MAX_LEN];
+  size_t na = mqttCriticalJson(after, sizeof(after));
+  if (nb == 0 || na == 0) {
+    Log::info(TAG, "mqtt.cmd_config_reinit reason=snapshot");
+    MQTTClient::reconnectWithCurrentConfig();
+    return;
+  }
+  if (strcmp(before, after) != 0) {
+    Log::info(TAG, "mqtt.cmd_config_reinit reason=connection_keys");
+    MQTTClient::reconnectWithCurrentConfig();
+    return;
+  }
+  Log::info(TAG, "mqtt.cmd_config_applied");
+}
+
 // Initialize MQTT: load config, TLS certs, set up subscriptions, connect.
 // in: none (reads Config, LittleFS /ca.crt, NVS cert namespace).
 // out: none.
@@ -337,6 +471,7 @@ void MQTTClient::begin() {
   _client.setCallback(onMessage);
 
 #ifdef MQTT_TLS
+  _tlsVerified = false;
   // Boot clock floor: lift an epoch clock to a sane lower bound of real time
   // before the first TLS handshake, so certificate validity checks pass from
   // the very first connect and no insecure window exists. Floor = newer of
@@ -410,6 +545,7 @@ void MQTTClient::begin() {
     if (allowInsecure) {
       Log::kvfw(TAG, "mqtt.tls_insecure reason=no_ca allow_insecure=set");
       _wifiClient.setInsecure();
+      _tlsVerified = false;
     } else {
       Log::error(TAG, "mqtt.tls_refused reason=no_ca allow_insecure=unset");
       _tlsRefused = true;
@@ -417,6 +553,7 @@ void MQTTClient::begin() {
     }
   } else {
     _wifiClient.setCACert(_caCert);
+    _tlsVerified = true;
   }
 #endif
 
@@ -441,6 +578,7 @@ void MQTTClient::begin() {
     char cliTopic[CLI_TOPIC_CAP];
     if (!cliInputSubscription(cliTopic, sizeof(cliTopic), prefix)) {
       Log::kvf("MQTT", "mqtt.cli_topic_truncated prefix=%s", prefix);
+      mqttSubscribeCmdConfig();
       return;
     }
 
@@ -457,6 +595,9 @@ void MQTTClient::begin() {
     }
   }
 
+  // After OTA and the CLI topic. Cellular replays only the first four
+  // registrations, and those two have to stay inside that budget.
+  mqttSubscribeCmdConfig();
   connect();
 }
 
@@ -815,6 +956,10 @@ void MQTTClient::tick() {
 // ---------------------------------------------------------------------------
 
 void MQTTClient::loop() {
+  if (_cmdConfigPending) {
+    _cmdConfigPending = false;
+    mqttApplyCmdConfig(_cmdConfigBuf);
+  }
 #ifdef MQTT_TLS
   // Persist the clock floor at most daily (see clock_floor_policy.h). The
   // clock only advances at real-time rate, so the stored value is always a
@@ -1116,6 +1261,7 @@ void MQTTClient::matchAndDispatch(const char* topic, const char* payload) {
 // same callbacks as the WiFi path.
 void MQTTClient::dispatchInbound(const char* topic, const char* payload, size_t length) {
   _inboundAuth = cliAuthModeFor(_fallbackMtls);
+  _dispatchTlsVerified = _fallbackTlsVerified;
   matchAndDispatch(topic, payload);
   (void)length;  // payload is null-terminated by caller
 }
@@ -1125,6 +1271,13 @@ void MQTTClient::setFallbackSessionMTLS(bool active) {
   _fallbackMtls = active;
   Log::kvf(TAG, "mqtt.session_auth transport=fallback mode=%s",
            active ? "mtls" : "password");
+}
+
+void MQTTClient::setFallbackTlsVerified(bool verified) {
+  if (_fallbackTlsVerified == verified) return;
+  _fallbackTlsVerified = verified;
+  Log::kvf(TAG, "mqtt.session_tls transport=fallback verified=%s",
+           verified ? "true" : "false");
 }
 
 // Cellular bring-up uses this to replay AT+SMSUB for every WiFi-side entry.
@@ -1149,6 +1302,7 @@ void MQTTClient::onMessage(char* topic, uint8_t* payload, unsigned int length) {
   payloadBuf[length] = '\0';
 
   _inboundAuth = cliAuthModeFor(_mtlsActive);
+  _dispatchTlsVerified = _tlsVerified;
   matchAndDispatch(topic, payloadBuf);
   free(payloadBuf);
 }
@@ -1560,10 +1714,30 @@ cleanup:
 
 // ---------------------------------------------------------------------------
 
-// Re-register core subscriptions (cli/#, OTA) under the current prefix.
+// Disconnect and let the loop reconnect from the current broker, port,
+// user, and password. The subscription table stays, including Lua callbacks.
+// in: none. out: none.
+void MQTTClient::reconnectWithCurrentConfig() {
+  if (_client.connected()) {
+    _client.disconnect();
+    _connectedSinceMs = 0;
+    Log::kvf(TAG, "mqtt.state_change from=connected to=disconnected reason=cfg_reconnect");
+  }
+  _reinitPending = true;
+}
+
+// Re-register core subscriptions (cli/#, OTA, cmd/config) under the current prefix.
 // Called after config.reload when mqtt.topic_prefix changed. Does not
 // re-register EventBus handlers or reload TLS certs.
 void MQTTClient::reinitSubscriptions() {
+  // Drop the session before subscribe(). subscribe() pumps the client
+  // while it is still connected. The reconnect resubscribes from the table.
+  if (_client.connected()) {
+    _client.disconnect();
+    _connectedSinceMs = 0;
+    Log::kvf(TAG, "mqtt.state_change from=connected to=disconnected reason=sub_reinit");
+  }
+
   _subs.reset();
 
   JsonObject  cfg    = Config::get();
@@ -1571,20 +1745,12 @@ void MQTTClient::reinitSubscriptions() {
   char cliTopic[CLI_TOPIC_CAP];
   if (!cliInputSubscription(cliTopic, sizeof(cliTopic), prefix)) {
     Log::kvf("MQTT", "mqtt.cli_topic_truncated prefix=%s", prefix);
-    return;
-  }
-
-  if (shellModeMqttAllowed(Shell::mode())) {
+  } else if (shellModeMqttAllowed(Shell::mode())) {
     MQTTClient::subscribe(cliTopic, cliInboundHandler);
   }
 
   OTAUpdate::begin();
-
-  if (_client.connected()) {
-    _client.disconnect();
-    _connectedSinceMs = 0;
-    Log::kvf(TAG, "mqtt.state_change from=connected to=disconnected reason=sub_reinit");
-  }
+  mqttSubscribeCmdConfig();
   _reinitPending = true;
 }
 
