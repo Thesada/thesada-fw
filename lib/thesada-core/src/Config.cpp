@@ -13,9 +13,11 @@ JsonDocument Config::_doc;
 
 // Prefix already written by replace(). save() writes this, not the boot
 // value holdTopicPrefix puts back into the live doc.
-static char _diskTopicPrefix[96];
+static char _diskTopicPrefix[Config::TOPIC_PREFIX_CAP];
 static bool _topicPrefixHeld = false;
 
+// Drop the boot-prefix overlay.
+// in: none. out: none.
 static void clearHeldTopicPrefix() {
   _topicPrefixHeld = false;
   _diskTopicPrefix[0] = '\0';
@@ -44,16 +46,20 @@ void Config::load() {
 // destroys the last good config and the load() rollback in set()/
 // replace() genuinely restores it.
 bool Config::save() {
-  char livePrefix[96];
+  char livePrefix[Config::TOPIC_PREFIX_CAP];
   bool swapped = false;
   if (_topicPrefixHeld) {
     const char* live = _doc["mqtt"]["topic_prefix"] | "";
     size_t n = strlen(live);
-    if (n < sizeof(livePrefix)) {
-      memcpy(livePrefix, live, n + 1);
-      _doc["mqtt"]["topic_prefix"] = _diskTopicPrefix;
-      swapped = true;
+    // The hold only stores a prefix that fits. A longer live value means
+    // something else wrote it; writing the doc now would drop the on-disk prefix.
+    if (n >= sizeof(livePrefix)) {
+      Log::error(TAG, "config.save_failed reason=prefix_length");
+      return false;
     }
+    memcpy(livePrefix, live, n + 1);
+    _doc["mqtt"]["topic_prefix"] = _diskTopicPrefix;
+    swapped = true;
   }
   auto restoreLivePrefix = [&]() {
     if (swapped) _doc["mqtt"]["topic_prefix"] = livePrefix;
@@ -89,36 +95,77 @@ bool Config::save() {
 // cleared doc is rolled back to the on-disk file so a bad MQTT payload
 // cannot wipe live config. in: JSON string. out: false if nothing was written.
 bool Config::replace(const char* json) {
+  char bootPrefix[Config::TOPIC_PREFIX_CAP];
+  bool keepBoot = false;
+  if (_topicPrefixHeld) {
+    if (!Config::copyBootTopicPrefix(bootPrefix, sizeof(bootPrefix))) {
+      Log::error(TAG, "config.replace_failed reason=prefix_length");
+      return false;
+    }
+    keepBoot = true;
+  }
+  // save() must write this document, not a prefix held from an earlier push.
   clearHeldTopicPrefix();
   _doc.clear();
   DeserializationError err = deserializeJson(_doc, json);
   if (err) {
     Log::kvfe(TAG, "config.replace_failed err=%s action=rollback", err.c_str());
     load();
+    if (keepBoot) Config::holdTopicPrefix(bootPrefix);
     return false;
   }
   if (!save()) {
     Log::error(TAG, "config.replace_failed reason=persist");
     load();
+    if (keepBoot) Config::holdTopicPrefix(bootPrefix);
     return false;
   }
   Log::info(TAG, "config.replaced source=mqtt");
   return true;
 }
 
-// in: boot prefix. out: none. A string that does not fit is left unchanged.
-void Config::holdTopicPrefix(const char* prefix) {
-  if (!prefix) return;
+// Keep `prefix` as the live topic prefix. The value already in the doc
+// stays the one save() writes.
+// in: boot prefix. out: false if prefix is null or either string does not fit.
+bool Config::holdTopicPrefix(const char* prefix) {
+  if (!prefix) {
+    Log::warn(TAG, "config.topic_prefix_hold_skipped reason=null");
+    return false;
+  }
   const char* disk = _doc["mqtt"]["topic_prefix"] | "";
   size_t diskLen = strlen(disk);
   size_t liveLen = strlen(prefix);
   if (diskLen >= sizeof(_diskTopicPrefix) || liveLen >= sizeof(_diskTopicPrefix)) {
     Log::warn(TAG, "config.topic_prefix_hold_skipped reason=length");
-    return;
+    return false;
   }
   memcpy(_diskTopicPrefix, disk, diskLen + 1);
   _topicPrefixHeld = true;
   _doc["mqtt"]["topic_prefix"] = prefix;
+  return true;
+}
+
+bool Config::topicPrefixHeld() {
+  return _topicPrefixHeld;
+}
+
+bool Config::copyBootTopicPrefix(char* out, size_t cap) {
+  if (!out || cap == 0 || !_topicPrefixHeld) return false;
+  const char* live = _doc["mqtt"]["topic_prefix"] | "";
+  size_t n = strlen(live);
+  if (n >= cap) {
+    Log::error(TAG, "config.boot_prefix_unavailable reason=length");
+    return false;
+  }
+  memcpy(out, live, n + 1);
+  return true;
+}
+
+bool Config::copyDiskDoc(JsonDocument& dst) {
+  dst.clear();
+  if (!dst.set(_doc.as<JsonObjectConst>())) return false;
+  if (_topicPrefixHeld) dst["mqtt"]["topic_prefix"] = _diskTopicPrefix;
+  return true;
 }
 
 // Set one value by dot-path (e.g. "telegram.cooldown_s"), preserving

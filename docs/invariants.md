@@ -5,7 +5,9 @@ listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
 Dated 2026-09-23 (`cmd/config` keeps a pushed `topic_prefix` at the boot
-value until restart, and reconnects broker changes without clearing
+value until restart. A prefix that does not fit is refused, a shell edit
+of another key keeps the boot value, and `config.save` still writes the
+prefix already on disk. Reconnects broker changes without clearing
 subscriptions. Prior: 2026-09-22 `cmd/config` accepts a JSON document on a
 CA-verified TLS session only, including a password session, and refuses a
 blob that drops `mqtt.broker`. It is not gated by `shell.mode`. Prior: 2026-09-17 OTA version compare rejects anything that is not N.N.N.
@@ -1545,17 +1547,23 @@ How enforced: `cmdConfigVerdict` (`cmd_config_policy.h`, host-tested in
 document with no non-empty `mqtt.broker`. WiFi sets the session bit only in
 the `setCACert` path. Cellular sets its own bit from the SMSSL choice, and
 `dispatchInbound` uses that bit rather than the WiFi one. `Config::replace`
-reloads the on-disk file when the write fails, and the apply does not
-reconnect unless that write succeeded. The reconnect leaves the
-subscription table in place. A later save still writes the prefix already
-on disk. `cmd/config` is registered after the OTA and CLI topics so those
-stay inside the cellular four-topic replay. A prefix that does not fit the
+reloads the on-disk file when the write fails and puts a held boot prefix
+back. The apply does not reconnect unless that write succeeded, and it
+refuses a prefix that does not fit the hold. The reconnect leaves the
+subscription table in place. `Config::save` and shell `config.save` write
+the prefix already on disk. Shell `config.set` and `config.del` put the
+boot prefix back unless the key is `mqtt` or `mqtt.topic_prefix`.
+`cmd/config` is registered after the OTA and CLI topics so those stay
+inside the cellular four-topic replay. A prefix that does not fit the
 CLI topic still subscribes `cmd/config`.
 
 Source: `lib/thesada-core/src/cmd_config_policy.h`,
-`lib/thesada-core/src/Config.cpp` (`replace`, `holdTopicPrefix`, `save`),
-`lib/thesada-core/src/MQTTClient.cpp` (`mqttApplyCmdConfig`, `begin`,
-`reconnectWithCurrentConfig`, `reinitSubscriptions`, `setFallbackTlsVerified`),
+`lib/thesada-core/src/Config.cpp` (`replace`, `holdTopicPrefix`, `save`,
+`set`, `load`, `copyDiskDoc`),
+`lib/thesada-core/src/MQTTClient.cpp` (`mqttApplyCmdConfig`,
+`mqttSubscribeCmdConfig`, `begin`, `reconnectWithCurrentConfig`,
+`reinitSubscriptions`, `setFallbackTlsVerified`),
+`lib/thesada-core/src/Shell.cpp` (`config.set`, `config.save`, `config.del`),
 `lib/thesada-mod-cellular/src/Cellular.cpp` (`mqttConnect`).
 
 ---

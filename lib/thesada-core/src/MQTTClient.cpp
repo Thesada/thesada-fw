@@ -373,7 +373,7 @@ static void mqttApplyCmdConfig(const char* json) {
     Log::warn(TAG, "mqtt.cmd_config_refused reason=broker");
     return;
   }
-  char prefixLive[96];
+  char prefixLive[Config::TOPIC_PREFIX_CAP];
   bool prefixFits = false;
   {
     const char* prefix = Config::get()["mqtt"]["topic_prefix"] | "thesada/node";
@@ -383,6 +383,11 @@ static void mqttApplyCmdConfig(const char* json) {
       prefixFits = true;
     }
   }
+  const char* incoming = doc["mqtt"]["topic_prefix"] | "thesada/node";
+  if (!prefixFits || strlen(incoming) >= Config::TOPIC_PREFIX_CAP) {
+    Log::warn(TAG, "mqtt.cmd_config_refused reason=prefix_length");
+    return;
+  }
   char before[LG_MAX_LEN];
   size_t nb = mqttCriticalJson(before, sizeof(before));
   if (!Config::replace(json)) {
@@ -390,11 +395,12 @@ static void mqttApplyCmdConfig(const char* json) {
     return;
   }
   const char* prefixNow = Config::get()["mqtt"]["topic_prefix"] | "thesada/node";
-  if (!prefixFits) {
-    Log::warn(TAG, "mqtt.cmd_config_prefix_unheld reason=length");
-  } else if (strcmp(prefixLive, prefixNow) != 0) {
-    Config::holdTopicPrefix(prefixLive);
-    Log::info(TAG, "mqtt.cmd_config_prefix_deferred");
+  if (strcmp(prefixLive, prefixNow) != 0) {
+    if (!Config::holdTopicPrefix(prefixLive)) {
+      Log::error(TAG, "mqtt.cmd_config_prefix_unheld");
+    } else {
+      Log::info(TAG, "mqtt.cmd_config_prefix_deferred");
+    }
   }
   char after[LG_MAX_LEN];
   size_t na = mqttCriticalJson(after, sizeof(after));

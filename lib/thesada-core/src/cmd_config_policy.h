@@ -137,6 +137,7 @@ static inline bool cmdConfigContainer(CmdConfigScan& p, char open, char close) {
   }
 }
 
+// Same cycle as cmdConfigContainer. Depth is capped by CMD_CONFIG_MAX_DEPTH.
 // NOLINTNEXTLINE(misc-no-recursion)
 static inline bool cmdConfigValue(CmdConfigScan& p) {
   if (!cmdConfigSkipWs(p)) return false;

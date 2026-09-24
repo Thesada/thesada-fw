@@ -784,8 +784,39 @@ static bool shellConfigWrite(JsonVariantConst src, ShellOutput out, size_t* byte
   return true;
 }
 
+struct BootPrefixKeep {
+  char prefix[Config::TOPIC_PREFIX_CAP];
+  bool keep;
+};
+
+// Remember a boot prefix held over the live doc. A shell write reloads the
+// file, and that reload would otherwise publish the pushed prefix immediately.
+// in: none. out: false when a held prefix does not fit and the command must stop.
+static bool captureBootPrefix(BootPrefixKeep* kept, ShellOutput out) {
+  kept->keep = false;
+  kept->prefix[0] = '\0';
+  if (!Config::topicPrefixHeld()) return true;
+  if (!Config::copyBootTopicPrefix(kept->prefix, sizeof(kept->prefix))) {
+    out("Refused: boot topic prefix does not fit");
+    return false;
+  }
+  kept->keep = true;
+  return true;
+}
+
+// in: captured prefix, the key this command wrote. out: none.
+static void restoreBootPrefix(const BootPrefixKeep* kept, const char* key) {
+  if (!kept->keep) return;
+  if (key && (strcmp(key, "mqtt") == 0 || strcmp(key, "mqtt.topic_prefix") == 0)) return;
+  if (!Config::holdTopicPrefix(kept->prefix)) {
+    Log::error("Shell", "config.boot_prefix_restore_failed");
+  }
+}
+
 static void cmd_config_set(int argc, char** argv, ShellOutput out) {
   if (argc < 3) { out("Usage: config.set <key> <value>  (then config.save to persist)"); return; }
+  BootPrefixKeep kept;
+  if (!captureBootPrefix(&kept, out)) return;
 
   String value;
   for (int i = 2; i < argc; i++) {
@@ -969,6 +1000,7 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
 
   // Does NOT trigger MQTT reconnect - that requires config.reload.
   Config::load();
+  restoreBootPrefix(&kept, argv[1]);
 
   char msg[128];
   if (value == "--delete") {
@@ -981,9 +1013,13 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
 
 // For programmatic changes to Config::get() that bypass config.set.
 static void cmd_config_save(int argc, char** argv, ShellOutput out) {
-  JsonObject cfg = Config::get();
+  JsonDocument dst;
+  if (!Config::copyDiskDoc(dst)) {
+    out("Failed to snapshot config");
+    return;
+  }
   size_t bytes = 0;
-  if (!shellConfigWrite(cfg, out, &bytes)) return;
+  if (!shellConfigWrite(dst.as<JsonVariantConst>(), out, &bytes)) return;
   char msg[64];
   snprintf(msg, sizeof(msg), "Config saved to /config.json (%d bytes)", (int)bytes);
   out(msg);
@@ -996,6 +1032,8 @@ static void cmd_config_save(int argc, char** argv, ShellOutput out) {
 // delete the stale node, then config.set recreates it with the new shape.
 static void cmd_config_del(int argc, char** argv, ShellOutput out) {
   if (argc < 2) { out("Usage: config.del <key>  (dot notation; bare section name deletes the section)"); return; }
+  BootPrefixKeep kept;
+  if (!captureBootPrefix(&kept, out)) return;
 
   if (!strchr(argv[1], '.')) {
     if (!LittleFS.exists("/config.json")) { out("config.json not found"); return; }
@@ -1010,6 +1048,7 @@ static void cmd_config_del(int argc, char** argv, ShellOutput out) {
     root.remove(argv[1]);
     if (!shellConfigWrite(doc.as<JsonVariantConst>(), out)) return;
     Config::load();
+    restoreBootPrefix(&kept, argv[1]);
     char msg[128];
     snprintf(msg, sizeof(msg), "Deleted %s (saved)", argv[1]);
     out(msg);
