@@ -135,7 +135,8 @@ bool Config::replace(const char* json) {
 
 // Keep `prefix` as the live topic prefix. The value already in the doc
 // stays the one save() writes.
-// in: boot prefix. out: false if prefix is null or either string does not fit.
+// in: boot prefix. out: false if prefix is null, the disk value is not a
+// string, or either string does not fit.
 bool Config::holdTopicPrefix(const char* prefix) {
   if (!prefix) {
     Log::warn(TAG, "config.topic_prefix_hold_skipped reason=null");
@@ -146,13 +147,17 @@ bool Config::holdTopicPrefix(const char* prefix) {
   bool present = false;
   const char* disk = "";
   JsonVariantConst prefixVar = mqtt["topic_prefix"];
-  if (!prefixVar.isNull() && !prefixVar.is<const char*>()) {
+  // Missing stays missing. null, numbers, and objects are not strings.
+  if (!prefixVar.isUnbound() && !prefixVar.is<const char*>()) {
     Log::warn(TAG, "config.topic_prefix_hold_skipped reason=type");
     return false;
   }
   if (prefixVar.is<const char*>()) {
     disk = prefixVar.as<const char*>();
-    if (!disk) disk = "";
+    if (!disk) {
+      Log::warn(TAG, "config.topic_prefix_hold_skipped reason=null");
+      return false;
+    }
     present = true;
   }
   size_t diskLen = strlen(disk);

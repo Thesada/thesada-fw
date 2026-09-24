@@ -383,7 +383,18 @@ static void mqttApplyCmdConfig(const char* json) {
       prefixFits = true;
     }
   }
-  const char* incoming = doc["mqtt"]["topic_prefix"] | "thesada/node";
+  JsonVariantConst incomingVar = doc["mqtt"]["topic_prefix"];
+  if (!incomingVar.isUnbound() && !incomingVar.is<const char*>()) {
+    Log::warn(TAG, "mqtt.cmd_config_refused reason=prefix_type");
+    return;
+  }
+  const char* incoming = incomingVar.is<const char*>()
+                             ? incomingVar.as<const char*>()
+                             : "thesada/node";
+  if (!incoming) {
+    Log::warn(TAG, "mqtt.cmd_config_refused reason=prefix_type");
+    return;
+  }
   // The subscribe buffer is TOPIC_PREFIX_CAP, and "/cmd/config" has to fit
   // in it with the prefix. A shorter check would save a prefix that can
   // never be subscribed after restart.

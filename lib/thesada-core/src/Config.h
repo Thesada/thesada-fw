@@ -21,8 +21,8 @@ public:
   static constexpr size_t TOPIC_PREFIX_CAP = 128;
   // Put the boot prefix back in the live doc after a replace. Later saves
   // still write the prefix that is already on disk.
-  // in: boot prefix, full string. out: false if prefix is null or either
-  // string does not fit. The live doc is unchanged on failure.
+  // in: boot prefix, full string. out: false if prefix is null, the disk
+  // value is not a string, or either string does not fit. Unchanged on failure.
   static bool holdTopicPrefix(const char* prefix);
   // in: none. out: true while a boot prefix is overlaid on the live doc.
   static bool topicPrefixHeld();
