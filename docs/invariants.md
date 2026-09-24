@@ -1549,7 +1549,8 @@ the `setCACert` path. Cellular sets its own bit from the SMSSL choice, and
 `dispatchInbound` uses that bit rather than the WiFi one. `Config::replace`
 reloads the on-disk file when the write fails and puts a held boot prefix
 back. The apply does not reconnect unless that write succeeded, and it
-refuses a prefix that does not fit the hold. The reconnect leaves the
+refuses a prefix that cannot form `/cmd/config`. An omitted
+`topic_prefix` stays omitted on the next save. The reconnect leaves the
 subscription table in place. `Config::save` and shell `config.save` write
 the prefix already on disk. Shell `config.set` and `config.del` put the
 boot prefix back unless the key is `mqtt` or `mqtt.topic_prefix`.

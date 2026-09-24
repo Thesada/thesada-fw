@@ -14,12 +14,14 @@ JsonDocument Config::_doc;
 // Prefix already written by replace(). save() writes this, not the boot
 // value holdTopicPrefix puts back into the live doc.
 static char _diskTopicPrefix[Config::TOPIC_PREFIX_CAP];
+static bool _diskTopicPrefixPresent = false;
 static bool _topicPrefixHeld = false;
 
 // Drop the boot-prefix overlay.
 // in: none. out: none.
 static void clearHeldTopicPrefix() {
   _topicPrefixHeld = false;
+  _diskTopicPrefixPresent = false;
   _diskTopicPrefix[0] = '\0';
 }
 
@@ -58,7 +60,14 @@ bool Config::save() {
       return false;
     }
     memcpy(livePrefix, live, n + 1);
-    _doc["mqtt"]["topic_prefix"] = _diskTopicPrefix;
+    if (_diskTopicPrefixPresent) {
+      _doc["mqtt"]["topic_prefix"] = _diskTopicPrefix;
+    } else {
+      // The pushed document left the key out. Writing "" would make the
+      // next boot read an empty prefix instead of the default.
+      JsonObject mqtt = _doc["mqtt"].as<JsonObject>();
+      if (!mqtt.isNull()) mqtt.remove("topic_prefix");
+    }
     swapped = true;
   }
   auto restoreLivePrefix = [&]() {
@@ -132,14 +141,29 @@ bool Config::holdTopicPrefix(const char* prefix) {
     Log::warn(TAG, "config.topic_prefix_hold_skipped reason=null");
     return false;
   }
-  const char* disk = _doc["mqtt"]["topic_prefix"] | "";
+  JsonObjectConst root = _doc.as<JsonObjectConst>();
+  JsonObjectConst mqtt = root["mqtt"];
+  bool present = false;
+  const char* disk = "";
+  JsonVariantConst prefixVar = mqtt["topic_prefix"];
+  if (!prefixVar.isNull() && !prefixVar.is<const char*>()) {
+    Log::warn(TAG, "config.topic_prefix_hold_skipped reason=type");
+    return false;
+  }
+  if (prefixVar.is<const char*>()) {
+    disk = prefixVar.as<const char*>();
+    if (!disk) disk = "";
+    present = true;
+  }
   size_t diskLen = strlen(disk);
   size_t liveLen = strlen(prefix);
   if (diskLen >= sizeof(_diskTopicPrefix) || liveLen >= sizeof(_diskTopicPrefix)) {
     Log::warn(TAG, "config.topic_prefix_hold_skipped reason=length");
     return false;
   }
-  memcpy(_diskTopicPrefix, disk, diskLen + 1);
+  if (present) memcpy(_diskTopicPrefix, disk, diskLen + 1);
+  else _diskTopicPrefix[0] = '\0';
+  _diskTopicPrefixPresent = present;
   _topicPrefixHeld = true;
   _doc["mqtt"]["topic_prefix"] = prefix;
   return true;
@@ -164,7 +188,10 @@ bool Config::copyBootTopicPrefix(char* out, size_t cap) {
 bool Config::copyDiskDoc(JsonDocument& dst) {
   dst.clear();
   if (!dst.set(_doc.as<JsonObjectConst>())) return false;
-  if (_topicPrefixHeld) dst["mqtt"]["topic_prefix"] = _diskTopicPrefix;
+  if (_topicPrefixHeld) {
+    if (_diskTopicPrefixPresent) dst["mqtt"]["topic_prefix"] = _diskTopicPrefix;
+    else dst["mqtt"].as<JsonObject>().remove("topic_prefix");
+  }
   return true;
 }
 

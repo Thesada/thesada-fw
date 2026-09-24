@@ -347,7 +347,7 @@ static void mqttSubscribeCmdConfig() {
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
   // Wider than CLI_TOPIC_CAP. A prefix that does not fit /cli/# can still
   // fit /cmd/config, and that topic has to stay subscribed.
-  char topic[128];
+  char topic[Config::TOPIC_PREFIX_CAP];
   if (!cliTopicJoin(topic, sizeof(topic), prefix, "/cmd/config")) {
     Log::kvf(TAG, "mqtt.cmd_config_topic_truncated prefix=%s", prefix);
     return;
@@ -384,7 +384,11 @@ static void mqttApplyCmdConfig(const char* json) {
     }
   }
   const char* incoming = doc["mqtt"]["topic_prefix"] | "thesada/node";
-  if (!prefixFits || strlen(incoming) >= Config::TOPIC_PREFIX_CAP) {
+  // The subscribe buffer is TOPIC_PREFIX_CAP, and "/cmd/config" has to fit
+  // in it with the prefix. A shorter check would save a prefix that can
+  // never be subscribed after restart.
+  if (!prefixFits ||
+      strlen(incoming) + strlen("/cmd/config") >= Config::TOPIC_PREFIX_CAP) {
     Log::warn(TAG, "mqtt.cmd_config_refused reason=prefix_length");
     return;
   }
