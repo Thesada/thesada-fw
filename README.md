@@ -2,11 +2,9 @@
 
 Know when your wood boiler runs dry or your well pump quits, on properties where WiFi does not reach.
 
-![Monitoring node wired in at the boiler, sensors clamped to the supply line](docs/img/field-install.png)
+<img src="docs/img/field-install.png" alt="Monitoring node wired in at the boiler, sensors clamped to the supply line" width="400">
 
 A node sits on the equipment and watches it. Temperature on the lines, current draw on the pump. When something goes wrong it messages your phone. When the WiFi is out of range, which out here it usually is, it falls back to the cell network and keeps reporting.
-
-![Telegram alert from the boiler node](docs/img/telegram-alert.png)
 
 Currently deployed on an outdoor wood boiler, reporting temperature, pump current and battery, plus indoor climate on a second sensor. Running 24/7 in the field.
 
@@ -53,6 +51,8 @@ Full documentation: [thesada.io/firmware](https://thesada.io/firmware/)
 - 35+ commands, reachable over serial, WebSocket, HTTP and MQTT. One handler each, no duplicated implementations.
 - Filesystem, config, network diagnostics, Lua, OTA, selftest, sensors, module status. Plus a debug set for remote sessions with no serial access: `boot.info`, `partitions`, `chip.info`, `net.mqtt` for the subscription table and recent traffic.
 
+<a href="docs/img/mqtt-shell.cast"><img src="docs/img/mqtt-shell.svg" alt="Shell over MQTT: chip.info, heap, fs.ls, config.get" width="420"></a> <a href="docs/img/boot-shell.cast"><img src="docs/img/boot-shell.svg" alt="Serial boot through boot.ready, then version, heap, uptime, fs.ls" width="420"></a>
+
 **OTA**
 - Push a `.bin` from the dashboard or curl it up.
 - Or pull: JSON manifest, SHA256 checked before it is applied, on a timer or triggered over MQTT.
@@ -68,6 +68,8 @@ Full documentation: [thesada.io/firmware](https://thesada.io/firmware/)
 - Sustain counters, so a single bad reading does not page you. Cooldowns, so a real fault does not page you forty times.
 - Telegram to one recipient or many, MQTT, or an HTTP webhook.
 - `Node.setTimeout(ms, fn)` for delayed actions, which is how boot alerts wait for the network to come up.
+
+<img src="docs/img/telegram-alert.png" alt="Telegram alert from the boiler node" width="260">
 
 ## Known limitations and ugly corners
 
