@@ -58,7 +58,8 @@ void PWMModule::setLevel(float level) {
   ledcWrite(_channel, duty);
 #endif
 
-  Log::kvf(TAG, "pwm.level_set pct=%.0f duty=%lu max=%lu", level * 100, duty, maxVal);
+  Log::kvf(TAG, "pwm.level_set pct=%.0f duty=%lu max=%lu", level * 100,
+           (unsigned long)duty, (unsigned long)maxVal);
 
   JsonObject  cfg    = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";

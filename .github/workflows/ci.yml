@@ -28,48 +28,13 @@ jobs:
           python-version: '3.11'
 
       - name: Install PlatformIO
-        # intelhex is an indirect runtime dep of the newer esptool.py that
-        # ships with espressif32; pinning it explicitly so CI builds do
-        # not fail with "ModuleNotFoundError: intelhex" on a fresh runner.
-        run: pip install --upgrade platformio intelhex
+        # NO_PIPX keeps the runner on the setup-python interpreter above.
+        run: make setup-py NO_PIPX=1
 
+      # Every board env, the minimal core-only build, and build/boards/ -
+      # the artifact layout the release job uploads.
       - name: Build all board targets
-        run: |
-          mkdir -p build/boards
-
-          # OWB (LILYGO T-SIM7080G-S3 - primary production, all modules)
-          pio run -e esp32-owb
-          cp .pio/build/esp32-owb/firmware.bin build/boards/firmware-owb.bin
-          cp build/firmware.json build/boards/firmware-owb.json
-
-          # OWB rescue (core + PMU only - remote unbricking stepping-stone)
-          pio run -e esp32-owb-rescue
-          cp .pio/build/esp32-owb-rescue/firmware.bin build/boards/firmware-owb-rescue.bin
-
-          # Bench/debug envs - compile coverage only, not shipped as releases.
-          pio run -e esp32-owb-debug
-          pio run -e esp32-s3-debug
-          pio run -e esp32-s3-debug-rescue
-          pio run -e esp32-s3-carrier
-
-          # Keep OWB as the default firmware.bin for backwards compat
-          cp build/boards/firmware-owb.bin build/firmware.bin
-
-      - name: Build minimal firmware (OWB core only)
-        run: |
-          cp src/thesada_config.h src/thesada_config.h.bak
-          sed -i 's/^#define ENABLE_TEMPERATURE/\/\/ #define ENABLE_TEMPERATURE/' src/thesada_config.h
-          sed -i 's/^#define ENABLE_ADS1115/\/\/ #define ENABLE_ADS1115/' src/thesada_config.h
-          sed -i 's/^#define ENABLE_BATTERY/\/\/ #define ENABLE_BATTERY/' src/thesada_config.h
-          sed -i 's/^#define ENABLE_PMU/\/\/ #define ENABLE_PMU/' src/thesada_config.h
-          sed -i 's/^#define ENABLE_SD/\/\/ #define ENABLE_SD/' src/thesada_config.h
-          sed -i 's/^#define ENABLE_CELLULAR/\/\/ #define ENABLE_CELLULAR/' src/thesada_config.h
-          sed -i 's/^#define ENABLE_TELEGRAM/\/\/ #define ENABLE_TELEGRAM/' src/thesada_config.h
-          sed -i 's/^#define ENABLE_WEBSERVER/\/\/ #define ENABLE_WEBSERVER/' src/thesada_config.h
-          sed -i 's/^#define ENABLE_SCRIPTENGINE/\/\/ #define ENABLE_SCRIPTENGINE/' src/thesada_config.h
-          pio run -e esp32-owb
-          cp .pio/build/esp32-owb/firmware.bin build/firmware_minimal.bin
-          mv src/thesada_config.h.bak src/thesada_config.h
+        run: make dist
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
@@ -92,10 +57,10 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Lua 5.3
-        run: sudo apt-get update && sudo apt-get install -y lua5.3
+        run: make setup-sys
 
       - name: Run Lua test suite
-        run: lua5.3 tests/lua/run_all.lua
+        run: make test-lua
 
   native-tests:
     # Host-native unit tests for the pure security logic (parse bounds, key
@@ -113,10 +78,10 @@ jobs:
           python-version: '3.11'
 
       - name: Install PlatformIO
-        run: pip install --upgrade platformio
+        run: make setup-py NO_PIPX=1
 
       - name: Run native unit tests
-        run: pio test -e native
+        run: make test-native
 
   coverage:
     # Line coverage over the same pure units the native tests exercise, floored
@@ -135,10 +100,10 @@ jobs:
           python-version: '3.11'
 
       - name: Install PlatformIO and gcovr
-        run: pip install --upgrade platformio gcovr
+        run: make setup-py NO_PIPX=1
 
       - name: Run coverage gate
-        run: ./scripts/check-coverage.sh
+        run: make coverage
 
       - name: Upload coverage report
         if: always()
@@ -148,8 +113,8 @@ jobs:
           path: build/coverage/
 
   static-analysis:
-    # cppcheck over the pure security units (scripts/static-check.sh). Fast,
-    # gates the release alongside the native unit tests.
+    # cppcheck and clang-tidy over the pure security units, then the
+    # path-safety gate. Gates the release alongside the native unit tests.
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -158,15 +123,19 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install cppcheck
-        run: sudo apt-get update && sudo apt-get install -y cppcheck
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
 
+      # PlatformIO only fetches Unity here; clang-tidy compiles the native
+      # test units to reach the headers.
+      - name: Install PlatformIO, cppcheck, clang-tidy
+        run: make setup-py NO_PIPX=1 && make setup-sys
+
+      # cppcheck, clang-tidy, then no LittleFS.open() on an unreviewed
+      # non-literal path.
       - name: Run static analysis
-        run: ./scripts/static-check.sh
-
-      # No LittleFS.open() on an unreviewed non-literal path.
-      - name: Check path safety
-        run: ./scripts/check-path-safety.sh
+        run: make lint
 
   invariant-ledger:
     # Server-side mirror of scripts/hooks/pre-commit: refuses a push or PR

@@ -3,12 +3,12 @@
 
 # PlatformIO
 .pio
+compile_commands.json
 .env
 build/
 
-# pioarduino / IDF component manager + per-env kconfig cache
-# sdkconfig.defaults IS tracked (carries mbedtls overrides for CYD env).
-# Per-env sdkconfig.<env> files are IDF output, regenerate on clean build.
+# pioarduino / IDF component manager leftovers - nothing here is consumed
+# by the arduino-only build, ignored so a stray hybrid run stays out of git.
 managed_components/
 .dummy
 sdkconfig.esp32-*

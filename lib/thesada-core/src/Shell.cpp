@@ -15,6 +15,7 @@
 #include "Net.h"
 #include "path_safety_policy.h"
 #include "ap_policy.h"
+#include "glob_policy.h"
 #include <thesada_config.h>
 #include <mbedtls/platform_util.h>
 #include <esp_ota_ops.h>
@@ -196,6 +197,13 @@ void Shell::loop() {
 void Shell::pumpConsole() {
   static char  buf[Shell::DEFERRED_LINE_LEN];
   static int   pos = 0;
+  // Drained, not left to fill the driver buffer: the console still echoes
+  // nothing and the line never reaches execute().
+  if (!shellModeSerialAllowed(mode())) {
+    while (Serial.available()) Serial.read();
+    pos = 0;
+    return;
+  }
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
@@ -413,6 +421,20 @@ bool Shell::pathSafe(const char* path) {
 static void cmd_ls(int argc, char** argv, ShellOutput out) {
   const char* path = (argc > 1) ? argv[1] : "/";
   if (!Shell::pathSafe(path)) { out("Invalid path"); return; }
+
+  // A trailing pattern filters the listing; the directory walked is the part
+  // before it, so fs.ls /sd/logs/*.csv lists only the matches.
+  char globDir[96], globPat[64];
+  const char* filter = nullptr;
+  if (globHasWildcard(path)) {
+    if (!globSplit(path, globDir, sizeof(globDir), globPat, sizeof(globPat))) {
+      out("Wildcards are allowed in the last path segment only");
+      return;
+    }
+    filter = globPat;
+    path = globDir;
+  }
+
   FS* fs = resolveFS(path);
   const char* fsPath = stripPrefix(path);
 
@@ -434,6 +456,7 @@ static void cmd_ls(int argc, char** argv, ShellOutput out) {
   char line[160];
   File entry = dir.openNextFile();
   while (entry) {
+    if (filter && !globMatch(filter, entry.name())) { entry = dir.openNextFile(); continue; }
     if (entry.isDirectory()) {
       snprintf(line, sizeof(line), "  [DIR]  %s/%s/", base, entry.name());
     } else {
@@ -474,9 +497,51 @@ static void cmd_cat(int argc, char** argv, ShellOutput out) {
   f.close();
 }
 
+// Remove every entry in one directory matching pattern. Reports the count;
+// config.json and ca.crt at the LittleFS root are skipped, never matched away.
+static void _rmGlob(int argc, char** argv, ShellOutput out) {
+  char dir[96], pat[64];
+  if (!globSplit(argv[1], dir, sizeof(dir), pat, sizeof(pat))) {
+    out("Wildcards are allowed in the last path segment only");
+    return;
+  }
+  bool confirmed = false;
+  for (int i = 2; i < argc; i++) {
+    if (strcmp(argv[i], "--yes") == 0) confirmed = true;
+  }
+  if (!confirmed) {
+    out("Wildcard remove needs --yes  (fs.rm <path> --yes)");
+    return;
+  }
+
+  FS* fs = resolveFS(dir);
+  File d = fs->open(stripPrefix(dir));
+  if (!d || !d.isDirectory()) { out("Not a directory or not found"); return; }
+
+  int removed = 0, failed = 0, skipped = 0;
+  char full[160], msg[96];
+  File entry = d.openNextFile();
+  while (entry) {
+    const char* name = entry.name();
+    if (!entry.isDirectory() && globMatch(pat, name)) {
+      if (globRmProtected(dir, name)) {
+        skipped++;
+      } else {
+        snprintf(full, sizeof(full), "%s%s%s", dir,
+                 dir[strlen(dir) - 1] == '/' ? "" : "/", name);
+        if (fs->remove(stripPrefix(full))) removed++; else failed++;
+      }
+    }
+    entry = d.openNextFile();
+  }
+  snprintf(msg, sizeof(msg), "Removed %d, failed %d, protected %d", removed, failed, skipped);
+  out(msg);
+}
+
 static void cmd_rm(int argc, char** argv, ShellOutput out) {
   if (argc < 2) { out("Usage: rm <path>"); return; }
   if (!Shell::pathSafe(argv[1])) { out("Invalid path"); return; }
+  if (globHasWildcard(argv[1])) { _rmGlob(argc, argv, out); return; }
   FS* fs = resolveFS(argv[1]);
   const char* fsPath = stripPrefix(argv[1]);
 
@@ -719,8 +784,39 @@ static bool shellConfigWrite(JsonVariantConst src, ShellOutput out, size_t* byte
   return true;
 }
 
+struct BootPrefixKeep {
+  char prefix[Config::TOPIC_PREFIX_CAP];
+  bool keep;
+};
+
+// Remember a boot prefix held over the live doc. A shell write reloads the
+// file, and that reload would otherwise publish the pushed prefix immediately.
+// in: none. out: false when a held prefix does not fit and the command must stop.
+static bool captureBootPrefix(BootPrefixKeep* kept, ShellOutput out) {
+  kept->keep = false;
+  kept->prefix[0] = '\0';
+  if (!Config::topicPrefixHeld()) return true;
+  if (!Config::copyBootTopicPrefix(kept->prefix, sizeof(kept->prefix))) {
+    out("Refused: boot topic prefix does not fit");
+    return false;
+  }
+  kept->keep = true;
+  return true;
+}
+
+// in: captured prefix, the key this command wrote. out: none.
+static void restoreBootPrefix(const BootPrefixKeep* kept, const char* key) {
+  if (!kept->keep) return;
+  if (key && (strcmp(key, "mqtt") == 0 || strcmp(key, "mqtt.topic_prefix") == 0)) return;
+  if (!Config::holdTopicPrefix(kept->prefix)) {
+    Log::error("Shell", "config.boot_prefix_restore_failed");
+  }
+}
+
 static void cmd_config_set(int argc, char** argv, ShellOutput out) {
   if (argc < 3) { out("Usage: config.set <key> <value>  (then config.save to persist)"); return; }
+  BootPrefixKeep kept;
+  if (!captureBootPrefix(&kept, out)) return;
 
   String value;
   for (int i = 2; i < argc; i++) {
@@ -904,6 +1000,7 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
 
   // Does NOT trigger MQTT reconnect - that requires config.reload.
   Config::load();
+  restoreBootPrefix(&kept, argv[1]);
 
   char msg[128];
   if (value == "--delete") {
@@ -916,9 +1013,13 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
 
 // For programmatic changes to Config::get() that bypass config.set.
 static void cmd_config_save(int argc, char** argv, ShellOutput out) {
-  JsonObject cfg = Config::get();
+  JsonDocument dst;
+  if (!Config::copyDiskDoc(dst)) {
+    out("Failed to snapshot config");
+    return;
+  }
   size_t bytes = 0;
-  if (!shellConfigWrite(cfg, out, &bytes)) return;
+  if (!shellConfigWrite(dst.as<JsonVariantConst>(), out, &bytes)) return;
   char msg[64];
   snprintf(msg, sizeof(msg), "Config saved to /config.json (%d bytes)", (int)bytes);
   out(msg);
@@ -931,6 +1032,8 @@ static void cmd_config_save(int argc, char** argv, ShellOutput out) {
 // delete the stale node, then config.set recreates it with the new shape.
 static void cmd_config_del(int argc, char** argv, ShellOutput out) {
   if (argc < 2) { out("Usage: config.del <key>  (dot notation; bare section name deletes the section)"); return; }
+  BootPrefixKeep kept;
+  if (!captureBootPrefix(&kept, out)) return;
 
   if (!strchr(argv[1], '.')) {
     if (!LittleFS.exists("/config.json")) { out("config.json not found"); return; }
@@ -945,6 +1048,7 @@ static void cmd_config_del(int argc, char** argv, ShellOutput out) {
     root.remove(argv[1]);
     if (!shellConfigWrite(doc.as<JsonVariantConst>(), out)) return;
     Config::load();
+    restoreBootPrefix(&kept, argv[1]);
     char msg[128];
     snprintf(msg, sizeof(msg), "Deleted %s (saved)", argv[1]);
     out(msg);
@@ -1231,14 +1335,15 @@ static void cmd_mqtt(int argc, char** argv, ShellOutput out) {
   snprintf(line, sizeof(line), "  transport: %s", viaCellular ? "cellular" : "WiFi");
   out(line);
 
-  snprintf(line, sizeof(line), "  subs: %u/%u", (unsigned)MQTTClient::_subCount, (unsigned)MQTT_MAX_SUBS);
+  snprintf(line, sizeof(line), "  subs: %u/%u",
+           (unsigned)MQTTClient::_subs.count(), (unsigned)MQTT_MAX_SUBS);
   out(line);
-  for (uint8_t i = 0; i < MQTTClient::_subCount; i++) {
-    snprintf(line, sizeof(line), "  [%u] %s %s",
-             (unsigned)i,
-             MQTTClient::_subs[i].topic,
-             MQTTClient::_subs[i].active ? "active" : "inactive");
-    out(line);
+  {
+    unsigned i = 0;
+    MQTTClient::_subs.forEachActive([&](const char* topic) {
+      snprintf(line, sizeof(line), "  [%u] %s", i++, topic);
+      out(line);
+    });
   }
 
   // RX ring - last N topics received at onMessage. If a topic was published
@@ -2155,9 +2260,9 @@ void Shell::registerBuiltins() {
   registerCommand("selftest",      "Run self-test checks",          cmd_selftest);
 
   // Filesystem
-  registerCommand("fs.ls",         "List directory (fs.ls [path])", cmd_ls);
+  registerCommand("fs.ls",         "List directory (fs.ls [path], glob ok)", cmd_ls);
   registerCommand("fs.cat",        "Print file contents",           cmd_cat);
-  registerCommand("fs.rm",         "Remove a file",                 cmd_rm);
+  registerCommand("fs.rm",         "Remove a file (glob needs --yes)", cmd_rm);
   registerCommand("fs.write",      "Write content to file",         cmd_write);
   registerCommand("fs.append",     "Append content to file",        cmd_write);
   registerCommand("fs.mv",         "Rename/move a file",            cmd_mv);
@@ -2201,8 +2306,28 @@ void Shell::registerBuiltins() {
   registerCommand("module.status", "Module status overview",        cmd_module_status);
 }
 
+ShellMode Shell::mode() {
+  static const ShellMode m = []() {
+    JsonVariantConst v = Config::get()["shell"]["mode"];
+    return shellModeResolve(!v.isNull(), v.is<const char*>() ? v.as<const char*>() : nullptr);
+  }();
+  return m;
+}
+
 void Shell::begin() {
   registerBuiltins();
 
-  Log::kvf("Shell", "shell.ready commands=%d", _commandCount);
+  JsonVariantConst modeVal = Config::get()["shell"]["mode"];
+  const char* raw = modeVal.is<const char*>() ? modeVal.as<const char*>() : nullptr;
+  if (!modeVal.isNull() && !raw) {
+    Log::kvfw("Shell", "shell.mode_not_a_string applied=off "
+                       "hint=\"full|serial-only|mqtt-only|off\"");
+  } else if (shellModeUnrecognised(raw)) {
+    Log::kvfw("Shell", "shell.mode_unrecognised value=%s applied=off "
+                       "hint=\"full|serial-only|mqtt-only|off\"", raw);
+  }
+  Log::kvf("Shell", "shell.ready commands=%d mode=%s serial=%d mqtt=%d",
+           _commandCount, raw ? raw : "full",
+           shellModeSerialAllowed(mode()) ? 1 : 0,
+           shellModeMqttAllowed(mode()) ? 1 : 0);
 }

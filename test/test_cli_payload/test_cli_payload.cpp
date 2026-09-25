@@ -27,7 +27,7 @@ void test_missing_newline(void) {
 void test_overlong_field_rejected_not_clipped(void) {
   // 50-char field (> 48 cap) then newline + value. Must reject, not clip.
   char p[80];
-  memset(p, 'A', 50); p[50] = '\n'; memcpy(p + 51, "val", 3);
+  memset(p, 'A', 50); p[50] = '\n'; memcpy(p + 51, "val", 3);  // NOLINT(bugprone-not-null-terminated-result): raw payload, no terminator by design
   char field[48]; const char* value; size_t vlen;
   TEST_ASSERT_TRUE(CliSplit::FieldTooLong ==
     cliSplitFieldValue(p, 54, field, sizeof(field), &value, &vlen));
@@ -46,7 +46,7 @@ void test_value_length_uses_real_field_len(void) {
   // Regression for the over-read: a 47-char field (fits the 48 cap) must yield
   // a value length derived from the real field length, never a clipped one.
   char p[80];
-  memset(p, 'B', 47); p[47] = '\n'; memcpy(p + 48, "secretval", 9);
+  memset(p, 'B', 47); p[47] = '\n'; memcpy(p + 48, "secretval", 9);  // NOLINT(bugprone-not-null-terminated-result): raw payload, no terminator by design
   char field[48]; const char* value; size_t vlen;
   TEST_ASSERT_TRUE(CliSplit::Ok ==
     cliSplitFieldValue(p, 48 + 9, field, sizeof(field), &value, &vlen));

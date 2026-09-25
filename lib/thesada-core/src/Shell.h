@@ -6,6 +6,7 @@
 
 #include <Arduino.h>
 #include <functional>
+#include "shell_mode_policy.h"
 
 namespace fs { class FS; }
 
@@ -32,6 +33,10 @@ class Shell {
 public:
   // Call once at boot, after all core classes are initialized.
   static void begin();
+
+  // shell.mode from config, resolved once on first use. Read before
+  // Shell::begin() by MQTTClient::begin(), so it cannot live in begin().
+  static ShellMode mode();
 
   // Run a command line synchronously on the caller's task. Callers in a
   // non-main context (AsyncTCP, PubSubClient callback) MUST use enqueue()

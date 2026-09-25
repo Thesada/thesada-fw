@@ -14,6 +14,7 @@
 #include <vector>
 #include <thesada_config.h>
 #include "cli_authz_policy.h"
+#include "mqtt_sub_table.h"
 
 #ifndef MQTT_QUEUE_SIZE
   #define MQTT_QUEUE_SIZE 8
@@ -31,11 +32,7 @@ struct MQTTMessage {
 
 using MQTTCallback = std::function<void(const char* topic, const char* payload)>;
 
-struct MQTTSubscription {
-  char topic[96];
-  MQTTCallback callback;
-  bool active;
-};
+using MQTTSubTable = MqttSubTable<MQTTCallback, MQTT_MAX_SUBS>;
 
 class MQTTClient {
 public:
@@ -49,6 +46,9 @@ public:
   static bool rollbackDecision(const char* lg, bool haveLg,
                                const char* rbCfg, const char* cur);
   static void reinitSubscriptions();
+  // Disconnect and reconnect from the current broker settings. Does not
+  // clear the subscription table.
+  static void reconnectWithCurrentConfig();
   static void loop();
   static void tick();  // lightweight keepalive - call during long init phases
   static void publish(const char* topic, const char* payload);
@@ -109,6 +109,11 @@ public:
   // session and its own credential, live at the same time as the WiFi one.
   // in:  active  true = that session presented this device's client cert
   static void setFallbackSessionMTLS(bool active);
+
+  // Whether the fallback transport's broker session checked the server
+  // certificate. Independent of the WiFi session's own check, and
+  // independent of client-cert mTLS. in: verified  true = CA was checked.
+  static void setFallbackTlsVerified(bool verified);
 
   // Iterate active subscription topics.
   // in:  fn  called with each topic string
@@ -194,8 +199,7 @@ public:
   static uint8_t       _queueTail;
   static uint8_t       _queueCount;
 
-  static MQTTSubscription _subs[MQTT_MAX_SUBS];
-  static uint8_t          _subCount;
+  static MQTTSubTable  _subs;
 
   static uint32_t      _lastAttempt;
   static uint32_t      _retryInterval;

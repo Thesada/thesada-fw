@@ -8,13 +8,13 @@ Patches welcome. This is a one-person project running real hardware in a cold pl
 
 **Branches.** `dev` is where work lands and it is the default branch, so branch off `dev` and target `dev`. `main` is release-only: it moves when a version ships. If you open against `main` I will just retarget it, no drama.
 
-**Building.** `python3 scripts/check_deps.py`, then `pio run -e esp32-s3-debug` for a bare devkit or `esp32-owb` for the LILYGO board. The devkit target needs no cellular hardware and is the easiest way in.
+**Building.** `make setup` once (PlatformIO, cppcheck, clang-tidy, Lua, git hooks), then `make build ENV=esp32-s3-debug` for a bare devkit or `ENV=esp32-owb` for the LILYGO board. Bare `make` lists every target. The devkit target needs no cellular hardware and is the easiest way in.
 
-**Tests.** `pio test -e native` runs the host-side unit tests, no board needed. `lua5.3 tests/lua/run_all.lua` covers the alert rules. Both run in CI and both need to pass.
+**Tests.** `make test` runs the host-side unit tests and the Lua rules harness, no board needed. `make lint` and `make coverage` are the other two gates. CI calls the same targets and all of them need to pass.
 
 **Your first PR will not build by itself.** GitHub holds workflow runs from a first-time contributor's fork at "action_required" until I approve them. If the checks look like they never ran, that is why. Say so on the PR and I will approve it.
 
-**Hooks.** Run `./scripts/hooks/install.sh` once. The pre-commit hook will stop you if you touch a load-bearing source file without updating [docs/invariants.md](docs/invariants.md). The exact list lives in `scripts/check-invariant-ledger.sh` so it cannot drift away from what CI enforces. That gate is deliberate: those files carry rules the rest of the firmware assumes, and the ledger is how they stay written down. CI runs the same check on every PR, so skipping the hooks only moves the failure later. If your change genuinely establishes no new invariant, put `INVARIANT_OK: 1` as a trailer in the commit message. Same deal as the message lint below: explicit on purpose, and it leaves a trail.
+**Hooks.** `make setup` links them (`./scripts/hooks/install.sh` by hand). The pre-commit hook will stop you if you touch a load-bearing source file without updating [docs/invariants.md](docs/invariants.md). The exact list lives in `scripts/check-invariant-ledger.sh` so it cannot drift away from what CI enforces. That gate is deliberate: those files carry rules the rest of the firmware assumes, and the ledger is how they stay written down. CI runs the same check on every PR, so skipping the hooks only moves the failure later. If your change genuinely establishes no new invariant, put `INVARIANT_OK: 1` as a trailer in the commit message. Same deal as the message lint below: explicit on purpose, and it leaves a trail.
 
 **Commit messages** get linted for things that should not be in a public repo. Internal hostnames, private IPs, references to my internal tracker. If the lint fires on a genuine false positive, `MSG_OK=1 git commit` gets past it. That bypass is an environment variable and leaves nothing behind in the commit, so use it when you mean it.
 

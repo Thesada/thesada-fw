@@ -4,7 +4,23 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-08-23 (MQTT CLI authorization gate; the mTLS verdict is bound
+Dated 2026-09-23 (`cmd/config` keeps a pushed `topic_prefix` at the boot
+value until restart. A prefix that does not fit is refused, a shell edit
+of another key keeps the boot value, and `config.save` still writes the
+prefix already on disk. Reconnects broker changes without clearing
+subscriptions. Prior: 2026-09-22 `cmd/config` accepts a JSON document on a
+CA-verified TLS session only, including a password session, and refuses a
+blob that drops `mqtt.broker`. It is not gated by `shell.mode`. Prior: 2026-09-17 OTA version compare rejects anything that is not N.N.N.
+Prior: 2026-09-06 wildcard fs.rm needs --yes and never takes config.json
+or ca.crt. Prior: certificate validity dates are not enforced by the
+shipped mbedtls build. Prior: shell.mode gates all three command transports. Prior:
+Basic auth is refused on cross-site state-changing requests, including the
+two side-effect GETs, and the login lockout counts only real credential
+guesses. Prior: Config.h carries the single-task note. Prior: OTA verification and cert/key structural decisions extracted
+to `ota_verify_policy.h` and `cert_policy.h`, host-tested under a 95% coverage
+floor; `certKeyInputsUsable` newly requires PEM structure on the mTLS install
+path; the mbedtls pair check itself is unchanged and still untested. Prior:
+MQTT CLI authorization gate; the mTLS verdict is bound
 to the mTLS listener port; `cert.clear` recovery on a broken stored cert;
 first-boot device identity; fallback AP refuses a default or absent
 passphrase and the recovery window that leaves; LiteServer module
@@ -108,7 +124,9 @@ included) switches it to verified TLS - same override pattern as
 
 Source: `lib/thesada-core/src/OTAUpdate.cpp` `begin()`, `check()`,
 `configureSecureClient()`, `loadCaCert()`; `lib/thesada-core/src/MQTTClient.cpp`
-CA-load block; `lib/thesada-core/src/ota_ca_progmem.h`.
+CA-load block; `lib/thesada-core/src/ota_ca_progmem.h`. The refuse/insecure/
+verified decision itself is `otaTlsMode()` in
+`lib/thesada-core/src/ota_verify_policy.h` (host-tested).
 
 ### Every `OTAUpdate::check()` exit emits exactly one `<prefix>/status/ota` record
 
@@ -135,7 +153,23 @@ Incremental hash update during `Update.write`; mismatch -> `Update.abort()`
 without flipping the boot partition. Inactive flash partition stays
 invalidated cleanly.
 
-Source: `lib/thesada-core/src/OTAUpdate.cpp` flashFromCallback path.
+Source: `lib/thesada-core/src/OTAUpdate.cpp` flashFromCallback path. The digest
+compare is `otaShaMatches()` in `lib/thesada-core/src/ota_verify_policy.h`, which
+now gates digest length before comparing; the streaming `mbedtls_sha256`
+accumulation stays in OTAUpdate.cpp and is not host-tested.
+
+### OTA version compare rejects anything that is not `N.N.N`
+
+`otaIsNewer` parses both sides with a strict digit-only three-field parser
+(`otaParseVersion`). Partial (`1.2`), signed (`-1.0.0`), trailing junk
+(`1.2.3x`), empty, or overflow fields make the predicate return false.
+A malformed local no longer makes every remote look newer. `force` still
+bypasses via `otaShouldUpdate`.
+
+How enforced: host tests in `test/test_ota_verify`. Coverage floor 95% on
+`ota_verify_policy.h`.
+
+Source: `lib/thesada-core/src/ota_verify_policy.h`.
 
 ### OTA-over-cellular shares the WiFi cert-verification gate
 
@@ -522,7 +556,12 @@ How enforced: every path that installs client mTLS material calls
 `mbedtls_pk_check_pair` and `mbedtls_pk_parse_key` take RNG callback
 args on mbedtls 3.x (pioarduino / IDF 5.x), the shorter forms on 2.x.
 
-Source: `lib/thesada-core/src/MQTTClient.cpp::validateClientCertKey`.
+Source: `lib/thesada-core/src/MQTTClient.cpp::validateClientCertKey`. It is now
+fronted by `certKeyInputsUsable()` in `lib/thesada-core/src/cert_policy.h`, a
+structural PEM pre-flight that is strictly more rejecting than the previous
+non-null/non-empty guard. **The pair check itself is unchanged and remains
+untested** - `cert_policy.h` covers structure and CN extraction only, not
+`mbedtls_pk_check_pair`.
 
 ### mTLS context reset between connect attempts
 
@@ -600,6 +639,105 @@ How enforced: the veto is the pure predicate `webAuthPassIsDefault` /
 
 Source: `lib/thesada-core/src/web_auth_policy.h`,
 `lib/thesada-mod-httpserver/src/HttpServer.cpp::_checkAuth`.
+
+### Basic auth is refused on a cross-site state-changing request
+
+Bearer tokens are read from a header the page must set, so a foreign
+page cannot mint one. Basic credentials are cached by the browser and
+replayed automatically, so a malicious LAN page can auto-submit a form
+at the device and reach `POST /api/restart` or `DELETE /api/file` with
+the operator's own credentials. When `Sec-Fetch-Site: cross-site`
+arrives on a state-changing request, Basic no longer counts; Bearer
+still does. Requests with no `Sec-Fetch-Site` at all - curl,
+`tests/test_firmware.py`, pre-2020 browsers - are untouched, which is
+the deliberate limit of the mitigation: it closes the browser-replay
+path, not scripted access.
+
+State-changing is the method OR a route that declares a side effect,
+because two GETs have one. `GET /api/ws/token` mints a 30 s IP-bound
+WS grant and `/ws/serial` reaches `Shell::enqueue`, so a cross-site
+call there is worse than any POST: WebSocket handshakes are not
+CORS-gated, so the attacker page opens the socket itself. `GET
+/api/auth/check` answers whether cached credentials are valid for this
+device, which is an enumeration oracle, and moves the rate-limit
+counter. Both pass `hasSideEffect=true`.
+
+How enforced: `webAuthBasicAllowed` / `webAuthMethodChangesState`
+(`web_auth_policy.h`, host-tested in `test/test_web_auth`), fed into
+the `basicOk` term of `_checkAuth`. An unknown or missing method counts
+as state-changing, so a new verb is refused rather than waved through.
+New routes inherit this for free - they must keep going through
+`_checkAuth`, never call `req->authenticate` directly. A new GET that
+changes state must pass `hasSideEffect=true`; the method cannot tell.
+
+The login rate limiter counts only a real guess (`webAuthCountsAsGuess`):
+a wrong credential that was actually offered. A cross-site refusal never
+reached the password check, and an anonymous request attempted nothing,
+so neither is counted - otherwise a foreign page could lock the operator
+out of their own device with five requests it cannot even read.
+
+Source: `lib/thesada-core/src/web_auth_policy.h`,
+`lib/thesada-mod-httpserver/src/HttpServer.cpp::_checkAuth`.
+
+### Certificate validity dates are not enforced, at any clock value
+
+`notBefore` and `notAfter` are never checked on this firmware. Not
+"skipped when the clock is floored" - the check is compiled out
+entirely, so an expired or not-yet-valid certificate is accepted on
+every TLS client the device opens: the OTA manifest and binary fetch,
+and the MQTT broker connection, both through `WiFiClientSecure`.
+
+The chain: `CONFIG_MBEDTLS_HAVE_TIME_DATE` is unset in the sdkconfig of
+every arduino-esp32 variant we ship against; `mbedtls/esp_config.h`
+turns that into `#undef MBEDTLS_HAVE_TIME_DATE`; and in
+`x509_crt.c` the `MBEDTLS_X509_BADCERT_EXPIRED` and
+`..._BADCERT_FUTURE` flags are only ever set inside
+`#if defined(MBEDTLS_HAVE_TIME_DATE)`. Upstream's own
+`mbedtls_config.h` does define it - IDF overrides that through
+`MBEDTLS_CONFIG_FILE`, and arduino-esp32 ships mbedtls precompiled, so
+the sdkconfig is what governs. This is the IDF default, not a change
+we made.
+
+What still holds: the chain of trust to the pinned CA (`setCACert`,
+`otaTlsMode` -> `OTA_TLS_VERIFIED` whenever `/ca.crt` is present) and
+the OTA payload SHA256 from the manifest. What does not: expiry, and
+with no CRL or OCSP either, certificate rotation is an operational
+control rather than something the fleet enforces.
+
+Do not write code that treats an expiry date as a security boundary,
+and do not "fix" this by enabling the option: `CLOCK_FLOOR_SANE_EPOCH`
+is 2023-11-14, so a device that has not reached NTP would read every
+certificate issued since then as not-yet-valid and refuse both OTA and
+MQTT. Any real fix is gated on a confirmed NTP sync and must fail open
+while unsynced.
+
+Source: `lib/thesada-core/src/ota_verify_policy.h::otaTlsMode`,
+`lib/thesada-core/src/OTAUpdate.cpp::configureSecureClient`,
+`lib/thesada-core/src/MQTTClient.cpp` (`_wifiClient`),
+`lib/thesada-core/src/clock_floor_policy.h::CLOCK_FLOOR_SANE_EPOCH`.
+### A wildcard `fs.rm` is gated and cannot take the two boot-critical files
+
+`fs.rm` accepts `*` and `?` in the last path segment only - a wildcard
+earlier in the path is refused rather than treated as a literal, which
+would delete a different set than the operator typed. A wildcard remove
+additionally requires `--yes`, and reports removed/failed/protected
+counts rather than going quiet.
+
+`/config.json` and `/ca.crt` at the LittleFS root are skipped by any
+wildcard, whatever the pattern: `fs.rm /* --yes` clears the root but
+leaves the device bootable and still able to verify TLS. An exact
+`fs.rm /config.json` still works - the veto is about a pattern reaching
+them by accident, not about making them undeletable.
+
+How enforced: `globMatch` / `globSplit` / `globRmProtected`
+(`glob_policy.h`, host-tested in `test/test_glob` under a 95% floor).
+`cmd_rm` routes to the glob path only when `globHasWildcard` says so, so
+the exact-path behaviour is unchanged. The matcher is iterative with a
+single backtrack point - no recursion, because this runs on the shell's
+4 KB stack.
+
+Source: `lib/thesada-core/src/glob_policy.h`,
+`lib/thesada-core/src/Shell.cpp` (`cmd_rm`, `_rmGlob`, `cmd_ls`).
 
 ### Auth-state TTLs compare rollover-safe, never `now < expiry`
 
@@ -756,9 +894,10 @@ work is on its own task but does not touch Config / EventBus directly.
 
 When a new module runs on a dedicated FreeRTOS task (likely BLE),
 this invariant breaks. The fix at that point is a recursive mutex
-modelled on `ATGuard` in `Cellular.cpp`. Until then, headers document
-the constraint and reviewers reject any new task-spawning module that
-calls into these singletons.
+modelled on `ATGuard` in `Cellular.cpp`. Until then, both headers
+(`Config.h`, `EventBus.h`) carry the constraint above the class, and
+reviewers reject any new task-spawning module that calls into these
+singletons.
 
 Source: `lib/thesada-core/src/Config.cpp`,
 `lib/thesada-core/src/EventBus.cpp`,
@@ -840,6 +979,34 @@ Source: `lib/thesada-mod-scriptengine/src/ScriptEngine.cpp`
 ---
 
 ## MQTT
+
+### The subscription table's `active` flags and its slot count clear together
+
+`MqttSubTable::reset()` is the only way to empty the table, and it clears both.
+Clearing `active` alone leaves the count high: the freed slots stay skipped by
+dispatch, and the next `subscribe()` writes past them. That is what happened:
+`MQTTClient::begin()` cleared the flags only, so the `ota.cmd_topic` subscription
+that `OTAUpdate::begin()` had registered in slot 0 was stranded inactive for the
+whole boot, and publishing to it did nothing until a `mqtt.topic_prefix` change
+forced a `reinitSubscriptions()`.
+
+Registration order is fixed by heap, not preference: `main.cpp` runs
+`OTAUpdate::begin()` before `MQTTClient::begin()` so the boot manifest fetch gets
+a contiguous heap. MQTT therefore inherits a non-empty table, resets it, and
+calls `OTAUpdate::registerCommandTopic()` to put the topic back - before the CLI
+block, which can return early on a truncated prefix. That function re-reads
+`ota.enabled` rather than the `_enabled` flag, so the second call site cannot
+hand a remote OTA trigger to a device whose config has OTA switched off.
+
+How enforced: the table is a type with no public way to clear one field
+(`mqtt_sub_table.h`, host-tested in `test/test_mqtt_sub_table` under a 95%
+floor). Anything that empties the table calls `reset()`. `mqtt.diag` prints
+`subs: n/max` and the active topics, which is where a stranded subscription
+shows.
+
+Source: `lib/thesada-core/src/mqtt_sub_table.h`,
+`lib/thesada-core/src/MQTTClient.cpp` `begin()` / `reinitSubscriptions()`,
+`lib/thesada-core/src/OTAUpdate.cpp::registerCommandTopic`.
 
 ### Cellular MQTT subscriptions mirror the WiFi-side `MQTTClient` registry
 
@@ -1244,6 +1411,30 @@ call sites in `CellularModule.cpp`, `Cellular.cpp`, `MQTTClient.cpp`,
 
 ## Module activation
 
+### A module is only compiled in if its library is listed in `lib_deps`
+
+`ENABLE_*` decides whether a module's code survives the preprocessor, but only
+after PlatformIO has decided to compile the file at all. It compiles a local
+library under `lib/` only when that library is named in `platformio.ini`
+`lib_deps`. A directory that is missing from that list never enters the
+dependency graph, never produces an object file, and never links - so its
+`MODULE_REGISTER` never runs and its `ENABLE_*` flag does nothing whatsoever.
+
+The failure is silent in both directions a reader would check. The build
+succeeds, because a library that is never built cannot fail to build, so the
+whole env matrix stays green. And the module is simply absent at runtime rather
+than disabled, so `module.status` does not list it either. Someone follows the
+README, uncomments the flag, flashes, and gets no behaviour and nothing to
+debug.
+
+How enforced: `scripts/check-lib-deps.sh`, run by `make lint` and therefore by
+CI. It fails when a `lib/<name>/` carrying a `library.json` is absent from
+`lib_deps`, and when a local `lib_deps` entry has no directory behind it. The
+check reads the wiring rather than trusting a green build, because a green
+build is exactly what this defect produces.
+
+Source: `platformio.ini` (`[env] lib_deps`), `scripts/check-lib-deps.sh`.
+
 ### A compiled-in module stays dark unless its config gate allows it
 
 Compile-time presence (`ENABLE_*`) only puts a module in the binary. It does
@@ -1293,9 +1484,89 @@ Source: `src/main.cpp` (`_wifiEnabled`/`_mqttEnabled`/`_otaEnabled`/
 The on-device recovery CLI (`Shell`) has no `enabled` gate at any tier. It is
 hard-mandatory so a bad config can never lock out the serial/MQTT recovery
 path. Reduced/headless command surface is a separate concern (`shell.mode`),
-not an on/off switch.
+not an on/off switch: `Shell` itself always exists and always runs, and the
+mode decides only which transports may reach it.
 
 Source: `src/main.cpp` (`Shell::begin()` called unconditionally).
+
+### `shell.mode` gates every transport into Shell, not just the two named ones
+
+Three code paths reach `Shell::execute`: the serial console
+(`Shell::pumpConsole`), the MQTT CLI (`cliInboundHandler` -> `runCli`), and
+HTTP - `POST /api/cmd` and the `/ws/serial` terminal both enqueue on the same
+ring. A mode that closed only the first two would leave the broadest remote
+surface open on a device the operator believes is headless, so every narrowing
+mode also closes the HTTP command surface; `full` is the only value that keeps
+it, and `/ws/serial` is closed at connect so a narrowed mode leaves neither an
+interactive session nor its log replay up. OTA is deliberately untouched in
+all modes: the periodic `manifest_url` poll is the recovery path when a mode
+change goes wrong, and it needs no subscription and no broker. The `ota.cmd_topic`
+push works from boot again now that the subscription-table reset is fixed, but
+it needs both, so it is a convenience and not the path to rely on.
+
+An absent key parses to `full`, so a config written before the key existed
+behaves exactly as it did. A present value that is not a known name parses to
+`off` and says so - `shell.mode_unrecognised` for a misspelt string,
+`shell.mode_not_a_string` for a bool, number or object, which the config layer
+would otherwise hand over as an absent key. A hardening request the firmware
+cannot read exactly must not silently serve the full surface. The mode is resolved once on first use, not
+per command - it changes on reboot, which is also when a config push lands.
+
+How enforced: `shellModeResolve` / `shellModeParse` /
+`shellModeSerialAllowed` / `shellModeMqttAllowed` / `shellModeHttpAllowed`
+(`shell_mode_policy.h`,
+host-tested in `test/test_shell_mode` under a 95% floor). The MQTT gate skips
+the `cli/#` subscription at both registration sites AND guards
+`cliInboundHandler`, so a retained message cannot slip through a reinit. A new
+transport that reaches `Shell` must add its own gate here; the predicate list
+is the checklist.
+
+Source: `lib/thesada-core/src/shell_mode_policy.h`,
+`lib/thesada-core/src/Shell.cpp` (`mode`, `pumpConsole`),
+`lib/thesada-core/src/MQTTClient.cpp` (`cliInboundHandler`, `begin`,
+`reinitSubscriptions`),
+`lib/thesada-mod-httpserver/src/HttpServer.cpp` (`cmdHandler`, `_ws`).
+
+### `cmd/config` is outside `shell.mode` and requires a verified broker
+
+`<prefix>/cmd/config` is not a shell transport. It stays subscribed when
+`shell.mode` is `off`, the same way the OTA command topic does, so a headless
+device with the web module off can still be given a new `config.json`. The
+payload is applied only when the broker session verified the server
+certificate. A password on that session is enough. `mqtt.allow_insecure`
+encrypts without that check and is refused. The body must be a JSON object
+that still contains a non-empty `mqtt.broker`. A change to the
+connection-critical mqtt keys reconnects without clearing the subscription
+table, so callbacks registered after boot stay. The last-good rollback
+still covers a broker the device cannot reach. `topic_prefix` is saved and
+stays at the boot value until restart. Anything else is written and left
+for the next restart.
+
+How enforced: `cmdConfigVerdict` (`cmd_config_policy.h`, host-tested in
+`test/test_cmd_config`) refuses an unverified session, a non-object, and a
+document with no non-empty `mqtt.broker`. WiFi sets the session bit only in
+the `setCACert` path. Cellular sets its own bit from the SMSSL choice, and
+`dispatchInbound` uses that bit rather than the WiFi one. `Config::replace`
+reloads the on-disk file when the write fails and puts a held boot prefix
+back. The apply does not reconnect unless that write succeeded, and it
+refuses a prefix that cannot form `/cmd/config`, and a prefix that is
+not a string. An omitted
+`topic_prefix` stays omitted on the next save. The reconnect leaves the
+subscription table in place. `Config::save` and shell `config.save` write
+the prefix already on disk. Shell `config.set` and `config.del` put the
+boot prefix back unless the key is `mqtt` or `mqtt.topic_prefix`.
+`cmd/config` is registered after the OTA and CLI topics so those stay
+inside the cellular four-topic replay. A prefix that does not fit the
+CLI topic still subscribes `cmd/config`.
+
+Source: `lib/thesada-core/src/cmd_config_policy.h`,
+`lib/thesada-core/src/Config.cpp` (`replace`, `holdTopicPrefix`, `save`,
+`set`, `load`, `copyDiskDoc`),
+`lib/thesada-core/src/MQTTClient.cpp` (`mqttApplyCmdConfig`,
+`mqttSubscribeCmdConfig`, `begin`, `reconnectWithCurrentConfig`,
+`reinitSubscriptions`, `setFallbackTlsVerified`),
+`lib/thesada-core/src/Shell.cpp` (`config.set`, `config.save`, `config.del`),
+`lib/thesada-mod-cellular/src/Cellular.cpp` (`mqttConnect`).
 
 ---
 

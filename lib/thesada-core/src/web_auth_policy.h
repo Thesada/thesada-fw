@@ -19,3 +19,29 @@ inline bool webAuthAllowed(bool passIsDefault, bool bearerValid, bool basicOk) {
   if (passIsDefault) return false;
   return bearerValid || basicOk;
 }
+
+// Safe methods per RFC 9110. Anything else - unknown or missing included -
+// counts as state-changing, so a new verb is refused rather than waved through.
+inline bool webAuthMethodChangesState(const char* method) {
+  if (!method) return true;
+  return !(strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0 ||
+           strcmp(method, "OPTIONS") == 0);
+}
+
+// A cross-site request replays cached Basic credentials; Bearer cannot ride
+// along that way. Refuse Basic for that one shape - curl sends no header.
+// stateChanging is the caller's verdict: the method, OR a route whose GET has
+// a side effect (/api/ws/token mints a WS grant, so it counts).
+// What the login rate limiter counts. A refusal by policy, or a request that
+// carried no credential at all, is not a guess - counting either lets a
+// foreign page lock the operator out of a device it cannot even read.
+inline bool webAuthCountsAsGuess(bool allowed, bool basicAllowed,
+                                 bool credentialOffered) {
+  return !allowed && basicAllowed && credentialOffered;
+}
+
+inline bool webAuthBasicAllowed(bool stateChanging, const char* secFetchSite) {
+  if (!secFetchSite || !*secFetchSite) return true;
+  if (!stateChanging) return true;
+  return strcmp(secFetchSite, "cross-site") != 0;
+}

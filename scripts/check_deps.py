@@ -38,17 +38,15 @@ PIO_LIBS = [
     ("milesburton/DallasTemperature", "4.0.6"),
     ("vshymanskyy/TinyGSM",          "0.12.0"),
     ("adafruit/Adafruit ADS1X15",    "2.6.2"),
-    ("olikraus/U8g2",                "2.35.30"),
-    ("bodmer/TFT_eSPI",              "2.5.43"),
+    ("jgromes/RadioLib",             "7.0.0"),
 ]
 
 # GitHub-only libs (no pinned version - always tracks HEAD/latest release).
 # We report the latest tag so the developer can decide whether to act.
 GITHUB_LIBS = [
     "lewisxhe/XPowersLib",
-    "mathieucarbou/ESPAsyncWebServer",
+    "ESP32Async/ESPAsyncWebServer",
     "sfranzyshen/ESP-Arduino-Lua",
-    "PaulStoffregen/XPT2046_Touchscreen",
 ]
 
 # PlatformIO platform package

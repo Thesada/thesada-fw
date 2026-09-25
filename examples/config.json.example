@@ -13,6 +13,10 @@
     "password": "changeme"
   },
 
+  "shell": {
+    "mode": "full"
+  },
+
   "wifi": {
     "networks": [
       { "ssid": "primary-ssid",   "password": "primary-password" },
@@ -27,17 +31,6 @@
     "gateway":               "192.168.1.1",
     "subnet":                "255.255.255.0",
     "dns":                   "8.8.8.8"
-  },
-
-  "eth": {
-    "static_ip": "",
-    "gateway":   "192.168.1.1",
-    "subnet":    "255.255.255.0",
-    "dns":       "8.8.8.8",
-    "phy_addr":  1,
-    "power_pin": 16,
-    "mdc":       23,
-    "mdio":      18
   },
 
   "ntp": {
@@ -81,10 +74,12 @@
   },
 
   "lua": {
+    "enabled":      true,
     "reload_topic": ""
   },
 
   "temperature": {
+    "enabled":            true,
     "pin":                12,
     "interval_s":         60,
     "auto_discover":      true,
@@ -104,6 +99,7 @@
   },
 
   "ads1115": {
+    "enabled":      true,
     "line_voltage": 120,
     "i2c_sda":      1,
     "i2c_scl":      2,
@@ -133,22 +129,29 @@
     "max_file_kb": 1024
   },
 
-  "display": {
-    "sda":             21,
-    "scl":             22,
-    "address":         60,
-    "rotation":        1,
-    "page_interval_s": 3
-  },
-
   "pwm": {
+    "enabled":      true,
     "pin":          16,
     "channel":      0,
     "frequency_hz": 25000,
     "resolution":   8
   },
 
+  "example_temperature_mqtt": {
+    "enabled":    false,
+    "pin":        12,
+    "interval_s": 60,
+    "name":       "example"
+  },
+
+  "example_remote_relay": {
+    "enabled":    false,
+    "pin":        4,
+    "active_low": false
+  },
+
   "telegram": {
+    "enabled":    false,
     "bot_token":  "",
     "chat_ids":   [],
     "cooldown_s": 300,
