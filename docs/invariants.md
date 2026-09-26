@@ -4,7 +4,12 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-09-23 (`cmd/config` keeps a pushed `topic_prefix` at the boot
+Dated 2026-09-26 (a failed setup passphrase does not leave a station network, the claim link drops trailing slashes, and a timed-out enroll POST is reaped before the next one starts). Previously 2026-09-25 (the setup page exists only while the fallback AP is up and no station network is saved, unless a result from this boot is still on screen; the form is applied on the main loop and the claim link is text. A pending OTA image is marked valid after the first MQTT session or five minutes up, and a crash loop meets neither. Publish topic buffers are 160 bytes so a long tenant slug is not clipped. The enrollment claim code is an 8-digit serial-seeded
+secret that never rotates and that password-session `secret.set` refuses;
+enrollment only talks to an `https://` base. The cert arrives by HTTPS pull,
+not over the AP. A stored enrollment cert is never polled for again, a reply
+is stored only when it names this unit and its pair validates, and the ack
+waits for the first mTLS session. Prior: 2026-09-23 `cmd/config` keeps a pushed `topic_prefix` at the boot
 value until restart. A prefix that does not fit is refused, a shell edit
 of another key keeps the boot value, and `config.save` still writes the
 prefix already on disk. Reconnects broker changes without clearing
@@ -352,9 +357,9 @@ flash.
 
 The keypair exists to prove possession during claiming: the device signs a
 challenge, and the holder of the public key can verify it. Claiming does not
-go over MQTT - a factory-fresh device has no broker credential at all, so the
-cert is delivered over the device's own access point and the device never
-contacts the broker until it already holds one.
+go over MQTT - a factory-fresh device has no broker credential at all. The
+access point only collects WiFi credentials; the device then pulls its cert
+from the app over HTTPS and never contacts the broker until it holds one.
 
 Caveat, flash encryption: with it enabled on S3 the NVS partition is bound to
 the chip, so identity cannot be read out or transplanted - but a chip swap or
@@ -371,6 +376,86 @@ build that cannot re-mint drops the unit onto the shared fallback name.
 
 Source: `lib/thesada-core/src/device_identity_policy.h`,
 `lib/thesada-core/src/Identity.cpp`, `test/test_device_identity/`.
+
+### The claim code is seeded over serial at flash time and never rotates
+
+The claim code is the bearer secret that lets an account claim an enrolled
+unit. It is printed on the unit's sticker next to the fallback-AP join QR, so
+it follows the same factory-sticker model as the AP passphrase.
+
+| Rule | Why |
+|---|---|
+| exactly 8 digits, seeded by `flash-provision.sh` into NVS field `enroll.claim_code` | the sticker and the claim form carry it; the device only ever sends it, never shows it |
+| never rotates, not on WiFi re-config, not on re-enroll | a rotated code no longer matches the sticker, and the unit has no display to show a new one |
+| password-session `secret.set` refuses the field | a holder of the shared pairing credential could otherwise set a known code and claim the unit into their own tenant |
+| never derived from the MAC or the device id | the device id is broadcast in the AP SSID, so a derived code is computable by anyone in range |
+| sent to the app only over a CA-verified HTTPS base (`enrollUrlUsable`: `https://` only, no userinfo, query or fragment) | plain http would hand the code, and later the private key, to the network |
+
+Eight digits is a small space on purpose: it has to be typeable. The app
+carries the rest of the guess resistance with a per-device failed-claim cap;
+the device cannot, because claiming happens between the account and the app.
+
+Source: `lib/thesada-core/src/enroll_policy.h`, `test/test_enroll_policy/`,
+`lib/thesada-core/src/cli_authz_policy.h::cliAuthzSecretFieldAllowed`,
+`scripts/flash-provision.sh`.
+
+### An enrolled cert is stored once, never re-polled, and acked after mTLS
+
+The app re-issues the cert on every `/cert` poll until the device acks, and
+each issue revokes the one before. The ack seals the enrollment row for good.
+
+| Rule | Why |
+|---|---|
+| once a cert is stored, the device never polls `/cert` again; it only acks | a re-poll revokes the cert the device just stored |
+| a reply is stored only when its `device_id` is this unit, host, port and prefix are usable (`enrollReplyUsable`), and the cert and key validate as a pair | a cert for another unit, or a broker the device cannot reach, strands it with nothing to retry |
+| write order is the NVS `ack_pending` flag, then `mqtt.*` config, then the cert | a power cut before the cert lands leaves no cert, so the next boot re-enrolls from announce |
+| the ack goes out only after a WiFi broker session that presented the client cert | sealing a cert that never connected leaves the app no way to re-issue |
+| the enrollment POST verifies the server against `/ca.crt` or the baked roots, never `setInsecure` | the claim code goes out, and the private key comes back, on this link |
+| HTTPS runs on its own 12 KB task; Config, Secret and NVS are touched only from the main loop | the handshake overflows the loop stack, and Config is single-task |
+| a timed-out POST is kept until its task finishes, and no second POST starts while it is alive | dropping the job and starting another overlaps two handshakes and leaks the first |
+
+Source: `lib/thesada-core/src/Enroll.cpp`, `lib/thesada-core/src/enroll_policy.h`,
+`test/test_enroll_policy/`, `MQTTClient::clientCertPairValid`,
+`MQTTClient::mtlsSessionUp`.
+
+### The setup page is the fallback AP, and only until a station network exists
+
+A unit with no display has to collect a station network and an app URL before it can enroll. The page is on the AP the sticker joins. It is not a general settings editor.
+
+| Rule | Why |
+|---|---|
+| served only while the fallback AP is up and no station network is saved, or while a result from this boot is still on screen | after a reboot the saved network means the page is closed, so the passphrase form does not stay reachable on the LAN |
+| the async handler only copies the form; Config and Secret are touched from the main loop | both are single-task, and the HTTP callbacks run on the AsyncTCP task |
+| the success page is the claim link as text, not a QR, and it does not echo the form | the link is the only thing the operator needs, and the passphrase must not come back in the HTML |
+| the passphrase is stored before the network is saved, and a failed save removes a passphrase this attempt just wrote | a saved network with no password closes the page on the next boot. An existing passphrase is replaced only after the save succeeds |
+| the claim link drops trailing slashes on the app URL | a doubled slash is a different route |
+| the app URL has to pass `enrollUrlUsable` | the next step sends the claim code over that URL |
+
+Source: `lib/thesada-core/src/setup_portal_policy.h`, `lib/thesada-core/src/SetupPortal.cpp`,
+`lib/thesada-mod-httpserver/src/HttpServer.cpp`, `test/test_setup_portal/`.
+
+### A pending OTA image is marked valid only after it has shown it can run
+
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` leaves a newly written image in `ESP_OTA_IMG_PENDING_VERIFY`. The bootloader rolls it back if the next boot never confirms it. USB-flashed images are not pending, so this rule does not touch them.
+
+| Rule | Why |
+|---|---|
+| `verifyRollbackLater` returns true | the Arduino core otherwise confirms a pending image in `initArduino`, before `setup`, and a crash loop would keep the bad image |
+| confirm on the first MQTT session this boot, WiFi or cellular, or after five minutes up, whichever comes first | a broker that is down, or a cellular-only unit, still has a way to keep a good image |
+| `confirmIfHealthy` runs on every main-loop turn, and `loop` calls it before the enabled and transport returns | `loop` itself is skipped when OTA is disabled or no transport is up, and that unit must still confirm or stay pending |
+| a failed IDF confirm is retried; a non-pending image is read once and then left alone | a crash loop never stays up five minutes and never connects, so it never confirms |
+
+This is not the MQTT config rollback. That one restores a broker config that never connected. This one confirms the firmware image.
+
+Source: `lib/thesada-core/src/ota_health_policy.h`, `lib/thesada-core/src/OTAUpdate.cpp`,
+`test/test_ota_health/`.
+
+### A publish topic buffer holds 160 bytes
+
+`Config::TOPIC_PREFIX_CAP` allows a prefix that, with `/sensor/battery/percent`, does not fit in a 64 or 96 byte topic. A clipped topic is a different topic. The queue slot, the subscription table, and the CLI topic buffers use the same 160 byte cap.
+
+Source: `MQTTClient.h` `MQTT_TOPIC_CAP`, `cli_topics.h` `CLI_TOPIC_CAP`,
+`mqtt_sub_table.h`.
 
 ### MQTT CLI commands are authorized against the session's auth mode
 
@@ -416,7 +501,8 @@ surface - the CLI carries no signature and no replay protection.
 scalar secret set (`mqtt.password`, `telegram.bot_token`, `web.password`,
 `wifi.ap_password`) plus per-SSID wifi passwords through it before mTLS is
 live. The gate holds the field to exactly that provisioning set
-(`cliAuthzSecretFieldAllowed`, backed by `secret_keymap.h`) - a containment
+(`cliAuthzSecretFieldAllowed`, backed by `secret_keymap.h`, minus
+`enroll.claim_code`, which is serial-only) - a containment
 line, not a defence: a holder of the armed pairing credential can still
 rewrite the web console and fallback-AP passphrases, because pairing must.
 That residual is why the password listener retires with portal-based

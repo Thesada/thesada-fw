@@ -532,7 +532,7 @@ void ScriptEngine::begin() {
   // Subscribe to MQTT reload trigger.
   JsonObject cfg = Config::get();
   const char* customTopic = cfg["lua"]["reload_topic"] | "";
-  char topic[96];
+  char topic[MQTT_TOPIC_CAP];
   if (strlen(customTopic) > 0) {
     strncpy(topic, customTopic, sizeof(topic) - 1);
     topic[sizeof(topic) - 1] = '\0';

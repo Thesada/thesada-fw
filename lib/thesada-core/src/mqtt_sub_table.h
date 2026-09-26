@@ -29,7 +29,7 @@ inline bool mqttSubMatches(const char* sub, const char* topic) {
 
 // CB is the callback type - std::function on the device, a plain function
 // pointer in the host tests - so this header pulls in no Arduino headers.
-template <typename CB, uint8_t N, size_t TOPIC_CAP = 96>
+template <typename CB, uint8_t N, size_t TOPIC_CAP = 160>
 class MqttSubTable {
  public:
   struct Slot {

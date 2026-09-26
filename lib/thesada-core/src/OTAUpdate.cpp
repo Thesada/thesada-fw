@@ -31,12 +31,49 @@
 #include <functional>
 #include <mbedtls/sha256.h>
 #include "ota_verify_policy.h"
+#include "ota_health_policy.h"
+#include <esp_ota_ops.h>
 
 #ifdef ENABLE_CELLULAR
 #include "Cellular.h"
 #endif
 
 static const char* TAG = "OTA";
+
+// The core confirms a pending image in initArduino unless this returns true.
+// in: none. out: true so the health gate below is the only confirm.
+extern "C" bool verifyRollbackLater() { return true; }
+
+static bool _otaMqttUp = false;
+static bool _otaPending = false;
+static bool _otaStateKnown = false;
+static bool _otaImageSettled = false;
+
+void OTAUpdate::noteMqttUp() { _otaMqttUp = true; }
+
+// Confirm a pending image once, and retry when the IDF call fails.
+// in: none. out: none. A non-pending image is read once and left alone.
+void OTAUpdate::confirmIfHealthy() {
+  if (_otaImageSettled) return;
+  if (!_otaStateKnown) {
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+    if (!running || esp_ota_get_state_partition(running, &state) != ESP_OK) return;
+    _otaPending = state == ESP_OTA_IMG_PENDING_VERIFY;
+    _otaStateKnown = true;
+    if (!_otaPending) {
+      _otaImageSettled = true;
+      return;
+    }
+  }
+  if (!otaHealthShouldMark(true, _otaMqttUp, millis())) return;
+  if (esp_ota_mark_app_valid_cancel_rollback() != ESP_OK) {
+    Log::warn(TAG, "ota.image_confirm_failed");
+    return;
+  }
+  _otaImageSettled = true;
+  Log::info(TAG, "ota.image_confirmed");
+}
 
 uint32_t OTAUpdate::_lastCheck       = 0;
 uint32_t OTAUpdate::_checkIntervalMs = 21600000;  // 6 hours
@@ -83,7 +120,7 @@ static void loadCaCert() {
 static void publishOtaRefusal(const char* reason) {
   JsonObject  cfg    = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-  char topic[96];
+  char topic[MQTT_TOPIC_CAP];
   snprintf(topic, sizeof(topic), "%s/status/ota", prefix);
   char payload[160];
   snprintf(payload, sizeof(payload),
@@ -422,7 +459,7 @@ void OTAUpdate::registerCommandTopic() {
   const char* customTopic = cfg["ota"]["cmd_topic"] | "";
   if (strlen(customTopic) == 0) return;
 
-  char topic[96];
+  char topic[MQTT_TOPIC_CAP];
   strncpy(topic, customTopic, sizeof(topic) - 1);
   topic[sizeof(topic) - 1] = '\0';
 
@@ -458,6 +495,7 @@ void OTAUpdate::triggerCheck(const char* manifestOverride, bool force) {
 }
 
 void OTAUpdate::loop() {
+  confirmIfHealthy();
   // Deferred MQTT-triggered check: runs outside MQTT callback context.
   if (_checkRequested) {
     _checkRequested = false;
@@ -576,7 +614,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
     // the latest. Without this an up-to-date check looks identical to
     // "device offline" or "silent refusal" from the broker side.
     const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-    char topic[96];
+    char topic[MQTT_TOPIC_CAP];
     snprintf(topic, sizeof(topic), "%s/status/ota", prefix);
     char payload[160];
     snprintf(payload, sizeof(payload),
@@ -593,7 +631,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
            remoteVersion.c_str(), binUrl.c_str());
 
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-  char statusTopic[96];
+  char statusTopic[MQTT_TOPIC_CAP];
   snprintf(statusTopic, sizeof(statusTopic), "%s/status/ota", prefix);
   char statusPayload[128];
   snprintf(statusPayload, sizeof(statusPayload),

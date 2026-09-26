@@ -77,7 +77,7 @@ void BatteryModule::readAndPublish() {
 
   // Per-sensor topics for HA discovery
   if (present) {
-    char perTopic[96], val[16];
+    char perTopic[MQTT_TOPIC_CAP], val[16];
     snprintf(perTopic, sizeof(perTopic), "%s/sensor/battery/percent", prefix);
     snprintf(val, sizeof(val), "%d", percent);
     MQTTClient::publish(perTopic, val);
@@ -91,7 +91,7 @@ void BatteryModule::readAndPublish() {
   }
 
   // Combined JSON topic (for Lua EventBus, backwards compat)
-  char topic[64];
+  char topic[MQTT_TOPIC_CAP];
   snprintf(topic, sizeof(topic), "%s/sensor/battery", prefix);
   char payload[128];
   serializeJson(doc, payload, sizeof(payload));

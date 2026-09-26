@@ -18,8 +18,8 @@ public:
   static const char* resolve(const char* nvsKey, const char* fallback,
                              char* out, size_t maxLen);
 
-  // Logical field -> 15-char-safe NVS key. Scalars (mqtt.password,
-  // telegram.bot_token, web.password, wifi.ap_password) and "wifi.password:<ssid>".
+  // Logical field -> 15-char-safe NVS key. Scalars (enroll.claim_code,
+  // mqtt.password, telegram.bot_token, web.password, wifi.ap_password) and "wifi.password:<ssid>".
   // out: true if known. in: field, keyOut buffer.
   static bool nvsKeyFor(const char* field, char* keyOut, size_t maxLen);
 
