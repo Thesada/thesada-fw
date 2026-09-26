@@ -7,8 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// The page is up only while the setup AP is up and no station network is
-// saved, or while a result from this boot is still on screen.
+// The page is up while the setup AP is up and no station is saved, or a result is held.
 // in: ap up, saved station networks, result held. out: true to serve it.
 inline bool setupPortalOpen(bool apActive, size_t stationNetworks, bool holdingResult) {
   return apActive && (stationNetworks == 0 || holdingResult);

@@ -50,12 +50,13 @@ static void copyField(char* dst, size_t cap, const char* src) {
 static bool applyForm() {
   _link[0] = '\0';
   _error = "";
-  // Password first. A saved network with no secret closes the page on reboot.
+  // New passphrase before the network. An existing one is replaced only after save.
   char field[sizeof("wifi.password:") + SSID_CAP];
   int wrote = snprintf(field, sizeof(field), "wifi.password:%s", _ssid);
-  bool stored = wrote > 0 && (size_t)wrote < sizeof(field) && Secret::set(field, _pass);
-  mbedtls_platform_zeroize(field, sizeof(field));
-  if (!stored) {
+  bool fieldOk = wrote > 0 && (size_t)wrote < sizeof(field);
+  bool had = fieldOk && Secret::has(field);
+  if (!fieldOk || (!had && !Secret::set(field, _pass))) {
+    mbedtls_platform_zeroize(field, sizeof(field));
     _error = "could not store the passphrase";
     return true;
   }
@@ -76,16 +77,26 @@ static bool applyForm() {
   enroll["url"] = String(base);
   if (!Config::save()) {
     Config::load();
+    if (!had) Secret::clear(field);
+    mbedtls_platform_zeroize(field, sizeof(field));
     _error = "could not save the network";
-    return stationNetworks() > 0;
+    return true;
   }
+  if (had && !Secret::set(field, _pass)) {
+    mbedtls_platform_zeroize(field, sizeof(field));
+    _error = "could not store the passphrase";
+    return true;
+  }
+  mbedtls_platform_zeroize(field, sizeof(field));
   char code[Secret::MAX_LEN] = {};
   bool have = enrollLoadClaimCode(code, sizeof(code));
   const char* id = Identity::deviceId();
-  if (!(have && id && enrollClaimLink(_link, sizeof(_link), base, id, code))) {
-    _link[0] = '\0';
-    _error = (have && id && id[0]) ? "claim link did not fit"
-                                   : "network saved; no claim code is seeded";
+  if (!have) {
+    _error = "network saved; no claim code is seeded";
+  } else if (!id || !identityDeviceIdValid(id)) {
+    _error = "network saved; claim link could not be built";
+  } else if (!enrollClaimLink(_link, sizeof(_link), base, id, code)) {
+    _error = "claim link did not fit";
   }
   mbedtls_platform_zeroize(code, sizeof(code));
   return true;

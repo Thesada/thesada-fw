@@ -105,8 +105,7 @@ inline bool enrollClaimLink(char* out, size_t cap, const char* base,
   return true;
 }
 
-// JSON body for every enroll call: device_id, pubkey and one of claim_token
-// (8 digits) or signature (128 hex). Inputs are validated, so none need escaping.
+// JSON body: device_id, pubkey, and claim_token or signature. Inputs are pre-checked.
 // in: out, cap, deviceId, pubkeyHex, key, value. out: true if built.
 inline bool enrollBody(char* out, size_t cap, const char* deviceId,
                        const char* pubkeyHex, const char* key, const char* value) {
@@ -138,8 +137,7 @@ inline bool enrollHostUsable(const char* host) {
   return n < ENROLL_HOST_CAP;
 }
 
-// Topic prefix from the cert reply: no wildcards, controls or edge slashes, and
-// room for "/cmd/config" in prefixCap, as the MQTT config path demands.
+// Topic prefix: no wildcards, controls, or edge slashes, with room for /cmd/config.
 // in: prefix, prefixCap. out: true when storable.
 inline bool enrollPrefixUsable(const char* prefix, size_t prefixCap) {
   static const char kLongest[] = "/cmd/config";
@@ -178,9 +176,8 @@ inline EnrollStep enrollStartStep(bool hasCert, bool ackPending) {
   return ackPending ? EnrollStep::AwaitMtls : EnrollStep::Done;
 }
 
-// Next step after an HTTP answer; status < 0 is a transport failure. The
-// server answers every refusal, rate limits included, with a bare 403.
-// in: step, status, failures, rnd. out: next step, delay before it, progressed.
+// Next step after an HTTP answer. status < 0 is transport failure. Refusals are 403.
+// in: step, status, failures, rnd. out: next step, delay, progressed.
 inline EnrollAction enrollOnResponse(EnrollStep step, int status,
                                      uint8_t failures, uint32_t rnd) {
   uint32_t back = enrollBackoffMs(failures, rnd);

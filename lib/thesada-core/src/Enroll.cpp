@@ -183,8 +183,8 @@ static bool onChallenge(const String& reply) {
   return identityHexEncode(sig, sizeof(sig), _sigHex, sizeof(_sigHex));
 }
 
-// Cert answer: store it only when every field is usable. Order matters: a
-// power cut before the cert lands restarts enrollment, never strands a half.
+// Store a cert reply only when every field is usable. NVS ack, then mqtt, then cert.
+// in: reply body. out: true when it was stored.
 static bool onCert(const String& reply) {
   JsonDocument doc;
   if (deserializeJson(doc, reply)) return false;

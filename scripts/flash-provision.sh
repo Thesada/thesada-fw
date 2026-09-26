@@ -159,10 +159,8 @@ def write_qr(path, payload):
 
 
 def needs_seed(sh, key, artifact, device_id):
-    # Decides whether key gets a fresh value. in: shell, NVS field, artifact
-    # path. out: True to seed; exits when the device holds one we cannot print.
-    # A config-backed value counts as seeded; reading only "nvs" as seeded
-    # would rotate a valid credential without --force.
+    # Whether key gets a fresh value. An nvs or config value counts as seeded.
+    # in: shell, NVS field, artifact path, device id. out: True to seed.
     source = secret_state(sh, key)
     seeded = source in ("nvs", "config")
     if not seeded or force:
@@ -174,6 +172,8 @@ def needs_seed(sh, key, artifact, device_id):
 
 
 def seed(sh, key, value):
+    # Write key into NVS and confirm secret.info reads nvs.
+    # in: shell, field, value. out: none. Exits when the write does not land.
     out = sh.cmd(f"secret.set {key} {value}", wait=2.0)
     if not any("secret stored in NVS" in line for line in out):
         fail(f"secret.set {key} refused: {out}")

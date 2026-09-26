@@ -7,12 +7,11 @@
 
 class Enroll {
  public:
-  // Picks the start step from NVS and registers enroll.status; idle without an
-  // identity, enroll.url or claim code. Call after Identity, MQTT and Shell.
+  // Register enroll.status and pick the start step. Idle without identity, url, or code.
+  // in: none. out: none. Call after Identity, MQTT, and Shell.
   static void begin();
 
-  // Non-blocking tick from the main loop: starts or collects at most one
-  // HTTPS request, which runs on its own task.
+  // Start or collect one HTTPS request on the enroll task. in: none. out: none.
   static void loop();
 
   // out: true while enrollment still has work to do this boot.

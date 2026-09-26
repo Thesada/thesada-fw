@@ -427,7 +427,7 @@ A unit with no display has to collect a station network and an app URL before it
 | served only while the fallback AP is up and no station network is saved, or while a result from this boot is still on screen | after a reboot the saved network means the page is closed, so the passphrase form does not stay reachable on the LAN |
 | the async handler only copies the form; Config and Secret are touched from the main loop | both are single-task, and the HTTP callbacks run on the AsyncTCP task |
 | the success page is the claim link as text, not a QR, and it does not echo the form | the link is the only thing the operator needs, and the passphrase must not come back in the HTML |
-| the passphrase is stored before the network is saved | a saved network with no password closes the page on the next boot, and the unit cannot join |
+| the passphrase is stored before the network is saved, and a failed save removes a passphrase this attempt just wrote | a saved network with no password closes the page on the next boot. An existing passphrase is replaced only after the save succeeds |
 | the claim link drops trailing slashes on the app URL | a doubled slash is a different route |
 | the app URL has to pass `enrollUrlUsable` | the next step sends the claim code over that URL |
 
