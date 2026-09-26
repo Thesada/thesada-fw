@@ -14,6 +14,7 @@
 #include "thesada_config.h"
 #include <Config.h>
 #include <Identity.h>
+#include <Enroll.h>
 #include <ModuleRegistry.h>
 #include <WiFiManager.h>
 #include <MQTTClient.h>
@@ -173,6 +174,7 @@ void setup() {
   }
 
   Shell::begin();
+  Enroll::begin();
   if (_heartbeatEnabled) HeartbeatLED::begin();
 
   // All modules self-registered via MODULE_REGISTER. beginAll() sorts by priority.
@@ -200,6 +202,8 @@ void loop() {
   // networkConnected() (WiFi/Eth-only) is false. The WiFi-specific
   // reconnect path inside loop() is no-op when WiFi is down.
   if (_mqttEnabled) MQTTClient::loop();
+  Enroll::loop();
+  OTAUpdate::confirmIfHealthy();
   if (_otaEnabled && otaTransportUp()) {
     OTAUpdate::loop();
   }

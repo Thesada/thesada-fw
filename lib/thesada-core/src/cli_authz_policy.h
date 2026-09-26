@@ -81,6 +81,8 @@ inline bool cliAuthzSecretFieldAllowed(const char* payload) {
   }
   if (n == 0) return true;  // bare secret.set answers its usage line only
   field[n] = '\0';
+  // The claim code decides who may claim the unit; the pairing credential must not.
+  if (strcmp(field, "enroll.claim_code") == 0) return false;
   char key[16];
   return secretNvsKeyFor(field, key, sizeof(key));
 }

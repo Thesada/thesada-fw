@@ -130,7 +130,7 @@ monitor: ## Serial console at 115200
 run: flash monitor ## Flash ENV, then open the serial console
 
 .PHONY: provision
-provision: ## First flash of a new board: upload + seed the AP passphrase (needs PORT)
+provision: ## First flash of a new board: upload + seed the AP passphrase and claim code (needs PORT)
 	@test -n "$(PORT)" || { echo "provision: PORT=/dev/cu.usbmodemXXXX required"; exit 1; }
 	./scripts/flash-provision.sh --env $(ENV) --port $(PORT)
 

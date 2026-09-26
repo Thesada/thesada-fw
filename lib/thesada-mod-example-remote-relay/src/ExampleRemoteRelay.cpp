@@ -60,7 +60,7 @@ void ExampleRemoteRelay::set(bool on) {
 void ExampleRemoteRelay::publishState() {
   JsonObject  cfg    = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-  char topic[96];
+  char topic[MQTT_TOPIC_CAP];
   int n = snprintf(topic, sizeof(topic), "%s/sensor/relay", prefix);
   if (n < 0 || n >= (int)sizeof(topic)) {
     Log::kvfw(TAG, "example_relay.topic_too_long prefix_len=%u", (unsigned)strlen(prefix));

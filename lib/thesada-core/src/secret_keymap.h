@@ -22,6 +22,7 @@ inline int secretWifiKey(const char* ssid, char* out, size_t maxLen) {
 inline bool secretNvsKeyFor(const char* field, char* keyOut, size_t maxLen) {
   if (!field || !keyOut || maxLen == 0) return false;
   static const struct { const char* field; const char* key; } kMap[] = {
+    { "enroll.claim_code",  "claim_code"     },
     { "mqtt.password",      "mqtt_password"  },
     { "telegram.bot_token", "telegram_token" },
     { "web.password",       "web_password"   },

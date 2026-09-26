@@ -22,17 +22,21 @@
 
 static constexpr uint8_t MQTT_MAX_SUBS  = 16;  // max MQTT subscriptions (CLI + Lua + modules)
 
+// A prefix near Config::TOPIC_PREFIX_CAP plus the longest sensor suffix.
+// The queue slot is the truncation point, so it uses the same cap.
+static constexpr size_t MQTT_TOPIC_CAP = 160;
+
 struct MQTTMessage {
   // payload sized to cover the 256-byte alert serialization buffer in
   // begin() - alerts are exactly the messages queued during outages.
-  char topic[64];
+  char topic[MQTT_TOPIC_CAP];
   char payload[256];
   bool valid;
 };
 
 using MQTTCallback = std::function<void(const char* topic, const char* payload)>;
 
-using MQTTSubTable = MqttSubTable<MQTTCallback, MQTT_MAX_SUBS>;
+using MQTTSubTable = MqttSubTable<MQTTCallback, MQTT_MAX_SUBS, MQTT_TOPIC_CAP>;
 
 class MQTTClient {
 public:
@@ -89,6 +93,12 @@ public:
 
   // out: true if both cert and key are present in NVS
   static bool hasClientCert();
+
+  // in: PEM cert + key. out: true when both parse and the key matches the cert.
+  static bool clientCertPairValid(const char* certPEM, const char* keyPEM);
+
+  // out: true while the WiFi broker session is up and presented the client cert
+  static bool mtlsSessionUp();
 
   // Hook fired from clearClientCert after NVS rows are gone.
   // Cellular installs one so its modem-side cert cache invalidates and

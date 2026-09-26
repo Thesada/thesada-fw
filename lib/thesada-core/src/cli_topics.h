@@ -25,7 +25,7 @@
 
 // One capacity for every CLI topic buffer. A single value keeps a prefix from
 // truncating on one path while fitting on another.
-#define CLI_TOPIC_CAP 96
+#define CLI_TOPIC_CAP 160
 
 // Join prefix + suffix into out. out: true when the whole topic fitted.
 inline bool cliTopicJoin(char* out, size_t cap, const char* prefix,

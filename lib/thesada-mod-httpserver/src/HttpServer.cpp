@@ -20,6 +20,7 @@
 #include <Shell.h>
 #include <WiFiManager.h>
 #include <MQTTClient.h>
+#include <SetupPortal.h>
 #include <ModuleRegistry.h>
 #include <ESPAsyncWebServer.h>
 #include <AsyncWebSocket.h>
@@ -27,6 +28,9 @@
 #include <LittleFS.h>
 #include <SD_MMC.h>
 #include <WiFi.h>
+#include <mbedtls/platform_util.h>
+#include <enroll_policy.h>
+#include <string.h>
 
 static const char* TAG = "WebServer";
 
@@ -329,6 +333,7 @@ void HttpServer::printState() {
 
 // Clean up WS clients and handle deferred restart requests
 void HttpServer::loop() {
+  SetupPortal::loop();
   if (!_serverStarted) {
     if (!netifUp()) return;
     server.begin();
@@ -372,6 +377,89 @@ void HttpServer::subscribeToEvents() {
 
 // ---------------------------------------------------------------------------
 
+static const char kSetupFields[] =
+  "<h1>thesada setup</h1><form method=\"post\" action=\"/setup\">"
+  "<p>WiFi name<br><input name=\"ssid\" maxlength=\"32\" required></p>"
+  "<p>Passphrase<br><input name=\"pass\" type=\"password\" minlength=\"8\" maxlength=\"63\" required></p>"
+  "<p>App URL<br><input name=\"url\" value=\"https://thesada.app\" maxlength=\"127\" required></p>"
+  "<p><button type=\"submit\">Save</button></p></form>";
+
+static const char kSetupWait[] =
+  "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+  "<meta http-equiv=\"refresh\" content=\"1;url=/setup\"><title>thesada setup</title></head>"
+  "<body><p>Saving. This page reloads in a moment.</p></body></html>";
+
+// One setup document. extra is already escaped, or null for the bare form.
+// in: optional paragraph. out: full HTML page.
+static String setupDocument(const char* extra) {
+  String page = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+                "<title>thesada setup</title></head><body>";
+  if (extra && extra[0]) {
+    page += "<p>";
+    page += extra;
+    page += "</p>";
+  }
+  page += kSetupFields;
+  page += "</body></html>";
+  return page;
+}
+
+// Escape text for an HTML body. Drops controls and non-ASCII.
+// in: raw text. out: escaped text, possibly empty.
+static String htmlText(const char* in) {
+  String out;
+  if (!in) return out;
+  for (const unsigned char* p = (const unsigned char*)in; *p; p++) {
+    if (*p == '&') out += "&amp;";
+    else if (*p == '<') out += "&lt;";
+    else if (*p == '>') out += "&gt;";
+    else if (*p == '"') out += "&quot;";
+    else if (*p >= 0x20 && *p < 0x7f) out += (char)*p;
+  }
+  return out;
+}
+
+// Copy one POST field. Rejects a value that does not fit, so a truncated
+// passphrase is never stored. in: request, field, dest, cap. out: copied.
+static bool copyPostField(AsyncWebServerRequest* req, const char* name,
+                          char* dst, size_t cap) {
+  dst[0] = '\0';
+  if (!req->hasParam(name, true) || cap == 0) return false;
+  const String& v = req->getParam(name, true)->value();
+  if ((size_t)v.length() >= cap) return false;
+  memcpy(dst, v.c_str(), v.length() + 1);
+  return true;
+}
+
+// Serve the setup form, the wait page, or the claim link. in: request. out: none.
+static void sendSetupPage(AsyncWebServerRequest* req) {
+  if (!SetupPortal::open()) {
+    req->send(404, "text/plain", "Not found");
+    return;
+  }
+  if (SetupPortal::busy()) {
+    req->send(200, "text/html", kSetupWait);
+    return;
+  }
+  const char* link = SetupPortal::claimLink();
+  if (SetupPortal::hasResult() && link && link[0]) {
+    String page = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+                  "<title>thesada setup</title></head><body>"
+                  "<p>Claim this device:</p><pre>";
+    page += htmlText(link);
+    page += "</pre></body></html>";
+    req->send(200, "text/html", page);
+    return;
+  }
+  const char* err = SetupPortal::resultError();
+  if (err && err[0]) {
+    String safe = htmlText(err);
+    req->send(200, "text/html", setupDocument(safe.c_str()));
+    return;
+  }
+  req->send(200, "text/html", setupDocument(nullptr));
+}
+
 // Register all HTTP routes, WebSocket handler, OTA endpoint, and captive portal
 void HttpServer::setupRoutes() {
   // Credentials are resolved per request in _checkAuth; check once here only
@@ -382,8 +470,36 @@ void HttpServer::setupRoutes() {
 
   // ── Dashboard HTML - public (sensor data is read-only) ────────────────────
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (SetupPortal::open()) {
+      req->redirect("/setup");
+      return;
+    }
     AsyncWebServerResponse* resp = req->beginResponse(200, "text/html", (const uint8_t*)DASHBOARD_HTML, strlen_P(DASHBOARD_HTML));
     req->send(resp);
+  });
+
+  server.on("/setup", HTTP_GET, [](AsyncWebServerRequest* req) {
+    sendSetupPage(req);
+  });
+
+  server.on("/setup", HTTP_POST, [](AsyncWebServerRequest* req) {
+    if (!SetupPortal::open()) {
+      req->send(404, "text/plain", "Not found");
+      return;
+    }
+    char ssid[33] = {};
+    char pass[64] = {};
+    char url[ENROLL_URL_CAP] = {};
+    bool queued = copyPostField(req, "ssid", ssid, sizeof(ssid)) &&
+                  copyPostField(req, "pass", pass, sizeof(pass)) &&
+                  copyPostField(req, "url", url, sizeof(url)) &&
+                  SetupPortal::submit(ssid, pass, url);
+    mbedtls_platform_zeroize(pass, sizeof(pass));
+    if (!queued) {
+      req->send(400, "text/plain", "rejected");
+      return;
+    }
+    req->send(200, "text/html", kSetupWait);
   });
 
   // ── GET /api/auth/check - credential verification (plain 200 or 401) ─────

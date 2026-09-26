@@ -379,7 +379,7 @@ void TemperatureModule::readAndPublish() {
     strncpy(slug, sname, sizeof(slug) - 1);
     slug[sizeof(slug) - 1] = '\0';
     for (char* p = slug; *p; p++) { if (*p == ' ') *p = '_'; *p = tolower(*p); }
-    char perTopic[96];
+    char perTopic[MQTT_TOPIC_CAP];
     snprintf(perTopic, sizeof(perTopic), "%s/sensor/temperature/%s", prefix, slug);
     char val[16];
     snprintf(val, sizeof(val), "%.2f", t);
@@ -389,7 +389,7 @@ void TemperatureModule::readAndPublish() {
   // Combined JSON topic (for Lua EventBus, SD logging, backwards compat).
   // Dynamic buffer - multi-bus probe counts can outgrow any fixed size and a
   // truncated payload would publish malformed JSON.
-  char topic[64];
+  char topic[MQTT_TOPIC_CAP];
   snprintf(topic, sizeof(topic), "%s/sensor/temperature", prefix);
   String payload;
   payload.reserve(measureJson(doc) + 1);

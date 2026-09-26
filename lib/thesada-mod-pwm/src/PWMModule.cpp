@@ -63,7 +63,7 @@ void PWMModule::setLevel(float level) {
 
   JsonObject  cfg    = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-  char topic[64];
+  char topic[MQTT_TOPIC_CAP];
   snprintf(topic, sizeof(topic), "%s/sensor/pwm", prefix);
 
   char payload[64];

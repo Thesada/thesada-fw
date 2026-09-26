@@ -356,6 +356,14 @@ void test_secret_set_holds_the_field_to_the_provisioning_set(void) {
   TEST_ASSERT_TRUE(cliAuthzSecretFieldAllowed(""));
 }
 
+// A holder of the shared pairing credential could otherwise rewrite the claim
+// code and claim the unit into their own tenant. Serial seeding only.
+void test_secret_set_never_takes_the_claim_code_over_mqtt(void) {
+  TEST_ASSERT_FALSE(cliAuthzSecretFieldAllowed("enroll.claim_code 48271935"));
+  TEST_ASSERT_FALSE(cliAuthzAllowed(CLI_AUTH_PASSWORD, "secret.set",
+                                    "enroll.claim_code 48271935", false));
+}
+
 void test_gate_wires_the_secret_field_rule(void) {
   TEST_ASSERT_TRUE(cliAuthzAllowed(CLI_AUTH_PASSWORD, "secret.set",
                                    "web.password w", false));
@@ -402,6 +410,7 @@ int main(int, char**) {
   RUN_TEST(test_password_admits_the_recovery_flow);
   RUN_TEST(test_gate_matches_commands_case_insensitively);
   RUN_TEST(test_secret_set_holds_the_field_to_the_provisioning_set);
+  RUN_TEST(test_secret_set_never_takes_the_claim_code_over_mqtt);
   RUN_TEST(test_gate_wires_the_secret_field_rule);
   return UNITY_END();
 }

@@ -349,7 +349,7 @@ void CellularModule::loop() {
 void CellularModule::emitActive(int active) {
   JsonObject  cfg = Config::get();
   const char* pfx = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-  char topic[96];
+  char topic[MQTT_TOPIC_CAP];
   snprintf(topic, sizeof(topic), "%s/cellular/active", pfx);
   Cellular::publish(topic, active ? "1" : "0");
 }
@@ -365,7 +365,7 @@ void CellularModule::emitActive(int active) {
 void CellularModule::emitRssi() {
   JsonObject  cfg = Config::get();
   const char* pfx = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-  char topic[96], val[8];
+  char topic[MQTT_TOPIC_CAP], val[8];
   snprintf(topic, sizeof(topic), "%s/cellular/rssi", pfx);
   snprintf(val, sizeof(val), "%d", Cellular::getSignalQuality());
   Cellular::publish(topic, val);

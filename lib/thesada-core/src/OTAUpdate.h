@@ -18,6 +18,14 @@ public:
   // out: none
   static void loop();
 
+  // Remember that a broker session came up this boot. The health gate marks
+  // a pending image valid on this, or after five minutes up. in: none. out: none.
+  static void noteMqttUp();
+
+  // Confirm a pending image, or leave it pending. Call every main-loop turn,
+  // including when loop() is skipped. in: none. out: none.
+  static void confirmIfHealthy();
+
   // Fetch manifest, compare version, download, verify SHA256, flash, reboot.
   // force=true bypasses isNewer() - re-flashes even when remote == local.
   // Useful for dev iteration without bumping FIRMWARE_VERSION each cycle.
