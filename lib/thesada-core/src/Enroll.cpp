@@ -49,6 +49,7 @@ static uint8_t    _failures   = 0;
 static uint32_t   _nextAt     = 0;
 static int        _lastStatus = 0;
 static EnrollJob* _job        = nullptr;
+static EnrollJob* _stale      = nullptr;
 static uint32_t   _jobAt      = 0;
 static bool       _rebootDue  = false;
 static uint32_t   _rebootAt   = 0;
@@ -252,8 +253,18 @@ static void finishJob() {
   advance(status);
 }
 
+// Free a timed-out job once its task has finished. in: none. out: none.
+static void reapStale() {
+  if (!_stale || !_stale->done) return;
+  mbedtls_platform_zeroize(_stale->body, sizeof(_stale->body));
+  wipeString(_stale->reply);
+  delete _stale;
+  _stale = nullptr;
+}
+
 // Build one POST and run it on the enroll task. in: none. out: none.
 static void startJob() {
+  if (_stale) return;
   EnrollJob* job = new (std::nothrow) EnrollJob();
   if (!job) { advance(-1); return; }
   bool ok = enrollEndpoint(_url, stepSuffix(_step), job->url, sizeof(job->url));
@@ -335,13 +346,16 @@ void Enroll::loop() {
     delay(100);
     ESP.restart();
   }
+  reapStale();
+  if (_stale) return;
   if (!_active) return;
   if (_job) {
     if (_job->done) {
       finishJob();
     } else if (millis() - _jobAt > JOB_CEILING_MS) {
-      // The task may still hold the pointer, so the job is leaked, not freed.
+      // The task still owns the job. Reap it once done; do not start another.
       Log::kvfe(TAG, "enroll.job_overran step=%s", stepName(_step));
+      _stale = _job;
       _job = nullptr;
       advance(-1);
     }

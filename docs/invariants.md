@@ -4,7 +4,7 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-09-25 (the setup page exists only while the fallback AP is up and no station network is saved, unless a result from this boot is still on screen; the form is applied on the main loop and the claim link is text. A pending OTA image is marked valid after the first MQTT session or five minutes up, and a crash loop meets neither. Publish topic buffers are 160 bytes so a long tenant slug is not clipped. The enrollment claim code is an 8-digit serial-seeded
+Dated 2026-09-26 (a failed setup passphrase does not leave a station network, the claim link drops trailing slashes, and a timed-out enroll POST is reaped before the next one starts). Previously 2026-09-25 (the setup page exists only while the fallback AP is up and no station network is saved, unless a result from this boot is still on screen; the form is applied on the main loop and the claim link is text. A pending OTA image is marked valid after the first MQTT session or five minutes up, and a crash loop meets neither. Publish topic buffers are 160 bytes so a long tenant slug is not clipped. The enrollment claim code is an 8-digit serial-seeded
 secret that never rotates and that password-session `secret.set` refuses;
 enrollment only talks to an `https://` base. The cert arrives by HTTPS pull,
 not over the AP. A stored enrollment cert is never polled for again, a reply
@@ -412,6 +412,7 @@ each issue revokes the one before. The ack seals the enrollment row for good.
 | the ack goes out only after a WiFi broker session that presented the client cert | sealing a cert that never connected leaves the app no way to re-issue |
 | the enrollment POST verifies the server against `/ca.crt` or the baked roots, never `setInsecure` | the claim code goes out, and the private key comes back, on this link |
 | HTTPS runs on its own 12 KB task; Config, Secret and NVS are touched only from the main loop | the handshake overflows the loop stack, and Config is single-task |
+| a timed-out POST is kept until its task finishes, and no second POST starts while it is alive | dropping the job and starting another overlaps two handshakes and leaks the first |
 
 Source: `lib/thesada-core/src/Enroll.cpp`, `lib/thesada-core/src/enroll_policy.h`,
 `test/test_enroll_policy/`, `MQTTClient::clientCertPairValid`,
@@ -426,6 +427,8 @@ A unit with no display has to collect a station network and an app URL before it
 | served only while the fallback AP is up and no station network is saved, or while a result from this boot is still on screen | after a reboot the saved network means the page is closed, so the passphrase form does not stay reachable on the LAN |
 | the async handler only copies the form; Config and Secret are touched from the main loop | both are single-task, and the HTTP callbacks run on the AsyncTCP task |
 | the success page is the claim link as text, not a QR, and it does not echo the form | the link is the only thing the operator needs, and the passphrase must not come back in the HTML |
+| the passphrase is stored before the network is saved | a saved network with no password closes the page on the next boot, and the unit cannot join |
+| the claim link drops trailing slashes on the app URL | a doubled slash is a different route |
 | the app URL has to pass `enrollUrlUsable` | the next step sends the claim code over that URL |
 
 Source: `lib/thesada-core/src/setup_portal_policy.h`, `lib/thesada-core/src/SetupPortal.cpp`,

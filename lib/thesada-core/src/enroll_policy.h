@@ -69,6 +69,14 @@ inline bool enrollUrlUsable(const char* url) {
   return true;
 }
 
+// Bytes of base with trailing slashes removed. in: base. out: length.
+inline size_t enrollBaseLen(const char* base) {
+  if (!base) return 0;
+  size_t n = strlen(base);
+  while (n > 0 && base[n - 1] == '/') n--;
+  return n;
+}
+
 // Joins base + ENROLL_PATH + suffix ("", "/verify", "/cert", "/ack"), dropping
 // trailing slashes on base. in: base, suffix, out, cap. out: true if it fitted.
 inline bool enrollEndpoint(const char* base, const char* suffix,
@@ -76,9 +84,23 @@ inline bool enrollEndpoint(const char* base, const char* suffix,
   if (!out || cap == 0) return false;
   out[0] = '\0';
   if (!suffix || !enrollUrlUsable(base)) return false;
-  size_t n = strlen(base);
-  while (n > 0 && base[n - 1] == '/') n--;
+  size_t n = enrollBaseLen(base);
   int w = snprintf(out, cap, "%.*s%s%s", (int)n, base, ENROLL_PATH, suffix);
+  if (w < 0 || (size_t)w >= cap) { out[0] = '\0'; return false; }
+  return true;
+}
+
+// Claim-form URL for the setup page. Trailing slashes on base are dropped.
+// in: out, cap, base, device id, 8-digit code. out: true if it fitted.
+inline bool enrollClaimLink(char* out, size_t cap, const char* base,
+                            const char* deviceId, const char* code) {
+  if (!out || cap == 0) return false;
+  out[0] = '\0';
+  if (!enrollUrlUsable(base) || !identityDeviceIdValid(deviceId) ||
+      !enrollClaimCodeValid(code)) return false;
+  size_t n = enrollBaseLen(base);
+  int w = snprintf(out, cap, "%.*s/devices/claim?device_id=%s&code=%s",
+                   (int)n, base, deviceId, code);
   if (w < 0 || (size_t)w >= cap) { out[0] = '\0'; return false; }
   return true;
 }

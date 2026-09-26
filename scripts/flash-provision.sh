@@ -203,10 +203,6 @@ try:
 
     current_url = "".join(sh.cmd(f"config.get {URL_KEY}")).strip().strip('"')
     set_url = current_url != app_url
-    if set_url:
-        out = sh.cmd(f"config.set {URL_KEY} {app_url}", wait=2.0)
-        if not any(line.startswith(f"Set {URL_KEY} = ") for line in out):
-            fail(f"config.set {URL_KEY} refused: {out}")
 
     if not (seed_ap or seed_claim or set_url):
         print(f"flash-provision: {device_id} already provisioned, artifacts in {dev_dir}")
@@ -255,6 +251,11 @@ try:
         png = os.path.join(dev_dir, "claim.png")
         if write_qr(png, link):
             written.append(png)
+
+    if set_url:
+        out = sh.cmd(f"config.set {URL_KEY} {app_url}", wait=2.0)
+        if not any(line.startswith(f"Set {URL_KEY} = ") for line in out):
+            fail(f"config.set {URL_KEY} refused: {out}")
 
     print(f"flash-provision: {device_id} provisioned, ssid {ssid}, app {app_url}")
     for path in written:

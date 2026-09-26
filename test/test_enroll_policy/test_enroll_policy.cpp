@@ -97,6 +97,18 @@ void test_endpoint_joins_path_and_suffix(void) {
 }
 
 // A portal-typed URL often ends in "/"; a doubled slash is a different route.
+void test_claim_link_drops_trailing_slashes(void) {
+  char out[180];
+  TEST_ASSERT_TRUE(enrollClaimLink(out, sizeof(out), "https://example.com/", kId, "12345678"));
+  TEST_ASSERT_EQUAL_STRING(
+      "https://example.com/devices/claim?device_id=thesada-dcb4d91acd28&code=12345678", out);
+  TEST_ASSERT_TRUE(enrollClaimLink(out, sizeof(out), "https://example.com//", kId, "12345678"));
+  TEST_ASSERT_EQUAL_STRING(
+      "https://example.com/devices/claim?device_id=thesada-dcb4d91acd28&code=12345678", out);
+  TEST_ASSERT_FALSE(enrollClaimLink(out, sizeof(out), "https://example.com", kId, "1234567"));
+  TEST_ASSERT_EQUAL_STRING("", out);
+}
+
 void test_endpoint_drops_trailing_slashes(void) {
   char out[160];
   TEST_ASSERT_TRUE(enrollEndpoint("https://example.com/sub//", "/ack", out, sizeof(out)));
@@ -298,6 +310,7 @@ int main(int, char**) {
   RUN_TEST(test_url_refuses_query_fragment_userinfo_and_controls);
   RUN_TEST(test_url_refuses_over_cap);
   RUN_TEST(test_endpoint_joins_path_and_suffix);
+  RUN_TEST(test_claim_link_drops_trailing_slashes);
   RUN_TEST(test_endpoint_drops_trailing_slashes);
   RUN_TEST(test_endpoint_refuses_bad_input_and_truncation);
   RUN_TEST(test_body_with_claim_token);

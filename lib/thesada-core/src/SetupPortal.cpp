@@ -50,6 +50,20 @@ static void copyField(char* dst, size_t cap, const char* src) {
 static bool applyForm() {
   _link[0] = '\0';
   _error = "";
+  // Password first. A saved network with no secret closes the page on reboot.
+  char field[sizeof("wifi.password:") + SSID_CAP];
+  int wrote = snprintf(field, sizeof(field), "wifi.password:%s", _ssid);
+  bool stored = wrote > 0 && (size_t)wrote < sizeof(field) && Secret::set(field, _pass);
+  mbedtls_platform_zeroize(field, sizeof(field));
+  if (!stored) {
+    _error = "could not store the passphrase";
+    return true;
+  }
+  char base[ENROLL_URL_CAP];
+  size_t n = enrollBaseLen(_url);
+  if (n >= sizeof(base)) n = sizeof(base) - 1;
+  memcpy(base, _url, n);
+  base[n] = '\0';
   JsonObject cfg = Config::get();
   JsonArray nets = cfg["wifi"]["networks"].is<JsonArray>()
                        ? cfg["wifi"]["networks"].as<JsonArray>()
@@ -59,32 +73,19 @@ static bool applyForm() {
   net["ssid"] = String(_ssid);
   JsonObject enroll = cfg["enroll"].is<JsonObject>() ? cfg["enroll"].as<JsonObject>()
                                                       : cfg["enroll"].to<JsonObject>();
-  enroll["url"] = String(_url);
+  enroll["url"] = String(base);
   if (!Config::save()) {
     Config::load();
     _error = "could not save the network";
     return stationNetworks() > 0;
   }
-  char field[sizeof("wifi.password:") + SSID_CAP];
-  int wrote = snprintf(field, sizeof(field), "wifi.password:%s", _ssid);
-  bool stored = wrote > 0 && (size_t)wrote < sizeof(field) && Secret::set(field, _pass);
-  mbedtls_platform_zeroize(field, sizeof(field));
-  if (!stored) {
-    _error = "could not store the passphrase";
-    return true;
-  }
   char code[Secret::MAX_LEN] = {};
   bool have = enrollLoadClaimCode(code, sizeof(code));
   const char* id = Identity::deviceId();
-  if (have && id && id[0]) {
-    int n = snprintf(_link, sizeof(_link), "%s/devices/claim?device_id=%s&code=%s",
-                     _url, id, code);
-    if (n < 0 || (size_t)n >= sizeof(_link)) {
-      _link[0] = '\0';
-      _error = "claim link did not fit";
-    }
-  } else {
-    _error = "network saved; no claim code is seeded";
+  if (!(have && id && enrollClaimLink(_link, sizeof(_link), base, id, code))) {
+    _link[0] = '\0';
+    _error = (have && id && id[0]) ? "claim link did not fit"
+                                   : "network saved; no claim code is seeded";
   }
   mbedtls_platform_zeroize(code, sizeof(code));
   return true;
