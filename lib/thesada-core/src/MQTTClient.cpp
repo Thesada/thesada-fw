@@ -2233,13 +2233,17 @@ bool MQTTClient::loadClientCert(char* cert, char* key, size_t maxLen) {
 
 // Erase cert + key from NVS. Fires the cleared hook so cellular drops its
 // cached cert and active session. Safe to call when absent.
-// out: true (or already absent).
+// out: true when neither half is left, including when both were absent.
 bool MQTTClient::clearClientCert() {
   Preferences prefs;
   if (!prefs.begin(CERT_NS, false)) return false;
-  prefs.remove(CERT_KEY_CERT);
-  prefs.remove(CERT_KEY_KEY);
+  bool certGone = !prefs.isKey(CERT_KEY_CERT) || prefs.remove(CERT_KEY_CERT);
+  bool keyGone  = !prefs.isKey(CERT_KEY_KEY)  || prefs.remove(CERT_KEY_KEY);
   prefs.end();
+  if (!certGone || !keyGone) {
+    Log::kvfe(TAG, "mqtt.cert_clear_failed cert_left=%d key_left=%d", !certGone, !keyGone);
+    return false;
+  }
   // The broken cert is gone, so the recovery permission it granted goes too.
   _storedCertBroken = false;
   if (_onCertClearedHook) _onCertClearedHook();
@@ -2251,6 +2255,8 @@ void MQTTClient::scheduleCertReboot(const char* reason) {
   _certRebootAtMs    = millis() + CERT_REBOOT_DELAY_MS;
   _certRebootPending = true;
 }
+
+bool MQTTClient::certRebootPending() { return _certRebootPending; }
 
 void MQTTClient::serviceCertReboot() {
   if (!_certRebootPending || (int32_t)(millis() - _certRebootAtMs) < 0) return;

@@ -28,33 +28,53 @@ static const char* TAG = "Enroll";
 static const char* NS    = "thesada-enroll";
 static const char* K_ACK = "ack_pending";
 
-static constexpr size_t   BODY_CAP        = 320;
+static constexpr size_t   BODY_CAP        = 384;
 static constexpr size_t   REPLY_CAP       = 6144;
 static constexpr uint32_t JOB_CEILING_MS  = 60000;
-static constexpr uint32_t REBOOT_DELAY_MS = 3000;
 static constexpr uint32_t TASK_STACK      = 12288;
+
+// Local outcomes recorded where an HTTP status would be.
+static constexpr int ST_LOCAL    = -1;  // no request went out, or it overran
+static constexpr int ST_OVERSIZE = -2;  // reply larger than REPLY_CAP
+static constexpr int ST_UNUSABLE = -3;  // 200 whose body could not be applied
 
 // One POST. Allocated by startJob, filled by enrollTask, freed by finishJob.
 struct EnrollJob {
   char          url[ENROLL_URL_CAP + 32];
   char          body[BODY_CAP];
   String        reply;
-  int           status = -1;
-  volatile bool done   = false;
+  int           status        = ST_LOCAL;
+  bool          isStatusCheck = false;
+  volatile bool done          = false;
 };
 
-static bool       _active     = false;
-static EnrollStep _step       = EnrollStep::Done;
-static uint8_t    _failures   = 0;
-static uint32_t   _nextAt     = 0;
-static int        _lastStatus = 0;
-static EnrollJob* _job        = nullptr;
-static EnrollJob* _stale      = nullptr;
-static uint32_t   _jobAt      = 0;
-static bool       _rebootDue  = false;
-static uint32_t   _rebootAt   = 0;
-static char       _url[ENROLL_URL_CAP];
-static char       _sigHex[ENROLL_SIG_HEX_LEN + 1];
+// Revocation status check. Shares the job slot with enrollment, which only
+// runs while no cert is stored, so the two never contend.
+struct StatusCheck {
+  bool     due        = false;
+  uint32_t at         = 0;
+  uint8_t  failures   = 0;
+  int      lastStatus = 0;
+  char     serial[ENROLL_SERIAL_HEX_CAP] = "";
+};
+
+static bool        _active     = false;
+static EnrollStep  _step       = EnrollStep::Done;
+static uint8_t     _failures   = 0;
+static uint32_t    _nextAt     = 0;
+static int         _lastStatus = 0;
+static EnrollJob*  _job        = nullptr;
+static EnrollJob*  _stale      = nullptr;
+static uint32_t    _jobAt      = 0;
+static char        _url[ENROLL_URL_CAP];
+static char        _sigHex[ENROLL_SIG_HEX_LEN + 1];
+static StatusCheck _check;
+
+// Queue the next revocation status check. in: delay. out: none.
+static void scheduleCheck(uint32_t delayMs) {
+  _check.due = true;
+  _check.at  = millis() + delayMs;
+}
 
 // Log name for one step. in: step. out: stable word, or "?" when unknown.
 static const char* stepName(EnrollStep s) {
@@ -134,10 +154,10 @@ static void enrollTask(void* arg) {
       job->status = http.POST((uint8_t*)job->body, strlen(job->body));
       if (job->status == 200) {
         if (http.getSize() > (int)REPLY_CAP) {
-          job->status = -2;
+          job->status = ST_OVERSIZE;
         } else {
           job->reply = http.getString();
-          if (job->reply.length() > REPLY_CAP) { wipeString(job->reply); job->status = -2; }
+          if (job->reply.length() > REPLY_CAP) { wipeString(job->reply); job->status = ST_OVERSIZE; }
         }
       }
       http.end();
@@ -168,6 +188,7 @@ static void advance(int status) {
   if (_step == EnrollStep::Done) {
     _active = false;
     Log::info(TAG, "enroll.sealed");
+    scheduleCheck(ENROLL_STATUS_EVERY_MS);
   }
 }
 
@@ -223,10 +244,9 @@ static bool onCert(const String& reply) {
     Log::error(TAG, "enroll.store_failed");
     return false;
   }
-  _rebootDue = true;
-  _rebootAt  = millis() + REBOOT_DELAY_MS;
+  MQTTClient::scheduleCertReboot("cert_stored");
   Log::kvf(TAG, "enroll.cert_stored broker=%s port=%ld reboot_in_ms=%lu",
-           host, port, (unsigned long)REBOOT_DELAY_MS);
+           host, port, (unsigned long)MQTTClient::CERT_REBOOT_DELAY_MS);
   return true;
 }
 
@@ -240,12 +260,15 @@ static bool onOk(EnrollStep step, const String& reply) {
   }
 }
 
+static void finishCheck(EnrollJob* job);
+
 // Take the finished POST off the task and advance. in: none. out: none.
 static void finishJob() {
   EnrollJob* job = _job;
   _job = nullptr;
+  if (job->isStatusCheck) { finishCheck(job); return; }
   int status = job->status;
-  if (status == 200 && !onOk(_step, job->reply)) status = -3;
+  if (status == 200 && !onOk(_step, job->reply)) status = ST_UNUSABLE;
   mbedtls_platform_zeroize(job->body, sizeof(job->body));
   wipeString(job->reply);
   delete job;
@@ -266,7 +289,7 @@ static void reapStale() {
 static void startJob() {
   if (_stale) return;
   EnrollJob* job = new (std::nothrow) EnrollJob();
-  if (!job) { advance(-1); return; }
+  if (!job) { advance(ST_LOCAL); return; }
   bool ok = enrollEndpoint(_url, stepSuffix(_step), job->url, sizeof(job->url));
   if (ok && _step == EnrollStep::Verify) {
     ok = enrollBody(job->body, sizeof(job->body), Identity::deviceId(),
@@ -287,11 +310,96 @@ static void startJob() {
   if (xTaskCreate(enrollTask, "enroll", TASK_STACK, job, tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
     mbedtls_platform_zeroize(job->body, sizeof(job->body));
     delete job;
-    advance(-1);
+    advance(ST_LOCAL);
     return;
   }
   _job   = job;
   _jobAt = millis();
+}
+
+// Record a check that got no usable answer and back off. in: status. out: none.
+static void checkUnanswered(int status) {
+  if (_check.failures < 255) _check.failures++;
+  _check.lastStatus = status;
+  uint32_t d = enrollBackoffMs(_check.failures, esp_random());
+  scheduleCheck(d);
+  Log::kvfw(TAG, "enroll.status_unanswered status=%d next_s=%lu failures=%u",
+            status, (unsigned long)(d / 1000), (unsigned)_check.failures);
+}
+
+// Sign and send the revocation status check for the stored cert.
+// in: none. out: none.
+static void startCheck() {
+  _check.due = false;
+  char cn[96], raw[96], nb[96], na[96];
+  if (!MQTTClient::getCertInfo(cn, raw, nb, na, sizeof(cn)) ||
+      !enrollSerialCanonical(raw, _check.serial, sizeof(_check.serial))) {
+    // No readable cert: nothing to check until the next boot decides again.
+    Log::kvfw(TAG, "enroll.status_skipped reason=no_cert");
+    return;
+  }
+  long long ts = (long long)time(nullptr);
+  char msg[128];
+  if (!enrollStatusMessage(msg, sizeof(msg), Identity::deviceId(), _check.serial, ts)) {
+    checkUnanswered(ST_LOCAL);
+    return;
+  }
+  uint8_t sig[64];
+  char    sigHex[ENROLL_SIG_HEX_LEN + 1];
+  bool signedOk = Identity::sign((const uint8_t*)msg, strlen(msg), sig) &&
+                  identityHexEncode(sig, sizeof(sig), sigHex, sizeof(sigHex));
+  EnrollJob* job = signedOk ? new (std::nothrow) EnrollJob() : nullptr;
+  if (job) job->isStatusCheck = true;
+  bool built = job &&
+               enrollEndpoint(_url, ENROLL_STATUS_SUFFIX, job->url, sizeof(job->url)) &&
+               enrollStatusBody(job->body, sizeof(job->body), Identity::deviceId(),
+                                Identity::publicKeyHex(), _check.serial, ts, sigHex);
+  if (!built ||
+      xTaskCreate(enrollTask, "enroll", TASK_STACK, job, tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
+    delete job;
+    checkUnanswered(ST_LOCAL);
+    return;
+  }
+  _job   = job;
+  _jobAt = millis();
+}
+
+// Apply a status answer: wipe and reboot on revoked, otherwise reschedule.
+// in: finished job (owned here). out: none.
+static void finishCheck(EnrollJob* job) {
+  int  status  = job->status;
+  bool revoked = false;
+  const char* answer = "other";  // fixed words only: the reply is not log-safe
+  if (status == 200) {
+    JsonDocument doc;
+    if (deserializeJson(doc, job->reply)) {
+      status = ST_UNUSABLE;
+    } else {
+      const char* st = doc["status"] | "";
+      if (strcmp(st, "active") == 0) answer = "active";
+      else if (strcmp(st, "unknown") == 0) answer = "unknown";
+      revoked = enrollStatusRevoked(status, st, doc["serial"] | "", _check.serial);
+    }
+  }
+  wipeString(job->reply);
+  delete job;
+  if (status != 200) { checkUnanswered(status); return; }
+  _check.failures   = 0;
+  _check.lastStatus = status;
+  if (revoked) {
+    Log::kvfw(TAG, "enroll.cert_revoked serial=%s", _check.serial);
+    if (MQTTClient::clearClientCert()) {
+      ackPendingSet(false);
+      MQTTClient::scheduleCertReboot("cert_revoked");
+      return;
+    }
+    Log::error(TAG, "enroll.cert_clear_failed");
+    checkUnanswered(ST_UNUSABLE);
+    return;
+  }
+  uint32_t d = enrollStatusCadenceMs(esp_random());
+  scheduleCheck(d);
+  Log::kvf(TAG, "enroll.status_kept answer=%s next_s=%lu", answer, (unsigned long)(d / 1000));
 }
 
 // Print the enrollment step. in: unused argc/argv, shell writer. out: none.
@@ -305,6 +413,14 @@ static void cmd_enroll_status(int, char**, ShellOutput out) {
   long wait = _active ? (long)(int32_t)(_nextAt - millis()) / 1000 : 0;
   snprintf(line, sizeof(line), "next_in_s:   %ld", wait < 0 ? 0L : wait);   out(line);
   snprintf(line, sizeof(line), "cert:        %s", MQTTClient::hasClientCert() ? "yes" : "no"); out(line);
+  if (_check.due) {
+    long checkWait = (long)(int32_t)(_check.at - millis()) / 1000;
+    snprintf(line, sizeof(line), "check_in_s:  %ld", checkWait < 0 ? 0L : checkWait);
+  } else {
+    snprintf(line, sizeof(line), "check_in_s:  (off)");
+  }
+  out(line);
+  snprintf(line, sizeof(line), "check_last:  %d", _check.lastStatus);       out(line);
 }
 
 void Enroll::begin() {
@@ -318,19 +434,27 @@ void Enroll::begin() {
   bool ackPending = ackPendingGet();
   if (!hasCert && ackPending) ackPendingSet(false);
   _step = enrollStartStep(hasCert, ackPending);
-  if (_step == EnrollStep::Done) return;
 
-  const char* url = Config::get()["enroll"]["url"] | "";
-  if (!enrollUrlUsable(url)) {
+  const char* url   = Config::get()["enroll"]["url"] | "";
+  bool        urlOk = enrollUrlUsable(url);
+  if (urlOk) {
+    strncpy(_url, url, sizeof(_url) - 1);
+    _url[sizeof(_url) - 1] = '\0';
+  }
+  char code[Secret::MAX_LEN];
+  bool haveCode = urlOk && enrollLoadClaimCode(code, sizeof(code));
+  mbedtls_platform_zeroize(code, sizeof(code));
+
+  if (_step == EnrollStep::Done) {
+    // Only a unit that can enroll again is checked: a wipe with no way back
+    // strands it, which is worse than holding a cert that no longer works.
+    if (haveCode) scheduleCheck(ENROLL_STATUS_FIRST_MS);
+    return;
+  }
+  if (!urlOk) {
     Log::kvfw(TAG, "enroll.disabled reason=no_url");
     return;
   }
-  strncpy(_url, url, sizeof(_url) - 1);
-  _url[sizeof(_url) - 1] = '\0';
-
-  char code[Secret::MAX_LEN];
-  bool haveCode = enrollLoadClaimCode(code, sizeof(code));
-  mbedtls_platform_zeroize(code, sizeof(code));
   if (!haveCode) {
     Log::kvfw(TAG, "enroll.disabled reason=no_claim_code");
     return;
@@ -341,23 +465,32 @@ void Enroll::begin() {
 }
 
 void Enroll::loop() {
-  if (_rebootDue && (int32_t)(millis() - _rebootAt) >= 0) {
-    Log::warn(TAG, "enroll.reboot reason=cert_stored");
-    delay(100);
-    ESP.restart();
-  }
   reapStale();
   if (_stale) return;
-  if (!_active) return;
   if (_job) {
     if (_job->done) {
       finishJob();
     } else if (millis() - _jobAt > JOB_CEILING_MS) {
       // The task still owns the job. Reap it once done; do not start another.
-      Log::kvfe(TAG, "enroll.job_overran step=%s", stepName(_step));
+      EnrollJob* overran = _job;
       _stale = _job;
-      _job = nullptr;
-      advance(-1);
+      _job   = nullptr;
+      if (overran->isStatusCheck) {
+        Log::kvfe(TAG, "enroll.status_overran");
+        checkUnanswered(ST_LOCAL);
+      } else {
+        Log::kvfe(TAG, "enroll.job_overran step=%s", stepName(_step));
+        advance(ST_LOCAL);
+      }
+    }
+    return;
+  }
+  bool rebooting = MQTTClient::certRebootPending();
+  if (!_active) {
+    // The signed timestamp must be current, not just past the boot floor.
+    if (_check.due && !rebooting && WiFiManager::connected() && WiFiManager::ntpSynced() &&
+        (int32_t)(millis() - _check.at) >= 0) {
+      startCheck();
     }
     return;
   }
@@ -369,7 +502,7 @@ void Enroll::loop() {
     }
     return;
   }
-  if (_rebootDue || !WiFiManager::connected()) return;
+  if (rebooting || !WiFiManager::connected()) return;
   if ((int32_t)(millis() - _nextAt) < 0) return;
   startJob();
 }

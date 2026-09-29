@@ -38,6 +38,12 @@ uint32_t   WiFiManager::_recheckIntervalMs = 900000UL;
 uint32_t   WiFiManager::_apStartTime       = 0;
 uint32_t   WiFiManager::_apTimeoutMs       = 300000UL;
 
+// Written from the SNTP task, read from the main loop.
+static volatile bool s_ntpSynced = false;
+
+// SNTP completion hook. in: new time (unused). out: none.
+static void onNtpSync(struct timeval*) { s_ntpSynced = true; }
+
 // ---------------------------------------------------------------------------
 
 // Initialize WiFi in station mode and start connection
@@ -144,6 +150,7 @@ void WiFiManager::scanAndConnect() {
           const char* ntpSrv  = cfg["ntp"]["server"]      | "pool.ntp.org";
           const char* ntpFb   = cfg["ntp"]["server2"]     | "time.cloudflare.com";
           int32_t     tzOff   = cfg["ntp"]["tz_offset_s"] | 0;
+          sntp_set_time_sync_notification_cb(onNtpSync);
           configTime(tzOff, 0, ntpSrv, ntpFb);
           uint32_t t0 = millis();
           while (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED &&
@@ -291,6 +298,8 @@ void WiFiManager::loop() {
 // ---------------------------------------------------------------------------
 
 // Return whether WiFi is connected and in CONNECTED state
+bool WiFiManager::ntpSynced() { return s_ntpSynced; }
+
 bool WiFiManager::connected() {
   return _status == WiFiStatus::CONNECTED && WiFi.status() == WL_CONNECTED;
 }

@@ -298,8 +298,134 @@ void test_reply_needs_our_id_and_usable_fields(void) {
   TEST_ASSERT_FALSE(enrollReplyUsable(kId, kId, "mqtt.example.com", 8884, "", 128));
 }
 
+// --- revocation status check -------------------------------------------------
+
+// The DER serial carries a 00 pad when the top bit is set, and each byte is
+// zero-padded; the app stores Go's %x of the integer.
+void test_serial_canonical_matches_the_app_form(void) {
+  char out[ENROLL_SERIAL_HEX_CAP];
+  TEST_ASSERT_TRUE(enrollSerialCanonical("00c3a1", out, sizeof(out)));
+  TEST_ASSERT_EQUAL_STRING("c3a1", out);
+  TEST_ASSERT_TRUE(enrollSerialCanonical("0a0b", out, sizeof(out)));
+  TEST_ASSERT_EQUAL_STRING("a0b", out);
+  TEST_ASSERT_TRUE(enrollSerialCanonical("00", out, sizeof(out)));
+  TEST_ASSERT_EQUAL_STRING("0", out);
+  TEST_ASSERT_TRUE(enrollSerialCanonical("7f", out, sizeof(out)));
+  TEST_ASSERT_EQUAL_STRING("7f", out);
+}
+
+void test_serial_canonical_refuses_junk_and_overflow(void) {
+  char out[ENROLL_SERIAL_HEX_CAP];
+  TEST_ASSERT_FALSE(enrollSerialCanonical(nullptr, out, sizeof(out)));
+  TEST_ASSERT_FALSE(enrollSerialCanonical("", out, sizeof(out)));
+  TEST_ASSERT_FALSE(enrollSerialCanonical("00C3", out, sizeof(out)));
+  TEST_ASSERT_FALSE(enrollSerialCanonical("0x1f", out, sizeof(out)));
+  TEST_ASSERT_EQUAL_STRING("", out);
+  char tiny[3];
+  TEST_ASSERT_FALSE(enrollSerialCanonical("00abc", tiny, sizeof(tiny)));
+  TEST_ASSERT_EQUAL_STRING("", tiny);
+}
+
+void test_serial_valid_is_canonical_only(void) {
+  TEST_ASSERT_TRUE(enrollSerialValid("c3a1"));
+  TEST_ASSERT_TRUE(enrollSerialValid("0"));
+  TEST_ASSERT_FALSE(enrollSerialValid("0c3a1"));
+  TEST_ASSERT_FALSE(enrollSerialValid("C3A1"));
+  TEST_ASSERT_FALSE(enrollSerialValid(""));
+  TEST_ASSERT_FALSE(enrollSerialValid(nullptr));
+  TEST_ASSERT_FALSE(enrollSerialValid("1234567890123456789012345678901234567890a"));
+}
+
+// The app rebuilds this string from the body, byte for byte.
+void test_status_message_is_the_signed_statement(void) {
+  char out[160];
+  TEST_ASSERT_TRUE(enrollStatusMessage(out, sizeof(out), kId, "c3a1", 1790611200LL));
+  TEST_ASSERT_EQUAL_STRING("thesada-enroll-status\nthesada-dcb4d91acd28\nc3a1\n1790611200", out);
+}
+
+// A clock still at the build floor would sign a timestamp the app refuses.
+void test_status_message_refuses_unset_clock_and_bad_fields(void) {
+  char out[160];
+  TEST_ASSERT_FALSE(enrollStatusMessage(out, sizeof(out), kId, "c3a1", 86400LL));
+  TEST_ASSERT_EQUAL_STRING("", out);
+  TEST_ASSERT_FALSE(enrollStatusMessage(out, sizeof(out), "not-an-id", "c3a1", 1790611200LL));
+  TEST_ASSERT_FALSE(enrollStatusMessage(out, sizeof(out), kId, "00c3a1", 1790611200LL));
+  char tiny[16];
+  TEST_ASSERT_FALSE(enrollStatusMessage(tiny, sizeof(tiny), kId, "c3a1", 1790611200LL));
+  TEST_ASSERT_EQUAL_STRING("", tiny);
+}
+
+void test_status_body_carries_every_field(void) {
+  char out[400];
+  TEST_ASSERT_TRUE(enrollStatusBody(out, sizeof(out), kId, kPk, "c3a1", 1790611200LL, kSig));
+  char want[400];
+  int w = snprintf(want, sizeof(want),
+                   "{\"device_id\":\"%s\",\"pubkey\":\"%s\",\"serial\":\"c3a1\","
+                   "\"ts\":1790611200,\"signature\":\"%s\"}", kId, kPk, kSig);
+  TEST_ASSERT_TRUE(w > 0 && (size_t)w < sizeof(want));
+  TEST_ASSERT_EQUAL_STRING(want, out);
+}
+
+void test_status_body_refuses_off_shape_values(void) {
+  char out[400];
+  TEST_ASSERT_FALSE(enrollStatusBody(out, sizeof(out), kId, kPk, "c3a1", 1790611200LL, "abcd"));
+  TEST_ASSERT_FALSE(enrollStatusBody(out, sizeof(out), kId, "abcd", "c3a1", 1790611200LL, kSig));
+  TEST_ASSERT_FALSE(enrollStatusBody(out, sizeof(out), kId, kPk, "", 1790611200LL, kSig));
+  TEST_ASSERT_FALSE(enrollStatusBody(out, sizeof(out), kId, kPk, "c3a1", 0LL, kSig));
+  char small[64];
+  TEST_ASSERT_FALSE(enrollStatusBody(small, sizeof(small), kId, kPk, "c3a1", 1790611200LL, kSig));
+  TEST_ASSERT_EQUAL_STRING("", small);
+}
+
+// Only an explicit revoked for this serial wipes; an outage or a stale
+// answer for another cert keeps it.
+void test_status_wipes_only_on_revoked_for_this_serial(void) {
+  TEST_ASSERT_TRUE(enrollStatusRevoked(200, "revoked", "c3a1", "c3a1"));
+  TEST_ASSERT_FALSE(enrollStatusRevoked(200, "active", "c3a1", "c3a1"));
+  TEST_ASSERT_FALSE(enrollStatusRevoked(200, "unknown", "c3a1", "c3a1"));
+  TEST_ASSERT_FALSE(enrollStatusRevoked(200, "revoked", "ffff", "c3a1"));
+  TEST_ASSERT_FALSE(enrollStatusRevoked(200, "revoked", "", "c3a1"));
+  TEST_ASSERT_FALSE(enrollStatusRevoked(200, "", "c3a1", "c3a1"));
+  TEST_ASSERT_FALSE(enrollStatusRevoked(403, "revoked", "c3a1", "c3a1"));
+  TEST_ASSERT_FALSE(enrollStatusRevoked(500, "revoked", "c3a1", "c3a1"));
+  TEST_ASSERT_FALSE(enrollStatusRevoked(-1, "revoked", "c3a1", "c3a1"));
+  TEST_ASSERT_FALSE(enrollStatusRevoked(200, nullptr, "c3a1", "c3a1"));
+  TEST_ASSERT_FALSE(enrollStatusRevoked(200, "revoked", "", ""));
+}
+
+void test_status_cadence_is_six_hours_plus_an_eighth(void) {
+  TEST_ASSERT_EQUAL_UINT32(ENROLL_STATUS_EVERY_MS, enrollStatusCadenceMs(0));
+  uint32_t top = enrollStatusCadenceMs(0xffffffffu);
+  TEST_ASSERT_TRUE(top >= ENROLL_STATUS_EVERY_MS);
+  TEST_ASSERT_TRUE(top <= ENROLL_STATUS_EVERY_MS + ENROLL_STATUS_EVERY_MS / 8);
+}
+
+// Unanswered checks back off from the enrollment floor, so even a unit that
+// never gets an answer stays under the server's 30 requests/h per device.
+void test_status_backoff_stays_under_the_server_rate_cap(void) {
+  TEST_ASSERT_TRUE(enrollBackoffMs(0, 0) >= 3600000u / 30);
+}
+
+void test_hex_len_counts_only_lowercase_hex(void) {
+  TEST_ASSERT_EQUAL_INT32(4, (int32_t)enrollHexLen("00ff"));
+  TEST_ASSERT_EQUAL_INT32(0, (int32_t)enrollHexLen(""));
+  TEST_ASSERT_EQUAL_INT32(-1, (int32_t)enrollHexLen("00FF"));
+  TEST_ASSERT_EQUAL_INT32(-1, (int32_t)enrollHexLen(nullptr));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
+  RUN_TEST(test_serial_canonical_matches_the_app_form);
+  RUN_TEST(test_serial_canonical_refuses_junk_and_overflow);
+  RUN_TEST(test_serial_valid_is_canonical_only);
+  RUN_TEST(test_status_message_is_the_signed_statement);
+  RUN_TEST(test_status_message_refuses_unset_clock_and_bad_fields);
+  RUN_TEST(test_status_body_carries_every_field);
+  RUN_TEST(test_status_body_refuses_off_shape_values);
+  RUN_TEST(test_status_wipes_only_on_revoked_for_this_serial);
+  RUN_TEST(test_status_cadence_is_six_hours_plus_an_eighth);
+  RUN_TEST(test_status_backoff_stays_under_the_server_rate_cap);
+  RUN_TEST(test_hex_len_counts_only_lowercase_hex);
   RUN_TEST(test_hex_accepts_exact_lowercase);
   RUN_TEST(test_hex_refuses_case_length_and_junk);
   RUN_TEST(test_claim_code_is_eight_digits);

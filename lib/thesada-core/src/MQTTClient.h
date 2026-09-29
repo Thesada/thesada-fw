@@ -88,7 +88,7 @@ public:
 
   // Clears both cert and key from NVS. Fires setOnClientCertCleared hook
   // after a successful clear so transports holding a cached upload can drop it.
-  // out: true on success
+  // out: true only when neither half is left in NVS
   static bool clearClientCert();
 
   // out: true if both cert and key are present in NVS
@@ -100,6 +100,9 @@ public:
 
   // in: reason for the log (static string). out: none.
   static void scheduleCertReboot(const char* reason);
+
+  // out: true once a cert reboot is scheduled; nothing new should start.
+  static bool certRebootPending();
 
   // Restarts once a scheduled cert reboot is due. Called every main-loop
   // tick, whether or not MQTT is enabled. in: none. out: none.
