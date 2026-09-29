@@ -609,16 +609,17 @@ Source: `lib/thesada-core/src/cli_authz_policy.h::cliAuthzPasswordCmdAllowed`,
 
 ### `cert.clear` that removed a cert reboots
 
-Clearing a stored cert drops the session and schedules the same deferred
-reboot `cert.apply` uses, 3 s out. Enrollment is decided once, in
+Clearing a stored cert schedules the same deferred reboot `cert.apply` uses,
+3 s out, and keeps the session until then so the command's reply is
+published. Enrollment is decided once, in
 `Enroll::begin` at boot, so without the reboot a unit whose owner revoked it
 sits with no cert and no enrollment until something else restarts it. After
 the reboot `enrollStartStep(hasCert=false)` starts at Announce when
 enrollment is configured, and a unit without enrollment comes up on
 password auth at whatever `mqtt.port` is stored, which is where the admin
 recovery flow's `config.set mqtt.port` has already put it. That flow also
-sends `restart` after `cert.clear`, which the dropped session may never
-deliver; the reboot now happens either way. A `cert.clear` with no cert
+sends `restart` after `cert.clear`; whichever lands first reboots the unit,
+and the outcome is the same. A `cert.clear` with no cert
 stored clears nothing and does not reboot.
 
 The latch is serviced from the main loop on every tick, outside
