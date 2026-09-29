@@ -2252,6 +2252,8 @@ void MQTTClient::scheduleCertReboot(const char* reason) {
   _certRebootPending = true;
 }
 
+bool MQTTClient::certRebootPending() { return _certRebootPending; }
+
 void MQTTClient::serviceCertReboot() {
   if (!_certRebootPending || (int32_t)(millis() - _certRebootAtMs) < 0) return;
   Log::kvfw(TAG, "mqtt.cert_reboot reason=%s", _certRebootReason);

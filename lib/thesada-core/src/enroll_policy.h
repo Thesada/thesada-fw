@@ -30,16 +30,22 @@ struct EnrollAction {
   bool       progressed;  // caller resets its failure count when true
 };
 
+// Length of s when every char is lowercase hex. in: s. out: length, or -1
+// when s is null or holds anything else.
+inline long enrollHexLen(const char* s) {
+  if (!s) return -1;
+  long n = 0;
+  for (; s[n]; n++) {
+    char c = s[n];
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return -1;
+  }
+  return n;
+}
+
 // Exactly len lowercase hex chars. Uppercase is refused: the server compares
 // hex strings, so a case change is a different key. in: s, len. out: valid.
 inline bool enrollHexValid(const char* s, size_t len) {
-  if (!s) return false;
-  size_t n = 0;
-  for (; s[n]; n++) {
-    char c = s[n];
-    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
-  }
-  return n == len;
+  return enrollHexLen(s) == (long)len;
 }
 
 // The flash-time claim code: exactly 8 ASCII digits.
@@ -160,6 +166,81 @@ inline bool enrollReplyUsable(const char* ourId, const char* replyId, const char
   return enrollHostUsable(host) && enrollPrefixUsable(prefix, prefixCap);
 }
 
+// --- Revocation status check -------------------------------------------------
+// A revoke gives the device no refusal it can see (PubSubClient ignores SUBACK
+// codes), so a unit holding a cert asks the app.
+
+#define ENROLL_STATUS_SUFFIX     "/status"
+#define ENROLL_STATUS_DOMAIN     "thesada-enroll-status"
+#define ENROLL_SERIAL_HEX_CAP    41            // 20-byte X.509 serial, plus NUL
+#define ENROLL_STATUS_FIRST_MS   300000u       // after boot, once WiFi settled
+#define ENROLL_STATUS_EVERY_MS   21600000u     // 6 h between answered checks
+#define ENROLL_STATUS_MIN_EPOCH  1767225600LL  // 2026-01-01: earlier = clock not set
+
+// The serial as the app stores it: lowercase hex, no leading zeros. The DER
+// bytes carry a 00 pad and zero-padded bytes that the app's %x drops.
+// in: raw hex, out, cap. out: true when in was hex and the result fitted.
+inline bool enrollSerialCanonical(const char* in, char* out, size_t cap) {
+  if (!out || cap == 0) return false;
+  out[0] = '\0';
+  if (!in || enrollHexLen(in) <= 0) return false;
+  while (in[0] == '0' && in[1] != '\0') in++;
+  size_t n = strlen(in);
+  if (n >= cap) return false;
+  memcpy(out, in, n + 1);
+  return true;
+}
+
+// Canonical serial shape: lowercase hex, no leading zero unless it is "0".
+// in: serial. out: true when canonical and within ENROLL_SERIAL_HEX_CAP.
+inline bool enrollSerialValid(const char* s) {
+  long n = enrollHexLen(s);
+  if (!s || n <= 0 || n >= ENROLL_SERIAL_HEX_CAP) return false;
+  return !(s[0] == '0' && n > 1);
+}
+
+// The signed statement: domain, device id, serial, unix seconds, newline
+// separated. The app rebuilds it from the body, so the two must agree byte
+// for byte. in: out, cap, device id, canonical serial, ts. out: true if built.
+inline bool enrollStatusMessage(char* out, size_t cap, const char* deviceId,
+                                const char* serial, long long ts) {
+  if (!out || cap == 0) return false;
+  out[0] = '\0';
+  if (!identityDeviceIdValid(deviceId) || !enrollSerialValid(serial)) return false;
+  if (ts < ENROLL_STATUS_MIN_EPOCH) return false;
+  int w = snprintf(out, cap, ENROLL_STATUS_DOMAIN "\n%s\n%s\n%lld", deviceId, serial, ts);
+  if (w < 0 || (size_t)w >= cap) { out[0] = '\0'; return false; }
+  return true;
+}
+
+// JSON body for POST /status. in: out, cap, device id, pubkey, serial, ts,
+// signature over enrollStatusMessage. out: true if built.
+inline bool enrollStatusBody(char* out, size_t cap, const char* deviceId,
+                             const char* pubkeyHex, const char* serial, long long ts,
+                             const char* sigHex) {
+  if (!out || cap == 0) return false;
+  out[0] = '\0';
+  if (!identityDeviceIdValid(deviceId) || !enrollSerialValid(serial)) return false;
+  if (!enrollHexValid(pubkeyHex, IDENTITY_PUBKEY_LEN * 2)) return false;
+  if (!enrollHexValid(sigHex, ENROLL_SIG_HEX_LEN) || ts < ENROLL_STATUS_MIN_EPOCH) return false;
+  int w = snprintf(out, cap,
+                   "{\"device_id\":\"%s\",\"pubkey\":\"%s\",\"serial\":\"%s\","
+                   "\"ts\":%lld,\"signature\":\"%s\"}",
+                   deviceId, pubkeyHex, serial, ts, sigHex);
+  if (w < 0 || (size_t)w >= cap) { out[0] = '\0'; return false; }
+  return true;
+}
+
+// Wipe only on an explicit "revoked" for this exact serial. Anything else,
+// including an outage, keeps the cert: a broken app must never wipe a fleet.
+// in: HTTP status, reply status, reply serial, our serial. out: true to wipe.
+inline bool enrollStatusRevoked(int httpStatus, const char* status,
+                                const char* replySerial, const char* ourSerial) {
+  if (httpStatus != 200 || !status || !replySerial || !ourSerial) return false;
+  if (!enrollSerialValid(ourSerial)) return false;
+  return strcmp(status, "revoked") == 0 && strcmp(replySerial, ourSerial) == 0;
+}
+
 // Exponential from ENROLL_BACKOFF_MIN_MS, capped, plus up to 25% jitter so
 // units behind one NAT do not retry in lockstep. in: failures, rnd. out: ms.
 inline uint32_t enrollBackoffMs(uint8_t failures, uint32_t rnd) {
@@ -167,6 +248,12 @@ inline uint32_t enrollBackoffMs(uint8_t failures, uint32_t rnd) {
   for (uint8_t i = 0; i < failures && d < ENROLL_BACKOFF_MAX_MS; i++) d *= 2;
   if (d > ENROLL_BACKOFF_MAX_MS) d = ENROLL_BACKOFF_MAX_MS;
   return d + rnd % (d / 4 + 1);
+}
+
+// Delay to the next status check after an answer, with up to 12.5% jitter;
+// an unanswered check uses enrollBackoffMs. in: rnd. out: ms.
+inline uint32_t enrollStatusCadenceMs(uint32_t rnd) {
+  return ENROLL_STATUS_EVERY_MS + rnd % (ENROLL_STATUS_EVERY_MS / 8 + 1);
 }
 
 // Where a boot starts. No cert means enroll from scratch; a cert whose ack

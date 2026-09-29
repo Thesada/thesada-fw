@@ -4,7 +4,7 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-09-28 (a `cert.clear` that removed a cert reboots 3 s later, so the next boot starts enrollment). Previously 2026-09-26 (a failed setup passphrase does not leave a station network, the claim link drops trailing slashes, and a timed-out enroll POST is reaped before the next one starts). Previously 2026-09-25 (the setup page exists only while the fallback AP is up and no station network is saved, unless a result from this boot is still on screen; the form is applied on the main loop and the claim link is text. A pending OTA image is marked valid after the first MQTT session or five minutes up, and a crash loop meets neither. Publish topic buffers are 160 bytes so a long tenant slug is not clipped. The enrollment claim code is an 8-digit serial-seeded
+Dated 2026-09-28 (a `cert.clear` that removed a cert reboots 3 s later, so the next boot starts enrollment; a unit that can re-enroll asks the app whether its cert serial is revoked and wipes only on an explicit, serial-matched "revoked"). Previously 2026-09-26 (a failed setup passphrase does not leave a station network, the claim link drops trailing slashes, and a timed-out enroll POST is reaped before the next one starts). Previously 2026-09-25 (the setup page exists only while the fallback AP is up and no station network is saved, unless a result from this boot is still on screen; the form is applied on the main loop and the claim link is text. A pending OTA image is marked valid after the first MQTT session or five minutes up, and a crash loop meets neither. Publish topic buffers are 160 bytes so a long tenant slug is not clipped. The enrollment claim code is an 8-digit serial-seeded
 secret that never rotates and that password-session `secret.set` refuses;
 enrollment only talks to an `https://` base. The cert arrives by HTTPS pull,
 not over the AP. A stored enrollment cert is never polled for again, a reply
@@ -629,6 +629,42 @@ HTTP shell.
 Source: `lib/thesada-core/src/Shell.cpp::cmd_cert_clear`,
 `lib/thesada-core/src/MQTTClient.cpp` (`scheduleCertReboot`,
 `serviceCertReboot`), `src/main.cpp::loop`.
+
+### A stored cert is wiped only on the app's explicit "revoked"
+
+A unit that missed `cert.clear` gets no refusal it can see: PubSubClient
+does not read SUBACK codes, so the session looks healthy after a revoke. It
+learns of the revoke by asking: `POST <enroll.url>/api/v1/devices/enroll/status` over the
+same CA-verified client as enrollment, five minutes after boot and every six
+hours after an answer, with backoff when unanswered.
+
+The request carries device id, pubkey, the cert serial and unix seconds,
+signed with the identity key over
+`thesada-enroll-status\n<device_id>\n<serial>\n<ts>`. The serial is canonical
+(lowercase hex, no leading zeros) because the DER bytes carry padding the app
+does not store; the reply's `serial` must come back in that same form. No
+check goes out until NTP has synced this boot: the boot clock floor keeps
+`time()` plausible but stale, and a stale timestamp is refused by the app.
+
+| Answer | Action |
+|---|---|
+| 200, `status` `revoked`, `serial` equal to ours | clear cert, reboot into enrollment |
+| 200, anything else | keep the cert, check again in six hours |
+| non-200, transport failure, unparseable | keep the cert, back off |
+
+Keeping the cert on everything but an explicit revoke is the load-bearing
+choice: an app outage or a restored database must never wipe a fleet. Only a
+unit that can enroll again runs the check (identity, a usable `enroll.url`
+and a claim code): a wipe with no way back strands it, which is worse than
+holding a cert that no longer works. A unit paired over `cert.apply` without a claim
+code learns of a revoke only from `cert.clear`. WiFi and the claim code live
+outside the cert namespace and survive the wipe. The reply's status is logged as a fixed
+word, never echoed.
+
+Source: `lib/thesada-core/src/enroll_policy.h` (`enrollStatus*`,
+`enrollSerial*`), `lib/thesada-core/src/Enroll.cpp` (`startCheck`,
+`finishCheck`), `lib/thesada-core/src/WiFiManager.cpp::ntpSynced`,
+`test/test_enroll_policy/`.
 
 ### Private key material in heap is zeroed before `free()`
 

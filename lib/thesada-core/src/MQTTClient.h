@@ -101,6 +101,9 @@ public:
   // in: reason for the log (static string). out: none.
   static void scheduleCertReboot(const char* reason);
 
+  // out: true once a cert reboot is scheduled; nothing new should start.
+  static bool certRebootPending();
+
   // Restarts once a scheduled cert reboot is due. Called every main-loop
   // tick, whether or not MQTT is enabled. in: none. out: none.
   static void serviceCertReboot();
