@@ -202,6 +202,7 @@ void loop() {
   // networkConnected() (WiFi/Eth-only) is false. The WiFi-specific
   // reconnect path inside loop() is no-op when WiFi is down.
   if (_mqttEnabled) MQTTClient::loop();
+  MQTTClient::serviceCertReboot();
   Enroll::loop();
   OTAUpdate::confirmIfHealthy();
   if (_otaEnabled && otaTransportUp()) {

@@ -94,6 +94,17 @@ public:
   // out: true if both cert and key are present in NVS
   static bool hasClientCert();
 
+  // A cert change applies only after a restart: WiFiClientSecure keeps sticky
+  // mbedtls state across a swap. The delay lets the shell reply go out first.
+  static constexpr uint32_t CERT_REBOOT_DELAY_MS = 3000;
+
+  // in: reason for the log (static string). out: none.
+  static void scheduleCertReboot(const char* reason);
+
+  // Restarts once a scheduled cert reboot is due. Called every main-loop
+  // tick, whether or not MQTT is enabled. in: none. out: none.
+  static void serviceCertReboot();
+
   // in: PEM cert + key. out: true when both parse and the key matches the cert.
   static bool clientCertPairValid(const char* certPEM, const char* keyPEM);
 
@@ -256,15 +267,11 @@ public:
 
   static bool          _reinitPending;
 
-public:
-  // Deferred reboot latch set by cert.apply. Main loop calls ESP.restart()
-  // once the deadline passes so the shell handler can publish its response
-  // before the reboot wipes the session. Unconditional reboot is the only
-  // reliable recovery when WiFiClientSecure holds sticky mbedtls state
-  // across cert swap (classic-platform boards hit this).
-  static bool     _certApplyRebootPending;
-  static uint32_t _certApplyRebootAtMs;
 private:
+  // Deferred cert reboot latch; see scheduleCertReboot.
+  static bool        _certRebootPending;
+  static uint32_t    _certRebootAtMs;
+  static const char* _certRebootReason;
 
   static constexpr uint32_t RETRY_MIN_MS   = 2000;
   static constexpr uint32_t RETRY_MAX_MS   = 60000;
