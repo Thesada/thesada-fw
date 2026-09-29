@@ -4,7 +4,7 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-09-26 (a failed setup passphrase does not leave a station network, the claim link drops trailing slashes, and a timed-out enroll POST is reaped before the next one starts). Previously 2026-09-25 (the setup page exists only while the fallback AP is up and no station network is saved, unless a result from this boot is still on screen; the form is applied on the main loop and the claim link is text. A pending OTA image is marked valid after the first MQTT session or five minutes up, and a crash loop meets neither. Publish topic buffers are 160 bytes so a long tenant slug is not clipped. The enrollment claim code is an 8-digit serial-seeded
+Dated 2026-09-28 (a `cert.clear` that removed a cert reboots 3 s later, so the next boot starts enrollment). Previously 2026-09-26 (a failed setup passphrase does not leave a station network, the claim link drops trailing slashes, and a timed-out enroll POST is reaped before the next one starts). Previously 2026-09-25 (the setup page exists only while the fallback AP is up and no station network is saved, unless a result from this boot is still on screen; the form is applied on the main loop and the claim link is text. A pending OTA image is marked valid after the first MQTT session or five minutes up, and a crash loop meets neither. Publish topic buffers are 160 bytes so a long tenant slug is not clipped. The enrollment claim code is an 8-digit serial-seeded
 secret that never rotates and that password-session `secret.set` refuses;
 enrollment only talks to an `https://` base. The cert arrives by HTTPS pull,
 not over the AP. A stored enrollment cert is never polled for again, a reply
@@ -606,6 +606,29 @@ mTLS-only for it.
 Source: `lib/thesada-core/src/cli_authz_policy.h::cliAuthzPasswordCmdAllowed`,
 `lib/thesada-core/src/MQTTClient.cpp` (`_storedCertBroken`),
 `test/test_cli_authz/`.
+
+### `cert.clear` that removed a cert reboots
+
+Clearing a stored cert drops the session and schedules the same deferred
+reboot `cert.apply` uses, 3 s out. Enrollment is decided once, in
+`Enroll::begin` at boot, so without the reboot a unit whose owner revoked it
+sits with no cert and no enrollment until something else restarts it. After
+the reboot `enrollStartStep(hasCert=false)` starts at Announce when
+enrollment is configured, and a unit without enrollment comes up on
+password auth at whatever `mqtt.port` is stored, which is where the admin
+recovery flow's `config.set mqtt.port` has already put it. That flow also
+sends `restart` after `cert.clear`, which the dropped session may never
+deliver; the reboot now happens either way. A `cert.clear` with no cert
+stored clears nothing and does not reboot.
+
+The latch is serviced from the main loop on every tick, outside
+`MQTTClient::loop`, so it fires with the session down and on a build or
+config with MQTT disabled, where `cert.clear` arrives over the serial or
+HTTP shell.
+
+Source: `lib/thesada-core/src/Shell.cpp::cmd_cert_clear`,
+`lib/thesada-core/src/MQTTClient.cpp` (`scheduleCertReboot`,
+`serviceCertReboot`), `src/main.cpp::loop`.
 
 ### Private key material in heap is zeroed before `free()`
 

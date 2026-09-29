@@ -208,8 +208,9 @@ uint32_t         MQTTClient::_lastHeapPublishMs = 0;
 uint32_t         MQTTClient::_lastHeapFree      = 0;
 uint32_t         MQTTClient::_lowHeapSinceMs    = 0;
 bool             MQTTClient::_reinitPending     = false;
-bool             MQTTClient::_certApplyRebootPending = false;
-uint32_t         MQTTClient::_certApplyRebootAtMs    = 0;
+bool             MQTTClient::_certRebootPending = false;
+uint32_t         MQTTClient::_certRebootAtMs    = 0;
+const char*      MQTTClient::_certRebootReason  = "";
 
 char             MQTTClient::_rxRing[MQTTClient::RX_RING_SIZE][96] = {};
 uint32_t         MQTTClient::_rxRingTs[MQTTClient::RX_RING_SIZE]    = {};
@@ -1026,16 +1027,6 @@ void MQTTClient::loop() {
   if (_manifestDirty && _client.connected() &&
       (millis() - _manifestDirtySinceMs) >= 5000) {
     publishRetainedManifest();
-  }
-
-  // cert.apply deferred reboot: shell handler publishes its response, then
-  // this tick fires the restart. Only reliable way to clear sticky
-  // WiFiClientSecure / mbedtls state on a cert swap; remote devices have
-  // no USB fallback so cert.apply must self-recover.
-  if (_certApplyRebootPending && (int32_t)(millis() - _certApplyRebootAtMs) >= 0) {
-    Log::warn(TAG, "cert.apply deferred reboot firing");
-    delay(100);
-    ESP.restart();
   }
 
   // Deferred reconnect after reinitSubscriptions(): clean stack gives
@@ -2253,6 +2244,19 @@ bool MQTTClient::clearClientCert() {
   _storedCertBroken = false;
   if (_onCertClearedHook) _onCertClearedHook();
   return true;
+}
+
+void MQTTClient::scheduleCertReboot(const char* reason) {
+  _certRebootReason  = reason;
+  _certRebootAtMs    = millis() + CERT_REBOOT_DELAY_MS;
+  _certRebootPending = true;
+}
+
+void MQTTClient::serviceCertReboot() {
+  if (!_certRebootPending || (int32_t)(millis() - _certRebootAtMs) < 0) return;
+  Log::kvfw(TAG, "mqtt.cert_reboot reason=%s", _certRebootReason);
+  delay(100);
+  ESP.restart();
 }
 
 void MQTTClient::setOnClientCertCleared(std::function<void()> fn) {
