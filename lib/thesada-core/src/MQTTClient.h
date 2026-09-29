@@ -88,7 +88,7 @@ public:
 
   // Clears both cert and key from NVS. Fires setOnClientCertCleared hook
   // after a successful clear so transports holding a cached upload can drop it.
-  // out: true on success
+  // out: true only when neither half is left in NVS
   static bool clearClientCert();
 
   // out: true if both cert and key are present in NVS

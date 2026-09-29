@@ -659,7 +659,9 @@ unit that can enroll again runs the check (identity, a usable `enroll.url`
 and a claim code): a wipe with no way back strands it, which is worse than
 holding a cert that no longer works. A unit paired over `cert.apply` without a claim
 code learns of a revoke only from `cert.clear`. WiFi and the claim code live
-outside the cert namespace and survive the wipe. The reply's status is logged as a fixed
+outside the cert namespace and survive the wipe. A wipe that leaves either
+half in NVS reports failure (`mqtt.cert_clear_failed`), does not reboot, and
+is retried on the backoff. The reply's status is logged as a fixed
 word, never echoed.
 
 Source: `lib/thesada-core/src/enroll_policy.h` (`enrollStatus*`,
