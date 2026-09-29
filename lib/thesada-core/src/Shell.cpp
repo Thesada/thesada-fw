@@ -1705,8 +1705,8 @@ static void cmd_cert_apply(int argc, char** argv, ShellOutput out) {
   MQTTClient::scheduleCertReboot("cert_apply");
 }
 
-// Erase stored mTLS cert + key from NVS, drop the session and reboot into a
-// cert-less boot. No cert stored: nothing cleared, no reboot.
+// Erase stored mTLS cert + key from NVS and reboot into a cert-less boot. The
+// session stays up until then so the reply is published. No cert: no reboot.
 // in: argc, argv, out. out: status line
 static void cmd_cert_clear(int argc, char** argv, ShellOutput out) {
   bool had = MQTTClient::hasClientCert();
@@ -1716,8 +1716,6 @@ static void cmd_cert_clear(int argc, char** argv, ShellOutput out) {
   }
   if (had) {
     out("Client cert + key cleared - rebooting in 3s");
-    MQTTClient::_client.disconnect();
-    MQTTClient::_wifiClient.stop();
     MQTTClient::scheduleCertReboot("cert_clear");
   } else {
     out("No cert to clear (already using password auth)");
