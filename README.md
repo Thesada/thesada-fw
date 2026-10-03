@@ -149,12 +149,15 @@ monitor, provision. CI runs the same targets.
 
 The fallback AP will not start without a real passphrase, so flash a new board
 through the provisioning wrapper instead - it uploads, seeds a random per-device
-passphrase over the serial shell and writes the join QR payload to a gitignored
-0600 file:
+passphrase and an 8-digit claim code over the serial shell, points `enroll.url`
+at the app, and writes the sticker payloads (AP join QR, claim link) to
+gitignored 0600 files:
 
 ```bash
 ./scripts/flash-provision.sh --env esp32-owb --port /dev/cu.usbmodem1101
 ```
+
+A self-hosted app passes its own base with `--app-url https://app.example.org`.
 
 ---
 
@@ -179,7 +182,7 @@ thesada-fw/
     thesada-mod-telegram/
   scripts/
     add_framework_libs.py     # PlatformIO framework lib discovery
-    flash-provision.sh        # flash + seed the per-device fallback-AP passphrase
+    flash-provision.sh        # flash + seed the fallback-AP passphrase and claim code
     ota_upload.py             # push OTA to a device over HTTP
     deploy-ota.sh             # deploy to self-hosted OTA server (gitignored)
   examples/                   # config.json.example and Lua script examples

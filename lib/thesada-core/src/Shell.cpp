@@ -1063,13 +1063,19 @@ static void cmd_config_del(int argc, char** argv, ShellOutput out) {
 // subscriptions and reconnect (reload-or-restart, like systemd).
 static void cmd_config_reload(int argc, char** argv, ShellOutput out) {
   JsonObject oldCfg = Config::get();
-  char oldPrefix[64], oldBroker[64], oldUser[64], oldPass[64], oldOtaTopic[96];
+  char oldPrefix[Config::TOPIC_PREFIX_CAP], oldBroker[96], oldUser[64], oldPass[64];
+  char oldOtaTopic[MQTT_TOPIC_CAP];
   uint16_t oldPort;
   strncpy(oldPrefix,   oldCfg["mqtt"]["topic_prefix"] | "thesada/node", sizeof(oldPrefix));
   strncpy(oldBroker,   oldCfg["mqtt"]["broker"]       | "",             sizeof(oldBroker));
   strncpy(oldUser,     oldCfg["mqtt"]["user"]          | "",             sizeof(oldUser));
   strncpy(oldPass,     oldCfg["mqtt"]["password"]      | "",             sizeof(oldPass));
   strncpy(oldOtaTopic, oldCfg["ota"]["cmd_topic"]      | "",             sizeof(oldOtaTopic));
+  oldPrefix[sizeof(oldPrefix) - 1] = '\0';
+  oldBroker[sizeof(oldBroker) - 1] = '\0';
+  oldUser[sizeof(oldUser) - 1] = '\0';
+  oldPass[sizeof(oldPass) - 1] = '\0';
+  oldOtaTopic[sizeof(oldOtaTopic) - 1] = '\0';
   oldPort = oldCfg["mqtt"]["port"] | 8883;
 
   Config::load();
@@ -1696,12 +1702,11 @@ static void cmd_cert_apply(int argc, char** argv, ShellOutput out) {
   // reliable recovery. Schedule it 3 s out so this handler can publish its
   // cli/response first and the main loop gets one tick to flush the socket.
   out("Cert + key present - rebooting in 3s to apply (mTLS on next boot)");
-  MQTTClient::_certApplyRebootAtMs    = millis() + 3000;
-  MQTTClient::_certApplyRebootPending = true;
+  MQTTClient::scheduleCertReboot("cert_apply");
 }
 
-// Erase stored mTLS cert + key from NVS and force a reconnect. Device
-// falls back to password auth on next connect. Safe if no cert present.
+// Erase stored mTLS cert + key from NVS and reboot into a cert-less boot. The
+// session stays up until then so the reply is published. No cert: no reboot.
 // in: argc, argv, out. out: status line
 static void cmd_cert_clear(int argc, char** argv, ShellOutput out) {
   bool had = MQTTClient::hasClientCert();
@@ -1710,9 +1715,8 @@ static void cmd_cert_clear(int argc, char** argv, ShellOutput out) {
     return;
   }
   if (had) {
-    out("Client cert + key cleared - reconnecting with password auth");
-    MQTTClient::_client.disconnect();
-    MQTTClient::_wifiClient.stop();
+    out("Client cert + key cleared - rebooting in 3s");
+    MQTTClient::scheduleCertReboot("cert_clear");
   } else {
     out("No cert to clear (already using password auth)");
   }
@@ -1743,7 +1747,7 @@ static void cmd_secret_clear(int argc, char** argv, ShellOutput out) {
 
 // Presence report only - never prints a secret value (write-only contract).
 static void cmd_secret_info(int argc, char** argv, ShellOutput out) {
-  const char* scalars[] = { "mqtt.password", "telegram.bot_token",
+  const char* scalars[] = { "enroll.claim_code", "mqtt.password", "telegram.bot_token",
                             "web.password", "wifi.ap_password" };
   char line[128];
   for (auto f : scalars) {

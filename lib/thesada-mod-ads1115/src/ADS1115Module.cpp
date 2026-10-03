@@ -186,7 +186,7 @@ void ADS1115Module::readAndPublish() {
     slug[sizeof(slug) - 1] = '\0';
     for (char* p = slug; *p; p++) { if (*p == ' ') *p = '_'; *p = tolower(*p); }
 
-    char perTopic[96], val[16];
+    char perTopic[MQTT_TOPIC_CAP], val[16];
     snprintf(perTopic, sizeof(perTopic), "%s/sensor/current/%s", prefix, slug);
     snprintf(val, sizeof(val), "%.2f", (float)(ch["current_a"] | 0.0f));
     MQTTClient::publish(perTopic, val);
@@ -199,7 +199,7 @@ void ADS1115Module::readAndPublish() {
   // Combined JSON topic (for Lua EventBus, SD logging, backwards compat).
   // Dynamic buffer - 8 channels across two devices outgrow any fixed size and
   // a truncated payload would publish malformed JSON.
-  char topic[64];
+  char topic[MQTT_TOPIC_CAP];
   snprintf(topic, sizeof(topic), "%s/sensor/current", prefix);
   String payload;
   payload.reserve(measureJson(doc) + 1);

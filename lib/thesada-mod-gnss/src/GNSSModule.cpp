@@ -93,7 +93,7 @@ void GNSSModule::readAndPublish() {
   // publish when we actually have a fix - emitting 0.0 for lat/lon would
   // land as
   // valid telemetry rows and skew charts.
-  char perTopic[80], val[24];
+  char perTopic[MQTT_TOPIC_CAP], val[24];
   snprintf(perTopic, sizeof(perTopic), "%s/sensor/gnss/fix", prefix);
   MQTTClient::publish(perTopic, _hasFix ? "1" : "0");
   if (_hasFix) {
@@ -118,7 +118,7 @@ void GNSSModule::readAndPublish() {
   MQTTClient::publish(perTopic, val);
 
   // Combined JSON for Lua / EventBus consumers (rules.lua, scripts).
-  char topic[64];
+  char topic[MQTT_TOPIC_CAP];
   snprintf(topic, sizeof(topic), "%s/sensor/gnss", prefix);
   char payload[192];
   serializeJson(doc, payload, sizeof(payload));

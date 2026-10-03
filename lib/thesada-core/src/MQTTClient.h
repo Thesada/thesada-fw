@@ -22,17 +22,21 @@
 
 static constexpr uint8_t MQTT_MAX_SUBS  = 16;  // max MQTT subscriptions (CLI + Lua + modules)
 
+// A prefix near Config::TOPIC_PREFIX_CAP plus the longest sensor suffix.
+// The queue slot is the truncation point, so it uses the same cap.
+static constexpr size_t MQTT_TOPIC_CAP = 160;
+
 struct MQTTMessage {
   // payload sized to cover the 256-byte alert serialization buffer in
   // begin() - alerts are exactly the messages queued during outages.
-  char topic[64];
+  char topic[MQTT_TOPIC_CAP];
   char payload[256];
   bool valid;
 };
 
 using MQTTCallback = std::function<void(const char* topic, const char* payload)>;
 
-using MQTTSubTable = MqttSubTable<MQTTCallback, MQTT_MAX_SUBS>;
+using MQTTSubTable = MqttSubTable<MQTTCallback, MQTT_MAX_SUBS, MQTT_TOPIC_CAP>;
 
 class MQTTClient {
 public:
@@ -84,11 +88,31 @@ public:
 
   // Clears both cert and key from NVS. Fires setOnClientCertCleared hook
   // after a successful clear so transports holding a cached upload can drop it.
-  // out: true on success
+  // out: true only when neither half is left in NVS
   static bool clearClientCert();
 
   // out: true if both cert and key are present in NVS
   static bool hasClientCert();
+
+  // A cert change applies only after a restart: WiFiClientSecure keeps sticky
+  // mbedtls state across a swap. The delay lets the shell reply go out first.
+  static constexpr uint32_t CERT_REBOOT_DELAY_MS = 3000;
+
+  // in: reason for the log (static string). out: none.
+  static void scheduleCertReboot(const char* reason);
+
+  // out: true once a cert reboot is scheduled; nothing new should start.
+  static bool certRebootPending();
+
+  // Restarts once a scheduled cert reboot is due. Called every main-loop
+  // tick, whether or not MQTT is enabled. in: none. out: none.
+  static void serviceCertReboot();
+
+  // in: PEM cert + key. out: true when both parse and the key matches the cert.
+  static bool clientCertPairValid(const char* certPEM, const char* keyPEM);
+
+  // out: true while the WiFi broker session is up and presented the client cert
+  static bool mtlsSessionUp();
 
   // Hook fired from clearClientCert after NVS rows are gone.
   // Cellular installs one so its modem-side cert cache invalidates and
@@ -246,15 +270,11 @@ public:
 
   static bool          _reinitPending;
 
-public:
-  // Deferred reboot latch set by cert.apply. Main loop calls ESP.restart()
-  // once the deadline passes so the shell handler can publish its response
-  // before the reboot wipes the session. Unconditional reboot is the only
-  // reliable recovery when WiFiClientSecure holds sticky mbedtls state
-  // across cert swap (classic-platform boards hit this).
-  static bool     _certApplyRebootPending;
-  static uint32_t _certApplyRebootAtMs;
 private:
+  // Deferred cert reboot latch; see scheduleCertReboot.
+  static bool        _certRebootPending;
+  static uint32_t    _certRebootAtMs;
+  static const char* _certRebootReason;
 
   static constexpr uint32_t RETRY_MIN_MS   = 2000;
   static constexpr uint32_t RETRY_MAX_MS   = 60000;

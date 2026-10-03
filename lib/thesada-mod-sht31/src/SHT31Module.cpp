@@ -141,7 +141,7 @@ void SHT31Module::publishHaDiscovery() {
   const char* unit    = cfg["temperature"]["unit"] | "C";
   const char* haUnit  = (unit[0] == 'F' || unit[0] == 'f') ? "\xC2\xB0""F" : "\xC2\xB0""C";
 
-  char availTopic[64];
+  char availTopic[MQTT_TOPIC_CAP];
   snprintf(availTopic, sizeof(availTopic), "%s/status", prefix);
 
   auto disc = [&](const char* uid, const char* name, const char* stateTopic,
@@ -165,7 +165,7 @@ void SHT31Module::publishHaDiscovery() {
     MQTTClient::publishRetained(topic, payload);
   };
 
-  char uid[48], st[96];
+  char uid[48], st[MQTT_TOPIC_CAP];
   snprintf(uid, sizeof(uid), "%s_sht31_temp", devId);
   snprintf(st, sizeof(st), "%s/sensor/temperature/sht31", prefix);
   disc(uid, "SHT31 Temperature", st, haUnit, "temperature", "measurement");
@@ -199,7 +199,7 @@ void SHT31Module::readAndPublish() {
   }
 
   // Per-sensor MQTT topics (HA discovery compatible)
-  char topic[96], val[16];
+  char topic[MQTT_TOPIC_CAP], val[16];
   snprintf(topic, sizeof(topic), "%s/sensor/temperature/sht31", prefix);
   snprintf(val, sizeof(val), "%.1f", displayTemp);
   MQTTClient::publish(topic, val);

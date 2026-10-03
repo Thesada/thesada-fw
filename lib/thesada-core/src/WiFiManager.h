@@ -27,6 +27,10 @@ public:
   // in: none. out: true only when associated and IP is assigned.
   static bool       connected();
 
+  // in: none. out: true once NTP has set the clock this boot. The boot clock
+  // floor keeps time() plausible without it, but not current.
+  static bool       ntpSynced();
+
   // in: none. out: true when fallback AP is active.
   static bool       isAPActive();
 

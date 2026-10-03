@@ -208,8 +208,9 @@ uint32_t         MQTTClient::_lastHeapPublishMs = 0;
 uint32_t         MQTTClient::_lastHeapFree      = 0;
 uint32_t         MQTTClient::_lowHeapSinceMs    = 0;
 bool             MQTTClient::_reinitPending     = false;
-bool             MQTTClient::_certApplyRebootPending = false;
-uint32_t         MQTTClient::_certApplyRebootAtMs    = 0;
+bool             MQTTClient::_certRebootPending = false;
+uint32_t         MQTTClient::_certRebootAtMs    = 0;
+const char*      MQTTClient::_certRebootReason  = "";
 
 char             MQTTClient::_rxRing[MQTTClient::RX_RING_SIZE][96] = {};
 uint32_t         MQTTClient::_rxRingTs[MQTTClient::RX_RING_SIZE]    = {};
@@ -256,6 +257,7 @@ void MQTTClient::setFallbackPublishing(bool active) {
       _queueCount = 0;
     }
     s_fallbackStartMs = millis();
+    OTAUpdate::noteMqttUp();
   } else if (!active) {
     s_fallbackStartMs = 0;
     // Yielding back to WiFi: clear the cellular-side republish guard so
@@ -345,8 +347,8 @@ static void cmdConfigInbound(const char* topic, const char* payload) {
 static void mqttSubscribeCmdConfig() {
   JsonObject cfg = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-  // Wider than CLI_TOPIC_CAP. A prefix that does not fit /cli/# can still
-  // fit /cmd/config, and that topic has to stay subscribed.
+  // Sized to the prefix cap: the gate is "prefix plus /cmd/config fits there".
+  // The subscription table is MQTT_TOPIC_CAP, which is wider, so it can store it.
   char topic[Config::TOPIC_PREFIX_CAP];
   if (!cliTopicJoin(topic, sizeof(topic), prefix, "/cmd/config")) {
     Log::kvf(TAG, "mqtt.cmd_config_topic_truncated prefix=%s", prefix);
@@ -565,7 +567,7 @@ void MQTTClient::begin() {
   EventBus::subscribe("alert", [](JsonObject data) {
     JsonObject  cfg    = Config::get();
     const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-    char topic[64];
+    char topic[MQTT_TOPIC_CAP];
     snprintf(topic, sizeof(topic), "%s/alert", prefix);
     char payload[256];
     serializeJson(data, payload, sizeof(payload));
@@ -756,7 +758,7 @@ void MQTTClient::connect() {
                                          passwordBuf, sizeof(passwordBuf));
   const char* prefix   = cfg["mqtt"]["topic_prefix"] | "thesada/node";
 
-  char availTopic[64];
+  char availTopic[MQTT_TOPIC_CAP];
   snprintf(availTopic, sizeof(availTopic), "%s/status", prefix);
 
   Log::kvf(TAG, "mqtt.connect_start client_id=%s", clientId);
@@ -846,6 +848,7 @@ void MQTTClient::connect() {
   }
 
   if (ok) {
+    OTAUpdate::noteMqttUp();
     _retryInterval = RETRY_MIN_MS;
     _retryCount    = 0;
     // Clear the reboot guard: a future failure starts a fresh streak.
@@ -1026,16 +1029,6 @@ void MQTTClient::loop() {
     publishRetainedManifest();
   }
 
-  // cert.apply deferred reboot: shell handler publishes its response, then
-  // this tick fires the restart. Only reliable way to clear sticky
-  // WiFiClientSecure / mbedtls state on a cert swap; remote devices have
-  // no USB fallback so cert.apply must self-recover.
-  if (_certApplyRebootPending && (int32_t)(millis() - _certApplyRebootAtMs) >= 0) {
-    Log::warn(TAG, "cert.apply deferred reboot firing");
-    delay(100);
-    ESP.restart();
-  }
-
   // Deferred reconnect after reinitSubscriptions(): clean stack gives
   // mbedtls enough room (~10 KB) for the TLS handshake.
   if (_reinitPending) {
@@ -1171,7 +1164,7 @@ void MQTTClient::publishRetainedManifest() {
   JsonObject cfg = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
 
-  char topic[96];
+  char topic[MQTT_TOPIC_CAP];
   snprintf(topic, sizeof(topic), "%s/info/retained_topics", prefix);
 
   recordRetainedTopic(topic);
@@ -1210,7 +1203,7 @@ void MQTTClient::publishRetainedSet(bool force) {
   JsonObject cfg = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
 
-  char availTopic[64];
+  char availTopic[MQTT_TOPIC_CAP];
   snprintf(availTopic, sizeof(availTopic), "%s/status", prefix);
   publishRetained(availTopic, "online");
 
@@ -1784,7 +1777,7 @@ void MQTTClient::publishDiscovery() {
     return;
   }
 
-  char availTopic[64];
+  char availTopic[MQTT_TOPIC_CAP];
   snprintf(availTopic, sizeof(availTopic), "%s/status", prefix);
 
   auto makeSlug = [](const char* name, char* slug, size_t sz) {
@@ -1826,7 +1819,7 @@ void MQTTClient::publishDiscovery() {
     yield();
   };
 
-  char slug[32], uid[48], stBuf[96];
+  char slug[32], uid[48], stBuf[MQTT_TOPIC_CAP];
 
   JsonArray sensors = cfg["temperature"]["sensors"].as<JsonArray>();
   if (sensors) {
@@ -1887,7 +1880,7 @@ void MQTTClient::publishDiscovery() {
   disc("sensor", uid, "WiFi IP", stBuf, "", "", "", "diagnostic");
 
   {
-    char t[96], v[32];
+    char t[MQTT_TOPIC_CAP], v[32];
     snprintf(t, sizeof(t), "%s/sensor/wifi/rssi", prefix);
     snprintf(v, sizeof(v), "%d", (int)WiFi.RSSI());
     _client.publish(t, v);
@@ -1946,7 +1939,7 @@ void MQTTClient::publishHeapStats() {
 #endif
   _lastHeapFree = freeHeap;
 
-  char topic[96], value[16];
+  char topic[MQTT_TOPIC_CAP], value[16];
 
   snprintf(topic, sizeof(topic), "%s/sensor/heap/free", prefix);
   snprintf(value, sizeof(value), "%lu", (unsigned long)freeHeap);
@@ -2099,7 +2092,7 @@ void MQTTClient::publishDeviceInfo() {
     mainHash,
     rulesHash);
 
-  char topic[96];
+  char topic[MQTT_TOPIC_CAP];
   snprintf(topic, sizeof(topic), "%s/info", prefix);
   publishRetained(topic, payload);
 }
@@ -2167,6 +2160,19 @@ bool MQTTClient::connected() {
   return _client.connected() || s_fallbackPublishing;
 }
 
+bool MQTTClient::mtlsSessionUp() {
+  return _client.connected() && _mtlsActive;
+}
+
+bool MQTTClient::clientCertPairValid(const char* certPEM, const char* keyPEM) {
+#ifdef MQTT_TLS
+  return validateClientCertKey(certPEM, keyPEM);
+#else
+  (void)certPEM; (void)keyPEM;
+  return false;
+#endif
+}
+
 time_t MQTTClient::lastPublishTime() {
   return _lastPublishTime;
 }
@@ -2227,17 +2233,36 @@ bool MQTTClient::loadClientCert(char* cert, char* key, size_t maxLen) {
 
 // Erase cert + key from NVS. Fires the cleared hook so cellular drops its
 // cached cert and active session. Safe to call when absent.
-// out: true (or already absent).
+// out: true when neither half is left, including when both were absent.
 bool MQTTClient::clearClientCert() {
   Preferences prefs;
   if (!prefs.begin(CERT_NS, false)) return false;
-  prefs.remove(CERT_KEY_CERT);
-  prefs.remove(CERT_KEY_KEY);
+  bool certGone = !prefs.isKey(CERT_KEY_CERT) || prefs.remove(CERT_KEY_CERT);
+  bool keyGone  = !prefs.isKey(CERT_KEY_KEY)  || prefs.remove(CERT_KEY_KEY);
   prefs.end();
+  if (!certGone || !keyGone) {
+    Log::kvfe(TAG, "mqtt.cert_clear_failed cert_left=%d key_left=%d", !certGone, !keyGone);
+    return false;
+  }
   // The broken cert is gone, so the recovery permission it granted goes too.
   _storedCertBroken = false;
   if (_onCertClearedHook) _onCertClearedHook();
   return true;
+}
+
+void MQTTClient::scheduleCertReboot(const char* reason) {
+  _certRebootReason  = reason;
+  _certRebootAtMs    = millis() + CERT_REBOOT_DELAY_MS;
+  _certRebootPending = true;
+}
+
+bool MQTTClient::certRebootPending() { return _certRebootPending; }
+
+void MQTTClient::serviceCertReboot() {
+  if (!_certRebootPending || (int32_t)(millis() - _certRebootAtMs) < 0) return;
+  Log::kvfw(TAG, "mqtt.cert_reboot reason=%s", _certRebootReason);
+  delay(100);
+  ESP.restart();
 }
 
 void MQTTClient::setOnClientCertCleared(std::function<void()> fn) {

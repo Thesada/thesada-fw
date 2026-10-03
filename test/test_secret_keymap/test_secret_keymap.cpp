@@ -17,10 +17,12 @@ void test_scalar_fields_map_to_short_keys(void) {
   TEST_ASSERT_EQUAL_STRING("web_password", key);
   TEST_ASSERT_TRUE(secretNvsKeyFor("wifi.ap_password", key, sizeof(key)));
   TEST_ASSERT_EQUAL_STRING("ap_password", key);
+  TEST_ASSERT_TRUE(secretNvsKeyFor("enroll.claim_code", key, sizeof(key)));
+  TEST_ASSERT_EQUAL_STRING("claim_code", key);
 }
 
 void test_all_keys_fit_nvs_15_char_limit(void) {
-  const char* fields[] = { "mqtt.password", "telegram.bot_token",
+  const char* fields[] = { "enroll.claim_code", "mqtt.password", "telegram.bot_token",
                            "web.password", "wifi.ap_password",
                            "wifi.password:a-very-long-ssid-name-exceeding-15" };
   char key[16];
