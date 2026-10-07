@@ -92,8 +92,11 @@ static bool rememberAbandoned(const esp_partition_t* part) {
   size_t date = prefs.putString("left_date", desc.date);
   size_t time = prefs.putString("left_time", desc.time);
   size_t rescue = prefs.putUChar("rescue", 1);
+  // The switch reboots in software, which counts as a crash. Leaving the
+  // streak at the limit makes the next update refuse to confirm.
+  size_t crash = prefs.putUInt("crash_n", 0);
   prefs.end();
-  if (ver == 0 || date == 0 || time == 0 || rescue == 0) {
+  if (ver == 0 || date == 0 || time == 0 || rescue == 0 || crash == 0) {
     Log::kvfe(TAG, "ota.abandoned_unrecorded reason=nvs_write");
     return false;
   }
@@ -175,6 +178,23 @@ uint32_t OTAUpdate::recordBootStreak(int resetReason, uint32_t* brownoutsOut) {
   return crashes;
 }
 
+// A software reset counts as a crash, so the next image must not inherit
+// a streak already at the limit. out: true when crash_n was stored as zero.
+static bool clearCrashStreak() {
+  Preferences prefs;
+  if (!prefs.begin("boot", false)) {
+    Log::kvfe(TAG, "ota.crash_streak_unread reason=nvs");
+    return false;
+  }
+  size_t wrote = prefs.putUInt("crash_n", 0);
+  prefs.end();
+  if (wrote == 0) {
+    Log::kvfe(TAG, "ota.crash_streak_unread reason=nvs_write");
+    return false;
+  }
+  return true;
+}
+
 void OTAUpdate::rollbackIfCrashLoop() {
   if (!_otaStreakKnown || !otaHealthShouldRollback(_otaCrashStreak)) return;
   const esp_partition_t* running = esp_ota_get_running_partition();
@@ -189,6 +209,9 @@ void OTAUpdate::rollbackIfCrashLoop() {
       // Leaving it pending lets the bootloader boot the slot just refused.
       Log::kvfe(TAG, "ota.image_rollback_failed reason=no_other_image state=pending streak=%lu",
                 (unsigned long)_otaCrashStreak);
+      // Confirm even if the clear fails. This image has no safe other slot,
+      // and leaving it pending lets the bootloader boot the one just refused.
+      clearCrashStreak();
       if (esp_ota_mark_app_valid_cancel_rollback() != ESP_OK) {
         Log::kvfe(TAG, "ota.image_rollback_failed reason=cancel_failed state=pending streak=%lu",
                   (unsigned long)_otaCrashStreak);
@@ -200,6 +223,7 @@ void OTAUpdate::rollbackIfCrashLoop() {
     }
     Log::kvfw(TAG, "ota.state_change from=pending to=previous reason=crash_streak streak=%lu",
               (unsigned long)_otaCrashStreak);
+    if (!clearCrashStreak()) return;
     if (esp_ota_mark_app_invalid_rollback_and_reboot() != ESP_OK) {
       Log::kvfe(TAG, "ota.image_rollback_failed state=pending streak=%lu",
                 (unsigned long)_otaCrashStreak);
@@ -246,6 +270,7 @@ void OTAUpdate::confirmIfHealthy() {
   }
   if (!_otaStreakKnown) return;
   if (!otaHealthShouldMark(true, _otaMqttUp, millis(), _otaCrashStreak)) return;
+  if (!clearCrashStreak()) return;
   if (esp_ota_mark_app_valid_cancel_rollback() != ESP_OK) {
     Log::warn(TAG, "ota.image_confirm_failed");
     return;
