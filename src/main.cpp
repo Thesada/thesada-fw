@@ -8,7 +8,6 @@
 #include <esp_task_wdt.h>
 #include <esp_log.h>
 #include <esp_system.h>
-#include <Preferences.h>
 #include <rom/rtc.h>
 #include <soc/soc_caps.h>
 #include "thesada_config.h"
@@ -51,16 +50,8 @@ static void logBootCause() {
     default:                reasonStr = "unknown"; break;
   }
 
-  Preferences p;
   uint32_t brownouts = 0;
-  if (p.begin("boot", false)) {
-    brownouts = p.getUInt("brownout_n", 0);
-    if (reason == ESP_RST_BROWNOUT) {
-      brownouts++;
-      p.putUInt("brownout_n", brownouts);
-    }
-    p.end();
-  }
+  uint32_t crashes = OTAUpdate::recordBootStreak((int)reason, &brownouts);
 
   int rtc0 = (int)rtc_get_reset_reason(0);
 #if SOC_CPU_CORES_NUM > 1
@@ -69,8 +60,9 @@ static void logBootCause() {
   int rtc1 = -1;
 #endif
 
-  Log::kvf("Boot", "boot.reset_info reason=%s code=%d rtc_core0=%d rtc_core1=%d brownout_total=%lu",
-           reasonStr, (int)reason, rtc0, rtc1, (unsigned long)brownouts);
+  Log::kvf("Boot", "boot.reset_info reason=%s code=%d rtc_core0=%d rtc_core1=%d brownout_total=%lu crash_streak=%lu",
+           reasonStr, (int)reason, rtc0, rtc1, (unsigned long)brownouts,
+           (unsigned long)crashes);
 }
 
 // Return true if WiFi (or the AP fallback) reports a usable link
@@ -98,6 +90,8 @@ static bool _heartbeatEnabled = true;
 
 void setup() {
   Serial.begin(115200);
+  logBootCause();
+  OTAUpdate::rollbackIfCrashLoop();
   // Don't block waiting for serial - CDC boards hang here without USB host
   uint32_t serialWait = millis();
   while (!Serial && millis() - serialWait < 3000) delay(10);
@@ -118,7 +112,6 @@ void setup() {
   esp_task_wdt_add(NULL);
 
   Log::info("Boot", "boot.start fw=thesada-fw version=" FIRMWARE_VERSION " built=\"" __DATE__ " " __TIME__ "\"");
-  logBootCause();
 
   // Quiet the IDF VFS layer's "file does not exist" ERROR logs. Every
   // LittleFS.exists("/foo") for a missing file emits one, even when our
