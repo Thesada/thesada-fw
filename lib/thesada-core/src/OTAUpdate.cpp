@@ -33,6 +33,9 @@
 #include "ota_verify_policy.h"
 #include "ota_health_policy.h"
 #include <esp_ota_ops.h>
+#include <nvs.h>
+#include <nvs_flash.h>
+#include <Preferences.h>
 
 #ifdef ENABLE_CELLULAR
 #include "Cellular.h"
@@ -40,18 +43,217 @@
 
 static const char* TAG = "OTA";
 
-// The core confirms a pending image in initArduino unless this returns true.
-// in: none. out: true so the health gate below is the only confirm.
-extern "C" bool verifyRollbackLater() { return true; }
+// initArduino calls this before setup. Rescue confirms only after the flag
+// is cleared: a flag left set would skip the health gate on the next OTA.
+// in: none. out: false confirms in the core; true leaves the health gate.
+extern "C" bool verifyRollbackLater() {
+  // Unreadable NVS defers. Confirming would skip the health gate.
+  if (nvs_flash_init() != ESP_OK) return true;
+  nvs_handle_t handle;
+  if (nvs_open("boot", NVS_READWRITE, &handle) != ESP_OK) return true;
+  uint8_t rescue = 0;
+  nvs_get_u8(handle, "rescue", &rescue);
+  bool defer = true;
+  if (rescue &&
+      nvs_set_u8(handle, "rescue", 0) == ESP_OK &&
+      nvs_commit(handle) == ESP_OK) {
+    defer = false;
+  }
+  nvs_close(handle);
+  return defer;
+}
 
 static bool _otaMqttUp = false;
 static bool _otaPending = false;
 static bool _otaStateKnown = false;
 static bool _otaImageSettled = false;
+static uint32_t _otaCrashStreak = 0;
+static bool _otaStreakKnown = false;
 
 void OTAUpdate::noteMqttUp() { _otaMqttUp = true; }
 
+// Store the image we are leaving and arm an immediate confirm on the next
+// boot. The switch is skipped when this cannot be stored: without it the
+// next limit can select this image again, and a reset can abort the slot
+// we are about to boot.
+// in: running partition. out: true when the left identity and rescue flag were written.
+static bool rememberAbandoned(const esp_partition_t* part) {
+  esp_app_desc_t desc;
+  if (!part || esp_ota_get_partition_description(part, &desc) != ESP_OK) {
+    Log::kvfe(TAG, "ota.abandoned_unrecorded reason=no_description");
+    return false;
+  }
+  Preferences prefs;
+  if (!prefs.begin("boot", false)) {
+    Log::kvfe(TAG, "ota.abandoned_unrecorded reason=nvs");
+    return false;
+  }
+  size_t ver = prefs.putString("left_ver", desc.version);
+  size_t date = prefs.putString("left_date", desc.date);
+  size_t time = prefs.putString("left_time", desc.time);
+  size_t rescue = prefs.putUChar("rescue", 1);
+  // The switch reboots in software, which counts as a crash. Leaving the
+  // streak at the limit makes the next update refuse to confirm.
+  size_t crash = prefs.putUInt("crash_n", 0);
+  prefs.end();
+  if (ver == 0 || date == 0 || time == 0 || rescue == 0 || crash == 0) {
+    Log::kvfe(TAG, "ota.abandoned_unrecorded reason=nvs_write");
+    return false;
+  }
+  return true;
+}
+
+// A missing description or an unread record must not look like a free slot.
+// in: candidate partition. out: true if it is the image we last left.
+static bool imageAbandoned(const esp_partition_t* part) {
+  esp_app_desc_t desc;
+  if (!part || esp_ota_get_partition_description(part, &desc) != ESP_OK) {
+    Log::kvfe(TAG, "ota.image_rollback_failed reason=no_description");
+    return true;
+  }
+  Preferences prefs;
+  if (!prefs.begin("boot", true)) {
+    Log::kvfe(TAG, "ota.image_rollback_failed reason=nvs");
+    return true;
+  }
+  String leftVer = prefs.getString("left_ver", "");
+  String leftDate = prefs.getString("left_date", "");
+  String leftTime = prefs.getString("left_time", "");
+  prefs.end();
+  return otaHealthIsAbandoned(desc.version, desc.date, desc.time,
+                              leftVer.c_str(), leftDate.c_str(), leftTime.c_str());
+}
+
+// The other OTA slot is a rollback target only when it is a different valid
+// image and not the one this guard already left.
+// in: running partition. out: that slot, or null when it must not be booted.
+static const esp_partition_t* rollbackTarget(const esp_partition_t* running) {
+  const esp_partition_t* other = esp_ota_get_next_update_partition(NULL);
+  esp_ota_img_states_t otherState = ESP_OTA_IMG_UNDEFINED;
+  if (!other || other == running ||
+      esp_ota_get_state_partition(other, &otherState) != ESP_OK ||
+      otherState != ESP_OTA_IMG_VALID || imageAbandoned(other)) {
+    return nullptr;
+  }
+  return other;
+}
+
+uint32_t OTAUpdate::recordBootStreak(int resetReason, uint32_t* brownoutsOut) {
+  Preferences prefs;
+  if (!prefs.begin("boot", false)) {
+    // Unread streak must not look like zero: confirm would keep a bad image.
+    Log::kvfe(TAG, "ota.crash_streak_unread");
+    _otaStreakKnown = false;
+    _otaCrashStreak = OTA_HEALTH_CRASH_LIMIT;
+    if (brownoutsOut) *brownoutsOut = 0;
+    return _otaCrashStreak;
+  }
+  uint32_t brownouts = prefs.getUInt("brownout_n", 0);
+  if (resetReason == OTA_RST_BROWNOUT) {
+    brownouts++;
+    if (prefs.putUInt("brownout_n", brownouts) == 0) {
+      prefs.end();
+      Log::kvfe(TAG, "ota.crash_streak_unread reason=nvs_write");
+      _otaStreakKnown = false;
+      _otaCrashStreak = OTA_HEALTH_CRASH_LIMIT;
+      if (brownoutsOut) *brownoutsOut = 0;
+      return _otaCrashStreak;
+    }
+  }
+  uint32_t crashes = otaHealthNextCrashStreak(prefs.getUInt("crash_n", 0),
+                                              otaHealthResetClass(resetReason));
+  // A failed write must not look stored. Confirm would keep a bad image.
+  if (prefs.putUInt("crash_n", crashes) == 0) {
+    prefs.end();
+    Log::kvfe(TAG, "ota.crash_streak_unread reason=nvs_write");
+    _otaStreakKnown = false;
+    _otaCrashStreak = OTA_HEALTH_CRASH_LIMIT;
+    if (brownoutsOut) *brownoutsOut = 0;
+    return _otaCrashStreak;
+  }
+  prefs.end();
+  _otaStreakKnown = true;
+  _otaCrashStreak = crashes;
+  if (brownoutsOut) *brownoutsOut = brownouts;
+  return crashes;
+}
+
+// A software reset counts as a crash, so the next image must not inherit
+// a streak already at the limit. out: true when crash_n was stored as zero.
+static bool clearCrashStreak() {
+  Preferences prefs;
+  if (!prefs.begin("boot", false)) {
+    Log::kvfe(TAG, "ota.crash_streak_unread reason=nvs");
+    return false;
+  }
+  size_t wrote = prefs.putUInt("crash_n", 0);
+  prefs.end();
+  if (wrote == 0) {
+    Log::kvfe(TAG, "ota.crash_streak_unread reason=nvs_write");
+    return false;
+  }
+  return true;
+}
+
+void OTAUpdate::rollbackIfCrashLoop() {
+  if (!_otaStreakKnown || !otaHealthShouldRollback(_otaCrashStreak)) return;
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+  if (!running || esp_ota_get_state_partition(running, &state) != ESP_OK) {
+    Log::kvfe(TAG, "ota.image_rollback_failed reason=state_unknown streak=%lu",
+              (unsigned long)_otaCrashStreak);
+    return;
+  }
+  if (state == ESP_OTA_IMG_PENDING_VERIFY) {
+    if (!rollbackTarget(running)) {
+      // Leaving it pending lets the bootloader boot the slot just refused.
+      Log::kvfe(TAG, "ota.image_rollback_failed reason=no_other_image state=pending streak=%lu",
+                (unsigned long)_otaCrashStreak);
+      // Confirm even if the clear fails. This image has no safe other slot,
+      // and leaving it pending lets the bootloader boot the one just refused.
+      clearCrashStreak();
+      if (esp_ota_mark_app_valid_cancel_rollback() != ESP_OK) {
+        Log::kvfe(TAG, "ota.image_rollback_failed reason=cancel_failed state=pending streak=%lu",
+                  (unsigned long)_otaCrashStreak);
+        return;
+      }
+      Log::kvfw(TAG, "ota.state_change from=pending to=valid reason=no_other_image streak=%lu",
+                (unsigned long)_otaCrashStreak);
+      return;
+    }
+    Log::kvfw(TAG, "ota.state_change from=pending to=previous reason=crash_streak streak=%lu",
+              (unsigned long)_otaCrashStreak);
+    if (!clearCrashStreak()) return;
+    if (esp_ota_mark_app_invalid_rollback_and_reboot() != ESP_OK) {
+      Log::kvfe(TAG, "ota.image_rollback_failed state=pending streak=%lu",
+                (unsigned long)_otaCrashStreak);
+    }
+    return;
+  }
+  if (state != ESP_OTA_IMG_VALID) {
+    Log::kvfe(TAG, "ota.image_rollback_failed reason=state_not_valid state=%d streak=%lu",
+              (int)state, (unsigned long)_otaCrashStreak);
+    return;
+  }
+  const esp_partition_t* other = rollbackTarget(running);
+  if (!other) {
+    Log::kvfe(TAG, "ota.image_rollback_failed reason=no_other_image streak=%lu",
+              (unsigned long)_otaCrashStreak);
+    return;
+  }
+  if (!rememberAbandoned(running)) return;
+  Log::kvfw(TAG, "ota.state_change from=valid to=other reason=crash_streak streak=%lu",
+            (unsigned long)_otaCrashStreak);
+  if (esp_ota_set_boot_partition(other) != ESP_OK) {
+    Log::kvfe(TAG, "ota.image_rollback_failed state=valid streak=%lu",
+              (unsigned long)_otaCrashStreak);
+    return;
+  }
+  ESP.restart();
+}
+
 // Confirm a pending image once, and retry when the IDF call fails.
+// An unread streak leaves a pending image pending.
 // in: none. out: none. A non-pending image is read once and left alone.
 void OTAUpdate::confirmIfHealthy() {
   if (_otaImageSettled) return;
@@ -66,13 +268,15 @@ void OTAUpdate::confirmIfHealthy() {
       return;
     }
   }
-  if (!otaHealthShouldMark(true, _otaMqttUp, millis())) return;
+  if (!_otaStreakKnown) return;
+  if (!otaHealthShouldMark(true, _otaMqttUp, millis(), _otaCrashStreak)) return;
+  if (!clearCrashStreak()) return;
   if (esp_ota_mark_app_valid_cancel_rollback() != ESP_OK) {
     Log::warn(TAG, "ota.image_confirm_failed");
     return;
   }
   _otaImageSettled = true;
-  Log::info(TAG, "ota.image_confirmed");
+  Log::info(TAG, "ota.state_change from=pending to=valid reason=healthy");
 }
 
 uint32_t OTAUpdate::_lastCheck       = 0;
