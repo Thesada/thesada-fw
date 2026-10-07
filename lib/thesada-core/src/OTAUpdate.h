@@ -22,6 +22,17 @@ public:
   // a pending image valid on this, or after five minutes up. in: none. out: none.
   static void noteMqttUp();
 
+  // Record this boot in the crash streak and the brownout counter.
+  // One NVS "boot" session updates crash_n and brownout_n.
+  // in: esp_reset_reason value, brownout total out (may be null).
+  // out: streak after this boot. On an unread streak the return is the
+  // crash limit and confirm stays shut.
+  static uint32_t recordBootStreak(int resetReason, uint32_t* brownoutsOut);
+
+  // If the streak is at the limit, boot the other valid image.
+  // in: none. out: none. Does not return when the switch works.
+  static void rollbackIfCrashLoop();
+
   // Confirm a pending image, or leave it pending. Call every main-loop turn,
   // including when loop() is skipped. in: none. out: none.
   static void confirmIfHealthy();
