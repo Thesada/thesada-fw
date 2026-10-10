@@ -97,6 +97,9 @@ test-lua: ## Lua rules harness against the mocked bindings
 coverage: ## Per-file line-coverage floors from scripts/coverage-floors.txt
 	./scripts/check-coverage.sh
 
+.PHONY: ci
+ci: test lint coverage dist ## Local CI: host tests, lint, coverage floors, every board build
+
 .PHONY: lint
 lint: ## cppcheck + clang-tidy on the pure units, then the path-safety and lib-deps gates
 	./scripts/static-check.sh
