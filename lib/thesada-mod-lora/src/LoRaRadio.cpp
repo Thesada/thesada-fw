@@ -8,11 +8,42 @@
 #include <RadioLib.h>
 #include <SPI.h>
 
+// A missing SX1262 holds BUSY. RadioLib waits that out and the task watchdog fires.
+static bool sx1262Answers(uint8_t nss, uint8_t sck, uint8_t miso, uint8_t mosi,
+                          uint8_t nrst, uint8_t busy) {
+  pinMode(nrst, OUTPUT);
+  pinMode(nss, OUTPUT);
+  pinMode(busy, INPUT);
+  digitalWrite(nss, HIGH);
+  digitalWrite(nrst, LOW);
+  delay(2);
+  digitalWrite(nrst, HIGH);
+
+  uint32_t t0 = millis();
+  while (digitalRead(busy) == HIGH && (uint32_t)(millis() - t0) < 20) delay(1);
+  if (digitalRead(busy) == HIGH) return false;
+
+  SPIClass spi(FSPI);
+  spi.begin(sck, miso, mosi, nss);
+  spi.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(nss, LOW);
+  spi.transfer(0xC0);
+  uint8_t st = spi.transfer(0x00);
+  digitalWrite(nss, HIGH);
+  spi.endTransaction();
+  spi.end();
+
+  if (st == 0x00 || st == 0xFF) return false;
+  uint8_t mode = (st >> 4) & 0x07;
+  return mode >= 2 && mode <= 6;
+}
+
 // Bring up SPI + radio core, then the RF switch. Returns RadioLib status.
 int LoRaRadio::begin(uint8_t nss, uint8_t sck, uint8_t miso, uint8_t mosi,
                      uint8_t nrst, uint8_t busy, uint8_t rxen, uint8_t txen,
                      float freq, float bw, uint8_t sf, uint8_t cr,
                      uint8_t syncWord, int8_t power, uint16_t preamble, float tcxo) {
+  if (!sx1262Answers(nss, sck, miso, mosi, nrst, busy)) return ERR_NO_MODULE;
   _spi = new SPIClass(FSPI);
   _spi->begin(sck, miso, mosi, nss);
   _radio = new SX1262(new Module(nss, RADIOLIB_NC, nrst, busy, *_spi));

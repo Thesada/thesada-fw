@@ -60,6 +60,10 @@ void LoRaModule::begin() {
   int st = _radio.begin(LORA_NSS, LORA_SCK, LORA_MISO, LORA_MOSI,
                         LORA_NRST, LORA_BUSY, LORA_RXEN, LORA_TXEN,
                         _freq, _bw, _sf, _cr, _syncWord, _power, _preamble, LORA_TCXO_V);
+  if (st == LoRaRadio::ERR_NO_MODULE) {
+    Log::kvfe(TAG, "lora.init_failed reason=no_module");
+    return;
+  }
   if (st != 0) {
     Log::kvfe(TAG, "lora.init_failed code=%d", st);
     return;
