@@ -1,15 +1,17 @@
 #!/bin/sh
-# thesada-fw pre-push reminder: HIL bench smoke before main.
+# thesada-fw pre-push: run local CI, then remind about the HIL bench.
 #
-# Board dev happens on the bench host where the USB rack lives; the HIL
-# orchestrator and board map live in the private infra repo. This hook only
-# REMINDS to run the bench smoke when pushing main - it never blocks the push.
-# (When the team grows, promote this to a real CI gate.)
-#
-# Override the suggested command:  THESADA_HIL_CMD="..." git push
-# Silence:                         THESADA_HIL_SKIP=1 git push
+# make ci is the same host and board work CI gates on. THESADA_CI_SKIP=1
+# skips that and still prints the bench reminder when pushing main.
+# The reminder never blocks. THESADA_HIL_SKIP=1 silences it.
+# Override the suggested bench command: THESADA_HIL_CMD="..." git push
 
 set -eu
+
+if [ -z "${THESADA_CI_SKIP:-}" ]; then
+  cd "$(git rev-parse --show-toplevel)"
+  make ci
+fi
 
 [ -n "${THESADA_HIL_SKIP:-}" ] && exit 0
 

@@ -25,8 +25,11 @@ struct LoRaRx {
 
 class LoRaRadio {
 public:
+  // No SX1262 answered the reset. RadioLib's busy wait would trip the watchdog.
+  static constexpr int ERR_NO_MODULE = -100;
+
   // Set up SPI, the SX1262, and the MCU-driven RF switch. Returns the RadioLib
-  // status code (0 = RADIOLIB_ERR_NONE). DIO1 is left NC (poll-mode).
+  // status code (0 = RADIOLIB_ERR_NONE), or ERR_NO_MODULE. DIO1 is left NC.
   int  begin(uint8_t nss, uint8_t sck, uint8_t miso, uint8_t mosi,
              uint8_t nrst, uint8_t busy, uint8_t rxen, uint8_t txen,
              float freq, float bw, uint8_t sf, uint8_t cr,
