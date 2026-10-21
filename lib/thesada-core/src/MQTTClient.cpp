@@ -132,6 +132,16 @@ static uint16_t  _brokerPort = 0;
 // in: cert (PEM string), key (PEM string).
 // out: true if both parse AND the key is the private half of the cert's
 //      public key.
+#if MBEDTLS_VERSION_MAJOR >= 3
+#include <esp_random.h>
+// mbedtls 3 needs an RNG for the key parse and the EC pair check (blinding);
+// a NULL one fails every pair. The hardware RNG is enough here.
+static int certCheckRng(void*, unsigned char* out, size_t len) {
+  esp_fill_random(out, len);
+  return 0;
+}
+#endif
+
 static bool validateClientCertKey(const char* cert, const char* key) {
   // Structural pre-flight before mbedtls sees attacker-influenced bytes:
   // both present, and each actually shaped like what it claims to be.
@@ -152,9 +162,9 @@ static bool validateClientCertKey(const char* cert, const char* key) {
     // pk_parse_key and pk_check_pair; 2.x has the shorter forms.
 #if MBEDTLS_VERSION_MAJOR >= 3
     if (mbedtls_pk_parse_key(&pk, (const unsigned char*)key, strlen(key) + 1,
-                             nullptr, 0, nullptr, nullptr) != 0)
+                             nullptr, 0, certCheckRng, nullptr) != 0)
       break;
-    if (mbedtls_pk_check_pair(&crt.pk, &pk, nullptr, nullptr) != 0)
+    if (mbedtls_pk_check_pair(&crt.pk, &pk, certCheckRng, nullptr) != 0)
       break;
 #else
     if (mbedtls_pk_parse_key(&pk, (const unsigned char*)key, strlen(key) + 1,

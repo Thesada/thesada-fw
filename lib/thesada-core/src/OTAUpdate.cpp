@@ -367,9 +367,11 @@ static void configureSecureClient(WiFiClientSecure& client) {
 static bool otaHttpGetWiFi(const char* url,
                            std::function<bool(const uint8_t*, size_t)> writeCallback,
                            int* outStatus, size_t* outLen) {
-  HTTPClient http;
+  // Clients before http: ~HTTPClient calls stop() on its client (core 3),
+  // so the client must outlive it. Locals die in reverse order.
   WiFiClientSecure secureClient;
   WiFiClient       plainClient;
+  HTTPClient http;
   bool https = strncmp(url, "https://", 8) == 0;
   if (https) {
     configureSecureClient(secureClient);

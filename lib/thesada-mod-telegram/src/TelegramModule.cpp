@@ -246,9 +246,9 @@ bool TelegramModule::send(const char* message) {
       String postBody;
       serializeJson(wdoc, postBody);
 
-      HTTPClient http;
       bool isHttps = String(url).startsWith("https");
-      WiFiClient pc;
+      WiFiClient pc;  // before http: ~HTTPClient calls stop() on it (core 3)
+      HTTPClient http;
       if (isHttps) {
         _webhookClient.stop();
         http.begin(_webhookClient, url);
