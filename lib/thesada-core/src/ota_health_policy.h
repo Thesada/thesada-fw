@@ -15,6 +15,10 @@
 // stays under the limit, so the OTA reboot can still confirm. Brownout holds.
 #define OTA_HEALTH_CRASH_LIMIT 3u
 
+// A valid image this long up clears its streak, so restarts weeks apart do
+// not add up. A loop that crashes sooner than this still reaches the limit.
+#define OTA_HEALTH_SETTLE_MS (60u * 60u * 1000u)
+
 // Numeric values of esp_reset_reason_t. Kept here so the host test does not
 // include the IDF header.
 #define OTA_RST_UNKNOWN   0
@@ -70,6 +74,14 @@ inline bool otaHealthShouldMark(bool pending, bool mqttUp, uint32_t uptimeMs,
   if (crashStreak >= OTA_HEALTH_CRASH_LIMIT) return false;
   if (mqttUp) return true;
   return uptimeMs >= OTA_HEALTH_MIN_MS;
+}
+
+// Clear a valid image's streak once it has run OTA_HEALTH_SETTLE_MS.
+// in: pending, uptime ms, crash streak. out: true to write the streak to 0.
+inline bool otaHealthShouldClearValid(bool pending, uint32_t uptimeMs,
+                                      uint32_t crashStreak) {
+  if (pending || crashStreak == 0) return false;
+  return uptimeMs >= OTA_HEALTH_SETTLE_MS;
 }
 
 // Abandon the running image once the crash streak hits the limit.

@@ -63,6 +63,32 @@ void test_mqtt_still_confirms_under_the_limit(void) {
   TEST_ASSERT_TRUE(otaHealthShouldMark(true, true, 0, OTA_HEALTH_CRASH_LIMIT - 1));
 }
 
+void test_valid_image_clears_its_streak_after_settling(void) {
+  TEST_ASSERT_FALSE(otaHealthShouldClearValid(false, OTA_HEALTH_SETTLE_MS - 1, 2));
+  TEST_ASSERT_TRUE(otaHealthShouldClearValid(false, OTA_HEALTH_SETTLE_MS, 2));
+  TEST_ASSERT_TRUE(otaHealthShouldClearValid(false, OTA_HEALTH_SETTLE_MS, OTA_HEALTH_CRASH_LIMIT));
+  TEST_ASSERT_FALSE(otaHealthShouldClearValid(false, OTA_HEALTH_SETTLE_MS, 0));
+  TEST_ASSERT_FALSE(otaHealthShouldClearValid(true, OTA_HEALTH_SETTLE_MS, 2));
+}
+
+void test_restarts_weeks_apart_never_reach_the_limit(void) {
+  uint32_t streak = 0;
+  for (int i = 0; i < 10; i++) {
+    streak = otaHealthNextCrashStreak(streak, otaHealthResetClass(OTA_RST_SW));
+    TEST_ASSERT_FALSE(otaHealthShouldRollback(streak));
+    if (otaHealthShouldClearValid(false, OTA_HEALTH_SETTLE_MS, streak)) streak = 0;
+  }
+}
+
+void test_a_fast_crash_loop_still_reaches_the_limit(void) {
+  uint32_t streak = 0;
+  for (uint32_t i = 0; i < OTA_HEALTH_CRASH_LIMIT; i++) {
+    TEST_ASSERT_FALSE(otaHealthShouldClearValid(false, OTA_HEALTH_SETTLE_MS - 1, streak));
+    streak = otaHealthNextCrashStreak(streak, otaHealthResetClass(OTA_RST_PANIC));
+  }
+  TEST_ASSERT_TRUE(otaHealthShouldRollback(streak));
+}
+
 void test_abandoned_image_matches_version_date_and_time(void) {
   TEST_ASSERT_FALSE(otaHealthIsAbandoned("1", "Oct  6 2026", "09:00:00", "", "", ""));
   TEST_ASSERT_TRUE(otaHealthIsAbandoned("1", "Oct  6 2026", "09:00:00",
@@ -82,6 +108,9 @@ int main(int, char**) {
   RUN_TEST(test_brownout_and_unknown_hold_the_streak);
   RUN_TEST(test_crash_limit_refuses_confirm_and_rolls_back);
   RUN_TEST(test_mqtt_still_confirms_under_the_limit);
+  RUN_TEST(test_valid_image_clears_its_streak_after_settling);
+  RUN_TEST(test_restarts_weeks_apart_never_reach_the_limit);
+  RUN_TEST(test_a_fast_crash_loop_still_reaches_the_limit);
   RUN_TEST(test_abandoned_image_matches_version_date_and_time);
   return UNITY_END();
 }

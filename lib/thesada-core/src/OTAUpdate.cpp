@@ -254,7 +254,7 @@ void OTAUpdate::rollbackIfCrashLoop() {
 
 // Confirm a pending image once, and retry when the IDF call fails.
 // An unread streak leaves a pending image pending.
-// in: none. out: none. A non-pending image is read once and left alone.
+// in: none. out: none. A valid image clears its streak after an hour up.
 void OTAUpdate::confirmIfHealthy() {
   if (_otaImageSettled) return;
   if (!_otaStateKnown) {
@@ -263,10 +263,17 @@ void OTAUpdate::confirmIfHealthy() {
     if (!running || esp_ota_get_state_partition(running, &state) != ESP_OK) return;
     _otaPending = state == ESP_OTA_IMG_PENDING_VERIFY;
     _otaStateKnown = true;
-    if (!_otaPending) {
-      _otaImageSettled = true;
-      return;
+  }
+  if (!_otaPending) {
+    if (!_otaStreakKnown || _otaCrashStreak == 0) { _otaImageSettled = true; return; }
+    if (!otaHealthShouldClearValid(false, millis(), _otaCrashStreak)) return;
+    if (clearCrashStreak()) {
+      Log::kvf(TAG, "ota.crash_streak_cleared reason=healthy_uptime streak=%lu",
+               (unsigned long)_otaCrashStreak);
+      _otaCrashStreak = 0;
     }
+    _otaImageSettled = true;
+    return;
   }
   if (!_otaStreakKnown) return;
   if (!otaHealthShouldMark(true, _otaMqttUp, millis(), _otaCrashStreak)) return;
