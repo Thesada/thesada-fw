@@ -129,6 +129,41 @@ void test_force_bypasses_version_gate(void) {
   TEST_ASSERT_FALSE(otaShouldUpdate("1.0.0", "garbage", false));
 }
 
+// ---- Fled-release skip ---------------------------------------------------
+
+// The image a switch booted refuses the build it fled, which is newer.
+void test_fled_release_is_skipped(void) {
+  TEST_ASSERT_TRUE(otaShouldUpdate("26.10.4", "26.10.3", false));
+  TEST_ASSERT_TRUE(otaSkipFled("26.10.4", "26.10.4", false));
+  // Read as N.N.N like otaIsNewer, so a zero-padded manifest is the same release.
+  TEST_ASSERT_TRUE(otaSkipFled("26.10.04", "26.10.4", false));
+  // Negative control: no record skips nothing.
+  TEST_ASSERT_FALSE(otaSkipFled("26.10.4", "", false));
+}
+
+void test_another_release_is_not_skipped(void) {
+  TEST_ASSERT_FALSE(otaSkipFled("26.10.5", "26.10.4", false));
+  TEST_ASSERT_FALSE(otaSkipFled("26.11.4", "26.10.4", false));
+  TEST_ASSERT_FALSE(otaSkipFled("27.10.4", "26.10.4", false));
+  TEST_ASSERT_FALSE(otaSkipFled("26.10.3", "26.10.4", false));
+}
+
+void test_force_installs_the_fled_release(void) {
+  TEST_ASSERT_FALSE(otaSkipFled("26.10.4", "26.10.4", true));
+  TEST_ASSERT_TRUE(otaShouldUpdate("26.10.4", "26.10.3", true));
+  // Negative control: the same inputs unforced skip.
+  TEST_ASSERT_TRUE(otaSkipFled("26.10.4", "26.10.4", false));
+}
+
+// A record that does not parse must not block the update it cannot name.
+void test_unparseable_fled_or_remote_skips_nothing(void) {
+  TEST_ASSERT_FALSE(otaSkipFled("26.10.4", nullptr, false));
+  TEST_ASSERT_FALSE(otaSkipFled("26.10.4", "26.10", false));
+  TEST_ASSERT_FALSE(otaSkipFled("26.10.4", "26.10.4x", false));
+  TEST_ASSERT_FALSE(otaSkipFled(nullptr, "26.10.4", false));
+  TEST_ASSERT_FALSE(otaSkipFled("garbage", "garbage", false));
+}
+
 // ---- Digest compare ------------------------------------------------------
 
 void test_matching_digest_accepts_either_case(void) {
@@ -170,6 +205,10 @@ int main(int, char**) {
   RUN_TEST(test_strict_version_parse);
   RUN_TEST(test_null_versions_are_not_newer);
   RUN_TEST(test_force_bypasses_version_gate);
+  RUN_TEST(test_fled_release_is_skipped);
+  RUN_TEST(test_another_release_is_not_skipped);
+  RUN_TEST(test_force_installs_the_fled_release);
+  RUN_TEST(test_unparseable_fled_or_remote_skips_nothing);
   RUN_TEST(test_matching_digest_accepts_either_case);
   RUN_TEST(test_mismatched_digest_rejects);
   RUN_TEST(test_wrong_length_digest_rejects);

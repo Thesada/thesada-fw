@@ -11,12 +11,14 @@
 | Corrupt / tampered image | SHA256 stream vs manifest mismatch -> `Log::error "SHA256 mismatch!"`, `Update.abort()` (`:784`) | Aborts, no flash |
 | Missing CA for OTA HTTPS | `Log::error "OTA disabled - no /ca.crt..."` -> `_enabled=false`; `reason:"no-ca"` (`:381`) | Fails closed unless `ota.allow_insecure=true` opt-in (logs warn) |
 | Heap too low for 2nd TLS session | `maxAllocHeap < 40000` -> `Log::info "Skipping - heap too low"` -> `reason:"heap-low"` (`:538`) | Boot-time check runs on clean heap; `--force` disconnects MQTT to free TLS buffers |
+| Confirmed build crash-loops, a slot switch boots the older image, the manifest still offers the build | `ota.fled_release_recorded version=` before the switch restart; every later check logs `ota.phase_change from=fetch_manifest to=idle reason=fled_release` -> `reason:"fled-release"` | Stays on the older image until the manifest offers another version, `ota.check --force`, or a firmware upload. A power-on does not lift it |
 | Cellular download stall | Range-chunk fail -> `Log::error "Range chunk failed at offset %u"` (`:292`) | 64KB Range chunks + periodic PDP bounce; `failed` status if unrecoverable |
 
 ## Gaps
 
 - **No firmware signature verification.** SHA256 is integrity-only (`:784`); `CONFIG_SECURE_BOOT is not set`, no `SECURE_SIGNED_APPS`. SECURITY.md:47 confirms. Anyone controlling the (CA-verified) origin/manifest can push arbitrary firmware whose SHA256 matches their own binary. **No detection, no recovery.**
 - **Rollback confirm is health-gated.** `verifyRollbackLater` returns true so `initArduino` does not confirm a pending image, unless the rescue flag was stored, both the clear and the commit succeeded, and no planned restart led to this boot. `OTAUpdate::confirmIfHealthy` marks it valid after the first MQTT session or five minutes up. A crash loop meets neither. Rollback runs only when the other slot is a different valid image that verifies whole and is not the slot a switch just came from. USB-flashed images are not pending; otadata reads them undefined, and they hold operator restarts like a valid image. After an hour up with a known crash streak they are marked valid, so the first OTA after a USB flash can roll back to them; an OTA that lands before that hour has no rollback target, as before. An undefined or unknown running state never switches slots.
+- **A pending build that never confirms is pulled again.** The bootloader aborts it, or the guard rolls it back, and the next check downloads it again; only a slot switch from a confirmed image records the release as fled. An image from 26.10.2 or older has no fled-release skip, so when a switch boots one it pulls the fled build again.
 - **CA / server cert expiry during OTA has no dedicated signal.** Surfaces only as a generic negative-status fetch failure (`:636`); the baked PROGMEM CA bundle can age out silently.
 
 ---

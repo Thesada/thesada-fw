@@ -1,7 +1,8 @@
 // thesada-fw - ota_verify_policy.h
 // Pure decisions on the OTA verification path: the TLS insecure-fallback guard,
-// manifest field validation, the version-update predicate, and the SHA256
-// digest compare. No HTTPClient, no Update, no mbedtls, so host unit-testable.
+// manifest field validation, the version-update predicate, the fled-release
+// skip, and the SHA256 digest compare. No HTTPClient, no Update, no mbedtls,
+// so host unit-testable.
 //
 // SCOPE: only these predicates moved. fetchManifest's HTTP and JSON handling,
 // and the streaming mbedtls_sha256 accumulation in applyUpdate, stay in
@@ -105,6 +106,17 @@ inline bool otaIsNewer(const char* remote, const char* local) {
 // Should the download proceed? force re-flashes even when remote is not newer.
 inline bool otaShouldUpdate(const char* remote, const char* local, bool force) {
   return force || otaIsNewer(remote, local);
+}
+
+// A manifest entry with the version a guard switch fled, compared as N.N.N
+// the way otaIsNewer reads it. in: remote, fled, force. out: true to skip.
+inline bool otaSkipFled(const char* remote, const char* fled, bool force) {
+  if (force) return false;
+  int rMajor = 0, rMinor = 0, rPatch = 0;
+  int fMajor = 0, fMinor = 0, fPatch = 0;
+  if (!otaParseVersion(remote, &rMajor, &rMinor, &rPatch)) return false;
+  if (!otaParseVersion(fled, &fMajor, &fMinor, &fPatch)) return false;
+  return rMajor == fMajor && rMinor == fMinor && rPatch == fPatch;
 }
 
 // Digest compare. Case-insensitive because the manifest may carry either case,

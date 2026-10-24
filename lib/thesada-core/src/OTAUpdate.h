@@ -38,8 +38,8 @@ public:
   // has reached the broker since it was installed. out: does not return.
   [[noreturn]] static void brokerRestart();
 
-  // If the streak is at the limit, boot the other valid image.
-  // in: none. out: none. Does not return when the switch works.
+  // If the streak is at the limit, boot the other valid image, recording a
+  // valid image's release as fled. in: none. out: none; no return on a switch.
   static void rollbackIfCrashLoop();
 
   // Record a first broker session, then confirm a pending image or leave it
@@ -47,7 +47,9 @@ public:
   static void confirmIfHealthy();
 
   // Fetch manifest, compare version, download, verify SHA256, flash, reboot.
-  // force=true bypasses isNewer() - re-flashes even when remote == local.
+  // A manifest version a guard switch fled is refused as fled-release.
+  // force=true bypasses isNewer() and that refusal - re-flashes even when
+  // remote == local.
   // Useful for dev iteration without bumping FIRMWARE_VERSION each cycle.
   //
   // WARNING: synchronous - blocks on fetch + download + flash + ESP.restart().

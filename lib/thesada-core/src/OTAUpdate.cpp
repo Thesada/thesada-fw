@@ -177,6 +177,29 @@ static void disarmRescue() {
   if (!cleared) Log::kvfe(TAG, "ota.rescue_left_set reason=nvs_write");
 }
 
+// Written after the boot slot is set, so a failed switch leaves no skip. A
+// lost write costs one more download of this release. in: none. out: none.
+static void recordFledRelease() {
+  Preferences prefs;
+  bool wrote = prefs.begin("boot", false) && prefs.putString("fled_ver", FIRMWARE_VERSION) != 0;
+  prefs.end();
+  if (wrote) Log::kvfw(TAG, "ota.fled_release_recorded version=%s", FIRMWARE_VERSION);
+  else Log::kvfe(TAG, "ota.fled_release_unrecorded reason=nvs_write");
+}
+
+// An unread record skips nothing: it must not hold back every update.
+// in: buffer and size. out: the release a guard switch fled, or empty.
+static void fledRelease(char* out, size_t cap) {
+  out[0] = '\0';
+  Preferences prefs;
+  if (!prefs.begin("boot", true)) {
+    Log::kvfw(TAG, "ota.fled_release_unread reason=nvs");
+    return;
+  }
+  if (prefs.isKey("fled_ver")) prefs.getString("fled_ver", out, cap);
+  prefs.end();
+}
+
 // An unreadable description or NVS must not look like a free slot.
 // in: candidate partition. out: true if it is the image a switch came from.
 static bool imageAbandoned(const esp_partition_t* part) {
@@ -399,6 +422,7 @@ void OTAUpdate::rollbackIfCrashLoop() {
     disarmRescue();
     return;
   }
+  recordFledRelease();
   ESP.restart();
 }
 
@@ -1018,7 +1042,18 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
     MQTTClient::publish(topic, payload);
     return;
   }
-  if (force && !isNewer(remoteVersion.c_str(), FIRMWARE_VERSION)) {
+  // Without this the image a switch booted pulls the fled build straight back.
+  char fled[32];
+  fledRelease(fled, sizeof(fled));
+  if (otaSkipFled(remoteVersion.c_str(), fled, force)) {
+    Log::kvfw(TAG, "ota.phase_change from=fetch_manifest to=idle reason=fled_release version=%s",
+              remoteVersion.c_str());
+    publishOtaRefusal("fled-release");
+    return;
+  }
+  if (force && otaSkipFled(remoteVersion.c_str(), fled, false)) {
+    Log::warn(TAG, "ota.force_reflash version=fled");
+  } else if (force && !isNewer(remoteVersion.c_str(), FIRMWARE_VERSION)) {
     Log::warn(TAG, "ota.force_reflash version=same_or_older");
   }
 
