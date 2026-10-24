@@ -177,27 +177,96 @@ static void disarmRescue() {
   if (!cleared) Log::kvfe(TAG, "ota.rescue_left_set reason=nvs_write");
 }
 
+// Survives a software reset and deep sleep, not a power-on: fled-skip seconds
+// not yet saved to NVS, then their complement.
+RTC_NOINIT_ATTR static uint32_t _otaFledUnsaved[2];
+
+// The fled record and its skip age, read once a boot.
+static struct {
+  bool loaded;
+  bool savedThisBoot;
+  char ver[32];
+  OtaFledAge saved;
+  uint32_t carry;   // unsaved seconds an earlier boot left in RTC memory
+  uint32_t markMs;  // millis at the last save this boot
+} _fled = {};
+
+static void putFledUnsaved(uint32_t s) {
+  _otaFledUnsaved[0] = s;
+  _otaFledUnsaved[1] = ~s;
+}
+
 // Written after the boot slot is set, so a failed switch leaves no skip. A
 // lost write costs one more download of this release. in: none. out: none.
 static void recordFledRelease() {
   Preferences prefs;
-  bool wrote = prefs.begin("boot", false) && prefs.putString("fled_ver", FIRMWARE_VERSION) != 0;
+  // Age first: a lost version write then leaves the old release a fresh day.
+  bool wrote = prefs.begin("boot", false) &&
+               prefs.putULong64("fled_age", otaFledPack({0, 0, 0})) != 0 &&
+               prefs.putString("fled_ver", FIRMWARE_VERSION) != 0;
   prefs.end();
+  putFledUnsaved(0);
   if (wrote) Log::kvfw(TAG, "ota.fled_release_recorded version=%s", FIRMWARE_VERSION);
   else Log::kvfe(TAG, "ota.fled_release_unrecorded reason=nvs_write");
 }
 
-// An unread record skips nothing: it must not hold back every update.
-// in: buffer and size. out: the release a guard switch fled, or empty.
-static void fledRelease(char* out, size_t cap) {
-  out[0] = '\0';
+// An unread record skips nothing: it must not hold back every update. The
+// RTC carry is taken once and zeroed. in: none. out: none.
+static void loadFled() {
+  if (_fled.loaded) return;
+  _fled.loaded = true;
+  _fled.carry = otaFledCarry(_otaFledUnsaved[0], _otaFledUnsaved[1]);
+  putFledUnsaved(0);
   Preferences prefs;
   if (!prefs.begin("boot", true)) {
     Log::kvfw(TAG, "ota.fled_release_unread reason=nvs");
     return;
   }
-  if (prefs.isKey("fled_ver")) prefs.getString("fled_ver", out, cap);
+  if (prefs.isKey("fled_ver")) prefs.getString("fled_ver", _fled.ver, sizeof(_fled.ver));
+  if (prefs.isKey("fled_age")) _fled.saved = otaFledUnpack(prefs.getULong64("fled_age", 0));
   prefs.end();
+}
+
+// in: none. out: the clock as an epoch once SNTP synced it, else 0.
+static uint32_t syncedEpoch() {
+  return WiFiManager::ntpSynced() ? (uint32_t)time(nullptr) : 0u;
+}
+
+static uint32_t fledUnsavedS() { return _fled.carry + (millis() - _fled.markMs) / 1000u; }
+
+// in: none. out: the saved age plus the time since that save.
+static uint32_t fledAgeNow() {
+  uint32_t elapsed = otaFledElapsed(fledUnsavedS(), !_fled.savedThisBoot,
+                                    _fled.saved.seenEpoch, syncedEpoch());
+  return otaFledAdvance(_fled.saved.ageS, elapsed);
+}
+
+// A failed write still moves the count on in RAM, so it is not retried every
+// turn. in: age, installs since expiry. out: none.
+static void saveFled(uint32_t ageS, uint8_t tries) {
+  const OtaFledAge next = {ageS, tries, syncedEpoch()};
+  Preferences prefs;
+  bool wrote = prefs.begin("boot", false) && prefs.putULong64("fled_age", otaFledPack(next)) != 0;
+  prefs.end();
+  if (!wrote) Log::kvfe(TAG, "ota.fled_age_unsaved reason=nvs_write");
+  _fled.saved = next;
+  _fled.savedThisBoot = true;
+  _fled.carry = 0;
+  _fled.markMs = millis();
+  putFledUnsaved(0);
+}
+
+// RTC memory holds the unsaved seconds each turn and NVS gets them every 10
+// min, so a reset loses none and a power-on under 10 min. in: none. out: none.
+static void ageFledRelease() {
+  loadFled();
+  if (!otaFledAges(_fled.ver, FIRMWARE_VERSION, _fled.saved.ageS)) return;
+  uint32_t unsaved = fledUnsavedS();
+  if (!otaFledSaveDue(unsaved, false)) {
+    putFledUnsaved(unsaved);
+    return;
+  }
+  saveFled(fledAgeNow(), _fled.saved.tries);
 }
 
 // An unreadable description or NVS must not look like a free slot.
@@ -449,6 +518,7 @@ static bool markUsbImageValid() {
 // in: none. out: none. A non-pending image clears its streak after an hour up,
 // and a USB-flashed one is then marked valid.
 void OTAUpdate::confirmIfHealthy() {
+  ageFledRelease();
   markProvenOnBroker();
   if (_otaImageSettled) return;
   if (!_otaStateKnown) {
@@ -1043,15 +1113,25 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
     return;
   }
   // Without this the image a switch booted pulls the fled build straight back.
-  char fled[32];
-  fledRelease(fled, sizeof(fled));
-  if (otaSkipFled(remoteVersion.c_str(), fled, force)) {
-    Log::kvfw(TAG, "ota.phase_change from=fetch_manifest to=idle reason=fled_release version=%s",
-              remoteVersion.c_str());
+  loadFled();
+  const uint32_t fledAge = fledAgeNow();
+  const uint8_t tries = _fled.saved.tries;
+  const OtaFledAction fled =
+      otaFledAction(remoteVersion.c_str(), _fled.ver, fledAge, tries, force);
+  if (fled == OTA_FLED_SKIP) {
+    if (otaFledSaveDue(fledUnsavedS(), !_fled.savedThisBoot)) saveFled(fledAge, tries);
+    Log::kvfw(TAG, "ota.phase_change from=fetch_manifest to=idle reason=fled_release version=%s age_s=%lu",
+              remoteVersion.c_str(), (unsigned long)fledAge);
     publishOtaRefusal("fled-release");
     return;
   }
-  if (force && otaSkipFled(remoteVersion.c_str(), fled, false)) {
+  if (fled == OTA_FLED_RETRY || fled == OTA_FLED_LAST) {
+    // Saved before the download, so a try that never boots still counts.
+    if (fled == OTA_FLED_LAST) saveFled(0, 0);
+    else saveFled(fledAge, (uint8_t)(tries + 1));
+    Log::kvfw(TAG, "ota.fled_release_retry version=%s try=%u", remoteVersion.c_str(),
+              (unsigned)(tries + 1));
+  } else if (fled == OTA_FLED_FORCED) {
     Log::warn(TAG, "ota.force_reflash version=fled");
   } else if (force && !isNewer(remoteVersion.c_str(), FIRMWARE_VERSION)) {
     Log::warn(TAG, "ota.force_reflash version=same_or_older");

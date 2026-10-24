@@ -42,14 +42,14 @@ public:
   // valid image's release as fled. in: none. out: none; no return on a switch.
   static void rollbackIfCrashLoop();
 
-  // Record a first broker session, then confirm a pending image or leave it
-  // pending. Call every main-loop turn, even when loop() is skipped.
+  // Age the fled skip, record a first broker session, confirm a pending image
+  // or leave it pending. Call every main-loop turn, even when loop() is skipped.
   static void confirmIfHealthy();
 
   // Fetch manifest, compare version, download, verify SHA256, flash, reboot.
-  // A manifest version a guard switch fled is refused as fled-release.
-  // force=true bypasses isNewer() and that refusal - re-flashes even when
-  // remote == local.
+  // A manifest version a guard switch fled is refused as fled-release for
+  // 24 h, then installed again. force=true bypasses isNewer() and that
+  // refusal - re-flashes even when remote == local.
   // Useful for dev iteration without bumping FIRMWARE_VERSION each cycle.
   //
   // WARNING: synchronous - blocks on fetch + download + flash + ESP.restart().
