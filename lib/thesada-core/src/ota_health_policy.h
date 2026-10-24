@@ -10,9 +10,8 @@
 // bootloader on the next reset. Five minutes covers a broker that is down.
 #define OTA_HEALTH_MIN_MS (5u * 60u * 1000u)
 
-// Panic, watchdog, and software resets. At the limit the running image is
-// abandoned. Power-on and deep sleep clear the streak. One software reset
-// stays under the limit, so the OTA reboot can still confirm. Brownout holds.
+// Crash resets that abandon the running image. Power-on and deep sleep clear,
+// brownout holds, and one OTA reboot stays under the limit.
 #define OTA_HEALTH_CRASH_LIMIT 3u
 
 // A valid image this long up clears its streak, so restarts weeks apart do
@@ -56,6 +55,60 @@ inline OtaResetClass otaHealthResetClass(int reason) {
     default:
       return OTA_RESET_HOLD;
   }
+}
+
+// RTC words a planned restart leaves for the next boot: an operator restart,
+// or a reboot from the MQTT budget. Any other value reads as unplanned.
+#define OTA_PLANNED_RESTART_MAGIC 0x504C4E44u
+#define OTA_PLANNED_BROKER_MAGIC  0x4D515454u
+
+enum OtaPlanned : uint8_t {
+  OTA_PLANNED_NONE     = 0,
+  OTA_PLANNED_OPERATOR = 1,
+  OTA_PLANNED_BROKER   = 2,
+};
+
+// Read the planned-restart marker and clear it, so it covers one boot only.
+// in: marker word. out: which restart left it, or none.
+inline OtaPlanned otaHealthTakePlanned(uint32_t* marker) {
+  OtaPlanned planned = OTA_PLANNED_NONE;
+  if (*marker == OTA_PLANNED_RESTART_MAGIC) planned = OTA_PLANNED_OPERATOR;
+  else if (*marker == OTA_PLANNED_BROKER_MAGIC) planned = OTA_PLANNED_BROKER;
+  *marker = 0;
+  return planned;
+}
+
+// Operator restarts, and MQTT budget reboots of a proven image, hold on a
+// confirmed image. in: reason, marker, confirmed, proven. out: reset class.
+inline OtaResetClass otaHealthBootClass(int reason, OtaPlanned planned, bool confirmed,
+                                        bool proven) {
+  if (reason == OTA_RST_SW && confirmed &&
+      (planned == OTA_PLANNED_OPERATOR || (planned == OTA_PLANNED_BROKER && proven))) {
+    return OTA_RESET_HOLD;
+  }
+  return otaHealthResetClass(reason);
+}
+
+// Proven-on-broker record: the slot address, little-endian, then the app ELF
+// sha256. A new OTA image differs in one or both.
+#define OTA_IMAGE_ID_LEN 36u
+
+// Build the running image's id. An all-zero hash would match every build.
+// in: slot address, 32-byte ELF hash, id out. out: false when the hash is empty.
+inline bool otaHealthImageId(uint32_t slotAddr, const uint8_t* elfSha, uint8_t* id) {
+  uint8_t any = 0;
+  for (size_t i = 0; i < 32; i++) any |= elfSha[i];
+  if (any == 0) return false;
+  for (size_t i = 0; i < 4; i++) id[i] = (uint8_t)(slotAddr >> (8 * i));
+  memcpy(id + 4, elfSha, 32);
+  return true;
+}
+
+// True only when the stored record names this exact image.
+// in: stored record and its length, running id. out: proven on the broker.
+inline bool otaHealthImageProven(const uint8_t* stored, size_t storedLen, const uint8_t* id) {
+  if (!stored || !id || storedLen != OTA_IMAGE_ID_LEN) return false;
+  return memcmp(stored, id, OTA_IMAGE_ID_LEN) == 0;
 }
 
 // Next streak after this boot. in: previous, class. out: new streak.

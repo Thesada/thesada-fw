@@ -89,6 +89,113 @@ void test_a_fast_crash_loop_still_reaches_the_limit(void) {
   TEST_ASSERT_TRUE(otaHealthShouldRollback(streak));
 }
 
+// Boots of a confirmed image after `n` restarts of one kind, from `streak`.
+static uint32_t afterRestarts(uint32_t streak, int n, OtaPlanned kind, bool confirmed,
+                              bool proven) {
+  for (int i = 0; i < n; i++) {
+    streak = otaHealthNextCrashStreak(
+        streak, otaHealthBootClass(OTA_RST_SW, kind, confirmed, proven));
+  }
+  return streak;
+}
+
+void test_operator_restart_on_a_confirmed_image_holds(void) {
+  TEST_ASSERT_EQUAL(OTA_RESET_HOLD, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_OPERATOR, true, false));
+  TEST_ASSERT_EQUAL(OTA_RESET_HOLD, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_OPERATOR, true, true));
+  TEST_ASSERT_EQUAL_UINT32(2, afterRestarts(2, 10, OTA_PLANNED_OPERATOR, true, false));
+  // Negative control: the same restarts with no marker reach the limit.
+  TEST_ASSERT_TRUE(otaHealthShouldRollback(afterRestarts(2, 1, OTA_PLANNED_NONE, true, false)));
+}
+
+void test_proven_image_holds_broker_outage_reboots(void) {
+  TEST_ASSERT_EQUAL(OTA_RESET_HOLD, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_BROKER, true, true));
+  uint32_t streak = afterRestarts(0, 10, OTA_PLANNED_BROKER, true, true);
+  TEST_ASSERT_EQUAL_UINT32(0, streak);
+  TEST_ASSERT_FALSE(otaHealthShouldRollback(streak));
+  // Negative control: the same image not yet proven counts them.
+  TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_BROKER, true, false));
+}
+
+void test_unproven_confirmed_image_escapes_on_broker_reboots(void) {
+  // OTA reboot into the pending image, then the five-minute confirm.
+  uint32_t streak = afterRestarts(0, 1, OTA_PLANNED_OPERATOR, false, false);
+  TEST_ASSERT_EQUAL_UINT32(1, streak);
+  TEST_ASSERT_TRUE(otaHealthShouldMark(true, false, OTA_HEALTH_MIN_MS, streak));
+  streak = 0;
+  // A budget reboot every ~30 min never reaches the hour that clears the streak.
+  for (uint32_t i = 0; i < OTA_HEALTH_CRASH_LIMIT; i++) {
+    TEST_ASSERT_FALSE(otaHealthShouldRollback(streak));
+    TEST_ASSERT_FALSE(otaHealthShouldClearValid(false, 30u * 60u * 1000u, streak));
+    streak = afterRestarts(streak, 1, OTA_PLANNED_BROKER, true, false);
+  }
+  TEST_ASSERT_TRUE(otaHealthShouldRollback(streak));
+  // Negative control: proven on the broker, the same reboots never escape.
+  TEST_ASSERT_FALSE(otaHealthShouldRollback(
+      afterRestarts(0, OTA_HEALTH_CRASH_LIMIT, OTA_PLANNED_BROKER, true, true)));
+}
+
+void test_new_ota_image_starts_unproven(void) {
+  uint8_t shaA[32], shaB[32];
+  for (int i = 0; i < 32; i++) {
+    shaA[i] = (uint8_t)(i + 1);
+    shaB[i] = (uint8_t)(i + 1);
+  }
+  shaB[31] ^= 0x80u;
+  uint8_t stored[OTA_IMAGE_ID_LEN], idSame[OTA_IMAGE_ID_LEN], idNew[OTA_IMAGE_ID_LEN],
+      idOtherSlot[OTA_IMAGE_ID_LEN];
+  TEST_ASSERT_TRUE(otaHealthImageId(0x10000u, shaA, stored));
+  TEST_ASSERT_TRUE(otaHealthImageId(0x10000u, shaA, idSame));
+  TEST_ASSERT_TRUE(otaHealthImageId(0x10000u, shaB, idNew));
+  TEST_ASSERT_TRUE(otaHealthImageId(0x310000u, shaA, idOtherSlot));
+  // Negative control: the image the record was written for is proven.
+  TEST_ASSERT_TRUE(otaHealthImageProven(stored, OTA_IMAGE_ID_LEN, idSame));
+  TEST_ASSERT_FALSE(otaHealthImageProven(stored, OTA_IMAGE_ID_LEN, idNew));
+  TEST_ASSERT_FALSE(otaHealthImageProven(stored, OTA_IMAGE_ID_LEN, idOtherSlot));
+  TEST_ASSERT_FALSE(otaHealthImageProven(stored, 0, idSame));
+  TEST_ASSERT_FALSE(otaHealthImageProven(stored, OTA_IMAGE_ID_LEN - 1, idSame));
+  TEST_ASSERT_FALSE(otaHealthImageProven(nullptr, OTA_IMAGE_ID_LEN, idSame));
+  uint8_t zero[32] = {0};
+  TEST_ASSERT_FALSE(otaHealthImageId(0x10000u, zero, idNew));
+}
+
+void test_pending_image_counts_every_restart(void) {
+  TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_OPERATOR, false, true));
+  TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_BROKER, false, true));
+  TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_NONE, false, true));
+  TEST_ASSERT_TRUE(otaHealthShouldRollback(
+      afterRestarts(0, OTA_HEALTH_CRASH_LIMIT, OTA_PLANNED_OPERATOR, false, true)));
+  // Negative control: the same restarts on a confirmed image hold.
+  TEST_ASSERT_FALSE(otaHealthShouldRollback(
+      afterRestarts(0, OTA_HEALTH_CRASH_LIMIT, OTA_PLANNED_OPERATOR, true, true)));
+}
+
+void test_panic_and_watchdogs_count_even_when_planned(void) {
+  const int crashes[] = {OTA_RST_PANIC, OTA_RST_INT_WDT, OTA_RST_TASK_WDT, OTA_RST_WDT};
+  for (int reason : crashes) {
+    TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(reason, OTA_PLANNED_OPERATOR, true, true));
+    TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(reason, OTA_PLANNED_BROKER, true, true));
+  }
+  // Negative control: a software reset with the same marker holds.
+  TEST_ASSERT_EQUAL(OTA_RESET_HOLD, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_OPERATOR, true, true));
+}
+
+void test_stale_marker_after_power_on_is_ignored(void) {
+  uint32_t marker = OTA_PLANNED_RESTART_MAGIC;
+  OtaPlanned planned = otaHealthTakePlanned(&marker);
+  // Negative control: the magic itself reads as planned.
+  TEST_ASSERT_EQUAL(OTA_PLANNED_OPERATOR, planned);
+  TEST_ASSERT_EQUAL(OTA_RESET_CLEAR, otaHealthBootClass(OTA_RST_POWERON, planned, true, true));
+  TEST_ASSERT_EQUAL_UINT32(0, marker);
+  TEST_ASSERT_EQUAL(OTA_PLANNED_NONE, otaHealthTakePlanned(&marker));
+  TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_NONE, true, true));
+  marker = OTA_PLANNED_BROKER_MAGIC;
+  TEST_ASSERT_EQUAL(OTA_PLANNED_BROKER, otaHealthTakePlanned(&marker));
+  TEST_ASSERT_EQUAL_UINT32(0, marker);
+  marker = OTA_PLANNED_RESTART_MAGIC ^ 1u;
+  TEST_ASSERT_EQUAL(OTA_PLANNED_NONE, otaHealthTakePlanned(&marker));
+  TEST_ASSERT_EQUAL_UINT32(0, marker);
+}
+
 void test_abandoned_image_matches_version_date_and_time(void) {
   TEST_ASSERT_FALSE(otaHealthIsAbandoned("1", "Oct  6 2026", "09:00:00", "", "", ""));
   TEST_ASSERT_TRUE(otaHealthIsAbandoned("1", "Oct  6 2026", "09:00:00",
@@ -111,6 +218,13 @@ int main(int, char**) {
   RUN_TEST(test_valid_image_clears_its_streak_after_settling);
   RUN_TEST(test_restarts_weeks_apart_never_reach_the_limit);
   RUN_TEST(test_a_fast_crash_loop_still_reaches_the_limit);
+  RUN_TEST(test_operator_restart_on_a_confirmed_image_holds);
+  RUN_TEST(test_proven_image_holds_broker_outage_reboots);
+  RUN_TEST(test_unproven_confirmed_image_escapes_on_broker_reboots);
+  RUN_TEST(test_new_ota_image_starts_unproven);
+  RUN_TEST(test_pending_image_counts_every_restart);
+  RUN_TEST(test_panic_and_watchdogs_count_even_when_planned);
+  RUN_TEST(test_stale_marker_after_power_on_is_ignored);
   RUN_TEST(test_abandoned_image_matches_version_date_and_time);
   return UNITY_END();
 }

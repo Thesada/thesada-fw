@@ -908,7 +908,7 @@ void MQTTClient::connect() {
                   (unsigned)(count + 1), (unsigned)maxReboots);
         mqttRebootCountBump(count + 1);
         delay(1000);
-        ESP.restart();
+        OTAUpdate::brokerRestart();
       }
       // Budget spent: fall through to backoff; the exhaustion path below
       // owns the halt messaging.
@@ -934,7 +934,7 @@ void MQTTClient::connect() {
         if (mqttCriticalJson(failing, sizeof(failing)) > 0) mqttWriteRbCfg(failing);
         mqttRebootCountBump(count + 1);
         delay(1000);
-        ESP.restart();
+        OTAUpdate::brokerRestart();
       } else {
         // Budget spent. Keep retrying, never reboot again.
         _rebootHalted = true;
@@ -1000,6 +1000,7 @@ void MQTTClient::loop() {
         Log::kvfe(TAG, "mqtt.heap_watchdog_reboot floor_b=%d hold_ms=%d",
                   (int)HEAP_REBOOT_FLOOR_BYTES, (int)HEAP_REBOOT_HOLD_MS);
         delay(100);
+        // Not plannedRestart: a heap that stays low is a fault, so it counts as a crash.
         esp_restart();
       }
     } else if (_lowHeapSinceMs != 0) {
@@ -2262,7 +2263,7 @@ void MQTTClient::serviceCertReboot() {
   if (!_certRebootPending || (int32_t)(millis() - _certRebootAtMs) < 0) return;
   Log::kvfw(TAG, "mqtt.cert_reboot reason=%s", _certRebootReason);
   delay(100);
-  ESP.restart();
+  OTAUpdate::plannedRestart();
 }
 
 void MQTTClient::setOnClientCertCleared(std::function<void()> fn) {
