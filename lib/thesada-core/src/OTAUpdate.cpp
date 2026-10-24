@@ -347,7 +347,7 @@ static void configureSecureClient(WiFiClientSecure& client) {
   } else {
     client.setCACert(_otaCaCert.c_str());
   }
-  client.setTimeout(10);            // arduino-esp32 v2.x: seconds (current platform)
+  client.setTimeout(10);            // core 2: seconds; http.setConnectTimeout caps connect
   client.setHandshakeTimeout(10);   // ssl handshake, always seconds
 }
 

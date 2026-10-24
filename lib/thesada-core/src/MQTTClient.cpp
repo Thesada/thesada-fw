@@ -505,10 +505,13 @@ void MQTTClient::begin() {
     }
   }
 
-  // Keep well under the 30 s hardware watchdog.
-  // v2.x setTimeout takes seconds; v3.x takes milliseconds. Setting both
-  // handles the difference. setHandshakeTimeout is always in seconds.
-  _wifiClient.setTimeout(10);
+  // TCP connect and TLS write capped at 10 s, under the 30 s watchdog. Core 3
+  // setTimeout is only the Stream read timeout; setConnectionTimeout caps these.
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  _wifiClient.setConnectionTimeout(10000);  // ms
+#else
+  _wifiClient.setTimeout(10);  // seconds
+#endif
   _wifiClient.setHandshakeTimeout(10);  // ssl handshake, always seconds
 
   // Load CA cert from LittleFS, else point straight at the baked bundle.

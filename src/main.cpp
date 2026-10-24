@@ -99,10 +99,11 @@ void setup() {
 
   // Hardware watchdog: reboot if loop() doesn't feed within 30s.
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
-  // IDF 5 pre-initializes TWDT. Use reconfigure to extend timeout to 30s.
+  // IDF 5 pre-initializes TWDT; reconfigure drops idle tasks not in the
+  // mask, so keep the CPU0 idle watch core 2 kept from sdkconfig.
   esp_task_wdt_config_t wdt_cfg = {
-    .timeout_ms = 60000,
-    .idle_core_mask = 0,
+    .timeout_ms = 30000,
+    .idle_core_mask = 1 << 0,
     .trigger_panic = true,
   };
   esp_task_wdt_reconfigure(&wdt_cfg);
