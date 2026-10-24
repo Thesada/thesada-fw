@@ -33,6 +33,7 @@
 #include "ota_verify_policy.h"
 #include "ota_health_policy.h"
 #include <esp_ota_ops.h>
+#include <esp_image_format.h>
 #include <esp_timer.h>
 #include <nvs.h>
 #include <nvs_flash.h>
@@ -44,6 +45,32 @@
 
 static const char* TAG = "OTA";
 
+// Survives a software reset, not a power-on. recordBootStreak reads and clears it.
+RTC_NOINIT_ATTR static uint32_t _otaPlannedRestart;
+// The rescue flag and pending state as initArduino saw them, before it confirms.
+static uint8_t _otaBootRescue = 0;
+static bool _otaBootPending = false;
+
+// in: wanted state. out: true when the running image reads it; unreadable is false.
+static bool runningImageIs(esp_ota_img_states_t want) {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+  return running && esp_ota_get_state_partition(running, &state) == ESP_OK && state == want;
+}
+
+static_assert(OTA_IMG_PENDING_VERIFY == ESP_OTA_IMG_PENDING_VERIFY &&
+                  OTA_IMG_VALID == ESP_OTA_IMG_VALID && OTA_IMG_UNDEFINED == ESP_OTA_IMG_UNDEFINED,
+              "ota_health_policy.h image states drifted from esp_ota_img_states_t");
+
+// Only a confirmed image may hold a planned restart; unknown counts.
+// in: none. out: true when the running image is valid, or undefined after a USB flash.
+static bool runningImageConfirmed() {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+  return running && esp_ota_get_state_partition(running, &state) == ESP_OK &&
+         otaHealthStateConfirmed((uint32_t)state);
+}
+
 // initArduino calls this before setup. Rescue confirms only after the flag
 // is cleared: a flag left set would skip the health gate on the next OTA.
 // in: none. out: false confirms in the core; true leaves the health gate.
@@ -52,13 +79,15 @@ extern "C" bool verifyRollbackLater() {
   if (nvs_flash_init() != ESP_OK) return true;
   nvs_handle_t handle;
   if (nvs_open("boot", NVS_READWRITE, &handle) != ESP_OK) return true;
-  uint8_t rescue = 0;
-  nvs_get_u8(handle, "rescue", &rescue);
+  uint8_t stored = 0;
+  nvs_get_u8(handle, "rescue", &stored);
+  _otaBootRescue = otaHealthRescue(stored, _otaPlannedRestart);
+  _otaBootPending = runningImageIs(ESP_OTA_IMG_PENDING_VERIFY);
   bool defer = true;
-  if (rescue &&
+  if (stored &&
       nvs_set_u8(handle, "rescue", 0) == ESP_OK &&
       nvs_commit(handle) == ESP_OK) {
-    defer = false;
+    defer = _otaBootRescue == 0;
   }
   nvs_close(handle);
   return defer;
@@ -72,8 +101,6 @@ static bool _otaImageSettled = false;
 static uint32_t _otaCrashStreak = 0;
 static bool _otaStreakKnown = false;
 static uint32_t _otaSettleFails = 0;  // failed healthy-hour clears and USB marks this boot
-// Survives a software reset, not a power-on. recordBootStreak reads and clears it.
-RTC_NOINIT_ATTR static uint32_t _otaPlannedRestart;
 // The running image's proven record is stored, or this boot already tried it.
 static bool _otaProvenDone = false;
 
@@ -122,53 +149,36 @@ static void markProvenOnBroker() {
   Log::info(TAG, "ota.image_proven reason=mqtt_up");
 }
 
-static_assert(OTA_IMG_PENDING_VERIFY == ESP_OTA_IMG_PENDING_VERIFY &&
-                  OTA_IMG_VALID == ESP_OTA_IMG_VALID && OTA_IMG_UNDEFINED == ESP_OTA_IMG_UNDEFINED,
-              "ota_health_policy.h image states drifted from esp_ota_img_states_t");
-
-// Only a confirmed image may hold a planned restart; unknown counts.
-// in: none. out: true when the running image is valid, or undefined after a USB flash.
-static bool runningImageConfirmed() {
-  const esp_partition_t* running = esp_ota_get_running_partition();
-  esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
-  return running && esp_ota_get_state_partition(running, &state) == ESP_OK &&
-         otaHealthStateConfirmed((uint32_t)state);
-}
-
-// Store the image we are leaving and arm an immediate confirm on the next
-// boot. The switch is skipped when this cannot be stored: without it the
-// next limit can select this image again, and a reset can abort the slot
-// we are about to boot.
-// in: running partition. out: true when the left identity and rescue flag were written.
-static bool rememberAbandoned(const esp_partition_t* part) {
-  esp_app_desc_t desc;
-  if (!part || esp_ota_get_partition_description(part, &desc) != ESP_OK) {
-    Log::kvfe(TAG, "ota.abandoned_unrecorded reason=no_description");
-    return false;
-  }
+// Zero the streak the switch reset adds to, then arm an immediate confirm of
+// the slot about to boot. out: true when both landed; the switch needs both.
+static bool armRescue() {
   Preferences prefs;
   if (!prefs.begin("boot", false)) {
-    Log::kvfe(TAG, "ota.abandoned_unrecorded reason=nvs");
+    Log::kvfe(TAG, "ota.image_rollback_failed reason=nvs");
     return false;
   }
-  size_t ver = prefs.putString("left_ver", desc.version);
-  size_t date = prefs.putString("left_date", desc.date);
-  size_t time = prefs.putString("left_time", desc.time);
-  size_t rescue = prefs.putUChar("rescue", 1);
-  // The switch reboots in software, which counts as a crash. Leaving the
-  // streak at the limit makes the next update refuse to confirm.
   size_t crash = prefs.putUInt("crash_n", 0);
+  size_t rescue = crash ? prefs.putUChar("rescue", OTA_RESCUE_ID) : 0;
   prefs.end();
   if (crash != 0) _otaCrashStreak = 0;
-  if (ver == 0 || date == 0 || time == 0 || rescue == 0 || crash == 0) {
-    Log::kvfe(TAG, "ota.abandoned_unrecorded reason=nvs_write");
+  if (rescue == 0) {
+    Log::kvfe(TAG, "ota.image_rollback_failed reason=nvs_write");
     return false;
   }
   return true;
 }
 
-// A missing description or an unread record must not look like a free slot.
-// in: candidate partition. out: true if it is the image we last left.
+// A flag left by a failed switch would confirm the next written image unchecked.
+// in: none. out: none.
+static void disarmRescue() {
+  Preferences prefs;
+  bool cleared = prefs.begin("boot", false) && prefs.putUChar("rescue", 0) != 0;
+  prefs.end();
+  if (!cleared) Log::kvfe(TAG, "ota.rescue_left_set reason=nvs_write");
+}
+
+// An unreadable description or NVS must not look like a free slot.
+// in: candidate partition. out: true if it is the image a switch came from.
 static bool imageAbandoned(const esp_partition_t* part) {
   esp_app_desc_t desc;
   if (!part || esp_ota_get_partition_description(part, &desc) != ESP_OK) {
@@ -180,30 +190,80 @@ static bool imageAbandoned(const esp_partition_t* part) {
     Log::kvfe(TAG, "ota.image_rollback_failed reason=nvs");
     return true;
   }
-  String leftVer = prefs.getString("left_ver", "");
-  String leftDate = prefs.getString("left_date", "");
-  String leftTime = prefs.getString("left_time", "");
+  // left_ver/left_date/left_time are not read: they hold prebuilt IDF strings
+  // that match every build. Kept for the older image in the other slot.
+  uint8_t left[OTA_IMAGE_ID_LEN] = {0};
+  size_t leftLen = prefs.isKey("left_id") ? prefs.getBytes("left_id", left, sizeof(left)) : 0;
   prefs.end();
-  return otaHealthIsAbandoned(desc.version, desc.date, desc.time,
-                              leftVer.c_str(), leftDate.c_str(), leftTime.c_str());
+  return otaHealthIsAbandoned(left, leftLen, part->address, desc.app_elf_sha256);
 }
 
-// The other OTA slot is a rollback target only when it is a different valid
-// image and not the one this guard already left.
-// in: running partition. out: that slot, or null when it must not be booted.
+// otadata keeps a slot VALID while a download overwrites it, and its new
+// descriptor reads early. in: candidate slot. out: true when the image verifies.
+static bool imageVerifies(const esp_partition_t* part) {
+  const esp_partition_pos_t pos = {part->address, part->size};
+  esp_image_metadata_t meta;
+  if (esp_image_verify(ESP_IMAGE_VERIFY_SILENT, &pos, &meta) == ESP_OK) return true;
+  Log::kvfe(TAG, "ota.image_rollback_failed reason=image_invalid");
+  return false;
+}
+
+// The other slot is a target only when it is a different valid image that
+// verifies and is not recorded as left. in: running. out: that slot, or null.
 static const esp_partition_t* rollbackTarget(const esp_partition_t* running) {
   const esp_partition_t* other = esp_ota_get_next_update_partition(NULL);
   esp_ota_img_states_t otherState = ESP_OTA_IMG_UNDEFINED;
   if (!other || other == running ||
       esp_ota_get_state_partition(other, &otherState) != ESP_OK ||
-      otherState != ESP_OTA_IMG_VALID || imageAbandoned(other)) {
+      otherState != ESP_OTA_IMG_VALID || imageAbandoned(other) || !imageVerifies(other)) {
     return nullptr;
   }
   return other;
 }
 
+// in: two app descriptors. out: true when version, date and time all match.
+static bool sameDescStrings(const esp_app_desc_t& a, const esp_app_desc_t& b) {
+  return strncmp(a.version, b.version, sizeof(a.version)) == 0 &&
+         strncmp(a.date, b.date, sizeof(a.date)) == 0 &&
+         strncmp(a.time, b.time, sizeof(a.time)) == 0;
+}
+
+// Drop a record that names the running slot, then on a switch arrival record
+// the slot it came from. in: open boot prefs. out: none.
+static void updateLeftRecord(Preferences& prefs) {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  uint8_t stored[OTA_IMAGE_ID_LEN] = {0};
+  size_t len = prefs.isKey("left_id") ? prefs.getBytes("left_id", stored, sizeof(stored)) : 0;
+  if (running && otaHealthLeftIsStale(stored, len, running->address)) {
+    if (prefs.remove("left_id")) Log::info(TAG, "ota.left_image_cleared reason=slot_running");
+    else Log::kvfe(TAG, "ota.left_image_kept reason=nvs_write");
+  }
+  if (!otaHealthIsArrival(_otaBootRescue, _otaBootPending)) return;
+  const esp_partition_t* other = esp_ota_get_next_update_partition(NULL);
+  esp_app_desc_t from, self;
+  uint8_t id[OTA_IMAGE_ID_LEN];
+  if (!running || !other || other == running ||
+      esp_ota_get_partition_description(other, &from) != ESP_OK ||
+      !otaHealthImageId(other->address, from.app_elf_sha256, id)) {
+    Log::kvfe(TAG, "ota.left_image_unrecorded reason=no_image_id");
+    return;
+  }
+  bool same = esp_ota_get_partition_description(running, &self) == ESP_OK &&
+              sameDescStrings(from, self);
+  if (!otaHealthRecordArrival(_otaBootRescue, same)) {
+    Log::info(TAG, "ota.left_image_unrecorded reason=older_guard");
+    return;
+  }
+  if (prefs.putBytes("left_id", id, sizeof(id)) != sizeof(id)) {
+    Log::kvfe(TAG, "ota.left_image_unrecorded reason=nvs_write");
+    return;
+  }
+  Log::kvf(TAG, "ota.left_image_recorded rescue=%u", (unsigned)_otaBootRescue);
+}
+
 uint32_t OTAUpdate::recordBootStreak(int resetReason, uint32_t* brownoutsOut) {
   OtaPlanned planned = otaHealthTakePlanned(&_otaPlannedRestart);
+  // Only a confirmed image may hold a planned restart; unknown counts.
   bool confirmed = planned != OTA_PLANNED_NONE && runningImageConfirmed();
   uint8_t id[OTA_IMAGE_ID_LEN];
   bool haveId = runningImageId(id);
@@ -216,6 +276,7 @@ uint32_t OTAUpdate::recordBootStreak(int resetReason, uint32_t* brownoutsOut) {
     if (brownoutsOut) *brownoutsOut = 0;
     return _otaCrashStreak;
   }
+  updateLeftRecord(prefs);
   uint32_t brownouts = prefs.getUInt("brownout_n", 0);
   if (resetReason == OTA_RST_BROWNOUT) {
     brownouts++;
@@ -323,12 +384,19 @@ void OTAUpdate::rollbackIfCrashLoop() {
               streak);
     return;
   }
-  if (!rememberAbandoned(running)) return;
+  // The image booted next records this one by its id, so it needs one.
+  uint8_t id[OTA_IMAGE_ID_LEN];
+  if (!runningImageId(id)) {
+    Log::kvfe(TAG, "ota.image_rollback_failed reason=no_image_id streak=%lu", streak);
+    return;
+  }
+  if (!armRescue()) return;
   Log::kvfw(TAG, "ota.state_change from=valid to=other reason=crash_streak streak=%lu",
             streak);
   if (esp_ota_set_boot_partition(other) != ESP_OK) {
     Log::kvfe(TAG, "ota.image_rollback_failed state=valid streak=%lu",
               streak);
+    disarmRescue();
     return;
   }
   ESP.restart();

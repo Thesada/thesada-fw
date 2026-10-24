@@ -24,7 +24,7 @@ public:
 
   // Record this boot in the crash streak and the brownout counter.
   // One NVS "boot" session updates crash_n and brownout_n. Consumes the
-  // restart marker and reads the proven-on-broker record.
+  // restart marker, reads the proven-on-broker record and keeps the left record.
   // in: esp_reset_reason value, brownout total out (may be null).
   // out: streak after this boot. On an unread streak the return is the
   // crash limit and confirm stays shut.
