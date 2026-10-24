@@ -31,6 +31,7 @@
 #include <lwip/netdb.h>
 #include <sys/time.h>
 #include <esp_chip_info.h>
+#include <esp_task_wdt.h>
 
 // NVS namespace separate from Config: cert survives factory reset and never
 // appears in /api/config or config.dump.
@@ -479,6 +480,7 @@ void MQTTClient::begin() {
   _brokerPort = port;
   _client.setServer(_brokerHost, port);
   _client.setKeepAlive(60);
+  _client.setSocketTimeout(5);  // CONNACK and read waits, s (default 15)
   _client.setBufferSize(_bufferIn);
   _client.setCallback(onMessage);
 
@@ -505,8 +507,8 @@ void MQTTClient::begin() {
     }
   }
 
-  // TCP connect and TLS write capped at 10 s, under the 30 s watchdog. Core 3
-  // setTimeout is only the Stream read timeout; setConnectionTimeout caps these.
+  // TCP connect 10 s + handshake 10 s + CONNACK 5 s = 25 s, under the 30 s
+  // watchdog; connect() feeds after DNS. Core 3 setTimeout only bounds reads.
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   _wifiClient.setConnectionTimeout(10000);  // ms
 #else
@@ -849,18 +851,25 @@ void MQTTClient::connect() {
   _mtlsWasActive = _mtlsActive;
 #endif
 
+  // Core 3 DNS has no cap and hostByName returns the lwIP error, not 0, on failure.
+  // Resolve, then feed: the connect below keeps TCP + TLS + CONNACK to 25 s.
+  IPAddress brokerIp;
+  const bool resolved = WiFi.hostByName(_brokerHost, brokerIp) == 1;
+  esp_task_wdt_reset();
+
   // Broker uses CN as username (use_identity_as_username) when mTLS is
   // active - sending user/pass alongside is redundant and confusing.
-  bool ok;
-  if (_mtlsActive) {
+  bool ok = false;
+  if (resolved && _mtlsActive) {
     ok = _client.connect(clientId, nullptr, nullptr, availTopic, 0, true, "offline");
-  } else {
+  } else if (resolved) {
     ok = (strlen(user) > 0)
       ? _client.connect(clientId, user, password, availTopic, 0, true, "offline")
       : _client.connect(clientId, availTopic, 0, true, "offline");
   }
 
   if (ok) {
+    esp_task_wdt_reset();  // the resubscribe and retained burst gets its own window
     OTAUpdate::noteMqttUp();
     _retryInterval = RETRY_MIN_MS;
     _retryCount    = 0;
@@ -899,8 +908,10 @@ void MQTTClient::connect() {
     publishRetainedSet(true);
     flushQueue();
   } else {
+    // A failed resolve never reached PubSubClient, so its state() is stale.
+    const int rc = resolved ? _client.state() : MQTT_CONNECT_FAILED;
     Log::kvfw(TAG, "mqtt.connect_failed rc=%d retry_ms=%lu",
-              _client.state(), (unsigned long)_retryInterval);
+              rc, (unsigned long)_retryInterval);
     _retryCount++;
     _retryInterval = min(_retryInterval * 2, (uint32_t)RETRY_MAX_MS);
 
@@ -912,7 +923,7 @@ void MQTTClient::connect() {
     // the heap check alone must not trigger. Consume the same NVS reboot
     // budget as the exhaustion path below - unbudgeted, a plain broker
     // outage on a CYD rebooted the device every ~15 s forever.
-    if (_retryCount >= 3 && _client.state() == MQTT_CONNECT_FAILED &&
+    if (_retryCount >= 3 && rc == MQTT_CONNECT_FAILED &&
         ESP.getMaxAllocHeap() < 40000 && !_rebootHalted) {
       uint8_t maxReboots = Config::get()["mqtt"]["max_exhaust_reboots"] | 3;
       uint8_t count      = mqttRebootCount();
