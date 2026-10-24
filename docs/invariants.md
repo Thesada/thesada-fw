@@ -4,7 +4,7 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-10-06 (a slot switch and a healthy confirm clear the crash streak, so the image that comes up next is not already at the limit). Previously 2026-10-06 (a pending image rolls back only when the other slot is a different valid image that is not the one just left; otherwise it is confirmed so the bootloader cannot boot that slot. A streak write that fails is treated as unread). Previously 2026-10-06 (a software reset counts toward the crash limit, so three restart loops abandon the image and one OTA reboot stays under it; power-on and deep sleep still clear the streak). Previously 2026-10-06 (three panic or watchdog resets abandon the running image: a pending image is marked invalid, a valid image boots the other valid slot and that slot is not the image just left, and a brownout holds the streak). Previously 2026-09-28 (a `cert.clear` that removed a cert reboots 3 s later, so the next boot starts enrollment; a unit that can re-enroll asks the app whether its cert serial is revoked and wipes only on an explicit, serial-matched "revoked"). Previously 2026-09-26 (a failed setup passphrase does not leave a station network, the claim link drops trailing slashes, and a timed-out enroll POST is reaped before the next one starts). Previously 2026-09-25 (the setup page exists only while the fallback AP is up and no station network is saved, unless a result from this boot is still on screen; the form is applied on the main loop and the claim link is text. A pending OTA image is marked valid after the first MQTT session or five minutes up, and a crash loop meets neither. Publish topic buffers are 160 bytes so a long tenant slug is not clipped. The enrollment claim code is an 8-digit serial-seeded
+Dated 2026-10-23 (a CA, cert or key PEM handed to `WiFiClientSecure` is static, owned for the client's lifetime, or declared before the client in the same scope; `net.http` no longer drops its CA PEM before the handshake). Previously 2026-10-06 (a slot switch and a healthy confirm clear the crash streak, so the image that comes up next is not already at the limit). Previously 2026-10-06 (a pending image rolls back only when the other slot is a different valid image that is not the one just left; otherwise it is confirmed so the bootloader cannot boot that slot. A streak write that fails is treated as unread). Previously 2026-10-06 (a software reset counts toward the crash limit, so three restart loops abandon the image and one OTA reboot stays under it; power-on and deep sleep still clear the streak). Previously 2026-10-06 (three panic or watchdog resets abandon the running image: a pending image is marked invalid, a valid image boots the other valid slot and that slot is not the image just left, and a brownout holds the streak). Previously 2026-09-28 (a `cert.clear` that removed a cert reboots 3 s later, so the next boot starts enrollment; a unit that can re-enroll asks the app whether its cert serial is revoked and wipes only on an explicit, serial-matched "revoked"). Previously 2026-09-26 (a failed setup passphrase does not leave a station network, the claim link drops trailing slashes, and a timed-out enroll POST is reaped before the next one starts). Previously 2026-09-25 (the setup page exists only while the fallback AP is up and no station network is saved, unless a result from this boot is still on screen; the form is applied on the main loop and the claim link is text. A pending OTA image is marked valid after the first MQTT session or five minutes up, and a crash loop meets neither. Publish topic buffers are 160 bytes so a long tenant slug is not clipped. The enrollment claim code is an 8-digit serial-seeded
 secret that never rotates and that password-session `secret.set` refuses;
 enrollment only talks to an `https://` base. The cert arrives by HTTPS pull,
 not over the AP. A stored enrollment cert is never polled for again, a reply
@@ -231,6 +231,38 @@ point at `.rodata`, so it must never be passed to `free()`.
 Source: `lib/thesada-core/src/clock_floor_policy.h`,
 `lib/thesada-core/src/MQTTClient.cpp` begin()/connect()/loop(),
 `lib/thesada-core/src/ota_ca_progmem.h`.
+
+### A PEM handed to `WiFiClientSecure` outlives every connect on that client
+
+`setCACert`, `setCertificate` and `setPrivateKey` keep the `const char*`,
+not a copy. The PEM is parsed on each `connect()`, including the reconnect
+an `HTTPClient` redirect makes, so the buffer must be live for every
+handshake the client can still start. That means one of three things: it
+is static (`.rodata` or a file-scope buffer), it is owned for the client's
+lifetime, or it is a local declared before the client in the same scope,
+so it is destroyed after the client. A PEM `String` scoped inside the `if`
+that read it is gone before `http.begin()`, and the handshake parses freed
+heap.
+
+| Site | PEM buffer | Why it lives long enough |
+|---|---|---|
+| `Shell.cpp` `httpFetchRun()` (`net.http`) | local `String pem` | declared first in the function, so it is destroyed after `tls` and `http` |
+| `Enroll.cpp` `enrollTask()` | local `String ca`, else `OTA_CA_PROGMEM` | `ca` is declared before `tls` in the same block; the bundle is `.rodata` |
+| `OTAUpdate.cpp` `configureSecureClient()` | file-static `_otaCaCert` | loaded once by `loadCaCert()`, never reassigned |
+| `MQTTClient.cpp` `begin()` | `_caCert`, pointing at `_caHeap` or `OTA_CA_PROGMEM` | `_caHeap` is never freed; the bundle is `.rodata` |
+| `MQTTClient.cpp` `connect()` | `_clientCert`, `_clientKey` | module buffers, freed only when a load fails; `connect()` then evicts the old pointer with `setCertificate(nullptr)` / `setPrivateKey(nullptr)` before any handshake |
+| `TelegramModule.cpp` `begin()` | static `_caCert`, `_webhookCaCert` | statics beside the static clients, set once in `begin()` |
+
+Cellular TLS is not on this list: the PEM is copied into the modem's
+filesystem.
+
+How enforced: code review. A new `setCACert` / `setCertificate` /
+`setPrivateKey` call adds its row here, naming the buffer and why it
+outlives the client.
+
+Source: `lib/thesada-core/src/Shell.cpp`, `lib/thesada-core/src/Enroll.cpp`,
+`lib/thesada-core/src/OTAUpdate.cpp`, `lib/thesada-core/src/MQTTClient.cpp`,
+`lib/thesada-mod-telegram/src/TelegramModule.cpp`, at the functions above.
 
 ---
 
