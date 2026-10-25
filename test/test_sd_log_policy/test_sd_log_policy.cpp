@@ -121,6 +121,28 @@ void test_only_last_slot_and_bounds(void) {
   TEST_ASSERT_EQUAL_INT(999, sdLogSlotsHighest(s));
 }
 
+// A directory named like a log holds its slot but is never resumed.
+void test_dir_holds_slot_but_is_not_resumed(void) {
+  SdLogSlots s;
+  sdLogSlotsClear(s);
+  sdLogSlotsAdd(s, "/log005.csv");
+  sdLogSlotsAdd(s, "/log999.csv", true);
+  TEST_ASSERT_EQUAL_INT(5, sdLogSlotsHighest(s));
+  TEST_ASSERT_TRUE(sdLogSlotsHas(s, 999));
+  TEST_ASSERT_EQUAL_INT(6, sdLogSlotsNextFree(s, 5));
+  TEST_ASSERT_EQUAL_INT(0, sdLogSlotsNextFree(s, 999));
+}
+
+// Only directories: nothing to resume, the first free slot opens.
+void test_only_dirs_resume_nothing(void) {
+  SdLogSlots s;
+  sdLogSlotsClear(s);
+  sdLogSlotsAdd(s, "/log001.csv", true);
+  sdLogSlotsAdd(s, "/log002.csv", true);
+  TEST_ASSERT_EQUAL_INT(0, sdLogSlotsHighest(s));
+  TEST_ASSERT_EQUAL_INT(3, sdLogSlotsNextFree(s, 1));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_index_parses_log_names);
@@ -133,5 +155,7 @@ int main(int, char**) {
   RUN_TEST(test_garbage_names_do_not_take_slots);
   RUN_TEST(test_full_set_has_no_free_slot);
   RUN_TEST(test_only_last_slot_and_bounds);
+  RUN_TEST(test_dir_holds_slot_but_is_not_resumed);
+  RUN_TEST(test_only_dirs_resume_nothing);
   return UNITY_END();
 }

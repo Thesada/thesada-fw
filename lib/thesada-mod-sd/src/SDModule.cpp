@@ -52,8 +52,9 @@ bool SDModule::_scanLogs(SdLogSlots& slots) {
     Log::error(TAG, "sd.log_scan_failed reason=root_open");
     return false;
   }
-  for (String n = root.getNextFileName(); n.length(); n = root.getNextFileName())
-    sdLogSlotsAdd(slots, n.c_str());
+  bool isDir = false;
+  for (String n = root.getNextFileName(&isDir); n.length(); n = root.getNextFileName(&isDir))
+    sdLogSlotsAdd(slots, n.c_str(), isDir);
   root.close();
   return true;
 }
@@ -80,7 +81,7 @@ bool SDModule::_openNextLog(const SdLogSlots& slots) {
 
 // Pick the active log file on boot.
 //
-// Resume the highest-numbered existing file if under _maxBytes:
+// Resume the highest-numbered regular log file if under _maxBytes:
 // _logPath = path, _logBytes = on-disk size. Avoids the per-boot empty-file
 // pile-up. If the highest file is at/over the limit, or none exist, fall
 // back to _openNextLog() to claim the lowest free slot.
