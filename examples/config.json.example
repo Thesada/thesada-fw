@@ -150,6 +150,12 @@
     "active_low": false
   },
 
+  "example_blink_led": {
+    "enabled":     false,
+    "pin":         21,
+    "interval_ms": 500
+  },
+
   "telegram": {
     "enabled":    false,
     "bot_token":  "",
