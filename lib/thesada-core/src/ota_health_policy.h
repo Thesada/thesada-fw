@@ -32,6 +32,11 @@
 #define OTA_RST_BROWNOUT  9
 #define OTA_RST_SDIO      10
 
+// Numeric values of esp_ota_img_states_t, for the same reason.
+#define OTA_IMG_PENDING_VERIFY 0x1u
+#define OTA_IMG_VALID          0x2u
+#define OTA_IMG_UNDEFINED      0xFFFFFFFFu
+
 enum OtaResetClass : uint8_t {
   OTA_RESET_CLEAR = 0,
   OTA_RESET_HOLD  = 1,
@@ -76,6 +81,12 @@ inline OtaPlanned otaHealthTakePlanned(uint32_t* marker) {
   else if (*marker == OTA_PLANNED_BROKER_MAGIC) planned = OTA_PLANNED_BROKER;
   *marker = 0;
   return planned;
+}
+
+// A USB flash leaves its slot UNDEFINED, which the bootloader never rolls
+// back, so it counts as confirmed. in: otadata state. out: confirmed.
+inline bool otaHealthStateConfirmed(uint32_t state) {
+  return state == OTA_IMG_VALID || state == OTA_IMG_UNDEFINED;
 }
 
 // Operator restarts, and MQTT budget reboots of a proven image, hold on a
@@ -129,12 +140,13 @@ inline bool otaHealthShouldMark(bool pending, bool mqttUp, uint32_t uptimeMs,
   return uptimeMs >= OTA_HEALTH_MIN_MS;
 }
 
-// Clear a valid image's streak once it has run OTA_HEALTH_SETTLE_MS.
-// in: pending, uptime ms, crash streak. out: true to write the streak to 0.
-inline bool otaHealthShouldClearValid(bool pending, uint32_t uptimeMs,
-                                      uint32_t crashStreak) {
+// Clear a valid image's streak once it has run OTA_HEALTH_SETTLE_MS, and again
+// that long after each failed clear. in: pending, uptime ms, streak, failed
+// clears this boot. out: true to write the streak to 0.
+inline bool otaHealthShouldClearValid(bool pending, uint32_t uptimeMs, uint32_t crashStreak,
+                                      uint32_t failedClears = 0) {
   if (pending || crashStreak == 0) return false;
-  return uptimeMs >= OTA_HEALTH_SETTLE_MS;
+  return uptimeMs / OTA_HEALTH_SETTLE_MS > failedClears;
 }
 
 // Abandon the running image once the crash streak hits the limit.

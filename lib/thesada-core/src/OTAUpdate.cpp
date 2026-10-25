@@ -69,6 +69,7 @@ static bool _otaStateKnown = false;
 static bool _otaImageSettled = false;
 static uint32_t _otaCrashStreak = 0;
 static bool _otaStreakKnown = false;
+static uint32_t _otaClearFails = 0;  // failed healthy-uptime clears this boot
 // Survives a software reset, not a power-on. recordBootStreak reads and clears it.
 RTC_NOINIT_ATTR static uint32_t _otaPlannedRestart;
 // The running image's proven record is stored, or this boot already tried it.
@@ -119,13 +120,17 @@ static void markProvenOnBroker() {
   Log::info(TAG, "ota.image_proven reason=mqtt_up");
 }
 
+static_assert(OTA_IMG_PENDING_VERIFY == ESP_OTA_IMG_PENDING_VERIFY &&
+                  OTA_IMG_VALID == ESP_OTA_IMG_VALID && OTA_IMG_UNDEFINED == ESP_OTA_IMG_UNDEFINED,
+              "ota_health_policy.h image states drifted from esp_ota_img_states_t");
+
 // Only a confirmed image may hold a planned restart; unknown counts.
-// in: none. out: true when the running image is ESP_OTA_IMG_VALID.
-static bool runningImageValid() {
+// in: none. out: true when the running image is valid, or undefined after a USB flash.
+static bool runningImageConfirmed() {
   const esp_partition_t* running = esp_ota_get_running_partition();
   esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
   return running && esp_ota_get_state_partition(running, &state) == ESP_OK &&
-         state == ESP_OTA_IMG_VALID;
+         otaHealthStateConfirmed((uint32_t)state);
 }
 
 // Store the image we are leaving and arm an immediate confirm on the next
@@ -197,7 +202,7 @@ static const esp_partition_t* rollbackTarget(const esp_partition_t* running) {
 
 uint32_t OTAUpdate::recordBootStreak(int resetReason, uint32_t* brownoutsOut) {
   OtaPlanned planned = otaHealthTakePlanned(&_otaPlannedRestart);
-  bool confirmed = planned != OTA_PLANNED_NONE && runningImageValid();
+  bool confirmed = planned != OTA_PLANNED_NONE && runningImageConfirmed();
   uint8_t id[OTA_IMAGE_ID_LEN];
   bool haveId = runningImageId(id);
   Preferences prefs;
@@ -342,12 +347,14 @@ void OTAUpdate::confirmIfHealthy() {
   }
   if (!_otaPending) {
     if (!_otaStreakKnown || _otaCrashStreak == 0) { _otaImageSettled = true; return; }
-    if (!otaHealthShouldClearValid(false, millis(), _otaCrashStreak)) return;
-    if (clearCrashStreak()) {
-      Log::kvf(TAG, "ota.crash_streak_cleared reason=healthy_uptime streak=%lu",
-               (unsigned long)_otaCrashStreak);
-      _otaCrashStreak = 0;
+    if (!otaHealthShouldClearValid(false, millis(), _otaCrashStreak, _otaClearFails)) return;
+    if (!clearCrashStreak()) {
+      _otaClearFails++;
+      return;
     }
+    Log::kvf(TAG, "ota.crash_streak_cleared reason=healthy_uptime streak=%lu",
+             (unsigned long)_otaCrashStreak);
+    _otaCrashStreak = 0;
     _otaImageSettled = true;
     return;
   }

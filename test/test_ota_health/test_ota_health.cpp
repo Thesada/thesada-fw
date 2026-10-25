@@ -71,6 +71,14 @@ void test_valid_image_clears_its_streak_after_settling(void) {
   TEST_ASSERT_FALSE(otaHealthShouldClearValid(true, OTA_HEALTH_SETTLE_MS, 2));
 }
 
+void test_failed_clear_retries_an_hour_later(void) {
+  TEST_ASSERT_FALSE(otaHealthShouldClearValid(false, OTA_HEALTH_SETTLE_MS, 2, 1));
+  TEST_ASSERT_FALSE(otaHealthShouldClearValid(false, 2u * OTA_HEALTH_SETTLE_MS - 1, 2, 1));
+  TEST_ASSERT_TRUE(otaHealthShouldClearValid(false, 2u * OTA_HEALTH_SETTLE_MS, 2, 1));
+  TEST_ASSERT_FALSE(otaHealthShouldClearValid(false, 2u * OTA_HEALTH_SETTLE_MS, 2, 2));
+  TEST_ASSERT_TRUE(otaHealthShouldClearValid(false, 3u * OTA_HEALTH_SETTLE_MS, 2, 2));
+}
+
 void test_restarts_weeks_apart_never_reach_the_limit(void) {
   uint32_t streak = 0;
   for (int i = 0; i < 10; i++) {
@@ -158,6 +166,19 @@ void test_new_ota_image_starts_unproven(void) {
   TEST_ASSERT_FALSE(otaHealthImageId(0x10000u, zero, idNew));
 }
 
+void test_usb_flashed_image_holds_operator_restarts(void) {
+  TEST_ASSERT_TRUE(otaHealthStateConfirmed(OTA_IMG_VALID));
+  TEST_ASSERT_TRUE(otaHealthStateConfirmed(OTA_IMG_UNDEFINED));
+  TEST_ASSERT_FALSE(otaHealthStateConfirmed(OTA_IMG_PENDING_VERIFY));
+  TEST_ASSERT_FALSE(otaHealthStateConfirmed(0x0u));  // new
+  TEST_ASSERT_FALSE(otaHealthStateConfirmed(0x3u));  // invalid
+  TEST_ASSERT_FALSE(otaHealthStateConfirmed(0x4u));  // aborted
+  bool usb = otaHealthStateConfirmed(OTA_IMG_UNDEFINED);
+  TEST_ASSERT_EQUAL_UINT32(0, afterRestarts(0, 5, OTA_PLANNED_OPERATOR, usb, false));
+  TEST_ASSERT_EQUAL_UINT32(OTA_HEALTH_CRASH_LIMIT,
+                           afterRestarts(0, 3, OTA_PLANNED_NONE, usb, false));
+}
+
 void test_pending_image_counts_every_restart(void) {
   TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_OPERATOR, false, true));
   TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_BROKER, false, true));
@@ -216,12 +237,14 @@ int main(int, char**) {
   RUN_TEST(test_crash_limit_refuses_confirm_and_rolls_back);
   RUN_TEST(test_mqtt_still_confirms_under_the_limit);
   RUN_TEST(test_valid_image_clears_its_streak_after_settling);
+  RUN_TEST(test_failed_clear_retries_an_hour_later);
   RUN_TEST(test_restarts_weeks_apart_never_reach_the_limit);
   RUN_TEST(test_a_fast_crash_loop_still_reaches_the_limit);
   RUN_TEST(test_operator_restart_on_a_confirmed_image_holds);
   RUN_TEST(test_proven_image_holds_broker_outage_reboots);
   RUN_TEST(test_unproven_confirmed_image_escapes_on_broker_reboots);
   RUN_TEST(test_new_ota_image_starts_unproven);
+  RUN_TEST(test_usb_flashed_image_holds_operator_restarts);
   RUN_TEST(test_pending_image_counts_every_restart);
   RUN_TEST(test_panic_and_watchdogs_count_even_when_planned);
   RUN_TEST(test_stale_marker_after_power_on_is_ignored);
