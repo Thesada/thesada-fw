@@ -152,7 +152,7 @@
 
   "example_blink_led": {
     "enabled":     false,
-    "pin":         2,
+    "pin":         21,
     "interval_ms": 500
   },
 

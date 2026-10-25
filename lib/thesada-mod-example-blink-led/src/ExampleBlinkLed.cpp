@@ -18,7 +18,7 @@ static const char* TAG = "ExBlink";
 void ExampleBlinkLed::begin() {
   JsonObject cfg = Config::get();
   _intervalMs = cfg["example_blink_led"]["interval_ms"] | 500;
-  _pin        = cfg["example_blink_led"]["pin"]         | 2;
+  _pin        = cfg["example_blink_led"]["pin"]         | 21;
 
   pinMode(_pin, OUTPUT);
   digitalWrite(_pin, _on ? HIGH : LOW);
