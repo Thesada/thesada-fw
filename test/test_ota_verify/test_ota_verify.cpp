@@ -200,6 +200,23 @@ void test_fled_second_try_restarts_the_day(void) {
   TEST_ASSERT_EQUAL(OTA_FLED_SKIP, otaFledAction(FLED, FLED, OTA_FLED_SKIP_S - 1, 1, false));
 }
 
+// Every save lost: each boot reads the expired record with no try spent.
+void test_fled_try_downloads_only_once_saved(void) {
+  TEST_ASSERT_FALSE(otaFledMayDownload(OTA_FLED_RETRY, false));
+  TEST_ASSERT_FALSE(otaFledMayDownload(OTA_FLED_LAST, false));
+  TEST_ASSERT_TRUE(otaFledMayDownload(OTA_FLED_RETRY, true));
+  TEST_ASSERT_TRUE(otaFledMayDownload(OTA_FLED_LAST, true));
+  // Negative control: an install that spends no try never waits on a save.
+  TEST_ASSERT_TRUE(otaFledMayDownload(OTA_FLED_NONE, false));
+  TEST_ASSERT_TRUE(otaFledMayDownload(OTA_FLED_FORCED, false));
+  int downloads = 0;
+  for (int boot = 0; boot < 10; boot++) {
+    const OtaFledAction a = otaFledAction(FLED, FLED, OTA_FLED_SKIP_S, 0, false);
+    if (otaFledMayDownload(a, false)) downloads++;
+  }
+  TEST_ASSERT_EQUAL(0, downloads);
+}
+
 void test_fled_age_survives_reboot(void) {
   const OtaFledAge saved = {OTA_FLED_SKIP_S - 600u, 1, T0};
   const OtaFledAge back = otaFledUnpack(otaFledPack(saved));
@@ -375,6 +392,7 @@ int main(int, char**) {
   RUN_TEST(test_unparseable_fled_or_remote_skips_nothing);
   RUN_TEST(test_fled_skip_expires_at_24h);
   RUN_TEST(test_fled_second_try_restarts_the_day);
+  RUN_TEST(test_fled_try_downloads_only_once_saved);
   RUN_TEST(test_fled_age_survives_reboot);
   RUN_TEST(test_fled_carry_is_capped);
   RUN_TEST(test_fled_unsynced_clock_counts_uptime);

@@ -242,8 +242,8 @@ static uint32_t fledAgeNow() {
 }
 
 // A failed write still moves the count on in RAM, so it is not retried every
-// turn. in: age, installs since expiry. out: none.
-static void saveFled(uint32_t ageS, uint8_t tries) {
+// turn. in: age, installs since expiry. out: true when NVS took it.
+static bool saveFled(uint32_t ageS, uint8_t tries) {
   const OtaFledAge next = {ageS, tries, syncedEpoch()};
   Preferences prefs;
   bool wrote = prefs.begin("boot", false) && prefs.putULong64("fled_age", otaFledPack(next)) != 0;
@@ -254,6 +254,7 @@ static void saveFled(uint32_t ageS, uint8_t tries) {
   _fled.carry = 0;
   _fled.markMs = millis();
   putFledUnsaved(0);
+  return wrote;
 }
 
 // RTC memory holds the unsaved seconds each turn and NVS gets them every 10
@@ -1127,8 +1128,14 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
   }
   if (fled == OTA_FLED_RETRY || fled == OTA_FLED_LAST) {
     // Saved before the download, so a try that never boots still counts.
-    if (fled == OTA_FLED_LAST) saveFled(0, 0);
-    else saveFled(fledAge, (uint8_t)(tries + 1));
+    const bool saved =
+        fled == OTA_FLED_LAST ? saveFled(0, 0) : saveFled(fledAge, (uint8_t)(tries + 1));
+    if (!otaFledMayDownload(fled, saved)) {
+      Log::kvfe(TAG, "ota.phase_change from=fetch_manifest to=idle reason=fled_try_unsaved version=%s",
+                remoteVersion.c_str());
+      publishOtaRefusal("fled-release");
+      return;
+    }
     Log::kvfw(TAG, "ota.fled_release_retry version=%s try=%u", remoteVersion.c_str(),
               (unsigned)(tries + 1));
   } else if (fled == OTA_FLED_FORCED) {

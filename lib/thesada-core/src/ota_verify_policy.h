@@ -211,6 +211,12 @@ inline OtaFledAction otaFledAction(const char* remote, const char* fled, uint32_
   return tries + 1u < OTA_FLED_TRIES ? OTA_FLED_RETRY : OTA_FLED_LAST;
 }
 
+// A try is spent before its download. One whose save failed reads as unspent
+// after the install reboots, so it does not download. in: action, saved. out: download.
+inline bool otaFledMayDownload(OtaFledAction action, bool saved) {
+  return saved || (action != OTA_FLED_RETRY && action != OTA_FLED_LAST);
+}
+
 // Digest compare. Case-insensitive because the manifest may carry either case,
 // but length-checked first so a truncated or padded digest is rejected outright
 // rather than leaning on the compare.
