@@ -18,6 +18,6 @@ public:
 private:
   uint32_t _intervalMs = 500;
   uint32_t _last       = 0;
-  int      _pin        = 2;
+  int      _pin        = 21;
   bool     _on         = false;
 };
