@@ -79,6 +79,13 @@ void test_failed_clear_retries_an_hour_later(void) {
   TEST_ASSERT_TRUE(otaHealthShouldClearValid(false, 3u * OTA_HEALTH_SETTLE_MS, 2, 2));
 }
 
+// 1194 h is past the 49.7-day wrap of a 32-bit millis().
+void test_clear_retry_survives_the_millis_wrap(void) {
+  TEST_ASSERT_TRUE(otaHealthShouldClearValid(false, 1194ULL * OTA_HEALTH_SETTLE_MS, 2, 1193));
+  // Negative control: one more failed clear waits for the next hour.
+  TEST_ASSERT_FALSE(otaHealthShouldClearValid(false, 1194ULL * OTA_HEALTH_SETTLE_MS, 2, 1194));
+}
+
 void test_restarts_weeks_apart_never_reach_the_limit(void) {
   uint32_t streak = 0;
   for (int i = 0; i < 10; i++) {
@@ -238,6 +245,7 @@ int main(int, char**) {
   RUN_TEST(test_mqtt_still_confirms_under_the_limit);
   RUN_TEST(test_valid_image_clears_its_streak_after_settling);
   RUN_TEST(test_failed_clear_retries_an_hour_later);
+  RUN_TEST(test_clear_retry_survives_the_millis_wrap);
   RUN_TEST(test_restarts_weeks_apart_never_reach_the_limit);
   RUN_TEST(test_a_fast_crash_loop_still_reaches_the_limit);
   RUN_TEST(test_operator_restart_on_a_confirmed_image_holds);

@@ -33,6 +33,7 @@
 #include "ota_verify_policy.h"
 #include "ota_health_policy.h"
 #include <esp_ota_ops.h>
+#include <esp_timer.h>
 #include <nvs.h>
 #include <nvs_flash.h>
 #include <Preferences.h>
@@ -347,7 +348,8 @@ void OTAUpdate::confirmIfHealthy() {
   }
   if (!_otaPending) {
     if (!_otaStreakKnown || _otaCrashStreak == 0) { _otaImageSettled = true; return; }
-    if (!otaHealthShouldClearValid(false, millis(), _otaCrashStreak, _otaClearFails)) return;
+    const uint64_t upMs = (uint64_t)esp_timer_get_time() / 1000;
+    if (!otaHealthShouldClearValid(false, upMs, _otaCrashStreak, _otaClearFails)) return;
     if (!clearCrashStreak()) {
       _otaClearFails++;
       return;

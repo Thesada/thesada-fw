@@ -141,9 +141,9 @@ inline bool otaHealthShouldMark(bool pending, bool mqttUp, uint32_t uptimeMs,
 }
 
 // Clear a valid image's streak once it has run OTA_HEALTH_SETTLE_MS, and again
-// that long after each failed clear. in: pending, uptime ms, streak, failed
-// clears this boot. out: true to write the streak to 0.
-inline bool otaHealthShouldClearValid(bool pending, uint32_t uptimeMs, uint32_t crashStreak,
+// that long after each failed clear. Uptime is 64-bit: millis() wraps at 49.7 days.
+// in: pending, uptime ms, streak, failed clears this boot. out: true to write 0.
+inline bool otaHealthShouldClearValid(bool pending, uint64_t uptimeMs, uint32_t crashStreak,
                                       uint32_t failedClears = 0) {
   if (pending || crashStreak == 0) return false;
   return uptimeMs / OTA_HEALTH_SETTLE_MS > failedClears;
