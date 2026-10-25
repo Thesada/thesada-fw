@@ -140,22 +140,30 @@ inline bool otaHealthShouldMark(bool pending, bool mqttUp, uint32_t uptimeMs,
   return uptimeMs >= OTA_HEALTH_MIN_MS;
 }
 
+// True once uptime has run OTA_HEALTH_SETTLE_MS, and that long again since the
+// last failed try. 0 means no failure: a try never runs before the first hour.
+inline bool otaHealthSettleDue(uint64_t uptimeMs, uint64_t lastFailMs) {
+  if (uptimeMs < OTA_HEALTH_SETTLE_MS) return false;
+  if (lastFailMs == 0) return true;
+  return uptimeMs >= lastFailMs && uptimeMs - lastFailMs >= OTA_HEALTH_SETTLE_MS;
+}
+
 // Clear a valid image's streak once it has run OTA_HEALTH_SETTLE_MS, and again
-// that long after each failed clear. Uptime is 64-bit: millis() wraps at 49.7 days.
-// in: pending, uptime ms, streak, failed clears this boot. out: true to write 0.
+// that long after each failed try. Uptime is 64-bit: millis() wraps at 49.7 days.
+// in: pending, uptime ms, streak, uptime of the last failed try (0 = none). out: true to write 0.
 inline bool otaHealthShouldClearValid(bool pending, uint64_t uptimeMs, uint32_t crashStreak,
-                                      uint32_t failedClears = 0) {
+                                      uint64_t lastFailMs = 0) {
   if (pending || crashStreak == 0) return false;
-  return uptimeMs / OTA_HEALTH_SETTLE_MS > failedClears;
+  return otaHealthSettleDue(uptimeMs, lastFailMs);
 }
 
 // Mark a USB-flashed (UNDEFINED) image valid once it has run OTA_HEALTH_SETTLE_MS
-// with a known streak, and again that long after each failed settle try.
-// in: otadata state, streak known, uptime ms, failed tries. out: true to mark.
+// with a known streak, and again that long after each failed try.
+// in: otadata state, streak known, uptime ms, uptime of the last failed try. out: true to mark.
 inline bool otaHealthShouldMarkUsbValid(uint32_t state, bool streakKnown, uint64_t uptimeMs,
-                                        uint32_t failedTries) {
+                                        uint64_t lastFailMs) {
   if (state != OTA_IMG_UNDEFINED || !streakKnown) return false;
-  return uptimeMs / OTA_HEALTH_SETTLE_MS > failedTries;
+  return otaHealthSettleDue(uptimeMs, lastFailMs);
 }
 
 // Abandon the running image once the crash streak hits the limit.

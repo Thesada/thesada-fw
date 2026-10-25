@@ -100,7 +100,7 @@ static uint32_t _otaRunState = 0;  // running slot's otadata state, once _otaSta
 static bool _otaImageSettled = false;
 static uint32_t _otaCrashStreak = 0;
 static bool _otaStreakKnown = false;
-static uint32_t _otaSettleFails = 0;  // failed healthy-hour clears and USB marks this boot
+static uint64_t _otaSettleFailMs = 0;  // uptime of the last failed clear or USB mark, 0 = none
 // The running image's proven record is stored, or this boot already tried it.
 static bool _otaProvenDone = false;
 
@@ -535,9 +535,9 @@ void OTAUpdate::confirmIfHealthy() {
     if (!_otaStreakKnown || (_otaCrashStreak == 0 && !usb)) { _otaImageSettled = true; return; }
     const uint64_t upMs = (uint64_t)esp_timer_get_time() / 1000;
     if (_otaCrashStreak != 0) {
-      if (!otaHealthShouldClearValid(false, upMs, _otaCrashStreak, _otaSettleFails)) return;
+      if (!otaHealthShouldClearValid(false, upMs, _otaCrashStreak, _otaSettleFailMs)) return;
       if (!clearCrashStreak()) {
-        _otaSettleFails++;
+        _otaSettleFailMs = upMs;
         return;
       }
       Log::kvf(TAG, "ota.crash_streak_cleared reason=healthy_uptime streak=%lu",
@@ -545,9 +545,9 @@ void OTAUpdate::confirmIfHealthy() {
       _otaCrashStreak = 0;
     }
     if (usb) {
-      if (!otaHealthShouldMarkUsbValid(_otaRunState, _otaStreakKnown, upMs, _otaSettleFails)) return;
+      if (!otaHealthShouldMarkUsbValid(_otaRunState, _otaStreakKnown, upMs, _otaSettleFailMs)) return;
       if (!markUsbImageValid()) {
-        _otaSettleFails++;
+        _otaSettleFailMs = upMs;
         return;
       }
     }

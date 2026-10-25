@@ -72,18 +72,28 @@ void test_valid_image_clears_its_streak_after_settling(void) {
 }
 
 void test_failed_clear_retries_an_hour_later(void) {
-  TEST_ASSERT_FALSE(otaHealthShouldClearValid(false, OTA_HEALTH_SETTLE_MS, 2, 1));
-  TEST_ASSERT_FALSE(otaHealthShouldClearValid(false, 2u * OTA_HEALTH_SETTLE_MS - 1, 2, 1));
-  TEST_ASSERT_TRUE(otaHealthShouldClearValid(false, 2u * OTA_HEALTH_SETTLE_MS, 2, 1));
-  TEST_ASSERT_FALSE(otaHealthShouldClearValid(false, 2u * OTA_HEALTH_SETTLE_MS, 2, 2));
-  TEST_ASSERT_TRUE(otaHealthShouldClearValid(false, 3u * OTA_HEALTH_SETTLE_MS, 2, 2));
+  const uint64_t h = OTA_HEALTH_SETTLE_MS;
+  TEST_ASSERT_FALSE(otaHealthShouldClearValid(false, h, 2, h));
+  TEST_ASSERT_FALSE(otaHealthShouldClearValid(false, 2 * h - 1, 2, h));
+  TEST_ASSERT_TRUE(otaHealthShouldClearValid(false, 2 * h, 2, h));
+  TEST_ASSERT_FALSE(otaHealthShouldClearValid(false, 2 * h, 2, 2 * h));
+  TEST_ASSERT_TRUE(otaHealthShouldClearValid(false, 3 * h, 2, 2 * h));
+}
+
+// A first failure late in uptime waits a full hour from that failure.
+void test_late_failed_clear_waits_an_hour_from_the_failure(void) {
+  const uint64_t failedAt = 2ULL * OTA_HEALTH_SETTLE_MS;
+  TEST_ASSERT_FALSE(otaHealthShouldClearValid(false, failedAt + 1, 2, failedAt));
+  TEST_ASSERT_FALSE(otaHealthShouldClearValid(false, failedAt + OTA_HEALTH_SETTLE_MS - 1, 2, failedAt));
+  TEST_ASSERT_TRUE(otaHealthShouldClearValid(false, failedAt + OTA_HEALTH_SETTLE_MS, 2, failedAt));
 }
 
 // 1194 h is past the 49.7-day wrap of a 32-bit millis().
 void test_clear_retry_survives_the_millis_wrap(void) {
-  TEST_ASSERT_TRUE(otaHealthShouldClearValid(false, 1194ULL * OTA_HEALTH_SETTLE_MS, 2, 1193));
-  // Negative control: one more failed clear waits for the next hour.
-  TEST_ASSERT_FALSE(otaHealthShouldClearValid(false, 1194ULL * OTA_HEALTH_SETTLE_MS, 2, 1194));
+  const uint64_t h = OTA_HEALTH_SETTLE_MS;
+  TEST_ASSERT_TRUE(otaHealthShouldClearValid(false, 1194 * h, 2, 1193 * h));
+  // Negative control: a failure later in that hour waits a full hour from it.
+  TEST_ASSERT_FALSE(otaHealthShouldClearValid(false, 1194 * h, 2, 1193 * h + 1));
 }
 
 void test_usb_image_is_marked_valid_after_the_settle_hour(void) {
@@ -99,10 +109,20 @@ void test_usb_image_is_marked_valid_after_the_settle_hour(void) {
 }
 
 void test_failed_usb_mark_retries_an_hour_later(void) {
-  TEST_ASSERT_FALSE(otaHealthShouldMarkUsbValid(OTA_IMG_UNDEFINED, true, 2u * OTA_HEALTH_SETTLE_MS - 1, 1));
-  TEST_ASSERT_TRUE(otaHealthShouldMarkUsbValid(OTA_IMG_UNDEFINED, true, 2u * OTA_HEALTH_SETTLE_MS, 1));
-  TEST_ASSERT_TRUE(otaHealthShouldMarkUsbValid(OTA_IMG_UNDEFINED, true, 1194ULL * OTA_HEALTH_SETTLE_MS, 1193));
-  TEST_ASSERT_FALSE(otaHealthShouldMarkUsbValid(OTA_IMG_UNDEFINED, true, 1194ULL * OTA_HEALTH_SETTLE_MS, 1194));
+  const uint64_t h = OTA_HEALTH_SETTLE_MS;
+  TEST_ASSERT_FALSE(otaHealthShouldMarkUsbValid(OTA_IMG_UNDEFINED, true, 2 * h - 1, h));
+  TEST_ASSERT_TRUE(otaHealthShouldMarkUsbValid(OTA_IMG_UNDEFINED, true, 2 * h, h));
+  TEST_ASSERT_TRUE(otaHealthShouldMarkUsbValid(OTA_IMG_UNDEFINED, true, 1194 * h, 1193 * h));
+  TEST_ASSERT_FALSE(otaHealthShouldMarkUsbValid(OTA_IMG_UNDEFINED, true, 1194 * h, 1193 * h + 1));
+}
+
+void test_late_failed_usb_mark_waits_an_hour_from_the_failure(void) {
+  const uint64_t failedAt = 2ULL * OTA_HEALTH_SETTLE_MS + 5000;
+  TEST_ASSERT_FALSE(otaHealthShouldMarkUsbValid(OTA_IMG_UNDEFINED, true, failedAt + 1, failedAt));
+  TEST_ASSERT_FALSE(
+      otaHealthShouldMarkUsbValid(OTA_IMG_UNDEFINED, true, failedAt + OTA_HEALTH_SETTLE_MS - 1, failedAt));
+  TEST_ASSERT_TRUE(
+      otaHealthShouldMarkUsbValid(OTA_IMG_UNDEFINED, true, failedAt + OTA_HEALTH_SETTLE_MS, failedAt));
 }
 
 void test_restarts_weeks_apart_never_reach_the_limit(void) {
@@ -450,9 +470,11 @@ int main(int, char**) {
   RUN_TEST(test_mqtt_still_confirms_under_the_limit);
   RUN_TEST(test_valid_image_clears_its_streak_after_settling);
   RUN_TEST(test_failed_clear_retries_an_hour_later);
+  RUN_TEST(test_late_failed_clear_waits_an_hour_from_the_failure);
   RUN_TEST(test_clear_retry_survives_the_millis_wrap);
   RUN_TEST(test_usb_image_is_marked_valid_after_the_settle_hour);
   RUN_TEST(test_failed_usb_mark_retries_an_hour_later);
+  RUN_TEST(test_late_failed_usb_mark_waits_an_hour_from_the_failure);
   RUN_TEST(test_restarts_weeks_apart_never_reach_the_limit);
   RUN_TEST(test_a_fast_crash_loop_still_reaches_the_limit);
   RUN_TEST(test_operator_restart_on_a_confirmed_image_holds);
