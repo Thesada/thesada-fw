@@ -33,6 +33,8 @@
 #include <Log.h>
 #include <Shell.h>
 #include <ModuleRegistry.h>
+#include <Watchdog.h>
+#include <boot_wait_policy.h>
 
 #include <LittleFS.h>
 #include <WiFi.h>
@@ -473,6 +475,18 @@ void ScriptEngine::callAllRegistrars() {
   }
 }
 
+static uint32_t _scriptStartMs = 0;
+
+// Count hook while a script file runs: feed until the budget is spent, then
+// abort. A script that swallows the error stops being fed and trips the TWDT.
+static void scriptBudgetHook(lua_State* L, lua_Debug*) {
+  if (waitBudgetSpent(_scriptStartMs, millis(), LUA_SCRIPT_BUDGET_MS)) {
+    luaL_error(L, "script.budget_exceeded budget_ms=%d", (int)LUA_SCRIPT_BUDGET_MS);
+    return;
+  }
+  Watchdog::feed();
+}
+
 // Load and execute a Lua script file from LittleFS
 bool ScriptEngine::executeFile(const char* path) {
   if (!gL) return false;
@@ -504,7 +518,13 @@ bool ScriptEngine::executeFile(const char* path) {
 
   int result = lua_load(gL, reader, &ctx, path, nullptr);
   f.close();
-  if (result == LUA_OK) result = lua_pcall(gL, 0, LUA_MULTRET, 0);
+  if (result == LUA_OK) {
+    _scriptStartMs = millis();
+    Watchdog::feed();
+    lua_sethook(gL, scriptBudgetHook, LUA_MASKCOUNT, LUA_HOOK_COUNT);
+    result = lua_pcall(gL, 0, LUA_MULTRET, 0);
+    lua_sethook(gL, nullptr, 0, 0);
+  }
   if (result != LUA_OK) {
     const char* err = lua_tostring(gL, -1);
     Log::kvfe(TAG, "script.exec_failed path=%s err=\"%.160s\"",

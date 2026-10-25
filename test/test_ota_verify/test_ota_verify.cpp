@@ -153,6 +153,29 @@ void test_null_digest_rejects(void) {
   TEST_ASSERT_FALSE(otaShaMatches(SHA_OK, nullptr));
 }
 
+void test_redirect_codes(void) {
+  const int yes[] = {301, 302, 303, 307, 308};
+  for (int c : yes) TEST_ASSERT_TRUE(otaIsRedirect(c));
+  const int no[] = {200, 204, 300, 304, 305, 306, 400, 404, -1, 0};
+  for (int c : no) TEST_ASSERT_FALSE(otaIsRedirect(c));
+}
+
+void test_redirect_keeps_scheme(void) {
+  TEST_ASSERT_TRUE(otaRedirectAllowed("https://a.example/f", "https://b.example/g"));
+  TEST_ASSERT_TRUE(otaRedirectAllowed("http://a.example/f", "http://b.example/g"));
+  TEST_ASSERT_FALSE(otaRedirectAllowed("https://a.example/f", "http://b.example/g"));
+  TEST_ASSERT_FALSE(otaRedirectAllowed("http://a.example/f", "https://b.example/g"));
+}
+
+void test_redirect_refuses_relative_and_junk(void) {
+  TEST_ASSERT_FALSE(otaRedirectAllowed("https://a.example/f", "/g"));
+  TEST_ASSERT_FALSE(otaRedirectAllowed("https://a.example/f", "https://"));
+  TEST_ASSERT_FALSE(otaRedirectAllowed("https://a.example/f", "https:///g"));
+  TEST_ASSERT_FALSE(otaRedirectAllowed("ftp://a.example/f", "ftp://b.example/g"));
+  TEST_ASSERT_FALSE(otaRedirectAllowed(nullptr, "https://b.example/g"));
+  TEST_ASSERT_FALSE(otaRedirectAllowed("https://a.example/f", nullptr));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_ca_present_is_verified);
@@ -174,5 +197,8 @@ int main(int, char**) {
   RUN_TEST(test_mismatched_digest_rejects);
   RUN_TEST(test_wrong_length_digest_rejects);
   RUN_TEST(test_null_digest_rejects);
+  RUN_TEST(test_redirect_codes);
+  RUN_TEST(test_redirect_keeps_scheme);
+  RUN_TEST(test_redirect_refuses_relative_and_junk);
   return UNITY_END();
 }

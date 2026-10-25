@@ -4,7 +4,7 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-10-25 (the SD log to resume or open is picked from one root listing, so a card with hundreds of logs boots inside the 30 s watchdog). Previously 2026-10-06 (a slot switch and a healthy confirm clear the crash streak, so the image that comes up next is not already at the limit). Previously 2026-10-06 (a pending image rolls back only when the other slot is a different valid image that is not the one just left; otherwise it is confirmed so the bootloader cannot boot that slot. A streak write that fails is treated as unread). Previously 2026-10-06 (a software reset counts toward the crash limit, so three restart loops abandon the image and one OTA reboot stays under it; power-on and deep sleep still clear the streak). Previously 2026-10-06 (three panic or watchdog resets abandon the running image: a pending image is marked invalid, a valid image boots the other valid slot and that slot is not the image just left, and a brownout holds the streak). Previously 2026-09-28 (a `cert.clear` that removed a cert reboots 3 s later, so the next boot starts enrollment; a unit that can re-enroll asks the app whether its cert serial is revoked and wipes only on an explicit, serial-matched "revoked"). Previously 2026-09-26 (a failed setup passphrase does not leave a station network, the claim link drops trailing slashes, and a timed-out enroll POST is reaped before the next one starts). Previously 2026-09-25 (the setup page exists only while the fallback AP is up and no station network is saved, unless a result from this boot is still on screen; the form is applied on the main loop and the claim link is text. A pending OTA image is marked valid after the first MQTT session or five minutes up, and a crash loop meets neither. Publish topic buffers are 160 bytes so a long tenant slug is not clipped. The enrollment claim code is an 8-digit serial-seeded
+Dated 2026-10-25 (no boot step blocks past the task watchdog without feeding it: the WiFi connect and NTP waits feed per poll step through `Watchdog::waitStep`, the OTA GET resolves and feeds before each redirect hop, and a boot Lua script is cut off after 10 s). Previously 2026-10-25 (the SD log to resume or open is picked from one root listing, so a card with hundreds of logs boots inside the 30 s watchdog). Previously 2026-10-06 (a slot switch and a healthy confirm clear the crash streak, so the image that comes up next is not already at the limit). Previously 2026-10-06 (a pending image rolls back only when the other slot is a different valid image that is not the one just left; otherwise it is confirmed so the bootloader cannot boot that slot. A streak write that fails is treated as unread). Previously 2026-10-06 (a software reset counts toward the crash limit, so three restart loops abandon the image and one OTA reboot stays under it; power-on and deep sleep still clear the streak). Previously 2026-10-06 (three panic or watchdog resets abandon the running image: a pending image is marked invalid, a valid image boots the other valid slot and that slot is not the image just left, and a brownout holds the streak). Previously 2026-09-28 (a `cert.clear` that removed a cert reboots 3 s later, so the next boot starts enrollment; a unit that can re-enroll asks the app whether its cert serial is revoked and wipes only on an explicit, serial-matched "revoked"). Previously 2026-09-26 (a failed setup passphrase does not leave a station network, the claim link drops trailing slashes, and a timed-out enroll POST is reaped before the next one starts). Previously 2026-09-25 (the setup page exists only while the fallback AP is up and no station network is saved, unless a result from this boot is still on screen; the form is applied on the main loop and the claim link is text. A pending OTA image is marked valid after the first MQTT session or five minutes up, and a crash loop meets neither. Publish topic buffers are 160 bytes so a long tenant slug is not clipped. The enrollment claim code is an 8-digit serial-seeded
 secret that never rotates and that password-session `secret.set` refuses;
 enrollment only talks to an `https://` base. The cert arrives by HTTPS pull,
 not over the AP. A stored enrollment cert is never polled for again, a reply
@@ -991,7 +991,8 @@ refactors of these modules are out of scope - the pump call is the
 contract.
 
 Source: `lib/thesada-core/src/Shell.cpp::pumpConsole` and call sites
-in `WiFiManager.cpp`, `OTAUpdate.cpp`, `Cellular.cpp`, `main.cpp`.
+in `Watchdog.cpp` (every `waitStep`), `OTAUpdate.cpp`, `Cellular.cpp`,
+`main.cpp`.
 
 ### The SD log pick is one root listing, never a 999-name probe
 
@@ -1014,6 +1015,49 @@ garbage names, a full set, an empty card); the coverage floor on
 
 Source: `lib/thesada-mod-sd/src/SDModule.cpp::_scanLogs`, `_openNextLog`,
 `_resumeOrOpen`; `lib/thesada-core/src/sd_log_policy.h`.
+
+### No boot step blocks past the task watchdog without feeding it
+
+`setup()` arms the 30 s task watchdog (`TASK_WDT_TIMEOUT_MS`) before any
+network or script work, and `loop()` is the only global feed. A step that
+can outlast the period feeds inside its own bounded loop, once per
+iteration, and only while its config-bounded exit is still ahead. Nothing
+disables or widens the watchdog to make a step fit: an unbounded wait must
+still reboot.
+
+| Step | Unfed span | Total bound |
+|---|---|---|
+| WiFi connect (`tryConnect`) | one 250 ms poll | `wifi.retries` (1-5) x SSIDs in range (max 8) x `wifi.timeout_per_ssid_s` (1-60 s) |
+| WiFi scan | one `scanNetworks()`, fed after | IDF scan |
+| NTP wait after connect | one 200 ms poll | 15 s |
+| OTA GET hop (`otaHttpGetWiFiHop`) | TCP 10 s + TLS 10 s + headers 5 s, after a fed DNS resolve | 5 same-scheme redirects; body loop fed per read, 5 min cap |
+| `main.lua` / `rules.lua` (`executeFile`) | 1000 VM instructions | 10 s, then `script.budget_exceeded` aborts the file |
+
+The poll steps go through one helper, `Watchdog::waitStep(ms)` (pump the
+console, sleep at most 1 s, feed). The Lua count hook feeds until the
+budget is spent and raises after; a script that catches that error is no
+longer fed and the watchdog fires. OTA follows redirects by hand
+(`HTTPC_DISABLE_FOLLOW_REDIRECTS`): HTTPClient's own redirect loop chains
+hops with no feed, and core 3 DNS is uncapped (about 7 s per server).
+
+Why: with two configured SSIDs out of reach the defaults alone held setup
+for 40 s, and the NTP wait stacks 15 s on a connect. Each tripped the
+watchdog before the first `loop()`.
+
+How enforced: `test/test_boot_wait_policy` (every poll step under half the
+period, clamps on every config key, the 40 s default case, rollover-safe
+budget); `test/test_ota_verify` (redirect codes, scheme kept, relative and
+junk Locations refused); the coverage floor on `boot_wait_policy.h`. The
+bench checks in the PR cover the paths the host cannot run.
+
+Not covered: a C binding that blocks inside a boot script (one
+`Telegram.send` is a single HTTPS POST under its own timeouts); module
+`begin()` calls not listed above carry their own caps (Cellular feeds,
+the SD pick is one listing).
+
+Source: `lib/thesada-core/src/Watchdog.cpp`, `boot_wait_policy.h`,
+`WiFiManager.cpp::scanAndConnect`, `tryConnect`;
+`OTAUpdate.cpp::otaHttpGetWiFi`; `ScriptEngine.cpp::executeFile`.
 
 ---
 

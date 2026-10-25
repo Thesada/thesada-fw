@@ -116,3 +116,22 @@ inline bool otaShaMatches(const char* computedHex, const char* expectedHex) {
   if (strlen(expectedHex) != OTA_SHA256_HEX_LEN) return false;
   return strcasecmp(computedHex, expectedHex) == 0;
 }
+
+// OTA GETs follow redirects by hand, one fed hop at a time.
+static const int OTA_REDIRECT_MAX = 5;
+
+// in: HTTP status. out: true for a redirect the OTA GET follows as a GET.
+inline bool otaIsRedirect(int code) {
+  return code == 301 || code == 302 || code == 303 || code == 307 || code == 308;
+}
+
+// in: the URL that redirected, its Location. out: true when the Location is
+// absolute and keeps the scheme, so an https fetch never drops to http.
+inline bool otaRedirectAllowed(const char* from, const char* to) {
+  if (!from || !to) return false;
+  const char* scheme = strncmp(from, "https://", 8) == 0 ? "https://"
+                     : strncmp(from, "http://", 7) == 0  ? "http://" : nullptr;
+  if (!scheme) return false;
+  size_t n = strlen(scheme);
+  return strncmp(to, scheme, n) == 0 && to[n] != '\0' && to[n] != '/';
+}
