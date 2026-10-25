@@ -67,10 +67,11 @@ extern "C" bool verifyRollbackLater() {
 static bool _otaMqttUp = false;
 static bool _otaPending = false;
 static bool _otaStateKnown = false;
+static uint32_t _otaRunState = 0;  // running slot's otadata state, once _otaStateKnown
 static bool _otaImageSettled = false;
 static uint32_t _otaCrashStreak = 0;
 static bool _otaStreakKnown = false;
-static uint32_t _otaClearFails = 0;  // failed healthy-uptime clears this boot
+static uint32_t _otaSettleFails = 0;  // failed healthy-hour clears and USB marks this boot
 // Survives a software reset, not a power-on. recordBootStreak reads and clears it.
 RTC_NOINIT_ATTR static uint32_t _otaPlannedRestart;
 // The running image's proven record is stored, or this boot already tried it.
@@ -333,9 +334,28 @@ void OTAUpdate::rollbackIfCrashLoop() {
   ESP.restart();
 }
 
+// The IDF marks the active otadata entry, which is the staged image once an
+// update is written, so this waits while the boot slot is not the running one.
+// in: none. out: true when the running USB image now reads VALID.
+static bool markUsbImageValid() {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  if (!running || esp_ota_get_boot_partition() != running) {
+    Log::kvfw(TAG, "ota.image_mark_failed reason=boot_slot_changed");
+    return false;
+  }
+  const esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+  if (err != ESP_OK) {
+    Log::kvfe(TAG, "ota.image_mark_failed reason=usb_flash err=0x%x", (unsigned)err);
+    return false;
+  }
+  Log::kvf(TAG, "ota.image_marked_valid reason=usb_flash");
+  return true;
+}
+
 // Confirm a pending image once, and retry when the IDF call fails.
 // An unread streak leaves a pending image pending.
-// in: none. out: none. A valid image clears its streak after an hour up.
+// in: none. out: none. A non-pending image clears its streak after an hour up,
+// and a USB-flashed one is then marked valid.
 void OTAUpdate::confirmIfHealthy() {
   markProvenOnBroker();
   if (_otaImageSettled) return;
@@ -344,19 +364,30 @@ void OTAUpdate::confirmIfHealthy() {
     esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
     if (!running || esp_ota_get_state_partition(running, &state) != ESP_OK) return;
     _otaPending = state == ESP_OTA_IMG_PENDING_VERIFY;
+    _otaRunState = (uint32_t)state;
     _otaStateKnown = true;
   }
   if (!_otaPending) {
-    if (!_otaStreakKnown || _otaCrashStreak == 0) { _otaImageSettled = true; return; }
+    const bool usb = _otaRunState == ESP_OTA_IMG_UNDEFINED;
+    if (!_otaStreakKnown || (_otaCrashStreak == 0 && !usb)) { _otaImageSettled = true; return; }
     const uint64_t upMs = (uint64_t)esp_timer_get_time() / 1000;
-    if (!otaHealthShouldClearValid(false, upMs, _otaCrashStreak, _otaClearFails)) return;
-    if (!clearCrashStreak()) {
-      _otaClearFails++;
-      return;
+    if (_otaCrashStreak != 0) {
+      if (!otaHealthShouldClearValid(false, upMs, _otaCrashStreak, _otaSettleFails)) return;
+      if (!clearCrashStreak()) {
+        _otaSettleFails++;
+        return;
+      }
+      Log::kvf(TAG, "ota.crash_streak_cleared reason=healthy_uptime streak=%lu",
+               (unsigned long)_otaCrashStreak);
+      _otaCrashStreak = 0;
     }
-    Log::kvf(TAG, "ota.crash_streak_cleared reason=healthy_uptime streak=%lu",
-             (unsigned long)_otaCrashStreak);
-    _otaCrashStreak = 0;
+    if (usb) {
+      if (!otaHealthShouldMarkUsbValid(_otaRunState, _otaStreakKnown, upMs, _otaSettleFails)) return;
+      if (!markUsbImageValid()) {
+        _otaSettleFails++;
+        return;
+      }
+    }
     _otaImageSettled = true;
     return;
   }

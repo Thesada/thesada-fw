@@ -149,6 +149,15 @@ inline bool otaHealthShouldClearValid(bool pending, uint64_t uptimeMs, uint32_t 
   return uptimeMs / OTA_HEALTH_SETTLE_MS > failedClears;
 }
 
+// Mark a USB-flashed (UNDEFINED) image valid once it has run OTA_HEALTH_SETTLE_MS
+// with a known streak, and again that long after each failed settle try.
+// in: otadata state, streak known, uptime ms, failed tries. out: true to mark.
+inline bool otaHealthShouldMarkUsbValid(uint32_t state, bool streakKnown, uint64_t uptimeMs,
+                                        uint32_t failedTries) {
+  if (state != OTA_IMG_UNDEFINED || !streakKnown) return false;
+  return uptimeMs / OTA_HEALTH_SETTLE_MS > failedTries;
+}
+
 // Abandon the running image once the crash streak hits the limit.
 // in: crash streak. out: true to boot the other image.
 inline bool otaHealthShouldRollback(uint32_t crashStreak) {

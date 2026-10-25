@@ -86,6 +86,25 @@ void test_clear_retry_survives_the_millis_wrap(void) {
   TEST_ASSERT_FALSE(otaHealthShouldClearValid(false, 1194ULL * OTA_HEALTH_SETTLE_MS, 2, 1194));
 }
 
+void test_usb_image_is_marked_valid_after_the_settle_hour(void) {
+  TEST_ASSERT_FALSE(otaHealthShouldMarkUsbValid(OTA_IMG_UNDEFINED, true, OTA_HEALTH_SETTLE_MS - 1, 0));
+  TEST_ASSERT_TRUE(otaHealthShouldMarkUsbValid(OTA_IMG_UNDEFINED, true, OTA_HEALTH_SETTLE_MS, 0));
+  // An unread streak may hide a crash loop.
+  TEST_ASSERT_FALSE(otaHealthShouldMarkUsbValid(OTA_IMG_UNDEFINED, false, OTA_HEALTH_SETTLE_MS, 0));
+  // Negative control: only an undefined image is marked here.
+  TEST_ASSERT_FALSE(otaHealthShouldMarkUsbValid(OTA_IMG_VALID, true, OTA_HEALTH_SETTLE_MS, 0));
+  TEST_ASSERT_FALSE(otaHealthShouldMarkUsbValid(OTA_IMG_PENDING_VERIFY, true, OTA_HEALTH_SETTLE_MS, 0));
+  TEST_ASSERT_FALSE(otaHealthShouldMarkUsbValid(0x0u, true, OTA_HEALTH_SETTLE_MS, 0));  // new
+  TEST_ASSERT_FALSE(otaHealthShouldMarkUsbValid(0x3u, true, OTA_HEALTH_SETTLE_MS, 0));  // invalid
+}
+
+void test_failed_usb_mark_retries_an_hour_later(void) {
+  TEST_ASSERT_FALSE(otaHealthShouldMarkUsbValid(OTA_IMG_UNDEFINED, true, 2u * OTA_HEALTH_SETTLE_MS - 1, 1));
+  TEST_ASSERT_TRUE(otaHealthShouldMarkUsbValid(OTA_IMG_UNDEFINED, true, 2u * OTA_HEALTH_SETTLE_MS, 1));
+  TEST_ASSERT_TRUE(otaHealthShouldMarkUsbValid(OTA_IMG_UNDEFINED, true, 1194ULL * OTA_HEALTH_SETTLE_MS, 1193));
+  TEST_ASSERT_FALSE(otaHealthShouldMarkUsbValid(OTA_IMG_UNDEFINED, true, 1194ULL * OTA_HEALTH_SETTLE_MS, 1194));
+}
+
 void test_restarts_weeks_apart_never_reach_the_limit(void) {
   uint32_t streak = 0;
   for (int i = 0; i < 10; i++) {
@@ -246,6 +265,8 @@ int main(int, char**) {
   RUN_TEST(test_valid_image_clears_its_streak_after_settling);
   RUN_TEST(test_failed_clear_retries_an_hour_later);
   RUN_TEST(test_clear_retry_survives_the_millis_wrap);
+  RUN_TEST(test_usb_image_is_marked_valid_after_the_settle_hour);
+  RUN_TEST(test_failed_usb_mark_retries_an_hour_later);
   RUN_TEST(test_restarts_weeks_apart_never_reach_the_limit);
   RUN_TEST(test_a_fast_crash_loop_still_reaches_the_limit);
   RUN_TEST(test_operator_restart_on_a_confirmed_image_holds);
