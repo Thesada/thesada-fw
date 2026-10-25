@@ -12,6 +12,8 @@
 #include <FS.h>
 #include <Module.h>
 
+struct SdLogSlots;
+
 class SDModule : public Module {
 public:
   void begin() override;
@@ -35,7 +37,8 @@ private:
   static uint32_t _logBytes;
   static uint32_t _maxBytes;
 
-  static bool _openNextLog();
+  static bool _scanLogs(SdLogSlots& slots);
+  static bool _openNextLog(const SdLogSlots& slots);
   static bool _resumeOrOpen();
   static void _rotate();
 

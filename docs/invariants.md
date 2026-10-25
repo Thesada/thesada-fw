@@ -4,7 +4,7 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-10-06 (a slot switch and a healthy confirm clear the crash streak, so the image that comes up next is not already at the limit). Previously 2026-10-06 (a pending image rolls back only when the other slot is a different valid image that is not the one just left; otherwise it is confirmed so the bootloader cannot boot that slot. A streak write that fails is treated as unread). Previously 2026-10-06 (a software reset counts toward the crash limit, so three restart loops abandon the image and one OTA reboot stays under it; power-on and deep sleep still clear the streak). Previously 2026-10-06 (three panic or watchdog resets abandon the running image: a pending image is marked invalid, a valid image boots the other valid slot and that slot is not the image just left, and a brownout holds the streak). Previously 2026-09-28 (a `cert.clear` that removed a cert reboots 3 s later, so the next boot starts enrollment; a unit that can re-enroll asks the app whether its cert serial is revoked and wipes only on an explicit, serial-matched "revoked"). Previously 2026-09-26 (a failed setup passphrase does not leave a station network, the claim link drops trailing slashes, and a timed-out enroll POST is reaped before the next one starts). Previously 2026-09-25 (the setup page exists only while the fallback AP is up and no station network is saved, unless a result from this boot is still on screen; the form is applied on the main loop and the claim link is text. A pending OTA image is marked valid after the first MQTT session or five minutes up, and a crash loop meets neither. Publish topic buffers are 160 bytes so a long tenant slug is not clipped. The enrollment claim code is an 8-digit serial-seeded
+Dated 2026-10-25 (the SD log to resume or open is picked from one root listing, so a card with hundreds of logs boots inside the 30 s watchdog). Previously 2026-10-06 (a slot switch and a healthy confirm clear the crash streak, so the image that comes up next is not already at the limit). Previously 2026-10-06 (a pending image rolls back only when the other slot is a different valid image that is not the one just left; otherwise it is confirmed so the bootloader cannot boot that slot. A streak write that fails is treated as unread). Previously 2026-10-06 (a software reset counts toward the crash limit, so three restart loops abandon the image and one OTA reboot stays under it; power-on and deep sleep still clear the streak). Previously 2026-10-06 (three panic or watchdog resets abandon the running image: a pending image is marked invalid, a valid image boots the other valid slot and that slot is not the image just left, and a brownout holds the streak). Previously 2026-09-28 (a `cert.clear` that removed a cert reboots 3 s later, so the next boot starts enrollment; a unit that can re-enroll asks the app whether its cert serial is revoked and wipes only on an explicit, serial-matched "revoked"). Previously 2026-09-26 (a failed setup passphrase does not leave a station network, the claim link drops trailing slashes, and a timed-out enroll POST is reaped before the next one starts). Previously 2026-09-25 (the setup page exists only while the fallback AP is up and no station network is saved, unless a result from this boot is still on screen; the form is applied on the main loop and the claim link is text. A pending OTA image is marked valid after the first MQTT session or five minutes up, and a crash loop meets neither. Publish topic buffers are 160 bytes so a long tenant slug is not clipped. The enrollment claim code is an 8-digit serial-seeded
 secret that never rotates and that password-session `secret.set` refuses;
 enrollment only talks to an `https://` base. The cert arrives by HTTPS pull,
 not over the AP. A stored enrollment cert is never polled for again, a reply
@@ -992,6 +992,28 @@ contract.
 
 Source: `lib/thesada-core/src/Shell.cpp::pumpConsole` and call sites
 in `WiFiManager.cpp`, `OTAUpdate.cpp`, `Cellular.cpp`, `main.cpp`.
+
+### The SD log pick is one root listing, never a 999-name probe
+
+`SDModule::begin()` runs inside `setup()` after the 30 s task watchdog is
+armed and before the first `loop()` feed. The active log is picked from
+one listing of the card root (`_scanLogs`), parsed by `sd_log_policy.h`:
+resume the highest `/logNNN.csv` under `sd.max_file_kb`, else claim the
+lowest free slot. No wrap past log999. `exists()` still guards the
+`FILE_WRITE` so an entry the listing missed is never truncated. A root
+that will not open is `sd.log_scan_failed`, not a blind create.
+
+Why: each `exists()` re-walks the FAT directory. Probing log999 down to
+log001 took ~29 s on a 694-file card and boot-looped owb-debug on the
+watchdog every ~58 s. Size-triggered rotation in `logEvent()` uses the
+same one listing.
+
+How enforced: `test/test_sd_log_policy` (694 files picks log694, gaps,
+garbage names, a full set, an empty card); the coverage floor on
+`sd_log_policy.h`.
+
+Source: `lib/thesada-mod-sd/src/SDModule.cpp::_scanLogs`, `_openNextLog`,
+`_resumeOrOpen`; `lib/thesada-core/src/sd_log_policy.h`.
 
 ---
 

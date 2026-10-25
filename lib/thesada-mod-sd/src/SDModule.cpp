@@ -13,6 +13,7 @@
 #include <ArduinoJson.h>
 #include <time.h>
 #include <ModuleRegistry.h>
+#include <sd_log_policy.h>
 
 static const char* TAG = "SD";
 
@@ -42,61 +43,75 @@ uint64_t SDModule::_dfUsed() {
   return _spiMode ? SD.usedBytes() : SD_MMC.usedBytes();
 }
 
-// Find the next free log slot (log001-log999) and create a CSV file with header
-bool SDModule::_openNextLog() {
+// One root listing marks every /logNNN.csv. Probing all 999 names with
+// exists() re-walks the directory per call: ~29 s on a 694-file card.
+bool SDModule::_scanLogs(SdLogSlots& slots) {
+  sdLogSlotsClear(slots);
+  File root = fs()->open("/");
+  if (!root || !root.isDirectory()) {
+    Log::error(TAG, "sd.log_scan_failed reason=root_open");
+    return false;
+  }
+  for (String n = root.getNextFileName(); n.length(); n = root.getNextFileName())
+    sdLogSlotsAdd(slots, n.c_str());
+  root.close();
+  return true;
+}
+
+// Claim the lowest free slot (log001-log999) and create a CSV with header.
+// exists() still guards FILE_WRITE so a missed entry is never truncated.
+bool SDModule::_openNextLog(const SdLogSlots& slots) {
   static const char* HEADER = "timestamp,sensor,data\n";
   fs::FS* sdfs = fs();
-  for (int i = 1; i <= 999; i++) {
+  for (int i = sdLogSlotsNextFree(slots, 1); i; i = sdLogSlotsNextFree(slots, i + 1)) {
     char path[20];
     snprintf(path, sizeof(path), "/log%03d.csv", i);
-    if (!sdfs->exists(path)) {
-      File f = sdfs->open(path, FILE_WRITE);
-      if (!f) return false;
-      f.print(HEADER);
-      f.close();
-      _logPath  = path;
-      _logBytes = strlen(HEADER);
-      return true;
-    }
+    if (sdfs->exists(path)) continue;
+    File f = sdfs->open(path, FILE_WRITE);
+    if (!f) return false;
+    f.print(HEADER);
+    f.close();
+    _logPath  = path;
+    _logBytes = strlen(HEADER);
+    return true;
   }
   return false;
 }
 
 // Pick the active log file on boot.
 //
-// Walk log999 -> log001 looking for the highest-numbered existing file.
-// If found and under _maxBytes, resume appending to it: _logPath = path,
-// _logBytes = on-disk size. Avoids the per-boot empty-file pile-up.
-// If the highest file is at/over the limit, or none
-// exist, fall back to _openNextLog() to claim a fresh slot.
+// Resume the highest-numbered existing file if under _maxBytes:
+// _logPath = path, _logBytes = on-disk size. Avoids the per-boot empty-file
+// pile-up. If the highest file is at/over the limit, or none exist, fall
+// back to _openNextLog() to claim the lowest free slot.
 //
 // Returns true on success (either resumed or new slot opened).
 bool SDModule::_resumeOrOpen() {
-  fs::FS* sdfs = fs();
-  for (int i = 999; i >= 1; i--) {
-    char path[20];
-    snprintf(path, sizeof(path), "/log%03d.csv", i);
-    if (!sdfs->exists(path)) continue;
+  SdLogSlots slots;
+  if (!_scanLogs(slots)) return false;
+  int hi = sdLogSlotsHighest(slots);
+  if (hi == 0) return _openNextLog(slots);
 
-    File f = sdfs->open(path, FILE_READ);
-    if (!f) return _openNextLog();
-    uint32_t sz = (uint32_t)f.size();
-    f.close();
+  char path[20];
+  snprintf(path, sizeof(path), "/log%03d.csv", hi);
+  File f = fs()->open(path, FILE_READ);
+  if (!f) return _openNextLog(slots);
+  uint32_t sz = (uint32_t)f.size();
+  f.close();
 
-    if (_maxBytes == 0 || sz < _maxBytes) {
-      _logPath  = path;
-      _logBytes = sz;
-      return true;
-    }
-    return _openNextLog();
+  if (_maxBytes == 0 || sz < _maxBytes) {
+    _logPath  = path;
+    _logBytes = sz;
+    return true;
   }
-  return _openNextLog();
+  return _openNextLog(slots);
 }
 
 // Rotate to a new log file when the current one exceeds the size limit
 void SDModule::_rotate() {
   Log::kvf(TAG, "sd.log_rotate reason=file_full path=%s", _logPath.c_str());
-  if (!_openNextLog()) {
+  SdLogSlots slots;
+  if (!_scanLogs(slots) || !_openNextLog(slots)) {
     Log::error(TAG, "sd.log_rotate_failed reason=no_free_slot action=stop_rotation");
     _maxBytes = 0;
     return;
