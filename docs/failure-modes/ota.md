@@ -16,7 +16,7 @@
 ## Gaps
 
 - **No firmware signature verification.** SHA256 is integrity-only (`:784`); `CONFIG_SECURE_BOOT is not set`, no `SECURE_SIGNED_APPS`. SECURITY.md:47 confirms. Anyone controlling the (CA-verified) origin/manifest can push arbitrary firmware whose SHA256 matches their own binary. **No detection, no recovery.**
-- **Rollback confirm is health-gated.** `verifyRollbackLater` returns true so `initArduino` does not confirm a pending image, unless the rescue flag was stored and both the clear and the commit succeeded. `OTAUpdate::confirmIfHealthy` marks it valid after the first MQTT session or five minutes up. A crash loop meets neither. Rollback runs only when the other slot is a different valid image and not the one just left. USB-flashed images are not pending.
+- **Rollback confirm is health-gated.** `verifyRollbackLater` returns true so `initArduino` does not confirm a pending image, unless the rescue flag was stored and both the clear and the commit succeeded. `OTAUpdate::confirmIfHealthy` marks it valid after the first MQTT session or five minutes up. A crash loop meets neither. Rollback runs only when the other slot is a different valid image and not the one just left. USB-flashed images are not pending; otadata reads them undefined, and they hold operator restarts like a valid image. After an hour up with a known crash streak they are marked valid, so the first OTA after a USB flash can roll back to them; an OTA that lands before that hour has no rollback target, as before. An undefined or unknown running state never switches slots.
 - **CA / server cert expiry during OTA has no dedicated signal.** Surfaces only as a generic negative-status fetch failure (`:636`); the baked PROGMEM CA bundle can age out silently.
 
 ---

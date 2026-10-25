@@ -684,7 +684,7 @@ static void cmd_identity_reset(int argc, char** argv, ShellOutput out) {
          : "identity erase FAILED");
   if (!ok) return;
   delay(200);
-  esp_restart();
+  OTAUpdate::plannedRestart();
 }
 
 // Reformat LittleFS - destroys every file. Requires `fs.format --yes` so
@@ -706,7 +706,7 @@ static void cmd_format(int argc, char** argv, ShellOutput out) {
   bool ok = LittleFS.format();
   out(ok ? "LittleFS reformatted - rebooting" : "LittleFS format FAILED - rebooting anyway");
   delay(200);
-  esp_restart();
+  OTAUpdate::plannedRestart();
 }
 
 // ---------------------------------------------------------------------------
@@ -2032,7 +2032,7 @@ static void cmd_module_status(int argc, char** argv, ShellOutput out) {
 static void cmd_restart(int argc, char** argv, ShellOutput out) {
   out("Restarting...");
   delay(100);
-  ESP.restart();
+  OTAUpdate::plannedRestart();
 }
 
 static void cmd_heap(int argc, char** argv, ShellOutput out) {
