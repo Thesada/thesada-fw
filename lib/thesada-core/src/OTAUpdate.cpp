@@ -1128,9 +1128,13 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
   }
   if (fled == OTA_FLED_RETRY || fled == OTA_FLED_LAST) {
     // Saved before the download, so a try that never boots still counts.
-    const bool saved =
-        fled == OTA_FLED_LAST ? saveFled(0, 0) : saveFled(fledAge, (uint8_t)(tries + 1));
+    const OtaFledAge spent = otaFledAfterTry(fled, fledAge, tries, true);
+    const bool saved = saveFled(spent.ageS, spent.tries);
     if (!otaFledMayDownload(fled, saved)) {
+      // saveFled moved RAM on; the try NVS did not take stays unspent.
+      const OtaFledAge kept = otaFledAfterTry(fled, fledAge, tries, false);
+      _fled.saved.ageS = kept.ageS;
+      _fled.saved.tries = kept.tries;
       Log::kvfe(TAG, "ota.phase_change from=fetch_manifest to=idle reason=fled_try_unsaved version=%s",
                 remoteVersion.c_str());
       publishOtaRefusal("fled-release");

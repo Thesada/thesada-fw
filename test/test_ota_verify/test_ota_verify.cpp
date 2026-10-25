@@ -217,6 +217,32 @@ void test_fled_try_downloads_only_once_saved(void) {
   TEST_ASSERT_EQUAL(0, downloads);
 }
 
+// Checks in one boot after the day: the first try's save fails, then NVS works.
+void test_fled_failed_try_save_spends_no_try(void) {
+  uint32_t age = OTA_FLED_SKIP_S;
+  uint8_t tries = 0;
+  int installs = 0;
+  const bool saves[] = {false, true, true};
+  for (bool ok : saves) {
+    const OtaFledAction a = otaFledAction(FLED, FLED, age, tries, false);
+    if (otaFledMayDownload(a, ok)) installs++;
+    const OtaFledAge held = otaFledAfterTry(a, age, tries, ok);
+    age = held.ageS;
+    tries = held.tries;
+    if (!ok) {
+      TEST_ASSERT_EQUAL(OTA_FLED_RETRY, otaFledAction(FLED, FLED, age, tries, false));
+      // The held age stays at the cap, so ageFledRelease writes nothing.
+      TEST_ASSERT_FALSE(otaFledAges(FLED, RUNNING, age));
+    }
+  }
+  TEST_ASSERT_EQUAL(2, installs);
+  // Negative control: two good saves spend the day.
+  TEST_ASSERT_EQUAL(OTA_FLED_SKIP, otaFledAction(FLED, FLED, age, tries, false));
+  const OtaFledAge last = otaFledAfterTry(OTA_FLED_LAST, OTA_FLED_SKIP_S, 1, false);
+  TEST_ASSERT_EQUAL_UINT32(OTA_FLED_SKIP_S, last.ageS);
+  TEST_ASSERT_EQUAL_UINT8(1, last.tries);
+}
+
 void test_fled_age_survives_reboot(void) {
   const OtaFledAge saved = {OTA_FLED_SKIP_S - 600u, 1, T0};
   const OtaFledAge back = otaFledUnpack(otaFledPack(saved));
@@ -393,6 +419,7 @@ int main(int, char**) {
   RUN_TEST(test_fled_skip_expires_at_24h);
   RUN_TEST(test_fled_second_try_restarts_the_day);
   RUN_TEST(test_fled_try_downloads_only_once_saved);
+  RUN_TEST(test_fled_failed_try_save_spends_no_try);
   RUN_TEST(test_fled_age_survives_reboot);
   RUN_TEST(test_fled_carry_is_capped);
   RUN_TEST(test_fled_unsynced_clock_counts_uptime);

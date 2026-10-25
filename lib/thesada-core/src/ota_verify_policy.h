@@ -217,6 +217,14 @@ inline bool otaFledMayDownload(OtaFledAction action, bool saved) {
   return saved || (action != OTA_FLED_RETRY && action != OTA_FLED_LAST);
 }
 
+// The age and tries a fled try leaves: spent once saved, unspent when NVS
+// refused the save. in: action, age now, tries, saved. out: record, seenEpoch 0.
+inline OtaFledAge otaFledAfterTry(OtaFledAction action, uint32_t ageS, uint8_t tries, bool saved) {
+  if (saved && action == OTA_FLED_LAST) return {0, 0, 0};
+  if (saved && action == OTA_FLED_RETRY) return {ageS, (uint8_t)(tries + 1u), 0};
+  return {ageS, tries, 0};
+}
+
 // Digest compare. Case-insensitive because the manifest may carry either case,
 // but length-checked first so a truncated or padded digest is rejected outright
 // rather than leaning on the compare.
