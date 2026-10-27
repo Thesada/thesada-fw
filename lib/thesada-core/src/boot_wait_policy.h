@@ -25,6 +25,12 @@ static const uint32_t NTP_WAIT_MS      = 15000;
 static const uint32_t LUA_SCRIPT_BUDGET_MS = 10000;
 static const int      LUA_HOOK_COUNT       = 1000;
 
+// Telegram POST after a fed DNS resolve: TCP connect + TLS handshake + HTTP read.
+// Core 3 defaults the handshake to 120 s, so it is set explicitly.
+static const uint32_t TELEGRAM_CONNECT_MS     = 5000;
+static const uint32_t TELEGRAM_HANDSHAKE_S    = 10;
+static const uint32_t TELEGRAM_HTTP_TIMEOUT_MS = 5000;
+
 // in: requested sleep. out: the sleep a fed step takes, 1..WAIT_STEP_MAX_MS.
 inline uint32_t waitStepMs(uint32_t ms) {
   if (ms < 1) return 1;

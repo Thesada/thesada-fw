@@ -17,8 +17,11 @@
 #include <WiFiManager.h>
 #include <MQTTClient.h>
 #include <Log.h>
+#include <Watchdog.h>
+#include <boot_wait_policy.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <LittleFS.h>
 #include "telegram_ca_progmem.h"
@@ -87,6 +90,7 @@ void TelegramModule::begin() {
     Log::error(TAG, "telegram.ca_missing sends=fail_closed");
   }
   _secClient.setTimeout(10);
+  _secClient.setHandshakeTimeout(TELEGRAM_HANDSHAKE_S);
 
   // Webhook client: /webhook-ca.crt on LittleFS enables verified TLS
   // (upload the endpoint's root, self-signed certs included - same
@@ -116,6 +120,7 @@ void TelegramModule::begin() {
     }
   }
   _webhookClient.setTimeout(10);
+  _webhookClient.setHandshakeTimeout(TELEGRAM_HANDSHAKE_S);
 
   Log::kvf(TAG, "telegram.ready token=%s chats=%d", hasToken ? "yes" : "no", nChats);
 
@@ -184,12 +189,21 @@ bool TelegramModule::sendTo(const char* chatId, const char* message) {
   // keeps the mbedtls context allocated - no new heap allocation needed.
   _secClient.stop();
 
+  // Core 3 DNS is uncapped: resolve, feed, and skip on failure so connect()
+  // only hits the cache. The POST is then capped (boot_wait_policy.h).
+  IPAddress apiIp;
+  const bool resolved = WiFi.hostByName("api.telegram.org", apiIp) == 1;
+  Watchdog::feed();
+  if (!resolved) { Log::warn(TAG, "telegram.send_skipped reason=dns"); return false; }
+
   HTTPClient http;
   http.begin(_secClient, url);
-  http.setTimeout(10000);  // 10s HTTP timeout
+  http.setConnectTimeout(TELEGRAM_CONNECT_MS);
+  http.setTimeout(TELEGRAM_HTTP_TIMEOUT_MS);
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(body);
   http.end();
+  Watchdog::feed();
 
   if (code == 200) {
     Log::kvf(TAG, "telegram.sent chat_id=%s", chatId);
