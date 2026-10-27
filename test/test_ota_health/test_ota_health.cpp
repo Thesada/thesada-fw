@@ -263,12 +263,198 @@ void test_stale_marker_after_power_on_is_ignored(void) {
   TEST_ASSERT_EQUAL_UINT32(0, marker);
 }
 
-void test_abandoned_image_matches_version_date_and_time(void) {
-  TEST_ASSERT_FALSE(otaHealthIsAbandoned("1", "Oct  6 2026", "09:00:00", "", "", ""));
-  TEST_ASSERT_TRUE(otaHealthIsAbandoned("1", "Oct  6 2026", "09:00:00",
-                                        "1", "Oct  6 2026", "09:00:00"));
-  TEST_ASSERT_FALSE(otaHealthIsAbandoned("1", "Oct  6 2026", "09:00:00",
-                                         "1", "Oct  6 2026", "10:00:00"));
+// Two builds on espressif32 6.13.0: the descriptor strings come from the
+// prebuilt IDF and match, only the ELF hash differs.
+struct TestBuild {
+  const char* version;
+  const char* date;
+  const char* time;
+  uint8_t sha[32];
+};
+
+static TestBuild testBuild(uint8_t seed) {
+  TestBuild b = {"esp-idf: v4.4.7 38eeba213a", "Mar  5 2024", "12:12:53", {0}};
+  for (int i = 0; i < 32; i++) b.sha[i] = (uint8_t)(seed + i);
+  return b;
+}
+
+static const uint32_t SLOT_0 = 0x10000u;
+static const uint32_t SLOT_1 = 0x610000u;
+
+// The record a switch arrival writes for the slot it came from.
+static void leftRecord(uint32_t slot, const TestBuild& b, uint8_t* rec) {
+  TEST_ASSERT_TRUE(otaHealthImageId(slot, b.sha, rec));
+}
+
+void test_builds_with_identical_descriptors_are_told_apart(void) {
+  TestBuild a = testBuild(1), b = testBuild(2);
+  TEST_ASSERT_EQUAL_STRING(a.version, b.version);
+  TEST_ASSERT_EQUAL_STRING(a.date, b.date);
+  TEST_ASSERT_EQUAL_STRING(a.time, b.time);
+  uint8_t rec[OTA_IMAGE_ID_LEN];
+  leftRecord(SLOT_0, a, rec);
+  TEST_ASSERT_FALSE(otaHealthIsAbandoned(rec, sizeof(rec), SLOT_0, b.sha));
+  // Negative control: the build the record was written for matches.
+  TEST_ASSERT_TRUE(otaHealthIsAbandoned(rec, sizeof(rec), SLOT_0, a.sha));
+}
+
+// Two slots and the left record, driven the way OTAUpdate.cpp drives them.
+struct Unit {
+  uint32_t addr[2];
+  TestBuild img[2];
+  int run;
+  uint8_t rec[OTA_IMAGE_ID_LEN];
+  size_t recLen;
+};
+
+static Unit unitOf(uint8_t seed0, uint8_t seed1) {
+  Unit u = {{SLOT_0, SLOT_1}, {testBuild(seed0), testBuild(seed1)}, 0, {0}, 0};
+  return u;
+}
+
+// recordBootStreak's part: drop a stale record, then record an arrival.
+static void bootUnit(Unit& u, uint8_t rescue, bool pending, bool sameStrings, bool dropStale) {
+  if (dropStale && otaHealthLeftIsStale(u.rec, u.recLen, u.addr[u.run])) u.recLen = 0;
+  if (!otaHealthIsArrival(rescue, pending) || !otaHealthRecordArrival(rescue, sameStrings)) return;
+  leftRecord(u.addr[1 - u.run], u.img[1 - u.run], u.rec);
+  u.recLen = OTA_IMAGE_ID_LEN;
+}
+
+static bool otherIsTarget(const Unit& u) {
+  int o = 1 - u.run;
+  return !otaHealthIsAbandoned(u.rec, u.recLen, u.addr[o], u.img[o].sha);
+}
+
+static void guardSwitch(Unit& u) {
+  TEST_ASSERT_TRUE(otherIsTarget(u));
+  u.run = 1 - u.run;
+  bootUnit(u, OTA_RESCUE_ID, true, true, true);
+}
+
+// An OTA writes the other slot and boots it pending, after a planned restart.
+static void install(Unit& u, uint8_t seed, bool dropStale, uint8_t storedRescue = 0) {
+  u.run = 1 - u.run;
+  u.img[u.run] = testBuild(seed);
+  bootUnit(u, otaHealthRescue(storedRescue, OTA_PLANNED_RESTART_MAGIC), true, true, dropStale);
+}
+
+void test_ping_pong_stops_after_one_switch(void) {
+  Unit u = unitOf(0xA0, 0xB0);
+  guardSwitch(u);
+  TEST_ASSERT_FALSE(otherIsTarget(u));
+  // Power cycles on B do not touch slot 0, so the record holds.
+  for (int i = 0; i < 3; i++) bootUnit(u, 0, false, true, true);
+  TEST_ASSERT_FALSE(otherIsTarget(u));
+}
+
+void test_a_reinstalled_build_is_a_target_again(void) {
+  Unit u = unitOf(0xA0, 0xB0);
+  guardSwitch(u);
+  install(u, 0xA0, true);
+  TEST_ASSERT_EQUAL_UINT32(0, u.recLen);
+  install(u, 0xD0, true);
+  TEST_ASSERT_TRUE(otherIsTarget(u));
+  // Negative control: a record that outlives the reinstall refuses A.
+  Unit v = unitOf(0xA0, 0xB0);
+  guardSwitch(v);
+  install(v, 0xA0, false);
+  install(v, 0xD0, false);
+  TEST_ASSERT_FALSE(otherIsTarget(v));
+}
+
+void test_a_boot_of_the_recorded_slot_drops_the_record(void) {
+  uint8_t rec[OTA_IMAGE_ID_LEN];
+  leftRecord(SLOT_0, testBuild(1), rec);
+  TEST_ASSERT_TRUE(otaHealthLeftIsStale(rec, sizeof(rec), SLOT_0));
+  // Negative control: the slot a switch went to keeps it.
+  TEST_ASSERT_FALSE(otaHealthLeftIsStale(rec, sizeof(rec), SLOT_1));
+  TEST_ASSERT_FALSE(otaHealthLeftIsStale(rec, sizeof(rec) - 1, SLOT_0));
+  TEST_ASSERT_FALSE(otaHealthLeftIsStale(nullptr, OTA_IMAGE_ID_LEN, SLOT_0));
+}
+
+void test_only_a_switch_arrival_writes_the_record(void) {
+  TEST_ASSERT_TRUE(otaHealthIsArrival(OTA_RESCUE_ID, true));
+  // A failed switch's leftover on the valid image, and no flag at all.
+  TEST_ASSERT_FALSE(otaHealthIsArrival(OTA_RESCUE_ID, false));
+  TEST_ASSERT_FALSE(otaHealthIsArrival(0, true));
+  Unit u = unitOf(0xA0, 0xB0);
+  bootUnit(u, OTA_RESCUE_ID, false, true, true);
+  TEST_ASSERT_TRUE(otherIsTarget(u));
+  // Negative control: the same flag on a pending boot records slot 1.
+  bootUnit(u, OTA_RESCUE_ID, true, true, true);
+  TEST_ASSERT_FALSE(otherIsTarget(u));
+}
+
+void test_a_planned_restart_voids_the_rescue_flag(void) {
+  TEST_ASSERT_EQUAL_UINT8(0, otaHealthRescue(OTA_RESCUE_ID, OTA_PLANNED_RESTART_MAGIC));
+  TEST_ASSERT_EQUAL_UINT8(0, otaHealthRescue(1, OTA_PLANNED_BROKER_MAGIC));
+  // Negative control: a switch restarts without a marker.
+  TEST_ASSERT_EQUAL_UINT8(OTA_RESCUE_ID, otaHealthRescue(OTA_RESCUE_ID, 0));
+  TEST_ASSERT_EQUAL_UINT8(1, otaHealthRescue(1, OTA_PLANNED_RESTART_MAGIC ^ 1u));
+  // A flag a failed switch left set does not make the next install an arrival.
+  Unit u = unitOf(0xA0, 0xB0);
+  install(u, 0xD0, true, OTA_RESCUE_ID);
+  TEST_ASSERT_EQUAL_UINT32(0, u.recLen);
+  TEST_ASSERT_TRUE(otherIsTarget(u));
+}
+
+void test_an_older_guard_arrival_is_recorded_across_platforms_only(void) {
+  // Same strings: the older guard's own record already refuses this image.
+  TEST_ASSERT_FALSE(otaHealthRecordArrival(1, true));
+  TEST_ASSERT_TRUE(otaHealthRecordArrival(1, false));
+  // Negative control: this guard's own flag records either way.
+  TEST_ASSERT_TRUE(otaHealthRecordArrival(OTA_RESCUE_ID, true));
+}
+
+void test_same_build_in_the_same_slot_matches(void) {
+  TestBuild a = testBuild(7);
+  uint8_t rec[OTA_IMAGE_ID_LEN];
+  leftRecord(SLOT_1, a, rec);
+  TEST_ASSERT_TRUE(otaHealthIsAbandoned(rec, sizeof(rec), SLOT_1, a.sha));
+  // The record names one slot and one build, like the proven record.
+  TEST_ASSERT_FALSE(otaHealthIsAbandoned(rec, sizeof(rec), SLOT_0, a.sha));
+  uint8_t flipped[OTA_IMAGE_ID_LEN];
+  memcpy(flipped, rec, sizeof(rec));
+  flipped[OTA_IMAGE_ID_LEN - 1] ^= 0x01u;
+  TEST_ASSERT_FALSE(otaHealthIsAbandoned(flipped, sizeof(flipped), SLOT_1, a.sha));
+}
+
+void test_old_format_record_does_not_block_a_switch(void) {
+  TestBuild a = testBuild(3);
+  // A unit with only left_ver/left_date/left_time reads no left_id.
+  uint8_t none[OTA_IMAGE_ID_LEN] = {0};
+  TEST_ASSERT_FALSE(otaHealthIsAbandoned(none, 0, SLOT_1, a.sha));
+  TEST_ASSERT_FALSE(otaHealthIsAbandoned(nullptr, 0, SLOT_1, a.sha));
+  // The old strings fed in as a record are still not a match.
+  const char* legacy = "esp-idf: v4.4.7 38eeba213a";
+  TEST_ASSERT_FALSE(otaHealthIsAbandoned((const uint8_t*)legacy, strlen(legacy) + 1, SLOT_1,
+                                         a.sha));
+  uint8_t rec[OTA_IMAGE_ID_LEN];
+  leftRecord(SLOT_1, a, rec);
+  TEST_ASSERT_FALSE(otaHealthIsAbandoned(rec, OTA_IMAGE_ID_LEN - 1, SLOT_1, a.sha));
+  // Negative control: the new record for the same image matches.
+  TEST_ASSERT_TRUE(otaHealthIsAbandoned(rec, OTA_IMAGE_ID_LEN, SLOT_1, a.sha));
+}
+
+void test_a_zero_hash_candidate_is_never_the_left_image(void) {
+  uint8_t zero[32] = {0};
+  uint8_t rec[OTA_IMAGE_ID_LEN];
+  TEST_ASSERT_FALSE(otaHealthImageId(SLOT_0, zero, rec));
+  leftRecord(SLOT_0, testBuild(1), rec);
+  TEST_ASSERT_FALSE(otaHealthIsAbandoned(rec, sizeof(rec), SLOT_0, zero));
+  TEST_ASSERT_FALSE(otaHealthIsAbandoned(rec, sizeof(rec), SLOT_0, nullptr));
+}
+
+void test_one_record_refuses_exactly_one_candidate(void) {
+  uint8_t rec[OTA_IMAGE_ID_LEN];
+  leftRecord(SLOT_0, testBuild(5), rec);
+  int refused = 0;
+  for (uint8_t seed = 0; seed < 16; seed++) {
+    TestBuild b = testBuild(seed);
+    refused += otaHealthIsAbandoned(rec, sizeof(rec), SLOT_0, b.sha) ? 1 : 0;
+    refused += otaHealthIsAbandoned(rec, sizeof(rec), SLOT_1, b.sha) ? 1 : 0;
+  }
+  TEST_ASSERT_EQUAL_INT(1, refused);
 }
 
 int main(int, char**) {
@@ -299,6 +485,16 @@ int main(int, char**) {
   RUN_TEST(test_pending_image_counts_every_restart);
   RUN_TEST(test_panic_and_watchdogs_count_even_when_planned);
   RUN_TEST(test_stale_marker_after_power_on_is_ignored);
-  RUN_TEST(test_abandoned_image_matches_version_date_and_time);
+  RUN_TEST(test_builds_with_identical_descriptors_are_told_apart);
+  RUN_TEST(test_ping_pong_stops_after_one_switch);
+  RUN_TEST(test_a_reinstalled_build_is_a_target_again);
+  RUN_TEST(test_a_boot_of_the_recorded_slot_drops_the_record);
+  RUN_TEST(test_only_a_switch_arrival_writes_the_record);
+  RUN_TEST(test_a_planned_restart_voids_the_rescue_flag);
+  RUN_TEST(test_an_older_guard_arrival_is_recorded_across_platforms_only);
+  RUN_TEST(test_same_build_in_the_same_slot_matches);
+  RUN_TEST(test_old_format_record_does_not_block_a_switch);
+  RUN_TEST(test_a_zero_hash_candidate_is_never_the_left_image);
+  RUN_TEST(test_one_record_refuses_exactly_one_candidate);
   return UNITY_END();
 }
