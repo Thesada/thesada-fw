@@ -166,9 +166,10 @@ static bool resolveFed(const char* host) {
 static int boundedPost(Client& c, const char* host, uint16_t port, const char* path,
                        const String& body) {
   if (!c.connect(host, port)) { c.stop(); return -1; }
-  String req = String("POST ") + path + " HTTP/1.1\r\nHost: " + host +
-               "\r\nContent-Type: application/json\r\nContent-Length: " + String(body.length()) +
-               "\r\nConnection: close\r\n\r\n";
+  String req = String("POST ") + path + " HTTP/1.1\r\nHost: " + host;
+  if (port != 80 && port != 443) { req += ':'; req += String(port); }
+  req += "\r\nContent-Type: application/json\r\nContent-Length: " + String(body.length()) +
+         "\r\nConnection: close\r\n\r\n";
   c.print(req);
   c.print(body);
   char line[48];

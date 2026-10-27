@@ -653,7 +653,7 @@ static void configureSecureClient(WiFiClientSecure& client) {
 // ---------------------------------------------------------------------------
 
 // One GET on one connection. A redirect fills *redirect and reads no body.
-// Unfed worst case: TCP 10 s + TLS 10 s + headers 5 s, under the 30 s TWDT.
+// Unfed: TCP 10 s + TLS 10 s + headers 5 s idle per line; a trickle trips the TWDT.
 static bool otaHttpGetWiFiHop(const char* url,
                               std::function<bool(const uint8_t*, size_t)> writeCallback,
                               int* outStatus, size_t* outLen, String* redirect) {

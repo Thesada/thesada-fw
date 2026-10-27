@@ -1069,9 +1069,9 @@ still reboot.
 | WiFi scan | one `scanNetworks()`, fed after | IDF scan |
 | NTP wait after connect | one 200 ms poll | 15 s |
 | MQTT connect (`MQTTClient::connect`) | dial: TCP 10 s + TLS 10 s, after a fed DNS resolve; then CONNECT write 10 s + CONNACK 5 s | one attempt per retry interval |
-| OTA GET hop (`otaHttpGetWiFiHop`) | TCP 10 s + TLS 10 s + headers 5 s, after a fed DNS resolve | 5 same-scheme redirects; body loop fed per read, 5 min cap |
+| OTA GET hop (`otaHttpGetWiFiHop`) | TCP 10 s + TLS 10 s + headers 5 s idle per line (a trickling origin can outlast it; the TWDT then reboots), after a fed DNS resolve | 5 same-scheme redirects; body loop fed per read, 5 min cap |
 | Telegram and webhook POST (`TelegramModule::sendTo`, `broadcast`) | TCP 5 s + TLS 10 s + write 5 s + status line 5 s (a hard deadline, not an inactivity timer), after a fed DNS resolve; a failed resolve skips the send | one POST per chat and one webhook, fed after each |
-| `main.lua` / `rules.lua` (`executeFile`) | 1000 VM instructions | 10 s, then `script.budget_exceeded` aborts the file |
+| `main.lua` / `rules.lua` (`executeFile`) | 1000 VM instructions | 10 s, then `script.budget_exceeded` aborts the file; a native binding (`Telegram.broadcast`) finishes its own fed POSTs first, so wall time can pass 10 s by those |
 
 The poll steps go through one helper, `Watchdog::waitStep(ms)` (pump the
 console, sleep at most 1 s, feed). The Lua count hook feeds until the
