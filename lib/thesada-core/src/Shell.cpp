@@ -684,7 +684,7 @@ static void cmd_identity_reset(int argc, char** argv, ShellOutput out) {
          : "identity erase FAILED");
   if (!ok) return;
   delay(200);
-  esp_restart();
+  OTAUpdate::plannedRestart();
 }
 
 // Reformat LittleFS - destroys every file. Requires `fs.format --yes` so
@@ -706,7 +706,7 @@ static void cmd_format(int argc, char** argv, ShellOutput out) {
   bool ok = LittleFS.format();
   out(ok ? "LittleFS reformatted - rebooting" : "LittleFS format FAILED - rebooting anyway");
   delay(200);
-  esp_restart();
+  OTAUpdate::plannedRestart();
 }
 
 // ---------------------------------------------------------------------------
@@ -1391,22 +1391,10 @@ struct HttpFetchJob {
   volatile bool done;       // task sets this last; cmd_http polls it
 };
 
-// Run the WiFi HTTPS fetch on a dedicated deep-stack task.
-//
-// Why a task: the mbedtls TLS handshake needs ~6 KB of stack, and
-// net.http executes deep in the deferred-CLI call chain on the main-loop
-// task (loop -> Shell::loop -> deferred drain -> execute -> cmd_http).
-// Doing the handshake there overflows the 8 KB loop-task stack - the
-// board resets silently (panic out the other UART, USB-CDC dead). This
-// task gets its own 12 KB stack; cmd_http blocks on job->done.
-//
-// The task is not subscribed to the task watchdog, so it does not feed
-// it - the main-loop task keeps feeding its own wdt from cmd_http's wait
-// loop. Every exit path sets job->done and self-deletes.
-// in:  arg - HttpFetchJob* (owned by cmd_http). out: job fields filled.
-static void httpFetchTask(void* arg) {
-  HttpFetchJob* job = static_cast<HttpFetchJob*>(arg);
-
+// The fetch itself. Every local, the CA PEM included, lives until return.
+// in:  job. out: job fields filled except done.
+static void httpFetchRun(HttpFetchJob* job) {
+  String           pem;  // setCACert keeps the pointer, not a copy
   WiFiClientSecure tls;
   WiFiClient       plain;
   tls.setHandshakeTimeout(10);  // seconds; the 120 s default is past any sane bound
@@ -1415,15 +1403,13 @@ static void httpFetchTask(void* arg) {
     // Reuse the same CA the OTA path uses - no second copy in code.
     File ca = LittleFS.open("/ca.crt", "r");
     if (ca) {
-      String pem = ca.readString();
+      pem = ca.readString();
       ca.close();
       tls.setCACert(pem.c_str());
     } else if (job->insecure) {
       tls.setInsecure();
     } else {
-      job->err  = "no /ca.crt on flash - pass --insecure to skip verification";
-      job->done = true;
-      vTaskDelete(nullptr);
+      job->err = "no /ca.crt on flash - pass --insecure to skip verification";
       return;
     }
   }
@@ -1432,9 +1418,7 @@ static void httpFetchTask(void* arg) {
   bool begun = job->https ? http.begin(tls, job->url)
                           : http.begin(plain, job->url);
   if (!begun) {
-    job->err  = "http.begin failed";
-    job->done = true;
-    vTaskDelete(nullptr);
+    job->err = "http.begin failed";
     return;
   }
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
@@ -1464,6 +1448,24 @@ static void httpFetchTask(void* arg) {
     }
   }
   http.end();
+}
+
+// Run the WiFi HTTPS fetch on a dedicated deep-stack task.
+//
+// Why a task: the mbedtls TLS handshake needs ~6 KB of stack, and
+// net.http executes deep in the deferred-CLI call chain on the main-loop
+// task (loop -> Shell::loop -> deferred drain -> execute -> cmd_http).
+// Doing the handshake there overflows the 8 KB loop-task stack - the
+// board resets silently (panic out the other UART, USB-CDC dead). This
+// task gets its own 12 KB stack; cmd_http blocks on job->done.
+//
+// The task is not subscribed to the task watchdog, so it does not feed
+// it - the main-loop task keeps feeding its own wdt from cmd_http's wait
+// loop. Every exit path sets job->done and self-deletes.
+// in:  arg - HttpFetchJob* (owned by cmd_http). out: job fields filled.
+static void httpFetchTask(void* arg) {
+  HttpFetchJob* job = static_cast<HttpFetchJob*>(arg);
+  httpFetchRun(job);
   job->done = true;
   vTaskDelete(nullptr);
 }
@@ -2030,7 +2032,7 @@ static void cmd_module_status(int argc, char** argv, ShellOutput out) {
 static void cmd_restart(int argc, char** argv, ShellOutput out) {
   out("Restarting...");
   delay(100);
-  ESP.restart();
+  OTAUpdate::plannedRestart();
 }
 
 static void cmd_heap(int argc, char** argv, ShellOutput out) {

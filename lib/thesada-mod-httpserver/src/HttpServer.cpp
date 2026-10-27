@@ -20,6 +20,7 @@
 #include <Shell.h>
 #include <WiFiManager.h>
 #include <MQTTClient.h>
+#include <OTAUpdate.h>
 #include <SetupPortal.h>
 #include <ModuleRegistry.h>
 #include <ESPAsyncWebServer.h>
@@ -344,7 +345,7 @@ void HttpServer::loop() {
   if (_restartPending) {
     Log::info(TAG, "web.restart reason=api_request");
     delay(500);
-    ESP.restart();
+    OTAUpdate::plannedRestart();
   }
 }
 

@@ -18,23 +18,32 @@ public:
   // out: none
   static void loop();
 
-  // Remember that a broker session came up this boot. The health gate marks
-  // a pending image valid on this, or after five minutes up. in: none. out: none.
+  // Remember that a broker session came up this boot. confirmIfHealthy then
+  // confirms a pending image and records this image as proven on the broker.
   static void noteMqttUp();
 
   // Record this boot in the crash streak and the brownout counter.
-  // One NVS "boot" session updates crash_n and brownout_n.
+  // One NVS "boot" session updates crash_n and brownout_n. Consumes the
+  // restart marker and reads the proven-on-broker record.
   // in: esp_reset_reason value, brownout total out (may be null).
   // out: streak after this boot. On an unread streak the return is the
   // crash limit and confirm stays shut.
   static uint32_t recordBootStreak(int resetReason, uint32_t* brownoutsOut);
 
+  // Restart on purpose. When the running image is valid the next boot holds
+  // the crash streak instead of counting it. in: none. out: does not return.
+  [[noreturn]] static void plannedRestart();
+
+  // Reboot from the MQTT budget. Holds the streak only on a valid image that
+  // has reached the broker since it was installed. out: does not return.
+  [[noreturn]] static void brokerRestart();
+
   // If the streak is at the limit, boot the other valid image.
   // in: none. out: none. Does not return when the switch works.
   static void rollbackIfCrashLoop();
 
-  // Confirm a pending image, or leave it pending. Call every main-loop turn,
-  // including when loop() is skipped. in: none. out: none.
+  // Record a first broker session, then confirm a pending image or leave it
+  // pending. Call every main-loop turn, even when loop() is skipped.
   static void confirmIfHealthy();
 
   // Fetch manifest, compare version, download, verify SHA256, flash, reboot.

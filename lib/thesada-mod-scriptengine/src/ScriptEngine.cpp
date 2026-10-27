@@ -30,6 +30,7 @@
 #include <Config.h>
 #include <EventBus.h>
 #include <MQTTClient.h>
+#include <OTAUpdate.h>
 #include <Log.h>
 #include <Shell.h>
 #include <ModuleRegistry.h>
@@ -166,7 +167,7 @@ static int lua_node_setTimeout(lua_State* L) {
 static int lua_node_restart(lua_State* L) {
   Log::info("Lua", "script.restart_requested");
   delay(100);
-  ESP.restart();
+  OTAUpdate::plannedRestart();
   return 0;
 }
 
