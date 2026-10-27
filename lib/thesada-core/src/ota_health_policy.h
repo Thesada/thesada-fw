@@ -172,15 +172,42 @@ inline bool otaHealthShouldRollback(uint32_t crashStreak) {
   return crashStreak >= OTA_HEALTH_CRASH_LIMIT;
 }
 
-// The slot we last left, matched on the image's own version, date, and time.
-// An empty bad version means nothing has been left. A new build differs in
-// date or time, so it can be selected.
-// in: candidate and recorded identity. out: true if this is the image we left.
-inline bool otaHealthIsAbandoned(const char* version, const char* date, const char* time,
-                                 const char* badVersion, const char* badDate,
-                                 const char* badTime) {
-  if (!badVersion || badVersion[0] == '\0') return false;
-  if (!version || !date || !time || !badDate || !badTime) return false;
-  return strcmp(version, badVersion) == 0 && strcmp(date, badDate) == 0 &&
-         strcmp(time, badTime) == 0;
+// True when the left record names this slot and build. No record, a short one,
+// or a zero hash is no match. in: record, length, slot, ELF hash. out: left.
+inline bool otaHealthIsAbandoned(const uint8_t* stored, size_t storedLen, uint32_t slotAddr,
+                                 const uint8_t* elfSha) {
+  uint8_t id[OTA_IMAGE_ID_LEN];
+  if (!elfSha || !otaHealthImageId(slotAddr, elfSha, id)) return false;
+  return otaHealthImageProven(stored, storedLen, id);
+}
+
+// Rescue flag this guard leaves for the slot it boots. The older guard wrote 1.
+#define OTA_RESCUE_ID 2u
+
+// An OTA or upload restarts planned and a switch does not, so a marker means
+// the flag is a leftover. in: stored flag, RTC marker. out: flag to honour.
+inline uint8_t otaHealthRescue(uint8_t stored, uint32_t marker) {
+  if (marker == OTA_PLANNED_RESTART_MAGIC || marker == OTA_PLANNED_BROKER_MAGIC) return 0;
+  return stored;
+}
+
+// A switch boots its target pending with the flag set; on a valid image the
+// flag is a failed switch's leftover. in: flag, pending. out: arrived by a switch.
+inline bool otaHealthIsArrival(uint8_t rescue, bool pending) {
+  return rescue != 0 && pending;
+}
+
+// The older guard (flag 1) refuses images with its own strings, so its arrival
+// is recorded only when they differ. in: flag, strings match. out: record.
+inline bool otaHealthRecordArrival(uint8_t rescue, bool sameStrings) {
+  return rescue == OTA_RESCUE_ID || !sameStrings;
+}
+
+// A record naming the running slot is stale: that slot was rewritten or fallen
+// back to. in: record, length, running slot address. out: true to remove it.
+inline bool otaHealthLeftIsStale(const uint8_t* stored, size_t storedLen, uint32_t runningAddr) {
+  if (!stored || storedLen != OTA_IMAGE_ID_LEN) return false;
+  uint32_t addr = 0;
+  for (size_t i = 0; i < 4; i++) addr |= (uint32_t)stored[i] << (8 * i);
+  return addr == runningAddr;
 }
