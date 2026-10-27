@@ -163,11 +163,11 @@ static bool resolveFed(const char* host) {
 
 // One POST, status line only. HTTPClient bounds inactivity, not the total, so a
 // slow-drip reply could outlast the TWDT; this reads under a hard deadline.
-static int boundedPost(Client& c, const char* host, uint16_t port, const char* path,
+static int boundedPost(Client& c, const char* host, uint16_t port, bool tls, const char* path,
                        const String& body) {
   if (!c.connect(host, port)) { c.stop(); return -1; }
   String req = String("POST ") + path + " HTTP/1.1\r\nHost: " + host;
-  if (port != 80 && port != 443) { req += ':'; req += String(port); }
+  if (port != (tls ? 443 : 80)) { req += ':'; req += String(port); }
   req += "\r\nContent-Type: application/json\r\nContent-Length: " + String(body.length()) +
          "\r\nConnection: close\r\n\r\n";
   c.print(req);
@@ -226,7 +226,7 @@ bool TelegramModule::sendTo(const char* chatId, const char* message) {
   _secClient.stop();
 
   if (!resolveFed("api.telegram.org")) { Log::warn(TAG, "telegram.send_skipped reason=dns"); return false; }
-  int code = boundedPost(_secClient, "api.telegram.org", 443, path, body);
+  int code = boundedPost(_secClient, "api.telegram.org", 443, true, path, body);
   Watchdog::feed();
 
   if (code == 200) {
@@ -296,8 +296,8 @@ bool TelegramModule::send(const char* message) {
         WiFiClient pc;
         pc.setTimeout(TELEGRAM_IO_MS / 1000);
         if (isHttps) _webhookClient.stop();
-        int code = isHttps ? boundedPost(_webhookClient, host, port, wpath, postBody)
-                           : boundedPost(pc, host, port, wpath, postBody);
+        int code = isHttps ? boundedPost(_webhookClient, host, port, true, wpath, postBody)
+                           : boundedPost(pc, host, port, false, wpath, postBody);
         Watchdog::feed();
         if (code > 0) {
           Log::kvf(TAG, "telegram.webhook_response status=%d", code);
