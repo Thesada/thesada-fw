@@ -32,3 +32,4 @@ lib/thesada-core/src/shell_mode_policy.h        95
 lib/thesada-core/src/glob_policy.h              95
 lib/thesada-core/src/mqtt_sub_table.h           95
 lib/thesada-core/src/boot_wait_policy.h          95
+lib/thesada-core/src/http_url_policy.h          95

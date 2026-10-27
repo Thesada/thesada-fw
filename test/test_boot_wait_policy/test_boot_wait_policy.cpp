@@ -85,10 +85,11 @@ void test_lua_budget_inside_period(void) {
 
 // One Telegram POST stays well inside a watchdog period between its feeds.
 void test_telegram_post_inside_period(void) {
-  const uint32_t unfed = TELEGRAM_CONNECT_MS + TELEGRAM_HANDSHAKE_S * 1000UL + TELEGRAM_HTTP_TIMEOUT_MS;
+  // connect + handshake + write + status line, all between two feeds.
+  const uint32_t unfed = 2 * TELEGRAM_IO_MS + TELEGRAM_HANDSHAKE_S * 1000UL + TELEGRAM_HTTP_TIMEOUT_MS;
   TEST_ASSERT_TRUE(unfed < TASK_WDT_TIMEOUT_MS);
   // Negative control: the core 3 default handshake alone overruns the period.
-  TEST_ASSERT_FALSE(TELEGRAM_CONNECT_MS + 120000UL + TELEGRAM_HTTP_TIMEOUT_MS < TASK_WDT_TIMEOUT_MS);
+  TEST_ASSERT_FALSE(2 * TELEGRAM_IO_MS + 120000UL + TELEGRAM_HTTP_TIMEOUT_MS < TASK_WDT_TIMEOUT_MS);
 }
 
 int main(int, char**) {

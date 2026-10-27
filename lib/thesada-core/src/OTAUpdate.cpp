@@ -33,6 +33,7 @@
 #include <functional>
 #include <mbedtls/sha256.h>
 #include "ota_verify_policy.h"
+#include "http_url_policy.h"
 #include "ota_health_policy.h"
 #include <esp_ota_ops.h>
 #include <esp_image_format.h>
@@ -651,27 +652,6 @@ static void configureSecureClient(WiFiClientSecure& client) {
 // Sectigo, etc - are baked into the firmware via ota_ca_progmem.h).
 // ---------------------------------------------------------------------------
 
-// Split an http(s) URL. in: url, host cap. out: host, path, port.
-static bool parseUrl(const char* url, char* host, size_t hostCap,
-                     const char** pathOut, uint16_t* portOut) {
-  const char* p = url;
-  uint16_t port = 443;
-  if (strncmp(p, "https://", 8) == 0)      { p += 8; port = 443; }
-  else if (strncmp(p, "http://",  7) == 0) { p += 7; port = 80;  }
-  else return false;
-  const char* slash   = strchr(p, '/');
-  const char* hostEnd = slash ? slash : p + strlen(p);
-  size_t hostLen      = hostEnd - p;
-  if (hostLen == 0 || hostLen >= hostCap) return false;
-  memcpy(host, p, hostLen);
-  host[hostLen] = '\0';
-  char* colon = strchr(host, ':');
-  if (colon) { *colon = '\0'; port = atoi(colon + 1); }
-  *pathOut = slash ? slash : "/";
-  *portOut = port;
-  return true;
-}
-
 // One GET on one connection. A redirect fills *redirect and reads no body.
 // Unfed worst case: TCP 10 s + TLS 10 s + headers 5 s, under the 30 s TWDT.
 static bool otaHttpGetWiFiHop(const char* url,
@@ -682,7 +662,7 @@ static bool otaHttpGetWiFiHop(const char* url,
   const char* path;
   uint16_t port;
   IPAddress ip;
-  if (!parseUrl(url, host, sizeof(host), &path, &port) || WiFi.hostByName(host, ip) != 1) {
+  if (!httpUrlSplit(url, host, sizeof(host), &path, &port) || WiFi.hostByName(host, ip) != 1) {
     Watchdog::feed();
     Log::kvfw(TAG, "ota.http_get_failed reason=resolve host=%.64s", host);
     if (outStatus) *outStatus = HTTPC_ERROR_CONNECTION_REFUSED;
@@ -816,7 +796,7 @@ static bool downloadBinaryChunkedCellular(
   char host[128] = "";
   const char* path = nullptr;
   uint16_t port = 443;
-  if (!parseUrl(url, host, sizeof(host), &path, &port)) {
+  if (!httpUrlSplit(url, host, sizeof(host), &path, &port)) {
     Log::error(TAG, "ota.download_failed reason=bad_url");
     return false;
   }
