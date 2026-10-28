@@ -34,6 +34,8 @@
 #include <Log.h>
 #include <Shell.h>
 #include <ModuleRegistry.h>
+#include <Watchdog.h>
+#include <boot_wait_policy.h>
 
 #include <LittleFS.h>
 #include <WiFi.h>
@@ -467,10 +469,55 @@ void ScriptEngine::addBindings(LuaBindingRegistrar fn) {
 }
 
 // Call all registered binding functions (core + module)
+static void wrapProtectedCalls(lua_State* L);
+
 void ScriptEngine::callAllRegistrars() {
   registerCoreBindings();
+  wrapProtectedCalls(gL);
   for (uint8_t i = 0; i < _registrarCount; i++) {
     if (_registrars[i]) _registrars[i](gL);
+  }
+}
+
+static uint32_t _scriptStartMs = 0;
+static bool _budgetActive = false;  // a file is running under the budget
+static bool _budgetHit = false;     // its budget ran out
+
+// Count hook while a script file runs: feed until the budget is spent, then
+// raise. Coroutines keep the hook after the file ends; it is inert then.
+static void scriptBudgetHook(lua_State* L, lua_Debug*) {
+  if (!_budgetActive) return;
+  if (waitBudgetSpent(_scriptStartMs, millis(), LUA_SCRIPT_BUDGET_MS)) {
+    _budgetHit = true;
+    luaL_error(L, "script.budget_exceeded budget_ms=%d", (int)LUA_SCRIPT_BUDGET_MS);
+    return;
+  }
+  Watchdog::feed();
+}
+
+// pcall/xpcall wrapper: once the budget is spent, re-raise after the protected
+// call, so a caught budget error climbs every pcall up to executeFile.
+static int budgetSafeCall(lua_State* L) {
+  const int n = lua_gettop(L);
+  lua_pushvalue(L, lua_upvalueindex(1));
+  lua_insert(L, 1);
+  lua_call(L, n, LUA_MULTRET);
+  if (_budgetActive && _budgetHit) {
+    return luaL_error(L, "script.budget_exceeded budget_ms=%d", (int)LUA_SCRIPT_BUDGET_MS);
+  }
+  return lua_gettop(L);
+}
+
+static void wrapProtectedCalls(lua_State* L) {
+  static const char* const names[] = {"pcall", "xpcall"};
+  for (const char* name : names) {
+    lua_getglobal(L, name);
+    if (lua_isfunction(L, -1)) {
+      lua_pushcclosure(L, budgetSafeCall, 1);
+      lua_setglobal(L, name);
+    } else {
+      lua_pop(L, 1);
+    }
   }
 }
 
@@ -505,7 +552,20 @@ bool ScriptEngine::executeFile(const char* path) {
 
   int result = lua_load(gL, reader, &ctx, path, nullptr);
   f.close();
-  if (result == LUA_OK) result = lua_pcall(gL, 0, LUA_MULTRET, 0);
+  if (result == LUA_OK) {
+    _scriptStartMs = millis();
+    _budgetHit = false;
+    _budgetActive = true;
+    Watchdog::feed();
+    lua_sethook(gL, scriptBudgetHook, LUA_MASKCOUNT, LUA_HOOK_COUNT);
+    result = lua_pcall(gL, 0, LUA_MULTRET, 0);
+    lua_sethook(gL, nullptr, 0, 0);
+    _budgetActive = false;
+    if (result == LUA_OK && _budgetHit) {
+      Log::kvfe(TAG, "script.exec_failed path=%s err=\"script.budget_exceeded caught\"", path);
+      return false;
+    }
+  }
   if (result != LUA_OK) {
     const char* err = lua_tostring(gL, -1);
     Log::kvfe(TAG, "script.exec_failed path=%s err=\"%.160s\"",

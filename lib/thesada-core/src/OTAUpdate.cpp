@@ -19,10 +19,12 @@
 #include "SleepManager.h"
 #include "Log.h"
 #include "Shell.h"
+#include "Watchdog.h"
 #include "ota_ca_progmem.h"
 #include <thesada_config.h>
 
 #include <HTTPClient.h>
+#include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Update.h>
 #include <LittleFS.h>
@@ -31,6 +33,7 @@
 #include <functional>
 #include <mbedtls/sha256.h>
 #include "ota_verify_policy.h"
+#include "http_url_policy.h"
 #include "ota_health_policy.h"
 #include <esp_ota_ops.h>
 #include <esp_image_format.h>
@@ -633,7 +636,7 @@ static void configureSecureClient(WiFiClientSecure& client) {
   } else {
     client.setCACert(_otaCaCert.c_str());
   }
-  client.setTimeout(10);            // arduino-esp32 v2.x: seconds (current platform)
+  client.setTimeout(10);            // core 2: seconds; http.setConnectTimeout caps connect
   client.setHandshakeTimeout(10);   // ssl handshake, always seconds
 }
 
@@ -649,13 +652,29 @@ static void configureSecureClient(WiFiClientSecure& client) {
 // Sectigo, etc - are baked into the firmware via ota_ca_progmem.h).
 // ---------------------------------------------------------------------------
 
-// in:  url, writeCallback. out: outStatus (200/404/...), outLen (bytes).
-static bool otaHttpGetWiFi(const char* url,
-                           std::function<bool(const uint8_t*, size_t)> writeCallback,
-                           int* outStatus, size_t* outLen) {
-  HTTPClient http;
+// One GET on one connection. A redirect fills *redirect and reads no body.
+// Unfed: TCP 10 s + TLS 10 s + headers 5 s idle per line; a trickle trips the TWDT.
+static bool otaHttpGetWiFiHop(const char* url,
+                              std::function<bool(const uint8_t*, size_t)> writeCallback,
+                              int* outStatus, size_t* outLen, String* redirect) {
+  // Resolve first and feed: core 3 DNS is uncapped (about 7 s per server).
+  char host[128] = "";
+  const char* path;
+  uint16_t port;
+  IPAddress ip;
+  if (!httpUrlSplit(url, host, sizeof(host), &path, &port) || WiFi.hostByName(host, ip) != 1) {
+    Watchdog::feed();
+    Log::kvfw(TAG, "ota.http_get_failed reason=resolve host=%.64s", host);
+    if (outStatus) *outStatus = HTTPC_ERROR_CONNECTION_REFUSED;
+    return false;
+  }
+  Watchdog::feed();
+
+  // Clients before http: ~HTTPClient calls stop() on its client (core 3),
+  // so the client must outlive it. Locals die in reverse order.
   WiFiClientSecure secureClient;
   WiFiClient       plainClient;
+  HTTPClient http;
   bool https = strncmp(url, "https://", 8) == 0;
   if (https) {
     configureSecureClient(secureClient);
@@ -663,14 +682,18 @@ static bool otaHttpGetWiFi(const char* url,
   } else {
     http.begin(plainClient, url);
   }
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
   http.setConnectTimeout(10000);
-  http.setTimeout(10000);
+  http.setTimeout(5000);
 
-  yield(); esp_task_wdt_reset();
   int code = http.GET();
-  yield(); esp_task_wdt_reset();
+  yield(); Watchdog::feed();
   if (outStatus) *outStatus = code;
+  if (otaIsRedirect(code) && http.getLocation().length() > 0) {
+    *redirect = http.getLocation();
+    http.end();
+    return true;
+  }
   if (code != 200) {
     http.end();
     return code > 0;  // negative = transport error; positive = HTTP-level error (still "transport ok")
@@ -682,7 +705,7 @@ static bool otaHttpGetWiFi(const char* url,
   uint8_t buf[1024];
   uint32_t deadline = millis() + 5UL * 60UL * 1000UL;  // 5 min cap
   while (millis() < deadline) {
-    yield(); esp_task_wdt_reset();
+    yield(); Watchdog::feed();
     Shell::pumpConsole();
     if (!stream->connected() && !stream->available()) break;
     int avail = stream->available();
@@ -702,6 +725,26 @@ static bool otaHttpGetWiFi(const char* url,
   return true;
 }
 
+// in:  url, writeCallback. out: outStatus (200/404/...), outLen (bytes).
+// Follows up to OTA_REDIRECT_MAX same-scheme redirects, one fed hop each.
+static bool otaHttpGetWiFi(const char* url,
+                           std::function<bool(const uint8_t*, size_t)> writeCallback,
+                           int* outStatus, size_t* outLen) {
+  String next = url;
+  for (int hop = 0; hop <= OTA_REDIRECT_MAX; hop++) {
+    String redirect;
+    bool ok = otaHttpGetWiFiHop(next.c_str(), writeCallback, outStatus, outLen, &redirect);
+    if (redirect.length() == 0) return ok;
+    if (!otaRedirectAllowed(next.c_str(), redirect.c_str())) {
+      Log::kvfw(TAG, "ota.redirect_refused reason=scheme_or_relative");
+      return true;  // the 3xx stays in outStatus
+    }
+    next = redirect;
+  }
+  Log::kvfw(TAG, "ota.redirect_refused reason=too_many max=%d", OTA_REDIRECT_MAX);
+  return true;
+}
+
 #ifdef ENABLE_CELLULAR
 // in:  url, writeCallback. out: outStatus, outLen.
 static bool otaHttpGetCellular(const char* url,
@@ -711,7 +754,7 @@ static bool otaHttpGetCellular(const char* url,
   uint16_t port = 443;
   if (strncmp(p, "https://", 8) == 0)      { p += 8; port = 443; }
   else if (strncmp(p, "http://",  7) == 0) { p += 7; port = 80;  }
-  char host[128];
+  char host[128] = "";
   const char* slash   = strchr(p, '/');
   const char* hostEnd = slash ? slash : p + strlen(p);
   size_t hostLen      = hostEnd - p;
@@ -734,26 +777,6 @@ static bool otaHttpGetCellular(const char* url,
 #endif
 
 #ifdef ENABLE_CELLULAR
-static bool parseUrl(const char* url, char* host, size_t hostCap,
-                     const char** pathOut, uint16_t* portOut) {
-  const char* p = url;
-  uint16_t port = 443;
-  if (strncmp(p, "https://", 8) == 0)      { p += 8; port = 443; }
-  else if (strncmp(p, "http://",  7) == 0) { p += 7; port = 80;  }
-  else return false;
-  const char* slash   = strchr(p, '/');
-  const char* hostEnd = slash ? slash : p + strlen(p);
-  size_t hostLen      = hostEnd - p;
-  if (hostLen == 0 || hostLen >= hostCap) return false;
-  memcpy(host, p, hostLen);
-  host[hostLen] = '\0';
-  char* colon = strchr(host, ':');
-  if (colon) { *colon = '\0'; port = atoi(colon + 1); }
-  *pathOut = slash ? slash : "/";
-  *portOut = port;
-  return true;
-}
-
 // Download a binary in 64 KB chunks via HTTP Range requests. Each chunk
 // is its own short-lived TLS session, which works around SIM7080G HTTP
 // session degradation past ~500-900 KB (observed on fw 1951B17). The
@@ -770,10 +793,10 @@ static bool downloadBinaryChunkedCellular(
   if (totalOut) *totalOut = 0;
   if (expectedSize == 0) return false;
 
-  char host[128];
+  char host[128] = "";
   const char* path = nullptr;
   uint16_t port = 443;
-  if (!parseUrl(url, host, sizeof(host), &path, &port)) {
+  if (!httpUrlSplit(url, host, sizeof(host), &path, &port)) {
     Log::error(TAG, "ota.download_failed reason=bad_url");
     return false;
   }

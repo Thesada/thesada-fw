@@ -52,7 +52,7 @@ GITHUB_LIBS = [
 # PlatformIO platform package
 PIO_PLATFORM_OWNER = "platformio"
 PIO_PLATFORM_NAME  = "espressif32"
-PIO_PLATFORM_PIN   = "6.13.0"
+PIO_PLATFORM_PIN   = "8.0.0"
 
 # Vendored libs - never checked automatically
 VENDORED = []

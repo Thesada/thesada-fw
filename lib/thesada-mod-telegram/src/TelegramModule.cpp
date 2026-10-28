@@ -17,8 +17,11 @@
 #include <WiFiManager.h>
 #include <MQTTClient.h>
 #include <Log.h>
+#include <Watchdog.h>
+#include <boot_wait_policy.h>
+#include <http_url_policy.h>
 #include <ArduinoJson.h>
-#include <HTTPClient.h>
+#include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <LittleFS.h>
 #include "telegram_ca_progmem.h"
@@ -86,7 +89,8 @@ void TelegramModule::begin() {
     // fails closed. Refusing to send beats leaking the token insecurely.
     Log::error(TAG, "telegram.ca_missing sends=fail_closed");
   }
-  _secClient.setTimeout(10);
+  _secClient.setTimeout(TELEGRAM_IO_MS / 1000);  // seconds: TCP connect and each write
+  _secClient.setHandshakeTimeout(TELEGRAM_HANDSHAKE_S);
 
   // Webhook client: /webhook-ca.crt on LittleFS enables verified TLS
   // (upload the endpoint's root, self-signed certs included - same
@@ -115,7 +119,8 @@ void TelegramModule::begin() {
       Log::warn(TAG, "telegram.webhook_ca_missing tls=unverified");
     }
   }
-  _webhookClient.setTimeout(10);
+  _webhookClient.setTimeout(TELEGRAM_IO_MS / 1000);
+  _webhookClient.setHandshakeTimeout(TELEGRAM_HANDSHAKE_S);
 
   Log::kvf(TAG, "telegram.ready token=%s chats=%d", hasToken ? "yes" : "no", nChats);
 
@@ -148,6 +153,42 @@ void TelegramModule::loop() {}
 
 // ---------------------------------------------------------------------------
 
+// Core 3 DNS is uncapped: resolve first and feed, so connect() only hits the cache.
+static bool resolveFed(const char* host) {
+  IPAddress ip;
+  const bool ok = WiFi.hostByName(host, ip) == 1;
+  Watchdog::feed();
+  return ok;
+}
+
+// One POST, status line only. HTTPClient bounds inactivity, not the total, so a
+// slow-drip reply could outlast the TWDT; this reads under a hard deadline.
+static int boundedPost(Client& c, const char* host, uint16_t port, bool tls, const char* path,
+                       const String& body) {
+  if (!c.connect(host, port)) { c.stop(); return -1; }
+  String req = String("POST ") + path + " HTTP/1.1\r\nHost: " + host;
+  if (port != (tls ? 443 : 80)) { req += ':'; req += String(port); }
+  req += "\r\nContent-Type: application/json\r\nContent-Length: " + String(body.length()) +
+         "\r\nConnection: close\r\n\r\n";
+  c.print(req);
+  c.print(body);
+  char line[48];
+  size_t n = 0;
+  const uint32_t t0 = millis();
+  while (millis() - t0 < TELEGRAM_HTTP_TIMEOUT_MS) {
+    const int ch = c.read();
+    if (ch < 0) {
+      if (!c.connected()) break;
+      delay(10);
+      continue;
+    }
+    if (ch == '\n') { line[n] = '\0'; c.stop(); return httpStatusCode(line); }
+    if (ch != '\r' && n < sizeof(line) - 1) line[n++] = (char)ch;
+  }
+  c.stop();
+  return -2;
+}
+
 // Send a message to a specific Telegram chat ID via the Bot API.
 // Skips the send if free heap is below TELEGRAM_HEAP_FLOOR_BYTES so the
 // TLS handshake here cannot starve the MQTT client of buffer space.
@@ -171,8 +212,8 @@ bool TelegramModule::sendTo(const char* chatId, const char* message) {
                                       tokenBuf, sizeof(tokenBuf));
   if (strlen(token) == 0) { Log::warn(TAG, "telegram.send_skipped reason=no_bot_token"); return false; }
 
-  char url[128];
-  snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/sendMessage", token);
+  char path[112];
+  snprintf(path, sizeof(path), "/bot%s/sendMessage", token);
 
   JsonDocument tdoc;
   tdoc["chat_id"] = chatId;
@@ -184,12 +225,9 @@ bool TelegramModule::sendTo(const char* chatId, const char* message) {
   // keeps the mbedtls context allocated - no new heap allocation needed.
   _secClient.stop();
 
-  HTTPClient http;
-  http.begin(_secClient, url);
-  http.setTimeout(10000);  // 10s HTTP timeout
-  http.addHeader("Content-Type", "application/json");
-  int code = http.POST(body);
-  http.end();
+  if (!resolveFed("api.telegram.org")) { Log::warn(TAG, "telegram.send_skipped reason=dns"); return false; }
+  int code = boundedPost(_secClient, "api.telegram.org", 443, true, path, body);
+  Watchdog::feed();
 
   if (code == 200) {
     Log::kvf(TAG, "telegram.sent chat_id=%s", chatId);
@@ -246,25 +284,27 @@ bool TelegramModule::send(const char* message) {
       String postBody;
       serializeJson(wdoc, postBody);
 
-      HTTPClient http;
-      bool isHttps = String(url).startsWith("https");
-      WiFiClient pc;
-      if (isHttps) {
-        _webhookClient.stop();
-        http.begin(_webhookClient, url);
+      char host[96];
+      const char* wpath;
+      uint16_t port;
+      bool isHttps = false;
+      if (!httpUrlSplit(url, host, sizeof(host), &wpath, &port, &isHttps)) {
+        Log::warn(TAG, "telegram.webhook_post_failed reason=bad_url");
+      } else if (!resolveFed(host)) {
+        Log::warn(TAG, "telegram.webhook_post_failed reason=dns");
       } else {
-        pc.setTimeout(10);
-        http.begin(pc, url);
+        WiFiClient pc;
+        pc.setTimeout(TELEGRAM_IO_MS / 1000);
+        if (isHttps) _webhookClient.stop();
+        int code = isHttps ? boundedPost(_webhookClient, host, port, true, wpath, postBody)
+                           : boundedPost(pc, host, port, false, wpath, postBody);
+        Watchdog::feed();
+        if (code > 0) {
+          Log::kvf(TAG, "telegram.webhook_response status=%d", code);
+        } else {
+          Log::warn(TAG, "telegram.webhook_post_failed");
+        }
       }
-      http.setTimeout(10000);  // 10s HTTP timeout
-      http.addHeader("Content-Type", "application/json");
-      int code = http.POST(postBody);
-      if (code > 0) {
-        Log::kvf(TAG, "telegram.webhook_response status=%d", code);
-      } else {
-        Log::warn(TAG, "telegram.webhook_post_failed");
-      }
-      http.end();
     }
   }
 

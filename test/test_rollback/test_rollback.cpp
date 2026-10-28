@@ -38,6 +38,27 @@ void test_no_failing_candidate_does_not_roll_back(void) {
   TEST_ASSERT_FALSE(mqttRollbackShould(GOOD, true, nullptr, BAD));
 }
 
+// --- mqttDefragRebootDue -----------------------------------------------------
+
+void test_defrag_reboot_on_tls_fail_low_heap(void) {
+  TEST_ASSERT_TRUE(mqttDefragRebootDue(3, true, -2, 39999, false));
+  TEST_ASSERT_TRUE(mqttDefragRebootDue(7, true, -2, 20000, false));
+}
+
+// A DNS outage reports rc -2 without a handshake: never a reboot.
+void test_defrag_reboot_not_on_dns_failure(void) {
+  TEST_ASSERT_FALSE(mqttDefragRebootDue(3, false, -2, 20000, false));
+  TEST_ASSERT_FALSE(mqttDefragRebootDue(99, false, -2, 0, false));
+}
+
+void test_defrag_reboot_other_gates(void) {
+  TEST_ASSERT_FALSE(mqttDefragRebootDue(2, true, -2, 20000, false));
+  TEST_ASSERT_FALSE(mqttDefragRebootDue(3, true, 5, 20000, false));
+  TEST_ASSERT_FALSE(mqttDefragRebootDue(3, true, -4, 20000, false));
+  TEST_ASSERT_FALSE(mqttDefragRebootDue(3, true, -2, 40000, false));
+  TEST_ASSERT_FALSE(mqttDefragRebootDue(3, true, -2, 20000, true));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_bad_config_that_rebooted_rolls_back);
@@ -45,5 +66,8 @@ int main(int, char**) {
   RUN_TEST(test_recovery_edit_after_streak_does_not_roll_back);
   RUN_TEST(test_no_snapshot_does_not_roll_back);
   RUN_TEST(test_no_failing_candidate_does_not_roll_back);
+  RUN_TEST(test_defrag_reboot_on_tls_fail_low_heap);
+  RUN_TEST(test_defrag_reboot_not_on_dns_failure);
+  RUN_TEST(test_defrag_reboot_other_gates);
   return UNITY_END();
 }

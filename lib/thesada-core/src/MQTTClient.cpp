@@ -31,6 +31,7 @@
 #include <lwip/netdb.h>
 #include <sys/time.h>
 #include <esp_chip_info.h>
+#include <esp_task_wdt.h>
 
 // NVS namespace separate from Config: cert survives factory reset and never
 // appears in /api/config or config.dump.
@@ -132,6 +133,16 @@ static uint16_t  _brokerPort = 0;
 // in: cert (PEM string), key (PEM string).
 // out: true if both parse AND the key is the private half of the cert's
 //      public key.
+#if MBEDTLS_VERSION_MAJOR >= 3
+#include <esp_random.h>
+// mbedtls 3 needs an RNG for the key parse and the EC pair check (blinding);
+// a NULL one fails every pair. The hardware RNG is enough here.
+static int certCheckRng(void*, unsigned char* out, size_t len) {
+  esp_fill_random(out, len);
+  return 0;
+}
+#endif
+
 static bool validateClientCertKey(const char* cert, const char* key) {
   // Structural pre-flight before mbedtls sees attacker-influenced bytes:
   // both present, and each actually shaped like what it claims to be.
@@ -152,9 +163,9 @@ static bool validateClientCertKey(const char* cert, const char* key) {
     // pk_parse_key and pk_check_pair; 2.x has the shorter forms.
 #if MBEDTLS_VERSION_MAJOR >= 3
     if (mbedtls_pk_parse_key(&pk, (const unsigned char*)key, strlen(key) + 1,
-                             nullptr, 0, nullptr, nullptr) != 0)
+                             nullptr, 0, certCheckRng, nullptr) != 0)
       break;
-    if (mbedtls_pk_check_pair(&crt.pk, &pk, nullptr, nullptr) != 0)
+    if (mbedtls_pk_check_pair(&crt.pk, &pk, certCheckRng, nullptr) != 0)
       break;
 #else
     if (mbedtls_pk_parse_key(&pk, (const unsigned char*)key, strlen(key) + 1,
@@ -469,6 +480,7 @@ void MQTTClient::begin() {
   _brokerPort = port;
   _client.setServer(_brokerHost, port);
   _client.setKeepAlive(60);
+  _client.setSocketTimeout(5);  // CONNACK and read waits, s (default 15)
   _client.setBufferSize(_bufferIn);
   _client.setCallback(onMessage);
 
@@ -495,10 +507,13 @@ void MQTTClient::begin() {
     }
   }
 
-  // Keep well under the 30 s hardware watchdog.
-  // v2.x setTimeout takes seconds; v3.x takes milliseconds. Setting both
-  // handles the difference. setHandshakeTimeout is always in seconds.
-  _wifiClient.setTimeout(10);
+  // _timeout bounds TCP connect and every TLS write; connect() dials, feeds,
+  // then PubSubClient's CONNECT write (10 s) + CONNACK (5 s) run unfed.
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  _wifiClient.setConnectionTimeout(10000);  // ms
+#else
+  _wifiClient.setTimeout(10);  // seconds
+#endif
   _wifiClient.setHandshakeTimeout(10);  // ssl handshake, always seconds
 
   // Load CA cert from LittleFS, else point straight at the baked bundle.
@@ -836,18 +851,44 @@ void MQTTClient::connect() {
   _mtlsWasActive = _mtlsActive;
 #endif
 
+  // Core 3 DNS has no cap and hostByName returns the lwIP error, not 0, on failure.
+  // Resolve, then feed; each later phase is capped, see begin().
+  IPAddress brokerIp;
+  const bool resolved = WiFi.hostByName(_brokerHost, brokerIp) == 1;
+  esp_task_wdt_reset();
+
+  // Dial the resolved address ourselves, so PubSubClient reuses the socket and
+  // never looks the name up again. TLS still verifies and sends SNI for the name.
+  bool dialed = false;
+  if (resolved) {
+#ifndef MQTT_TLS
+    _wifiClient.stop();
+#endif
+    _client.connected();  // sees the stop(), so a stale CONNECTED state clears
+#ifdef MQTT_TLS
+    dialed = _wifiClient.connect(brokerIp, _brokerPort, _brokerHost,
+                                 _tlsVerified ? _caCert : nullptr,
+                                 _mtlsActive ? _clientCert : nullptr,
+                                 _mtlsActive ? _clientKey : nullptr) == 1;
+#else
+    dialed = _wifiClient.connect(brokerIp, _brokerPort) == 1;
+#endif
+    esp_task_wdt_reset();
+  }
+
   // Broker uses CN as username (use_identity_as_username) when mTLS is
   // active - sending user/pass alongside is redundant and confusing.
-  bool ok;
-  if (_mtlsActive) {
+  bool ok = false;
+  if (dialed && _mtlsActive) {
     ok = _client.connect(clientId, nullptr, nullptr, availTopic, 0, true, "offline");
-  } else {
+  } else if (dialed) {
     ok = (strlen(user) > 0)
       ? _client.connect(clientId, user, password, availTopic, 0, true, "offline")
       : _client.connect(clientId, availTopic, 0, true, "offline");
   }
 
   if (ok) {
+    esp_task_wdt_reset();  // the resubscribe and retained burst gets its own window
     OTAUpdate::noteMqttUp();
     _retryInterval = RETRY_MIN_MS;
     _retryCount    = 0;
@@ -886,8 +927,11 @@ void MQTTClient::connect() {
     publishRetainedSet(true);
     flushQueue();
   } else {
+    // A failed resolve or dial never reached PubSubClient, so its state() is stale.
+    const int rc = dialed ? _client.state() : MQTT_CONNECT_FAILED;
+    if (dialed) _wifiClient.stop();
     Log::kvfw(TAG, "mqtt.connect_failed rc=%d retry_ms=%lu",
-              _client.state(), (unsigned long)_retryInterval);
+              rc, (unsigned long)_retryInterval);
     _retryCount++;
     _retryInterval = min(_retryInterval * 2, (uint32_t)RETRY_MAX_MS);
 
@@ -899,8 +943,8 @@ void MQTTClient::connect() {
     // the heap check alone must not trigger. Consume the same NVS reboot
     // budget as the exhaustion path below - unbudgeted, a plain broker
     // outage on a CYD rebooted the device every ~15 s forever.
-    if (_retryCount >= 3 && _client.state() == MQTT_CONNECT_FAILED &&
-        ESP.getMaxAllocHeap() < 40000 && !_rebootHalted) {
+    if (mqttDefragRebootDue(_retryCount, resolved, rc, ESP.getMaxAllocHeap(),
+                            _rebootHalted)) {
       uint8_t maxReboots = Config::get()["mqtt"]["max_exhaust_reboots"] | 3;
       uint8_t count      = mqttRebootCount();
       if (count < maxReboots) {
