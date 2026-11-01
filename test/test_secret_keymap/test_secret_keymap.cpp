@@ -41,15 +41,15 @@ void test_unknown_field_rejected(void) {
 
 void test_wifi_password_keyed_by_ssid(void) {
   char key[16];
-  TEST_ASSERT_TRUE(secretNvsKeyFor("wifi.password:RebelIOT", key, sizeof(key)));
+  TEST_ASSERT_TRUE(secretNvsKeyFor("wifi.password:HomeNet", key, sizeof(key)));
   TEST_ASSERT_EQUAL_STRING_LEN("wifi_pw_", key, 8);
   TEST_ASSERT_FALSE(secretNvsKeyFor("wifi.password:", key, sizeof(key)));  // no ssid
 }
 
 void test_wifi_key_deterministic_and_ssid_distinct(void) {
   char a[16], b[16], c[16];
-  secretWifiKey("RebelIOT", a, sizeof(a));
-  secretWifiKey("RebelIOT", b, sizeof(b));
+  secretWifiKey("HomeNet", a, sizeof(a));
+  secretWifiKey("HomeNet", b, sizeof(b));
   secretWifiKey("OtherNet", c, sizeof(c));
   TEST_ASSERT_EQUAL_STRING(a, b);          // same ssid -> same key
   TEST_ASSERT_TRUE(strcmp(a, c) != 0);     // different ssid -> different key
@@ -58,7 +58,7 @@ void test_wifi_key_deterministic_and_ssid_distinct(void) {
 void test_truncating_buffer_rejected(void) {
   char tiny[5];   // too small for any key -> clean failure, not a silent remap
   TEST_ASSERT_FALSE(secretNvsKeyFor("mqtt.password", tiny, sizeof(tiny)));
-  TEST_ASSERT_FALSE(secretNvsKeyFor("wifi.password:RebelIOT", tiny, sizeof(tiny)));
+  TEST_ASSERT_FALSE(secretNvsKeyFor("wifi.password:HomeNet", tiny, sizeof(tiny)));
 }
 
 int main(int, char**) {

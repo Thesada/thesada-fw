@@ -37,7 +37,7 @@
 
 ShellEntry Shell::_commands[MAX_COMMANDS];
 int Shell::_commandCount = 0;
-char Shell::_parseBuf[256];
+char Shell::_parseBuf[SHELL_LINE_MAX];
 
 Shell::FSMount Shell::_fsMounts[Shell::FS_MOUNTS_MAX] = {};
 int            Shell::_fsMountCount = 0;
@@ -53,23 +53,6 @@ uint8_t             Shell::_ringTail = 0;
 static portMUX_TYPE _shellRingMux = portMUX_INITIALIZER_UNLOCKED;
 
 // ---------------------------------------------------------------------------
-// Parser
-// ---------------------------------------------------------------------------
-
-int Shell::parse(const char* line, char** argv, int maxArgs) {
-  strncpy(_parseBuf, line, sizeof(_parseBuf) - 1);
-  _parseBuf[sizeof(_parseBuf) - 1] = '\0';
-
-  int argc = 0;
-  char* token = strtok(_parseBuf, " \t");
-  while (token && argc < maxArgs) {
-    argv[argc++] = token;
-    token = strtok(nullptr, " \t");
-  }
-  return argc;
-}
-
-// ---------------------------------------------------------------------------
 // Command registry
 // ---------------------------------------------------------------------------
 
@@ -82,8 +65,19 @@ void Shell::registerCommand(const char* name, const char* help, ShellCommand han
 void Shell::execute(const char* line, ShellOutput out) {
   if (!line || strlen(line) == 0) return;
 
-  char* argv[16];
-  int argc = parse(line, argv, 16);
+  char* argv[SHELL_ARGS_MAX];
+  int argc = 0;
+  ShellLine split = shellSplitLine(line, _parseBuf, sizeof(_parseBuf), argv, SHELL_ARGS_MAX, &argc);
+  if (split != ShellLine::Ok) {
+    char msg[80];
+    if (split == ShellLine::TooLong) {
+      snprintf(msg, sizeof(msg), "Line too long (max %u bytes) - not run", (unsigned)(SHELL_LINE_MAX - 1));
+    } else {
+      snprintf(msg, sizeof(msg), "Too many arguments (max %d words) - not run", SHELL_ARGS_MAX);
+    }
+    out(msg);
+    return;
+  }
   if (argc == 0) return;
 
   for (int i = 0; i < _commandCount; i++) {
@@ -105,6 +99,7 @@ void Shell::execute(const char* line, ShellOutput out) {
 // captures inline.
 bool Shell::enqueue(const char* line, ShellOutput sink) {
   if (!line || strlen(line) == 0) return false;
+  if (!shellFits(line, DEFERRED_LINE_LEN)) return false;
   bool accepted = false;
   taskENTER_CRITICAL(&_shellRingMux);
   uint8_t next = (uint8_t)((_ringTail + 1) % DEFERRED_RING_SIZE);
@@ -197,24 +192,34 @@ void Shell::loop() {
 void Shell::pumpConsole() {
   static char  buf[Shell::DEFERRED_LINE_LEN];
   static int   pos = 0;
+  static bool  overflow = false;
   // Drained, not left to fill the driver buffer: the console still echoes
   // nothing and the line never reaches execute().
   if (!shellModeSerialAllowed(mode())) {
     while (Serial.available()) Serial.read();
     pos = 0;
+    overflow = false;
     return;
   }
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
       buf[pos] = '\0';
-      if (pos > 0) {
+      if (overflow) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Line too long (max %d bytes) - not run", (int)sizeof(buf) - 1);
+        Console::reply(msg);
+        Console::endReply();
+      } else if (pos > 0) {
         Shell::execute(buf, [](const char* line) { Console::reply(line); });
         Console::endReply();
       }
       pos = 0;
+      overflow = false;
     } else if (pos < (int)sizeof(buf) - 1) {
       buf[pos++] = c;
+    } else {
+      overflow = true;
     }
   }
 }
@@ -584,13 +589,18 @@ static void cmd_write(int argc, char** argv, ShellOutput out) {
   out(msg);
 }
 
-// Rename or move a file
+// Rename or move a file. Both paths must resolve to one filesystem; rename
+// cannot cross mounts, and the stripped dst would land on the src mount.
 static void cmd_mv(int argc, char** argv, ShellOutput out) {
   if (argc < 3) { out("Usage: mv <src> <dst>"); return; }
   if (!Shell::pathSafe(argv[1]) || !Shell::pathSafe(argv[2])) {
     out("Invalid path"); return;
   }
   FS* fs = resolveFS(argv[1]);
+  if (resolveFS(argv[2]) != fs) {
+    out("Cannot move between filesystems");
+    return;
+  }
   const char* src = stripPrefix(argv[1]);
   const char* dst = stripPrefix(argv[2]);
 
@@ -684,7 +694,7 @@ static void cmd_identity_reset(int argc, char** argv, ShellOutput out) {
          : "identity erase FAILED");
   if (!ok) return;
   delay(200);
-  esp_restart();
+  OTAUpdate::plannedRestart();
 }
 
 // Reformat LittleFS - destroys every file. Requires `fs.format --yes` so
@@ -706,7 +716,7 @@ static void cmd_format(int argc, char** argv, ShellOutput out) {
   bool ok = LittleFS.format();
   out(ok ? "LittleFS reformatted - rebooting" : "LittleFS format FAILED - rebooting anyway");
   delay(200);
-  esp_restart();
+  OTAUpdate::plannedRestart();
 }
 
 // ---------------------------------------------------------------------------
@@ -737,6 +747,7 @@ static void cmd_config_get(int argc, char** argv, ShellOutput out) {
   JsonVariant current = cfg;
 
   char key[128];
+  if (!shellFits(argv[1], sizeof(key))) { out("Key too long (max 127 bytes)"); return; }
   strncpy(key, argv[1], sizeof(key) - 1);
   key[sizeof(key) - 1] = '\0';
 
@@ -815,6 +826,8 @@ static void restoreBootPrefix(const BootPrefixKeep* kept, const char* key) {
 
 static void cmd_config_set(int argc, char** argv, ShellOutput out) {
   if (argc < 3) { out("Usage: config.set <key> <value>  (then config.save to persist)"); return; }
+  char key[128];
+  if (!shellFits(argv[1], sizeof(key))) { out("Key too long (max 127 bytes)"); return; }
   BootPrefixKeep kept;
   if (!captureBootPrefix(&kept, out)) return;
 
@@ -838,7 +851,6 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
   DeserializationError err = deserializeJson(doc, json);
   if (err) { out("JSON parse error in config.json"); return; }
 
-  char key[128];
   strncpy(key, argv[1], sizeof(key) - 1);
   key[sizeof(key) - 1] = '\0';
 
@@ -1391,22 +1403,10 @@ struct HttpFetchJob {
   volatile bool done;       // task sets this last; cmd_http polls it
 };
 
-// Run the WiFi HTTPS fetch on a dedicated deep-stack task.
-//
-// Why a task: the mbedtls TLS handshake needs ~6 KB of stack, and
-// net.http executes deep in the deferred-CLI call chain on the main-loop
-// task (loop -> Shell::loop -> deferred drain -> execute -> cmd_http).
-// Doing the handshake there overflows the 8 KB loop-task stack - the
-// board resets silently (panic out the other UART, USB-CDC dead). This
-// task gets its own 12 KB stack; cmd_http blocks on job->done.
-//
-// The task is not subscribed to the task watchdog, so it does not feed
-// it - the main-loop task keeps feeding its own wdt from cmd_http's wait
-// loop. Every exit path sets job->done and self-deletes.
-// in:  arg - HttpFetchJob* (owned by cmd_http). out: job fields filled.
-static void httpFetchTask(void* arg) {
-  HttpFetchJob* job = static_cast<HttpFetchJob*>(arg);
-
+// The fetch itself. Every local, the CA PEM included, lives until return.
+// in:  job. out: job fields filled except done.
+static void httpFetchRun(HttpFetchJob* job) {
+  String           pem;  // setCACert keeps the pointer, not a copy
   WiFiClientSecure tls;
   WiFiClient       plain;
   tls.setHandshakeTimeout(10);  // seconds; the 120 s default is past any sane bound
@@ -1415,15 +1415,13 @@ static void httpFetchTask(void* arg) {
     // Reuse the same CA the OTA path uses - no second copy in code.
     File ca = LittleFS.open("/ca.crt", "r");
     if (ca) {
-      String pem = ca.readString();
+      pem = ca.readString();
       ca.close();
       tls.setCACert(pem.c_str());
     } else if (job->insecure) {
       tls.setInsecure();
     } else {
-      job->err  = "no /ca.crt on flash - pass --insecure to skip verification";
-      job->done = true;
-      vTaskDelete(nullptr);
+      job->err = "no /ca.crt on flash - pass --insecure to skip verification";
       return;
     }
   }
@@ -1432,9 +1430,7 @@ static void httpFetchTask(void* arg) {
   bool begun = job->https ? http.begin(tls, job->url)
                           : http.begin(plain, job->url);
   if (!begun) {
-    job->err  = "http.begin failed";
-    job->done = true;
-    vTaskDelete(nullptr);
+    job->err = "http.begin failed";
     return;
   }
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
@@ -1464,6 +1460,24 @@ static void httpFetchTask(void* arg) {
     }
   }
   http.end();
+}
+
+// Run the WiFi HTTPS fetch on a dedicated deep-stack task.
+//
+// Why a task: the mbedtls TLS handshake needs ~6 KB of stack, and
+// net.http executes deep in the deferred-CLI call chain on the main-loop
+// task (loop -> Shell::loop -> deferred drain -> execute -> cmd_http).
+// Doing the handshake there overflows the 8 KB loop-task stack - the
+// board resets silently (panic out the other UART, USB-CDC dead). This
+// task gets its own 12 KB stack; cmd_http blocks on job->done.
+//
+// The task is not subscribed to the task watchdog, so it does not feed
+// it - the main-loop task keeps feeding its own wdt from cmd_http's wait
+// loop. Every exit path sets job->done and self-deletes.
+// in:  arg - HttpFetchJob* (owned by cmd_http). out: job fields filled.
+static void httpFetchTask(void* arg) {
+  HttpFetchJob* job = static_cast<HttpFetchJob*>(arg);
+  httpFetchRun(job);
   job->done = true;
   vTaskDelete(nullptr);
 }
@@ -2030,7 +2044,7 @@ static void cmd_module_status(int argc, char** argv, ShellOutput out) {
 static void cmd_restart(int argc, char** argv, ShellOutput out) {
   out("Restarting...");
   delay(100);
-  ESP.restart();
+  OTAUpdate::plannedRestart();
 }
 
 static void cmd_heap(int argc, char** argv, ShellOutput out) {

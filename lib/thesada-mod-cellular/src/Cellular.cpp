@@ -1688,6 +1688,17 @@ bool Cellular::publish(const char* topic, const char* payload, bool retain) {
     return false;
   }
 
+  // A clipped command loses its closing quote; refuse it before the wait and bus.
+  size_t len = strlen(payload);
+  char cmd[MQTT_TOPIC_CAP + 32];
+  int n = snprintf(cmd, sizeof(cmd), "+SMPUB=\"%s\",%d,1,%d",
+                   topic, (int)len, retain ? 1 : 0);
+  if (n < 0 || (size_t)n >= sizeof(cmd)) {
+    Log::kvfw(TAG, "cellular.publish_skipped reason=topic_too_long topic_len=%u topic=%.64s",
+              (unsigned)strlen(topic), topic);
+    return false;
+  }
+
   // Rate-limit before AT-bus acquire so concurrent callers wait for the
   // mutex, not for a sleeping publisher. Each successful publish updates
   // _lastSmpubMs; the next caller pays the remaining quantum.
@@ -1708,11 +1719,6 @@ bool Cellular::publish(const char* topic, const char* payload, bool retain) {
     return false;
   }
   _lastSmpubMs = millis();
-
-  size_t len = strlen(payload);
-  char cmd[128];
-  snprintf(cmd, sizeof(cmd), "+SMPUB=\"%s\",%d,1,%d",
-           topic, (int)len, retain ? 1 : 0);
 
   // Use cellATWrite (raw Serial1 + URC routing) instead of TinyGSM's
   // sendAT/waitResponse pair. waitResponse does not recognize +SMSUB:
@@ -2183,12 +2189,18 @@ bool Cellular::resolveHost(const char* host, char* out, size_t outLen) {
   if (!host || !out || outLen == 0) return false;
   out[0] = '\0';
 
+  // recount 2, per-try timeout 5000 ms.
+  char cmd[160];
+  int n = snprintf(cmd, sizeof(cmd), "+CDNSGIP=\"%s\",2,5000", host);
+  if (n < 0 || (size_t)n >= sizeof(cmd)) {
+    Log::kvfw(TAG, "cellular.resolve_skipped reason=host_too_long host_len=%u",
+              (unsigned)strlen(host));
+    return false;
+  }
+
   ATGuard g(15000UL);
   if (!g.ok()) return false;
 
-  // recount 2, per-try timeout 5000 ms.
-  char cmd[160];
-  snprintf(cmd, sizeof(cmd), "+CDNSGIP=\"%s\",2,5000", host);
   if (cellAT(cmd, "OK", 8000UL, nullptr) != 1) return false;
 
   // Drain Serial1 for the +CDNSGIP: URC (arrives after the OK).
@@ -2243,6 +2255,15 @@ bool Cellular::resolveHost(const char* host, char* out, size_t outLen) {
 bool Cellular::ntpSync(const char* server, uint32_t timeoutMs) {
   if (!server) return false;
 
+  // tz 0 -> modem keeps UTC; the ESP32 clock stores a UTC epoch.
+  char cmd[128];
+  int n = snprintf(cmd, sizeof(cmd), "+CNTP=\"%s\",0", server);
+  if (n < 0 || (size_t)n >= sizeof(cmd)) {
+    Log::kvfw(TAG, "cellular.ntp_skipped reason=server_too_long server_len=%u",
+              (unsigned)strlen(server));
+    return false;
+  }
+
   ATGuard g(timeoutMs + 5000UL);
   if (!g.ok()) return false;
 
@@ -2250,9 +2271,6 @@ bool Cellular::ntpSync(const char* server, uint32_t timeoutMs) {
   // does not work on this part).
   cellAT("+CNTPCID=0", "OK", 5000UL, nullptr);
 
-  // tz 0 -> modem keeps UTC; the ESP32 clock stores a UTC epoch.
-  char cmd[128];
-  snprintf(cmd, sizeof(cmd), "+CNTP=\"%s\",0", server);
   if (cellAT(cmd, "OK", 5000UL, nullptr) != 1) return false;
 
   // Execute the sync. Result is a +CNTP: <code> URC after the OK; the

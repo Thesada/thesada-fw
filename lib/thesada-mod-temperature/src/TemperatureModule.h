@@ -8,6 +8,7 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <ArduinoJson.h>
+#include <temp_guard_policy.h>
 #include <vector>
 #include <string>
 
@@ -15,7 +16,7 @@ struct TempSensor {
   DeviceAddress address;
   char          addressStr[17];
   char          name[32];
-  float         lastTemp = -127.0f;  // last known good reading
+  TempGuard     guard;               // last accepted + held reading
   uint8_t       busIdx   = 0;        // which _buses entry this probe lives on
 };
 
@@ -51,7 +52,7 @@ private:
   // Drop list+config entries that no longer respond. Returns count removed.
   size_t pruneSensors();
   void   removeSensorsFromConfig(const std::vector<std::string>& addrs);
-  // Read one probe: lib retries + reject implausible jump. -127 if unreadable.
+  // Read one probe: lib retries + plausibility guard. -127 if no usable reading.
   float  readSensorC(TempSensor& s);
 
   std::vector<TempBus>    _buses;       // one OneWire bus per configured pin
@@ -63,5 +64,5 @@ private:
   bool     _autoDiscover  = true;
   bool     _useFahrenheit = false;
   uint8_t  _readRetries   = 2;      // getTempC retries on transient bus fault
-  float    _maxDeltaC     = 40.0f;  // reject jumps > this from last good (0=off)
+  float    _maxDeltaC     = 40.0f;  // hold jumps > this until confirmed (0=off)
 };

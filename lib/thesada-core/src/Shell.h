@@ -7,6 +7,7 @@
 #include <Arduino.h>
 #include <functional>
 #include "shell_mode_policy.h"
+#include "shell_line_policy.h"
 
 namespace fs { class FS; }
 
@@ -46,9 +47,10 @@ public:
   static void execute(const char* line, ShellOutput out);
 
   // Stage a command for the main-loop drain. false if the ring is full (caller
-  // surfaces "shell busy"). sink fires once per output line during execute().
+  // surfaces "shell busy") or the line does not fit DEFERRED_LINE_LEN, which is
+  // refused, never clipped. sink fires once per output line during execute().
   // Safe from any task; copies happen under a brief critical section.
-  // in: command, output sink. out: true if accepted, false if ring full.
+  // in: command, output sink. out: true if accepted, false if full or too long.
   static bool enqueue(const char* line, ShellOutput sink);
 
   // Stage an arbitrary callable for the main-loop drain - for transports whose
@@ -136,11 +138,10 @@ public:
 
 private:
   static void registerBuiltins();
-  static int parse(const char* line, char** argv, int maxArgs);
 
   static ShellEntry _commands[MAX_COMMANDS];
   static int _commandCount;
-  static char _parseBuf[256];  // mutable copy for tokenization
+  static char _parseBuf[SHELL_LINE_MAX];  // mutable copy for tokenization
 
   // FS mount registry, walked in registration order by resolveFS.
   static constexpr int FS_MOUNTS_MAX = 4;

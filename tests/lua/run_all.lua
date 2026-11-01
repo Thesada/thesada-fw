@@ -26,6 +26,7 @@ local H = require("harness")
 local TEST_MODULES = {
   "test_main",
   "test_rules",
+  "test_rules_example",
   "test_synthetic",
 }
 

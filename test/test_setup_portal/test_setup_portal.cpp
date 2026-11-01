@@ -15,7 +15,7 @@ void test_portal_opens_only_on_the_ap_without_a_station(void) {
 }
 
 void test_ssid_is_one_to_32_bytes_without_controls(void) {
-  TEST_ASSERT_TRUE(setupSsidUsable("RebelIOT"));
+  TEST_ASSERT_TRUE(setupSsidUsable("HomeNet"));
   TEST_ASSERT_TRUE(setupSsidUsable("a b"));
   TEST_ASSERT_TRUE(setupSsidUsable("bad<ssid>"));
   TEST_ASSERT_TRUE(setupSsidUsable("say \"hi\""));
@@ -46,9 +46,9 @@ void test_passphrase_is_8_to_63_printable(void) {
 }
 
 void test_form_needs_an_https_url(void) {
-  TEST_ASSERT_TRUE(setupFormUsable("RebelIOT", "12345678", "https://thesada.app"));
-  TEST_ASSERT_FALSE(setupFormUsable("RebelIOT", "12345678", "http://thesada.app"));
-  TEST_ASSERT_FALSE(setupFormUsable("RebelIOT", "short", "https://thesada.app"));
+  TEST_ASSERT_TRUE(setupFormUsable("HomeNet", "12345678", "https://thesada.app"));
+  TEST_ASSERT_FALSE(setupFormUsable("HomeNet", "12345678", "http://thesada.app"));
+  TEST_ASSERT_FALSE(setupFormUsable("HomeNet", "short", "https://thesada.app"));
 }
 
 int main(int, char**) {

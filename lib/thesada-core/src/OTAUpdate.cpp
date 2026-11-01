@@ -19,10 +19,12 @@
 #include "SleepManager.h"
 #include "Log.h"
 #include "Shell.h"
+#include "Watchdog.h"
 #include "ota_ca_progmem.h"
 #include <thesada_config.h>
 
 #include <HTTPClient.h>
+#include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Update.h>
 #include <LittleFS.h>
@@ -31,8 +33,11 @@
 #include <functional>
 #include <mbedtls/sha256.h>
 #include "ota_verify_policy.h"
+#include "http_url_policy.h"
 #include "ota_health_policy.h"
 #include <esp_ota_ops.h>
+#include <esp_image_format.h>
+#include <esp_timer.h>
 #include <nvs.h>
 #include <nvs_flash.h>
 #include <Preferences.h>
@@ -43,6 +48,32 @@
 
 static const char* TAG = "OTA";
 
+// Survives a software reset, not a power-on. recordBootStreak reads and clears it.
+RTC_NOINIT_ATTR static uint32_t _otaPlannedRestart;
+// The rescue flag and pending state as initArduino saw them, before it confirms.
+static uint8_t _otaBootRescue = 0;
+static bool _otaBootPending = false;
+
+// in: wanted state. out: true when the running image reads it; unreadable is false.
+static bool runningImageIs(esp_ota_img_states_t want) {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+  return running && esp_ota_get_state_partition(running, &state) == ESP_OK && state == want;
+}
+
+static_assert(OTA_IMG_PENDING_VERIFY == ESP_OTA_IMG_PENDING_VERIFY &&
+                  OTA_IMG_VALID == ESP_OTA_IMG_VALID && OTA_IMG_UNDEFINED == ESP_OTA_IMG_UNDEFINED,
+              "ota_health_policy.h image states drifted from esp_ota_img_states_t");
+
+// Only a confirmed image may hold a planned restart; unknown counts.
+// in: none. out: true when the running image is valid, or undefined after a USB flash.
+static bool runningImageConfirmed() {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+  return running && esp_ota_get_state_partition(running, &state) == ESP_OK &&
+         otaHealthStateConfirmed((uint32_t)state);
+}
+
 // initArduino calls this before setup. Rescue confirms only after the flag
 // is cleared: a flag left set would skip the health gate on the next OTA.
 // in: none. out: false confirms in the core; true leaves the health gate.
@@ -51,13 +82,15 @@ extern "C" bool verifyRollbackLater() {
   if (nvs_flash_init() != ESP_OK) return true;
   nvs_handle_t handle;
   if (nvs_open("boot", NVS_READWRITE, &handle) != ESP_OK) return true;
-  uint8_t rescue = 0;
-  nvs_get_u8(handle, "rescue", &rescue);
+  uint8_t stored = 0;
+  nvs_get_u8(handle, "rescue", &stored);
+  _otaBootRescue = otaHealthRescue(stored, _otaPlannedRestart);
+  _otaBootPending = runningImageIs(ESP_OTA_IMG_PENDING_VERIFY);
   bool defer = true;
-  if (rescue &&
+  if (stored &&
       nvs_set_u8(handle, "rescue", 0) == ESP_OK &&
       nvs_commit(handle) == ESP_OK) {
-    defer = false;
+    defer = _otaBootRescue == 0;
   }
   nvs_close(handle);
   return defer;
@@ -66,45 +99,182 @@ extern "C" bool verifyRollbackLater() {
 static bool _otaMqttUp = false;
 static bool _otaPending = false;
 static bool _otaStateKnown = false;
+static uint32_t _otaRunState = 0;  // running slot's otadata state, once _otaStateKnown
 static bool _otaImageSettled = false;
 static uint32_t _otaCrashStreak = 0;
 static bool _otaStreakKnown = false;
+static uint64_t _otaSettleFailMs = 0;  // uptime of the last failed clear or USB mark, 0 = none
+// The running image's proven record is stored, or this boot already tried it.
+static bool _otaProvenDone = false;
 
 void OTAUpdate::noteMqttUp() { _otaMqttUp = true; }
 
-// Store the image we are leaving and arm an immediate confirm on the next
-// boot. The switch is skipped when this cannot be stored: without it the
-// next limit can select this image again, and a reset can abort the slot
-// we are about to boot.
-// in: running partition. out: true when the left identity and rescue flag were written.
-static bool rememberAbandoned(const esp_partition_t* part) {
+void OTAUpdate::plannedRestart() {
+  _otaPlannedRestart = OTA_PLANNED_RESTART_MAGIC;
+  esp_restart();
+}
+
+void OTAUpdate::brokerRestart() {
+  _otaPlannedRestart = OTA_PLANNED_BROKER_MAGIC;
+  esp_restart();
+}
+
+// This slot and its ELF hash. in: id out, OTA_IMAGE_ID_LEN bytes.
+// out: false when the running image or its hash cannot be read.
+static bool runningImageId(uint8_t* id) {
+  const esp_partition_t* running = esp_ota_get_running_partition();
   esp_app_desc_t desc;
-  if (!part || esp_ota_get_partition_description(part, &desc) != ESP_OK) {
-    Log::kvfe(TAG, "ota.abandoned_unrecorded reason=no_description");
-    return false;
+  if (!running || esp_ota_get_partition_description(running, &desc) != ESP_OK) return false;
+  return otaHealthImageId(running->address, desc.app_elf_sha256, id);
+}
+
+// Store this image's id on its first broker session, once per image.
+// in: none. out: none. A failed write is tried again on the next boot.
+static void markProvenOnBroker() {
+  if (_otaProvenDone || !_otaMqttUp) return;
+  _otaProvenDone = true;
+  uint8_t id[OTA_IMAGE_ID_LEN];
+  if (!runningImageId(id)) {
+    Log::kvfe(TAG, "ota.image_proven_unrecorded reason=no_image_id");
+    return;
   }
   Preferences prefs;
   if (!prefs.begin("boot", false)) {
-    Log::kvfe(TAG, "ota.abandoned_unrecorded reason=nvs");
+    Log::kvfe(TAG, "ota.image_proven_unrecorded reason=nvs");
+    return;
+  }
+  size_t wrote = prefs.putBytes("proven_id", id, sizeof(id));
+  prefs.end();
+  if (wrote != sizeof(id)) {
+    Log::kvfe(TAG, "ota.image_proven_unrecorded reason=nvs_write");
+    return;
+  }
+  Log::info(TAG, "ota.image_proven reason=mqtt_up");
+}
+
+// Zero the streak the switch reset adds to, then arm an immediate confirm of
+// the slot about to boot. out: true when both landed; the switch needs both.
+static bool armRescue() {
+  Preferences prefs;
+  if (!prefs.begin("boot", false)) {
+    Log::kvfe(TAG, "ota.image_rollback_failed reason=nvs");
     return false;
   }
-  size_t ver = prefs.putString("left_ver", desc.version);
-  size_t date = prefs.putString("left_date", desc.date);
-  size_t time = prefs.putString("left_time", desc.time);
-  size_t rescue = prefs.putUChar("rescue", 1);
-  // The switch reboots in software, which counts as a crash. Leaving the
-  // streak at the limit makes the next update refuse to confirm.
   size_t crash = prefs.putUInt("crash_n", 0);
+  size_t rescue = crash ? prefs.putUChar("rescue", OTA_RESCUE_ID) : 0;
   prefs.end();
-  if (ver == 0 || date == 0 || time == 0 || rescue == 0 || crash == 0) {
-    Log::kvfe(TAG, "ota.abandoned_unrecorded reason=nvs_write");
+  if (crash != 0) _otaCrashStreak = 0;
+  if (rescue == 0) {
+    Log::kvfe(TAG, "ota.image_rollback_failed reason=nvs_write");
     return false;
   }
   return true;
 }
 
-// A missing description or an unread record must not look like a free slot.
-// in: candidate partition. out: true if it is the image we last left.
+// A flag left by a failed switch would confirm the next written image unchecked.
+// in: none. out: none.
+static void disarmRescue() {
+  Preferences prefs;
+  bool cleared = prefs.begin("boot", false) && prefs.putUChar("rescue", 0) != 0;
+  prefs.end();
+  if (!cleared) Log::kvfe(TAG, "ota.rescue_left_set reason=nvs_write");
+}
+
+// Survives a software reset and deep sleep, not a power-on: fled-skip seconds
+// not yet saved to NVS, then their complement.
+RTC_NOINIT_ATTR static uint32_t _otaFledUnsaved[2];
+
+// The fled record and its skip age, read once a boot.
+static struct {
+  bool loaded;
+  bool savedThisBoot;
+  char ver[32];
+  OtaFledAge saved;
+  uint32_t carry;   // unsaved seconds an earlier boot left in RTC memory
+  uint32_t markMs;  // millis at the last save this boot
+} _fled = {};
+
+static void putFledUnsaved(uint32_t s) {
+  _otaFledUnsaved[0] = s;
+  _otaFledUnsaved[1] = ~s;
+}
+
+// Written after the boot slot is set, so a failed switch leaves no skip. A
+// lost write costs one more download of this release. in: none. out: none.
+static void recordFledRelease() {
+  Preferences prefs;
+  // Age first: a lost version write then leaves the old release a fresh day.
+  bool wrote = prefs.begin("boot", false) &&
+               prefs.putULong64("fled_age", otaFledPack({0, 0, 0})) != 0 &&
+               prefs.putString("fled_ver", FIRMWARE_VERSION) != 0;
+  prefs.end();
+  putFledUnsaved(0);
+  if (wrote) Log::kvfw(TAG, "ota.fled_release_recorded version=%s", FIRMWARE_VERSION);
+  else Log::kvfe(TAG, "ota.fled_release_unrecorded reason=nvs_write");
+}
+
+// An unread record skips nothing: it must not hold back every update. The
+// RTC carry is taken once and zeroed. in: none. out: none.
+static void loadFled() {
+  if (_fled.loaded) return;
+  _fled.loaded = true;
+  _fled.carry = otaFledCarry(_otaFledUnsaved[0], _otaFledUnsaved[1]);
+  putFledUnsaved(0);
+  Preferences prefs;
+  if (!prefs.begin("boot", true)) {
+    Log::kvfw(TAG, "ota.fled_release_unread reason=nvs");
+    return;
+  }
+  if (prefs.isKey("fled_ver")) prefs.getString("fled_ver", _fled.ver, sizeof(_fled.ver));
+  if (prefs.isKey("fled_age")) _fled.saved = otaFledUnpack(prefs.getULong64("fled_age", 0));
+  prefs.end();
+}
+
+// in: none. out: the clock as an epoch once SNTP synced it, else 0.
+static uint32_t syncedEpoch() {
+  return WiFiManager::ntpSynced() ? (uint32_t)time(nullptr) : 0u;
+}
+
+static uint32_t fledUnsavedS() { return _fled.carry + (millis() - _fled.markMs) / 1000u; }
+
+// in: none. out: the saved age plus the time since that save.
+static uint32_t fledAgeNow() {
+  uint32_t elapsed = otaFledElapsed(fledUnsavedS(), !_fled.savedThisBoot,
+                                    _fled.saved.seenEpoch, syncedEpoch());
+  return otaFledAdvance(_fled.saved.ageS, elapsed);
+}
+
+// A failed write still moves the count on in RAM, so it is not retried every
+// turn. in: age, installs since expiry. out: true when NVS took it.
+static bool saveFled(uint32_t ageS, uint8_t tries) {
+  const OtaFledAge next = {ageS, tries, syncedEpoch()};
+  Preferences prefs;
+  bool wrote = prefs.begin("boot", false) && prefs.putULong64("fled_age", otaFledPack(next)) != 0;
+  prefs.end();
+  if (!wrote) Log::kvfe(TAG, "ota.fled_age_unsaved reason=nvs_write");
+  _fled.saved = next;
+  _fled.savedThisBoot = true;
+  _fled.carry = 0;
+  _fled.markMs = millis();
+  putFledUnsaved(0);
+  return wrote;
+}
+
+// RTC memory holds the unsaved seconds each turn and NVS gets them every 10
+// min, so a reset loses none and a power-on under 10 min. in: none. out: none.
+static void ageFledRelease() {
+  loadFled();
+  if (!otaFledAges(_fled.ver, FIRMWARE_VERSION, _fled.saved.ageS)) return;
+  uint32_t unsaved = fledUnsavedS();
+  if (!otaFledSaveDue(unsaved, false)) {
+    putFledUnsaved(unsaved);
+    return;
+  }
+  saveFled(fledAgeNow(), _fled.saved.tries);
+}
+
+// An unreadable description or NVS must not look like a free slot.
+// in: candidate partition. out: true if it is the image a switch came from.
 static bool imageAbandoned(const esp_partition_t* part) {
   esp_app_desc_t desc;
   if (!part || esp_ota_get_partition_description(part, &desc) != ESP_OK) {
@@ -116,29 +286,83 @@ static bool imageAbandoned(const esp_partition_t* part) {
     Log::kvfe(TAG, "ota.image_rollback_failed reason=nvs");
     return true;
   }
-  String leftVer = prefs.getString("left_ver", "");
-  String leftDate = prefs.getString("left_date", "");
-  String leftTime = prefs.getString("left_time", "");
+  // left_ver/left_date/left_time are not read: they hold prebuilt IDF strings
+  // that match every build. Kept for the older image in the other slot.
+  uint8_t left[OTA_IMAGE_ID_LEN] = {0};
+  size_t leftLen = prefs.isKey("left_id") ? prefs.getBytes("left_id", left, sizeof(left)) : 0;
   prefs.end();
-  return otaHealthIsAbandoned(desc.version, desc.date, desc.time,
-                              leftVer.c_str(), leftDate.c_str(), leftTime.c_str());
+  return otaHealthIsAbandoned(left, leftLen, part->address, desc.app_elf_sha256);
 }
 
-// The other OTA slot is a rollback target only when it is a different valid
-// image and not the one this guard already left.
-// in: running partition. out: that slot, or null when it must not be booted.
+// otadata keeps a slot VALID while a download overwrites it, and its new
+// descriptor reads early. in: candidate slot. out: true when the image verifies.
+static bool imageVerifies(const esp_partition_t* part) {
+  const esp_partition_pos_t pos = {part->address, part->size};
+  esp_image_metadata_t meta;
+  if (esp_image_verify(ESP_IMAGE_VERIFY_SILENT, &pos, &meta) == ESP_OK) return true;
+  Log::kvfe(TAG, "ota.image_rollback_failed reason=image_invalid");
+  return false;
+}
+
+// The other slot is a target only when it is a different valid image that
+// verifies and is not recorded as left. in: running. out: that slot, or null.
 static const esp_partition_t* rollbackTarget(const esp_partition_t* running) {
   const esp_partition_t* other = esp_ota_get_next_update_partition(NULL);
   esp_ota_img_states_t otherState = ESP_OTA_IMG_UNDEFINED;
   if (!other || other == running ||
       esp_ota_get_state_partition(other, &otherState) != ESP_OK ||
-      otherState != ESP_OTA_IMG_VALID || imageAbandoned(other)) {
+      otherState != ESP_OTA_IMG_VALID || imageAbandoned(other) || !imageVerifies(other)) {
     return nullptr;
   }
   return other;
 }
 
+// in: two app descriptors. out: true when version, date and time all match.
+static bool sameDescStrings(const esp_app_desc_t& a, const esp_app_desc_t& b) {
+  return strncmp(a.version, b.version, sizeof(a.version)) == 0 &&
+         strncmp(a.date, b.date, sizeof(a.date)) == 0 &&
+         strncmp(a.time, b.time, sizeof(a.time)) == 0;
+}
+
+// Drop a record that names the running slot, then on a switch arrival record
+// the slot it came from. in: open boot prefs. out: none.
+static void updateLeftRecord(Preferences& prefs) {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  uint8_t stored[OTA_IMAGE_ID_LEN] = {0};
+  size_t len = prefs.isKey("left_id") ? prefs.getBytes("left_id", stored, sizeof(stored)) : 0;
+  if (running && otaHealthLeftIsStale(stored, len, running->address)) {
+    if (prefs.remove("left_id")) Log::info(TAG, "ota.left_image_cleared reason=slot_running");
+    else Log::kvfe(TAG, "ota.left_image_kept reason=nvs_write");
+  }
+  if (!otaHealthIsArrival(_otaBootRescue, _otaBootPending)) return;
+  const esp_partition_t* other = esp_ota_get_next_update_partition(NULL);
+  esp_app_desc_t from, self;
+  uint8_t id[OTA_IMAGE_ID_LEN];
+  if (!running || !other || other == running ||
+      esp_ota_get_partition_description(other, &from) != ESP_OK ||
+      !otaHealthImageId(other->address, from.app_elf_sha256, id)) {
+    Log::kvfe(TAG, "ota.left_image_unrecorded reason=no_image_id");
+    return;
+  }
+  bool same = esp_ota_get_partition_description(running, &self) == ESP_OK &&
+              sameDescStrings(from, self);
+  if (!otaHealthRecordArrival(_otaBootRescue, same)) {
+    Log::info(TAG, "ota.left_image_unrecorded reason=older_guard");
+    return;
+  }
+  if (prefs.putBytes("left_id", id, sizeof(id)) != sizeof(id)) {
+    Log::kvfe(TAG, "ota.left_image_unrecorded reason=nvs_write");
+    return;
+  }
+  Log::kvf(TAG, "ota.left_image_recorded rescue=%u", (unsigned)_otaBootRescue);
+}
+
 uint32_t OTAUpdate::recordBootStreak(int resetReason, uint32_t* brownoutsOut) {
+  OtaPlanned planned = otaHealthTakePlanned(&_otaPlannedRestart);
+  // Only a confirmed image may hold a planned restart; unknown counts.
+  bool confirmed = planned != OTA_PLANNED_NONE && runningImageConfirmed();
+  uint8_t id[OTA_IMAGE_ID_LEN];
+  bool haveId = runningImageId(id);
   Preferences prefs;
   if (!prefs.begin("boot", false)) {
     // Unread streak must not look like zero: confirm would keep a bad image.
@@ -148,6 +372,7 @@ uint32_t OTAUpdate::recordBootStreak(int resetReason, uint32_t* brownoutsOut) {
     if (brownoutsOut) *brownoutsOut = 0;
     return _otaCrashStreak;
   }
+  updateLeftRecord(prefs);
   uint32_t brownouts = prefs.getUInt("brownout_n", 0);
   if (resetReason == OTA_RST_BROWNOUT) {
     brownouts++;
@@ -160,8 +385,13 @@ uint32_t OTAUpdate::recordBootStreak(int resetReason, uint32_t* brownoutsOut) {
       return _otaCrashStreak;
     }
   }
-  uint32_t crashes = otaHealthNextCrashStreak(prefs.getUInt("crash_n", 0),
-                                              otaHealthResetClass(resetReason));
+  uint8_t stored[OTA_IMAGE_ID_LEN] = {0};
+  size_t storedLen =
+      prefs.isKey("proven_id") ? prefs.getBytes("proven_id", stored, sizeof(stored)) : 0;
+  bool proven = haveId && otaHealthImageProven(stored, storedLen, id);
+  _otaProvenDone = proven;
+  OtaResetClass kind = otaHealthBootClass(resetReason, planned, confirmed, proven);
+  uint32_t crashes = otaHealthNextCrashStreak(prefs.getUInt("crash_n", 0), kind);
   // A failed write must not look stored. Confirm would keep a bad image.
   if (prefs.putUInt("crash_n", crashes) == 0) {
     prefs.end();
@@ -175,6 +405,14 @@ uint32_t OTAUpdate::recordBootStreak(int resetReason, uint32_t* brownoutsOut) {
   _otaStreakKnown = true;
   _otaCrashStreak = crashes;
   if (brownoutsOut) *brownoutsOut = brownouts;
+  if (resetReason == OTA_RST_SW && confirmed && kind == OTA_RESET_HOLD) {
+    Log::kvf(TAG, "ota.crash_streak_held reason=%s streak=%lu",
+             planned == OTA_PLANNED_BROKER ? "broker_restart" : "planned_restart",
+             (unsigned long)crashes);
+  } else if (resetReason == OTA_RST_SW && confirmed && planned == OTA_PLANNED_BROKER) {
+    Log::kvfw(TAG, "ota.crash_streak_counted reason=broker_restart_unproven streak=%lu",
+              (unsigned long)crashes);
+  }
   return crashes;
 }
 
@@ -197,76 +435,127 @@ static bool clearCrashStreak() {
 
 void OTAUpdate::rollbackIfCrashLoop() {
   if (!_otaStreakKnown || !otaHealthShouldRollback(_otaCrashStreak)) return;
+  const unsigned long streak = _otaCrashStreak;
   const esp_partition_t* running = esp_ota_get_running_partition();
   esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
   if (!running || esp_ota_get_state_partition(running, &state) != ESP_OK) {
     Log::kvfe(TAG, "ota.image_rollback_failed reason=state_unknown streak=%lu",
-              (unsigned long)_otaCrashStreak);
+              streak);
     return;
   }
   if (state == ESP_OTA_IMG_PENDING_VERIFY) {
     if (!rollbackTarget(running)) {
       // Leaving it pending lets the bootloader boot the slot just refused.
       Log::kvfe(TAG, "ota.image_rollback_failed reason=no_other_image state=pending streak=%lu",
-                (unsigned long)_otaCrashStreak);
+                streak);
       // Confirm even if the clear fails. This image has no safe other slot,
       // and leaving it pending lets the bootloader boot the one just refused.
-      clearCrashStreak();
+      if (clearCrashStreak()) _otaCrashStreak = 0;
       if (esp_ota_mark_app_valid_cancel_rollback() != ESP_OK) {
         Log::kvfe(TAG, "ota.image_rollback_failed reason=cancel_failed state=pending streak=%lu",
-                  (unsigned long)_otaCrashStreak);
+                  streak);
         return;
       }
       Log::kvfw(TAG, "ota.state_change from=pending to=valid reason=no_other_image streak=%lu",
-                (unsigned long)_otaCrashStreak);
+                streak);
       return;
     }
     Log::kvfw(TAG, "ota.state_change from=pending to=previous reason=crash_streak streak=%lu",
-              (unsigned long)_otaCrashStreak);
+              streak);
     if (!clearCrashStreak()) return;
     if (esp_ota_mark_app_invalid_rollback_and_reboot() != ESP_OK) {
       Log::kvfe(TAG, "ota.image_rollback_failed state=pending streak=%lu",
-                (unsigned long)_otaCrashStreak);
+                streak);
     }
     return;
   }
   if (state != ESP_OTA_IMG_VALID) {
     Log::kvfe(TAG, "ota.image_rollback_failed reason=state_not_valid state=%d streak=%lu",
-              (int)state, (unsigned long)_otaCrashStreak);
+              (int)state, streak);
     return;
   }
   const esp_partition_t* other = rollbackTarget(running);
   if (!other) {
     Log::kvfe(TAG, "ota.image_rollback_failed reason=no_other_image streak=%lu",
-              (unsigned long)_otaCrashStreak);
+              streak);
     return;
   }
-  if (!rememberAbandoned(running)) return;
+  // The image booted next records this one by its id, so it needs one.
+  uint8_t id[OTA_IMAGE_ID_LEN];
+  if (!runningImageId(id)) {
+    Log::kvfe(TAG, "ota.image_rollback_failed reason=no_image_id streak=%lu", streak);
+    return;
+  }
+  if (!armRescue()) return;
   Log::kvfw(TAG, "ota.state_change from=valid to=other reason=crash_streak streak=%lu",
-            (unsigned long)_otaCrashStreak);
+            streak);
   if (esp_ota_set_boot_partition(other) != ESP_OK) {
     Log::kvfe(TAG, "ota.image_rollback_failed state=valid streak=%lu",
-              (unsigned long)_otaCrashStreak);
+              streak);
+    disarmRescue();
     return;
   }
+  recordFledRelease();
   ESP.restart();
+}
+
+// The IDF marks the active otadata entry, which is the staged image once an
+// update is written, so this waits while the boot slot is not the running one.
+// in: none. out: true when the running USB image now reads VALID.
+static bool markUsbImageValid() {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  if (!running || esp_ota_get_boot_partition() != running) {
+    Log::kvfw(TAG, "ota.image_mark_failed reason=boot_slot_changed");
+    return false;
+  }
+  const esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+  if (err != ESP_OK) {
+    Log::kvfe(TAG, "ota.image_mark_failed reason=usb_flash err=0x%x", (unsigned)err);
+    return false;
+  }
+  Log::kvf(TAG, "ota.image_marked_valid reason=usb_flash");
+  return true;
 }
 
 // Confirm a pending image once, and retry when the IDF call fails.
 // An unread streak leaves a pending image pending.
-// in: none. out: none. A non-pending image is read once and left alone.
+// in: none. out: none. A non-pending image clears its streak after an hour up,
+// and a USB-flashed one is then marked valid.
 void OTAUpdate::confirmIfHealthy() {
+  ageFledRelease();
+  markProvenOnBroker();
   if (_otaImageSettled) return;
   if (!_otaStateKnown) {
     const esp_partition_t* running = esp_ota_get_running_partition();
     esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
     if (!running || esp_ota_get_state_partition(running, &state) != ESP_OK) return;
     _otaPending = state == ESP_OTA_IMG_PENDING_VERIFY;
+    _otaRunState = (uint32_t)state;
     _otaStateKnown = true;
-    if (!_otaPending) {
-      _otaImageSettled = true;
-      return;
+  }
+  if (!_otaPending) {
+    const bool usb = _otaRunState == ESP_OTA_IMG_UNDEFINED;
+    if (!_otaStreakKnown || (_otaCrashStreak == 0 && !usb)) { _otaImageSettled = true; return; }
+    const uint64_t upMs = (uint64_t)esp_timer_get_time() / 1000;
+    if (_otaCrashStreak != 0) {
+      if (!otaHealthShouldClearValid(false, upMs, _otaCrashStreak, _otaSettleFailMs)) return;
+      if (!clearCrashStreak()) {
+        _otaSettleFailMs = upMs;
+        return;
+      }
+      Log::kvf(TAG, "ota.crash_streak_cleared reason=healthy_uptime streak=%lu",
+               (unsigned long)_otaCrashStreak);
+      _otaCrashStreak = 0;
     }
+    if (usb) {
+      if (!otaHealthShouldMarkUsbValid(_otaRunState, _otaStreakKnown, upMs, _otaSettleFailMs)) return;
+      if (!markUsbImageValid()) {
+        _otaSettleFailMs = upMs;
+        return;
+      }
+    }
+    _otaImageSettled = true;
+    return;
   }
   if (!_otaStreakKnown) return;
   if (!otaHealthShouldMark(true, _otaMqttUp, millis(), _otaCrashStreak)) return;
@@ -347,7 +636,7 @@ static void configureSecureClient(WiFiClientSecure& client) {
   } else {
     client.setCACert(_otaCaCert.c_str());
   }
-  client.setTimeout(10);            // arduino-esp32 v2.x: seconds (current platform)
+  client.setTimeout(10);            // core 2: seconds; http.setConnectTimeout caps connect
   client.setHandshakeTimeout(10);   // ssl handshake, always seconds
 }
 
@@ -363,13 +652,29 @@ static void configureSecureClient(WiFiClientSecure& client) {
 // Sectigo, etc - are baked into the firmware via ota_ca_progmem.h).
 // ---------------------------------------------------------------------------
 
-// in:  url, writeCallback. out: outStatus (200/404/...), outLen (bytes).
-static bool otaHttpGetWiFi(const char* url,
-                           std::function<bool(const uint8_t*, size_t)> writeCallback,
-                           int* outStatus, size_t* outLen) {
-  HTTPClient http;
+// One GET on one connection. A redirect fills *redirect and reads no body.
+// Unfed: TCP 10 s + TLS 10 s + headers 5 s idle per line; a trickle trips the TWDT.
+static bool otaHttpGetWiFiHop(const char* url,
+                              std::function<bool(const uint8_t*, size_t)> writeCallback,
+                              int* outStatus, size_t* outLen, String* redirect) {
+  // Resolve first and feed: core 3 DNS is uncapped (about 7 s per server).
+  char host[128] = "";
+  const char* path;
+  uint16_t port;
+  IPAddress ip;
+  if (!httpUrlSplit(url, host, sizeof(host), &path, &port) || WiFi.hostByName(host, ip) != 1) {
+    Watchdog::feed();
+    Log::kvfw(TAG, "ota.http_get_failed reason=resolve host=%.64s", host);
+    if (outStatus) *outStatus = HTTPC_ERROR_CONNECTION_REFUSED;
+    return false;
+  }
+  Watchdog::feed();
+
+  // Clients before http: ~HTTPClient calls stop() on its client (core 3),
+  // so the client must outlive it. Locals die in reverse order.
   WiFiClientSecure secureClient;
   WiFiClient       plainClient;
+  HTTPClient http;
   bool https = strncmp(url, "https://", 8) == 0;
   if (https) {
     configureSecureClient(secureClient);
@@ -377,14 +682,18 @@ static bool otaHttpGetWiFi(const char* url,
   } else {
     http.begin(plainClient, url);
   }
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
   http.setConnectTimeout(10000);
-  http.setTimeout(10000);
+  http.setTimeout(5000);
 
-  yield(); esp_task_wdt_reset();
   int code = http.GET();
-  yield(); esp_task_wdt_reset();
+  yield(); Watchdog::feed();
   if (outStatus) *outStatus = code;
+  if (otaIsRedirect(code) && http.getLocation().length() > 0) {
+    *redirect = http.getLocation();
+    http.end();
+    return true;
+  }
   if (code != 200) {
     http.end();
     return code > 0;  // negative = transport error; positive = HTTP-level error (still "transport ok")
@@ -396,7 +705,7 @@ static bool otaHttpGetWiFi(const char* url,
   uint8_t buf[1024];
   uint32_t deadline = millis() + 5UL * 60UL * 1000UL;  // 5 min cap
   while (millis() < deadline) {
-    yield(); esp_task_wdt_reset();
+    yield(); Watchdog::feed();
     Shell::pumpConsole();
     if (!stream->connected() && !stream->available()) break;
     int avail = stream->available();
@@ -416,6 +725,26 @@ static bool otaHttpGetWiFi(const char* url,
   return true;
 }
 
+// in:  url, writeCallback. out: outStatus (200/404/...), outLen (bytes).
+// Follows up to OTA_REDIRECT_MAX same-scheme redirects, one fed hop each.
+static bool otaHttpGetWiFi(const char* url,
+                           std::function<bool(const uint8_t*, size_t)> writeCallback,
+                           int* outStatus, size_t* outLen) {
+  String next = url;
+  for (int hop = 0; hop <= OTA_REDIRECT_MAX; hop++) {
+    String redirect;
+    bool ok = otaHttpGetWiFiHop(next.c_str(), writeCallback, outStatus, outLen, &redirect);
+    if (redirect.length() == 0) return ok;
+    if (!otaRedirectAllowed(next.c_str(), redirect.c_str())) {
+      Log::kvfw(TAG, "ota.redirect_refused reason=scheme_or_relative");
+      return true;  // the 3xx stays in outStatus
+    }
+    next = redirect;
+  }
+  Log::kvfw(TAG, "ota.redirect_refused reason=too_many max=%d", OTA_REDIRECT_MAX);
+  return true;
+}
+
 #ifdef ENABLE_CELLULAR
 // in:  url, writeCallback. out: outStatus, outLen.
 static bool otaHttpGetCellular(const char* url,
@@ -425,7 +754,7 @@ static bool otaHttpGetCellular(const char* url,
   uint16_t port = 443;
   if (strncmp(p, "https://", 8) == 0)      { p += 8; port = 443; }
   else if (strncmp(p, "http://",  7) == 0) { p += 7; port = 80;  }
-  char host[128];
+  char host[128] = "";
   const char* slash   = strchr(p, '/');
   const char* hostEnd = slash ? slash : p + strlen(p);
   size_t hostLen      = hostEnd - p;
@@ -448,26 +777,6 @@ static bool otaHttpGetCellular(const char* url,
 #endif
 
 #ifdef ENABLE_CELLULAR
-static bool parseUrl(const char* url, char* host, size_t hostCap,
-                     const char** pathOut, uint16_t* portOut) {
-  const char* p = url;
-  uint16_t port = 443;
-  if (strncmp(p, "https://", 8) == 0)      { p += 8; port = 443; }
-  else if (strncmp(p, "http://",  7) == 0) { p += 7; port = 80;  }
-  else return false;
-  const char* slash   = strchr(p, '/');
-  const char* hostEnd = slash ? slash : p + strlen(p);
-  size_t hostLen      = hostEnd - p;
-  if (hostLen == 0 || hostLen >= hostCap) return false;
-  memcpy(host, p, hostLen);
-  host[hostLen] = '\0';
-  char* colon = strchr(host, ':');
-  if (colon) { *colon = '\0'; port = atoi(colon + 1); }
-  *pathOut = slash ? slash : "/";
-  *portOut = port;
-  return true;
-}
-
 // Download a binary in 64 KB chunks via HTTP Range requests. Each chunk
 // is its own short-lived TLS session, which works around SIM7080G HTTP
 // session degradation past ~500-900 KB (observed on fw 1951B17). The
@@ -484,10 +793,10 @@ static bool downloadBinaryChunkedCellular(
   if (totalOut) *totalOut = 0;
   if (expectedSize == 0) return false;
 
-  char host[128];
+  char host[128] = "";
   const char* path = nullptr;
   uint16_t port = 443;
-  if (!parseUrl(url, host, sizeof(host), &path, &port)) {
+  if (!httpUrlSplit(url, host, sizeof(host), &path, &port)) {
     Log::error(TAG, "ota.download_failed reason=bad_url");
     return false;
   }
@@ -827,7 +1136,38 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
     MQTTClient::publish(topic, payload);
     return;
   }
-  if (force && !isNewer(remoteVersion.c_str(), FIRMWARE_VERSION)) {
+  // Without this the image a switch booted pulls the fled build straight back.
+  loadFled();
+  const uint32_t fledAge = fledAgeNow();
+  const uint8_t tries = _fled.saved.tries;
+  const OtaFledAction fled =
+      otaFledAction(remoteVersion.c_str(), _fled.ver, fledAge, tries, force);
+  if (fled == OTA_FLED_SKIP) {
+    if (otaFledSaveDue(fledUnsavedS(), !_fled.savedThisBoot)) saveFled(fledAge, tries);
+    Log::kvfw(TAG, "ota.phase_change from=fetch_manifest to=idle reason=fled_release version=%s age_s=%lu",
+              remoteVersion.c_str(), (unsigned long)fledAge);
+    publishOtaRefusal("fled-release");
+    return;
+  }
+  if (fled == OTA_FLED_RETRY || fled == OTA_FLED_LAST) {
+    // Saved before the download, so a try that never boots still counts.
+    const OtaFledAge spent = otaFledAfterTry(fled, fledAge, tries, true);
+    const bool saved = saveFled(spent.ageS, spent.tries);
+    if (!otaFledMayDownload(fled, saved)) {
+      // saveFled moved RAM on; the try NVS did not take stays unspent.
+      const OtaFledAge kept = otaFledAfterTry(fled, fledAge, tries, false);
+      _fled.saved.ageS = kept.ageS;
+      _fled.saved.tries = kept.tries;
+      Log::kvfe(TAG, "ota.phase_change from=fetch_manifest to=idle reason=fled_try_unsaved version=%s",
+                remoteVersion.c_str());
+      publishOtaRefusal("fled-release");
+      return;
+    }
+    Log::kvfw(TAG, "ota.fled_release_retry version=%s try=%u", remoteVersion.c_str(),
+              (unsigned)(tries + 1));
+  } else if (fled == OTA_FLED_FORCED) {
+    Log::warn(TAG, "ota.force_reflash version=fled");
+  } else if (force && !isNewer(remoteVersion.c_str(), FIRMWARE_VERSION)) {
     Log::warn(TAG, "ota.force_reflash version=same_or_older");
   }
 
@@ -847,7 +1187,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
   if (applyUpdate(binUrl, sha256, binSize)) {
     Log::kvf(TAG, "ota.phase_change from=apply to=reboot version=%s", remoteVersion.c_str());
     delay(500);
-    ESP.restart();
+    plannedRestart();
   } else {
     Log::error(TAG, "ota.update_failed");
     snprintf(statusPayload, sizeof(statusPayload),
