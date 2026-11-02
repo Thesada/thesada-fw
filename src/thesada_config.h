@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
-#define FIRMWARE_VERSION "26.10.2"  // CalVer YY.0M.MICRO; bump on each release
+#define FIRMWARE_VERSION "26.11.1"  // CalVer YY.0M.MICRO; bump on each release
 
 // ── Memory tuning defaults ──────────────────────────────────────────────────
 #define LOG_RING_SIZE       50    // log replay lines for WS terminal
@@ -43,6 +43,7 @@
 // ── Example modules ─────────────────────────────────────────────────────────
 // Minimal modules that show the pattern, not deployment hardware. Off in every
 // build unless you turn one on; see lib/thesada-mod-example-*/.
+// #define ENABLE_EXAMPLE_BLINK_LED         // blink an LED on a configurable timer
 // #define ENABLE_EXAMPLE_TEMPERATURE_MQTT  // one DS18B20, published every interval
 // #define ENABLE_EXAMPLE_REMOTE_RELAY      // a GPIO driven by `relay.set on|off|toggle`
 

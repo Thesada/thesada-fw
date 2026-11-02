@@ -80,11 +80,22 @@ end
 
 -- ── Temperature alerts ──────────────────────────────────────────────────────
 -- Thresholds are always in Celsius (temp_c). Display value (temp) uses
--- the configured unit (C or F).
+-- the configured unit (C or F). A probe with no reading this cycle arrives
+-- as { name, address, stale = true } with no temp_c or temp.
 
 EventBus.subscribe("temperature", function(data)
   if not data.sensors then return end
   for _, s in ipairs(data.sensors) do
+
+    -- Probe not reading (sustained): the checks below cannot see this probe
+    local st_key = "stale:" .. s.name
+    if s.stale then
+      if temp_sustained(st_key) then
+        notify(s.name .. ": probe not reading", st_key)
+      end
+      goto continue
+    end
+    temp_clear(st_key)
 
     -- Overheat: specific sensor >= threshold (sustained)
     local oh_key = "overheat:" .. s.name
@@ -115,6 +126,8 @@ EventBus.subscribe("temperature", function(data)
     else
       temp_clear(fr_key)
     end
+
+    ::continue::
   end
 end)
 

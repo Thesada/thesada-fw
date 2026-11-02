@@ -18,3 +18,11 @@ inline bool mqttRollbackShould(const char* lg, bool haveLg,
   if (strcmp(cur, lg) == 0) return false;     // current == last-good
   return true;
 }
+
+// Low-heap defrag reboot: three straight failures that resolved the broker
+// and died before it answered (rc -2) on a heap under 40 KB, budget not
+// halted. A DNS outage never reached TLS, so it never qualifies.
+inline bool mqttDefragRebootDue(unsigned retryCount, bool resolved, int rc,
+                                unsigned maxAllocHeap, bool halted) {
+  return retryCount >= 3 && resolved && rc == -2 && maxAllocHeap < 40000 && !halted;
+}

@@ -17,7 +17,7 @@
 //   Config.get(key)                    - read config value by dot-notation key
 //   Node.restart()                     - reboot the device
 //   Node.version()                     - returns FIRMWARE_VERSION string
-//   Node.uptime()                      - returns millis() as number
+//   Node.uptime()                      - ms since boot, 64-bit, never wraps
 //
 // Hot reload:
 //   ScriptEngine::reload() bumps generation counter, destroys Lua state,
@@ -30,9 +30,15 @@
 #include <Config.h>
 #include <EventBus.h>
 #include <MQTTClient.h>
+#include <OTAUpdate.h>
 #include <Log.h>
 #include <Shell.h>
 #include <ModuleRegistry.h>
+#include <Watchdog.h>
+#include <boot_wait_policy.h>
+#include <lua_timer_policy.h>
+
+#include <esp_timer.h>
 
 #include <LittleFS.h>
 #include <WiFi.h>
@@ -133,19 +139,26 @@ static const luaL_Reg mqttLib[] = {
 
 // Timer queue for Node.setTimeout
 struct LuaTimer {
-  uint32_t fireAt;
+  uint64_t fireAt;  // uptime ms, see lua_timer_policy.h
   int callbackRef;  // LUA_NOREF if unused
 };
 static constexpr int MAX_TIMERS = 8;
 static LuaTimer _timers[MAX_TIMERS] = {};
 
+static uint64_t uptimeMs() { return (uint64_t)(esp_timer_get_time() / 1000); }
+
 // Lua binding: Node.setTimeout(ms, callback) - queue a one-shot timer
 static int lua_node_setTimeout(lua_State* L) {
-  int ms = (int)luaL_checknumber(L, 1);
+  lua_Number ms = luaL_checknumber(L, 1);
   luaL_checktype(L, 2, LUA_TFUNCTION);
+  uint64_t fireAt = 0;
+  if (!luaTimerFireAt(uptimeMs(), (double)ms, &fireAt)) {
+    Log::kvfw("Lua", "script.timer_refused reason=nan_delay");
+    lua_pushboolean(L, false);
+    return 1;
+  }
   lua_pushvalue(L, 2);
   int ref = luaL_ref(L, LUA_REGISTRYINDEX);
-  uint32_t fireAt = millis() + (uint32_t)ms;
 
   for (int i = 0; i < MAX_TIMERS; i++) {
     if (_timers[i].callbackRef == LUA_NOREF) {
@@ -164,7 +177,7 @@ static int lua_node_setTimeout(lua_State* L) {
 static int lua_node_restart(lua_State* L) {
   Log::info("Lua", "script.restart_requested");
   delay(100);
-  ESP.restart();
+  OTAUpdate::plannedRestart();
   return 0;
 }
 
@@ -174,9 +187,10 @@ static int lua_node_version(lua_State* L) {
   return 1;
 }
 
-// Lua binding: Node.uptime() - return millis since boot
+// Lua binding: Node.uptime() - ms since boot from the 64-bit esp_timer.
+// LUA_32BITS makes it a float: monotonic, its step grows with uptime.
 static int lua_node_uptime(lua_State* L) {
-  lua_pushnumber(L, (lua_Number)millis());
+  lua_pushnumber(L, (lua_Number)uptimeMs());
   return 1;
 }
 
@@ -466,10 +480,55 @@ void ScriptEngine::addBindings(LuaBindingRegistrar fn) {
 }
 
 // Call all registered binding functions (core + module)
+static void wrapProtectedCalls(lua_State* L);
+
 void ScriptEngine::callAllRegistrars() {
   registerCoreBindings();
+  wrapProtectedCalls(gL);
   for (uint8_t i = 0; i < _registrarCount; i++) {
     if (_registrars[i]) _registrars[i](gL);
+  }
+}
+
+static uint32_t _scriptStartMs = 0;
+static bool _budgetActive = false;  // a file is running under the budget
+static bool _budgetHit = false;     // its budget ran out
+
+// Count hook while a script file runs: feed until the budget is spent, then
+// raise. Coroutines keep the hook after the file ends; it is inert then.
+static void scriptBudgetHook(lua_State* L, lua_Debug*) {
+  if (!_budgetActive) return;
+  if (waitBudgetSpent(_scriptStartMs, millis(), LUA_SCRIPT_BUDGET_MS)) {
+    _budgetHit = true;
+    luaL_error(L, "script.budget_exceeded budget_ms=%d", (int)LUA_SCRIPT_BUDGET_MS);
+    return;
+  }
+  Watchdog::feed();
+}
+
+// pcall/xpcall wrapper: once the budget is spent, re-raise after the protected
+// call, so a caught budget error climbs every pcall up to executeFile.
+static int budgetSafeCall(lua_State* L) {
+  const int n = lua_gettop(L);
+  lua_pushvalue(L, lua_upvalueindex(1));
+  lua_insert(L, 1);
+  lua_call(L, n, LUA_MULTRET);
+  if (_budgetActive && _budgetHit) {
+    return luaL_error(L, "script.budget_exceeded budget_ms=%d", (int)LUA_SCRIPT_BUDGET_MS);
+  }
+  return lua_gettop(L);
+}
+
+static void wrapProtectedCalls(lua_State* L) {
+  static const char* const names[] = {"pcall", "xpcall"};
+  for (const char* name : names) {
+    lua_getglobal(L, name);
+    if (lua_isfunction(L, -1)) {
+      lua_pushcclosure(L, budgetSafeCall, 1);
+      lua_setglobal(L, name);
+    } else {
+      lua_pop(L, 1);
+    }
   }
 }
 
@@ -504,7 +563,20 @@ bool ScriptEngine::executeFile(const char* path) {
 
   int result = lua_load(gL, reader, &ctx, path, nullptr);
   f.close();
-  if (result == LUA_OK) result = lua_pcall(gL, 0, LUA_MULTRET, 0);
+  if (result == LUA_OK) {
+    _scriptStartMs = millis();
+    _budgetHit = false;
+    _budgetActive = true;
+    Watchdog::feed();
+    lua_sethook(gL, scriptBudgetHook, LUA_MASKCOUNT, LUA_HOOK_COUNT);
+    result = lua_pcall(gL, 0, LUA_MULTRET, 0);
+    lua_sethook(gL, nullptr, 0, 0);
+    _budgetActive = false;
+    if (result == LUA_OK && _budgetHit) {
+      Log::kvfe(TAG, "script.exec_failed path=%s err=\"script.budget_exceeded caught\"", path);
+      return false;
+    }
+  }
   if (result != LUA_OK) {
     const char* err = lua_tostring(gL, -1);
     Log::kvfe(TAG, "script.exec_failed path=%s err=\"%.160s\"",
@@ -644,10 +716,11 @@ uint32_t ScriptEngine::generation() {
 // Fire any expired Lua timers registered via Node.setTimeout
 void ScriptEngine::loop() {
   if (!gL) return;
-  uint32_t now = millis();
+  uint64_t upMs = uptimeMs();
 
   // Periodic full GC. See LUA_GC_INTERVAL_MS in thesada_config.h for rationale.
 #if LUA_GC_INTERVAL_MS > 0
+  uint32_t now = millis();
   static uint32_t lastGc = 0;
   if (now - lastGc >= LUA_GC_INTERVAL_MS) {
     lastGc = now;
@@ -656,7 +729,7 @@ void ScriptEngine::loop() {
 #endif
 
   for (int i = 0; i < MAX_TIMERS; i++) {
-    if (_timers[i].callbackRef != LUA_NOREF && now >= _timers[i].fireAt) {
+    if (_timers[i].callbackRef != LUA_NOREF && luaTimerDue(upMs, _timers[i].fireAt)) {
       int ref = _timers[i].callbackRef;
       _timers[i].callbackRef = LUA_NOREF;
       lua_rawgeti(gL, LUA_REGISTRYINDEX, ref);

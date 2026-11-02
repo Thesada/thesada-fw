@@ -25,7 +25,7 @@ Full documentation: [thesada.io/firmware](https://thesada.io/firmware/)
 - Cert upgrade is skipped below 40 KB free heap, because a TLS allocation on a constrained board takes the whole node down with it.
 
 **Sensors and power**
-- DS18B20 temperature over OneWire. Multi-sensor, auto-discovered, falls back to the last known value when one drops off the bus.
+- DS18B20 temperature over OneWire. Multi-sensor, auto-discovered. A probe that stops answering is published as `stale` with no value, never its last reading, and a jump past `max_delta_c` counts once the next reading confirms it.
 - SHT31 temperature and humidity, driven directly, no external library.
 - ADS1115 RMS current. 30 samples across two 60 Hz cycles, reported in amps and watts for the SCT-013-030 clamp. This is the pump-is-running signal.
 - Celsius or Fahrenheit, and the choice follows through to MQTT, the dashboard and Home Assistant.
@@ -115,7 +115,7 @@ Minimal build (core only) saves ~313 KB flash. Full build with all modules: 1.4 
 
 ## Examples
 
-Two modules exist only to be read: `lib/thesada-mod-example-temperature-mqtt/` (one DS18B20, published every interval, the sensor shape) and `lib/thesada-mod-example-remote-relay/` (a GPIO driven by `relay.set on|off|toggle` over serial, HTTP or MQTT, the actuator shape). Each is one header and one source file, and each is off in every build until you uncomment its `ENABLE_EXAMPLE_*` line in `src/thesada_config.h` and set `"enabled": true` in its `config.json` block. Copy one, rename it, and you have a module.
+Three modules exist only to be read: `lib/thesada-mod-example-blink-led/` (blink an LED on a configurable timer, the periodic output shape), `lib/thesada-mod-example-temperature-mqtt/` (one DS18B20, published every interval, the sensor shape), and `lib/thesada-mod-example-remote-relay/` (a GPIO driven by `relay.set on|off|toggle` over serial, HTTP or MQTT, the actuator shape). Each is one header and one source file, and each is off in every build until you uncomment its `ENABLE_EXAMPLE_*` line in `src/thesada_config.h` and set `"enabled": true` in its `config.json` block. Copy one, rename it, and you have a module.
 
 ## Hardware
 

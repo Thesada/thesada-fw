@@ -23,6 +23,7 @@
 #include <Console.h>
 #include <SleepManager.h>
 #include <HeartbeatLED.h>
+#include <boot_wait_policy.h>
 #ifdef ENABLE_CELLULAR
 #include <Cellular.h>
 #endif
@@ -90,6 +91,10 @@ static bool _heartbeatEnabled = true;
 
 void setup() {
   Serial.begin(115200);
+#if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
+  // Drop console output when no host reads; a blocked write starves the task watchdog.
+  Serial.setTxTimeoutMs(0);
+#endif
   logBootCause();
   OTAUpdate::rollbackIfCrashLoop();
   // Don't block waiting for serial - CDC boards hang here without USB host
@@ -97,17 +102,19 @@ void setup() {
   while (!Serial && millis() - serialWait < 3000) delay(10);
   Console::begin();
 
-  // Hardware watchdog: reboot if loop() doesn't feed within 30s.
+  // Task watchdog: reboot if loop() doesn't feed within 30 s. Every setup()
+  // wait below feeds per bounded step (Watchdog::waitStep), never globally.
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
-  // IDF 5 pre-initializes TWDT. Use reconfigure to extend timeout to 30s.
+  // IDF 5 pre-initializes TWDT; reconfigure drops idle tasks not in the
+  // mask, so keep the CPU0 idle watch core 2 kept from sdkconfig.
   esp_task_wdt_config_t wdt_cfg = {
-    .timeout_ms = 60000,
-    .idle_core_mask = 0,
+    .timeout_ms = TASK_WDT_TIMEOUT_MS,
+    .idle_core_mask = 1 << 0,
     .trigger_panic = true,
   };
   esp_task_wdt_reconfigure(&wdt_cfg);
 #else
-  esp_task_wdt_init(30, true);
+  esp_task_wdt_init(TASK_WDT_TIMEOUT_MS / 1000, true);
 #endif
   esp_task_wdt_add(NULL);
 

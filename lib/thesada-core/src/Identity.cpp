@@ -13,6 +13,9 @@
 
 #include <nvs.h>
 #include <esp_system.h>
+#if __has_include(<esp_mac.h>)
+#include <esp_mac.h>  // core 3 (IDF 5): esp_efuse_mac_get_default moved here
+#endif
 
 #ifdef ENABLE_IDENTITY
 #include <sodium.h>

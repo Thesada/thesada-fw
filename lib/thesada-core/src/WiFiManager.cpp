@@ -1,7 +1,7 @@
 // thesada-fw - WiFiManager.cpp
 // Scans visible networks, matches against the configured "wifi.networks" list,
 // ranks matches by RSSI (strongest first), and tries each for
-// "wifi.timeout_per_ssid_s" seconds (default 10). On total failure sets status
+// "wifi.timeout_per_ssid_s" seconds (default 10, max 60). On total failure sets status
 // ALL_FAILED so the cellular path can take over. While on cellular,
 // recheckWiFi() re-runs the scan/connect cycle every
 // "wifi.wifi_check_interval_s" seconds (default 900 = 15 min).
@@ -13,7 +13,8 @@
 #include "Config.h"
 #include "Secret.h"
 #include "Log.h"
-#include "Shell.h"
+#include "Watchdog.h"
+#include "boot_wait_policy.h"
 #include <WiFi.h>
 #include <DNSServer.h>
 #include <time.h>
@@ -61,7 +62,7 @@ void WiFiManager::scanAndConnect() {
 
   JsonObject cfg      = Config::get();
   JsonArray  networks = cfg["wifi"]["networks"].as<JsonArray>();
-  uint32_t   timeout  = (uint32_t)(cfg["wifi"]["timeout_per_ssid_s"]    | 10)  * 1000UL;
+  uint32_t   timeout  = wifiSsidTimeoutMs(cfg["wifi"]["timeout_per_ssid_s"] | WIFI_SSID_TIMEOUT_DEF_S);
   _recheckIntervalMs  = (uint32_t)(cfg["wifi"]["wifi_check_interval_s"] | 900) * 1000UL;
 
   if (networks.isNull() || networks.size() == 0) {
@@ -73,6 +74,7 @@ void WiFiManager::scanAndConnect() {
   // Passive scan of visible APs.
   Log::info(TAG, "wifi.scan_start");
   int found = WiFi.scanNetworks();
+  Watchdog::feed();
   Log::kvf(TAG, "wifi.scan_done visible=%d", found);
 
   // Match configured networks against scan results; record best RSSI per SSID.
@@ -130,8 +132,8 @@ void WiFiManager::scanAndConnect() {
     }
   }
 
-  // Try each candidate, with retries. Default 2 attempts per SSID.
-  uint8_t maxRetries = cfg["wifi"]["retries"] | 2;
+  // Try each candidate, with retries. Default 2 attempts per SSID, max 5.
+  uint8_t maxRetries = wifiRetries(cfg["wifi"]["retries"] | WIFI_RETRIES_DEF);
 
   for (uint8_t attempt = 1; attempt <= maxRetries; attempt++) {
     for (uint8_t i = 0; i < count; i++) {
@@ -144,7 +146,7 @@ void WiFiManager::scanAndConnect() {
         Log::kvf(TAG, "wifi.state_change from=scanning to=connected ssid=%s ip=%s",
                  candidates[i].ssid, WiFi.localIP().toString().c_str());
 
-        // Start NTP sync and wait up to 15 s.
+        // Start NTP sync and wait up to NTP_WAIT_MS.
         {
           JsonObject  cfg     = Config::get();
           const char* ntpSrv  = cfg["ntp"]["server"]      | "pool.ntp.org";
@@ -154,9 +156,8 @@ void WiFiManager::scanAndConnect() {
           configTime(tzOff, 0, ntpSrv, ntpFb);
           uint32_t t0 = millis();
           while (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED &&
-                 millis() - t0 < 15000) {
-            Shell::pumpConsole();
-            delay(200);
+                 !waitBudgetSpent(t0, millis(), NTP_WAIT_MS)) {
+            Watchdog::waitStep(NTP_POLL_STEP_MS);
           }
           if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
             Log::info(TAG, "wifi.ntp_synced");
@@ -197,12 +198,11 @@ bool WiFiManager::tryConnect(const char* ssid, const char* password, uint32_t ti
   WiFi.begin(ssid, password);
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - start >= timeoutMs) {
+    if (waitBudgetSpent(start, millis(), timeoutMs)) {
       WiFi.disconnect(true);
       return false;
     }
-    Shell::pumpConsole();
-    delay(250);
+    Watchdog::waitStep(WIFI_POLL_STEP_MS);
   }
   return true;
 }

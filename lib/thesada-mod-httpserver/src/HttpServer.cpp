@@ -13,6 +13,7 @@
 #include <Config.h>
 #include <Secret.h>
 #include <web_auth_policy.h>
+#include <login_rate_policy.h>
 #include <ttl_policy.h>
 #include <EventBus.h>
 #include <Log.h>
@@ -20,6 +21,7 @@
 #include <Shell.h>
 #include <WiFiManager.h>
 #include <MQTTClient.h>
+#include <OTAUpdate.h>
 #include <SetupPortal.h>
 #include <ModuleRegistry.h>
 #include <ESPAsyncWebServer.h>
@@ -29,6 +31,7 @@
 #include <SD_MMC.h>
 #include <WiFi.h>
 #include <mbedtls/platform_util.h>
+#include <esp_timer.h>
 #include <enroll_policy.h>
 #include <string.h>
 
@@ -64,43 +67,19 @@ static String _cmdBodyBuf;
 // Auth helpers
 // ---------------------------------------------------------------------------
 
-// Rate limiter: 5 failures per source IP → 30 s lockout.
-struct _RLEntry { char ip[20]; uint8_t fails; uint32_t until; };
-static _RLEntry _rlTable[16] = {};
-static uint8_t  _rlCount     = 0;
+// Clock for every auth deadline here (lockout, tokens, WS grants): 64-bit
+// uptime ms, because a millis() deadline goes stale at the 49.7-day wrap.
+static uint64_t _uptimeMs() { return (uint64_t)esp_timer_get_time() / 1000; }
 
-// Check if an IP is allowed or currently rate-limited (rollover-safe, see
-// ttl_policy.h - a plain compare re-opens lockouts across the millis() wrap).
-static bool _rlAllow(const String& ip) {
-  for (uint8_t i = 0; i < _rlCount; i++) {
-    if (strcmp(_rlTable[i].ip, ip.c_str()) != 0) continue;
-    return ttlReached(millis(), _rlTable[i].until);
-  }
-  return true;
-}
-// Record a failed auth attempt and lock out after 5 failures
-static void _rlFail(const String& ip) {
-  for (uint8_t i = 0; i < _rlCount; i++) {
-    if (strcmp(_rlTable[i].ip, ip.c_str()) != 0) continue;
-    if (++_rlTable[i].fails >= 5) _rlTable[i].until = millis() + 30000UL;
-    return;
-  }
-  if (_rlCount < 16) {
-    strncpy(_rlTable[_rlCount].ip, ip.c_str(), sizeof(_rlTable[0].ip) - 1);
-    _rlTable[_rlCount].ip[sizeof(_rlTable[0].ip) - 1] = '\0';
-    _rlTable[_rlCount].fails = 1;
-    _rlTable[_rlCount].until = 0;
-    _rlCount++;
-  }
-}
-// Clear the failure counter for an IP after a successful auth
-static void _rlReset(const String& ip) {
-  for (uint8_t i = 0; i < _rlCount; i++) {
-    if (strcmp(_rlTable[i].ip, ip.c_str()) != 0) continue;
-    _rlTable[i].fails = 0; _rlTable[i].until = 0;
-    return;
-  }
-}
+// Login lockout per source IP: 5 counted guesses -> 30 s (login_rate_policy.h).
+static LoginRateTable<> _rl;
+
+// False while ip is locked out. in: source ip. out: true to serve the attempt.
+static bool _rlAllow(const String& ip) { return _rl.allow(ip.c_str(), _uptimeMs()); }
+// Count one wrong guess from ip. in: source ip.
+static void _rlFail(const String& ip) { _rl.fail(ip.c_str(), _uptimeMs()); }
+// Forget ip after a successful auth. in: source ip.
+static void _rlReset(const String& ip) { _rl.reset(ip.c_str()); }
 
 // Reject path traversal attempts. Returns true if path is safe.
 // Delegates to Shell::pathSafe so HTTP, Shell (serial/WS), and MQTT CLI
@@ -118,7 +97,7 @@ static constexpr uint8_t  MAX_TOKENS = 4;
 static constexpr uint32_t TOKEN_TTL_MS = 3600000UL;  // 1 hour
 static constexpr uint8_t  TOKEN_LEN = 16;             // 16 bytes = 32 hex chars
 
-struct _TokenEntry { char token[33]; uint32_t expiry; };
+struct _TokenEntry { char token[33]; uint64_t expiry; };
 static _TokenEntry _tokens[MAX_TOKENS] = {};
 
 // Generate a random hex token
@@ -130,17 +109,13 @@ static void _genToken(char* out) {
   out[TOKEN_LEN * 2] = '\0';
 }
 
-// Create a new token and return it (evicts oldest if full)
+// Create a new token and return it (evicts the one closest to expiry if full)
 static const char* _createToken() {
-  uint32_t now = millis();
+  const uint64_t now = _uptimeMs();
   uint8_t slot = 0;
-  int32_t minRemain = INT32_MAX;
   for (uint8_t i = 0; i < MAX_TOKENS; i++) {
     if (!ttlActive(now, _tokens[i].expiry)) { slot = i; break; }
-    // Evict by smallest remaining time, never by raw expiry values (which
-    // sort wrongly across the millis() wrap).
-    int32_t remain = ttlRemaining(now, _tokens[i].expiry);
-    if (remain < minRemain) { minRemain = remain; slot = i; }
+    if (_tokens[i].expiry < _tokens[slot].expiry) slot = i;
   }
   _genToken(_tokens[slot].token);
   _tokens[slot].expiry = now + TOKEN_TTL_MS;
@@ -162,7 +137,7 @@ static bool _validateToken(const char* token) {
   if (!token) return false;
   size_t tlen = strlen(token);
   if (tlen != TOKEN_LEN * 2) return false;
-  uint32_t now = millis();
+  const uint64_t now = _uptimeMs();
   bool found = false;
   for (uint8_t i = 0; i < MAX_TOKENS; i++) {
     bool active = ttlActive(now, _tokens[i].expiry);
@@ -256,12 +231,12 @@ static bool _checkAuth(AsyncWebServerRequest* req, bool hasSideEffect = false,
 
 // IP-based WS pre-auth: GET /api/ws/token (auth-gated) marks the caller's IP as
 // authorized for 30 s. WS_EVT_CONNECT checks the IP - no query-param parsing needed.
-struct _WsAuth { char ip[20]; uint32_t expiry; };
+struct _WsAuth { char ip[20]; uint64_t expiry; };
 static _WsAuth _wsAuth[4] = {};
 
 // Grant a 30-second WebSocket authorization window for the given IP
 static void _grantWsAuth(const String& ip) {
-  uint32_t now = millis();
+  const uint64_t now = _uptimeMs();
   uint8_t  slot = 0;
   for (uint8_t i = 0; i < 4; i++) {
     if (!ttlActive(now, _wsAuth[i].expiry)) { slot = i; break; }
@@ -273,7 +248,7 @@ static void _grantWsAuth(const String& ip) {
 
 // Consume a one-time WebSocket auth token for the given IP
 static bool _consumeWsAuth(const String& ip) {
-  uint32_t now = millis();
+  const uint64_t now = _uptimeMs();
   for (uint8_t i = 0; i < 4; i++) {
     if (ttlActive(now, _wsAuth[i].expiry) && strcmp(_wsAuth[i].ip, ip.c_str()) == 0) {
       _wsAuth[i].expiry = 0;  // one-time use
@@ -344,7 +319,7 @@ void HttpServer::loop() {
   if (_restartPending) {
     Log::info(TAG, "web.restart reason=api_request");
     delay(500);
-    ESP.restart();
+    OTAUpdate::plannedRestart();
   }
 }
 
@@ -1012,6 +987,10 @@ void HttpServer::setupRoutes() {
         // AsyncWebSocketClient* pointer captured here.
         if (!shellModeHttpAllowed(Shell::mode())) {
           client->text("[shell.mode closes the HTTP command surface]");
+          return;
+        }
+        if (cmd.length() >= Shell::DEFERRED_LINE_LEN) {
+          client->text("[line too long - not run]");
           return;
         }
         uint32_t cid = client->id();

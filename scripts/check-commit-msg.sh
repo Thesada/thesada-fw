@@ -1,17 +1,12 @@
 #!/bin/sh
 # thesada-fw commit-message lint.
 #
-# thesada-fw is a public repo. Commit messages are mirrored to GitHub and
-# show up verbatim in `git log` and in auto-generated release notes, so
-# private references must never land in one. This scans a single commit
-# message for the recurring offenders:
+# Development happens on Forgejo; publish copies commit subjects into the
+# public GitHub release body (it strips #<n> issue refs itself). This scans
+# a single commit message for what must never reach that body:
 #
-#   - internal issue-tracker refs    #<digits>
 #   - internal hostnames             (use example.com in public text)
 #   - RFC1918 IP addresses           10/172.16-31/192.168
-#
-# Merge commits are skipped - their `#<n>` is a GitHub PR number, which is
-# public and legitimate.
 #
 # in:  $1 - path to the commit message file (as passed to a commit-msg hook)
 # out: exit 0 clean, exit 1 with the offending lines on a hit.
@@ -27,14 +22,7 @@ if [ "${MSG_OK:-}" = "1" ]; then
   exit 0
 fi
 
-# Merge commits carry a public GitHub PR number - not ours to police.
-first_line=$(head -n1 "$msg_file")
-case "$first_line" in
-  "Merge "*) exit 0 ;;
-esac
-
-# Drop comment lines (the git template's `#` block) so they cannot
-# false-positive as tracker refs. Real refs appear inline, not at col 0.
+# Drop comment lines (the git template's `#` block).
 body=$(grep -v '^#' "$msg_file" || true)
 
 fail=0
@@ -46,9 +34,6 @@ report() {
   fail=1
 }
 
-report "internal issue-tracker ref (#NN) - drop it or describe the change instead" \
-  "$(printf '%s\n' "$body" | grep -nE '#[0-9]+' || true)"
-
 report "internal hostname - use example.com in public text" \
   "$(printf '%s\n' "$body" | grep -nE '[A-Za-z0-9-]+\.thesada\.app' || true)"
 
@@ -57,7 +42,7 @@ report "private IP address (RFC1918) - redact it" \
 
 if [ "$fail" -ne 0 ]; then
   echo "" >&2
-  echo "thesada-fw is public - sanitize the message, or bypass with:" >&2
+  echo "commit subjects reach the public release body - sanitize the message, or bypass with:" >&2
   echo "    MSG_OK=1   (env var for the commit)" >&2
   exit 1
 fi
