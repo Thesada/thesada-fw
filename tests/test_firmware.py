@@ -1605,8 +1605,8 @@ Skippable groups (--skip a,b,c):
 Examples:
   python tests/test_firmware.py
   python tests/test_firmware.py --port /dev/cu.usbmodem1101
-  python tests/test_firmware.py --http 172.16.1.212 --web-pass changeme
-  python tests/test_firmware.py --http 172.16.1.212 --web-pass changeme --skip ota,cellular,ads1115
+  python tests/test_firmware.py --http 192.0.2.10 --web-pass changeme
+  python tests/test_firmware.py --http 192.0.2.10 --web-pass changeme --skip ota,cellular,ads1115
   python tests/test_firmware.py --skip sensors,ads1115,mqtt,ota,websocket,sd,cellular
   python tests/test_firmware.py --web-pass changeme   # enables /api/cmd HTTP test (serial mode)
 """)
@@ -1621,7 +1621,7 @@ Examples:
                         help="Board device_id for per-board HIL profile asserts "
                              "(node|sht31|owb-debug)")
     parser.add_argument("--http",      metavar="HOST",
-                        help="Use HTTP shell instead of serial (e.g. 172.16.1.212). "
+                        help="Use HTTP shell instead of serial (e.g. 192.0.2.10). "
                              "Requires --web-pass.")
     parser.add_argument("--skip",      default="",
                         help="Comma-separated manual test groups to skip")

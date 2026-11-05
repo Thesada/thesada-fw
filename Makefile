@@ -142,3 +142,5 @@ provision: ## First flash of a new board: upload + seed the AP passphrase and cl
 .PHONY: clean
 clean: ## Remove build output: .pio, build/, compile_commands.json
 	rm -rf .pio build compile_commands.json
+
+-include .forgejo/publish.mk

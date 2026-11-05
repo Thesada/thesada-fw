@@ -75,8 +75,8 @@ class MqttSubTable {
     }
   }
 
-  // Active topics, in registration order. Used to replay AT+SMSUB on the
-  // cellular session and to resubscribe after a reconnect.
+  // Active topics, in registration order. Used to resubscribe after a
+  // reconnect.
   template <typename Fn>
   void forEachActive(Fn fn) const {
     for (uint8_t i = 0; i < _count; i++) {

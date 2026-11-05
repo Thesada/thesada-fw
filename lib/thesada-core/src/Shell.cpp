@@ -37,7 +37,9 @@
 
 ShellEntry Shell::_commands[MAX_COMMANDS];
 int Shell::_commandCount = 0;
-char Shell::_parseBuf[256];
+char Shell::_parseBuf[SHELL_NEST_MAX][SHELL_LINE_MAX];
+bool Shell::_failed[SHELL_NEST_MAX] = {};
+int  Shell::_depth = 0;
 
 Shell::FSMount Shell::_fsMounts[Shell::FS_MOUNTS_MAX] = {};
 int            Shell::_fsMountCount = 0;
@@ -53,49 +55,61 @@ uint8_t             Shell::_ringTail = 0;
 static portMUX_TYPE _shellRingMux = portMUX_INITIALIZER_UNLOCKED;
 
 // ---------------------------------------------------------------------------
-// Parser
-// ---------------------------------------------------------------------------
-
-int Shell::parse(const char* line, char** argv, int maxArgs) {
-  strncpy(_parseBuf, line, sizeof(_parseBuf) - 1);
-  _parseBuf[sizeof(_parseBuf) - 1] = '\0';
-
-  int argc = 0;
-  char* token = strtok(_parseBuf, " \t");
-  while (token && argc < maxArgs) {
-    argv[argc++] = token;
-    token = strtok(nullptr, " \t");
-  }
-  return argc;
-}
-
-// ---------------------------------------------------------------------------
 // Command registry
 // ---------------------------------------------------------------------------
 
-void Shell::registerCommand(const char* name, const char* help, ShellCommand handler) {
+void Shell::registerCommand(const char* name, const char* help, ShellCommand handler,
+                            int restFrom) {
   if (_commandCount >= MAX_COMMANDS) return;
-  _commands[_commandCount] = {name, help, handler};
+  _commands[_commandCount] = {name, help, handler, restFrom};
   _commandCount++;
 }
 
-void Shell::execute(const char* line, ShellOutput out) {
-  if (!line || strlen(line) == 0) return;
-
-  char* argv[16];
-  int argc = parse(line, argv, 16);
-  if (argc == 0) return;
-
-  for (int i = 0; i < _commandCount; i++) {
-    if (strcasecmp(argv[0], _commands[i].name) == 0) {
-      _commands[i].handler(argc, argv, out);
-      return;
-    }
-  }
-
-  char msg[128];
-  snprintf(msg, sizeof(msg), "Unknown command: %s  (type 'help')", argv[0]);
+void Shell::fail(ShellOutput out, const char* msg) {
+  if (_depth > 0) _failed[_depth - 1] = true;
   out(msg);
+}
+
+ShellResult Shell::execute(const char* line, ShellOutput out) {
+  if (!line || strlen(line) == 0) return ShellResult::Ok;
+
+  int slot = shellParseSlot(_depth);
+  if (slot < 0) {
+    out("Shell busy (nested command) - not run");
+    return ShellResult::Failed;
+  }
+  char* buf = _parseBuf[slot];
+  char* argv[SHELL_ARGS_MAX];
+  int argc = 0;
+  // Name first, then split again the way that command takes its arguments.
+  ShellLine split = shellSplitLine(line, buf, SHELL_LINE_MAX, argv, SHELL_ARGS_MAX, &argc, 1);
+  const ShellEntry* cmd = nullptr;
+  for (int i = 0; split == ShellLine::Ok && argc > 0 && i < _commandCount; i++) {
+    if (strcasecmp(argv[0], _commands[i].name) == 0) { cmd = &_commands[i]; break; }
+  }
+  if (cmd) split = shellSplitLine(line, buf, SHELL_LINE_MAX, argv, SHELL_ARGS_MAX, &argc, cmd->restFrom);
+
+  bool handlerFailed = false;
+  if (split != ShellLine::Ok) {
+    char msg[80];
+    if (split == ShellLine::TooLong) {
+      snprintf(msg, sizeof(msg), "Line too long (max %u bytes) - not run", (unsigned)(SHELL_LINE_MAX - 1));
+    } else {
+      snprintf(msg, sizeof(msg), "Too many arguments (max %d words) - not run", SHELL_ARGS_MAX);
+    }
+    out(msg);
+  } else if (cmd) {
+    _failed[slot] = false;
+    _depth++;
+    cmd->handler(argc, argv, out);
+    _depth--;
+    handlerFailed = _failed[slot];
+  } else if (argc > 0) {
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Unknown command: %s  (type 'help')", argv[0]);
+    out(msg);
+  }
+  return shellDispatchResult(split, argc, cmd != nullptr, handlerFailed);
 }
 
 // Stage a command for main-loop execution via the deferred dispatcher.
@@ -105,6 +119,7 @@ void Shell::execute(const char* line, ShellOutput out) {
 // captures inline.
 bool Shell::enqueue(const char* line, ShellOutput sink) {
   if (!line || strlen(line) == 0) return false;
+  if (!shellFits(line, DEFERRED_LINE_LEN)) return false;
   bool accepted = false;
   taskENTER_CRITICAL(&_shellRingMux);
   uint8_t next = (uint8_t)((_ringTail + 1) % DEFERRED_RING_SIZE);
@@ -197,24 +212,37 @@ void Shell::loop() {
 void Shell::pumpConsole() {
   static char  buf[Shell::DEFERRED_LINE_LEN];
   static int   pos = 0;
+  static bool  overflow = false;
   // Drained, not left to fill the driver buffer: the console still echoes
   // nothing and the line never reaches execute().
   if (!shellModeSerialAllowed(mode())) {
     while (Serial.available()) Serial.read();
     pos = 0;
+    overflow = false;
     return;
   }
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
       buf[pos] = '\0';
-      if (pos > 0) {
+      bool wasOverflow = overflow;
+      bool hasLine = pos > 0;
+      // Reset before running: a line typed while it blocks starts at buf[0].
+      pos = 0;
+      overflow = false;
+      if (wasOverflow) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Line too long (max %d bytes) - not run", (int)sizeof(buf) - 1);
+        Console::reply(msg);
+        Console::endReply();
+      } else if (hasLine) {
         Shell::execute(buf, [](const char* line) { Console::reply(line); });
         Console::endReply();
       }
-      pos = 0;
     } else if (pos < (int)sizeof(buf) - 1) {
       buf[pos++] = c;
+    } else {
+      overflow = true;
     }
   }
 }
@@ -567,11 +595,7 @@ static void cmd_write(int argc, char** argv, ShellOutput out) {
 
   bool append = (strcasecmp(argv[0], "fs.append") == 0);
 
-  String content;
-  for (int i = 2; i < argc; i++) {
-    if (i > 2) content += " ";
-    content += argv[i];
-  }
+  String content(argv[2]);  // restFrom 2: the rest of the line as typed
 
   File f = fs->open(fsPath, append ? "a" : "w");
   if (!f) { out("Failed to open for writing"); return; }
@@ -584,13 +608,18 @@ static void cmd_write(int argc, char** argv, ShellOutput out) {
   out(msg);
 }
 
-// Rename or move a file
+// Rename or move a file. Both paths must resolve to one filesystem; rename
+// cannot cross mounts, and the stripped dst would land on the src mount.
 static void cmd_mv(int argc, char** argv, ShellOutput out) {
   if (argc < 3) { out("Usage: mv <src> <dst>"); return; }
   if (!Shell::pathSafe(argv[1]) || !Shell::pathSafe(argv[2])) {
     out("Invalid path"); return;
   }
   FS* fs = resolveFS(argv[1]);
+  if (resolveFS(argv[2]) != fs) {
+    out("Cannot move between filesystems");
+    return;
+  }
   const char* src = stripPrefix(argv[1]);
   const char* dst = stripPrefix(argv[2]);
 
@@ -737,6 +766,7 @@ static void cmd_config_get(int argc, char** argv, ShellOutput out) {
   JsonVariant current = cfg;
 
   char key[128];
+  if (!shellFits(argv[1], sizeof(key))) { out("Key too long (max 127 bytes)"); return; }
   strncpy(key, argv[1], sizeof(key) - 1);
   key[sizeof(key) - 1] = '\0';
 
@@ -770,14 +800,14 @@ static void cmd_config_get(int argc, char** argv, ShellOutput out) {
 // good config. Reports failure to the shell caller.
 static bool shellConfigWrite(JsonVariantConst src, ShellOutput out, size_t* bytes = nullptr) {
   File wf = LittleFS.open("/config.json.tmp", "w");
-  if (!wf) { out("Failed to write config.json"); return false; }
+  if (!wf) { Shell::fail(out, "Failed to write config.json"); return false; }
   size_t written  = serializeJsonPretty(src, wf);
   size_t expected = measureJsonPretty(src);
   wf.close();
   if (written < expected ||
       !LittleFS.rename("/config.json.tmp", "/config.json")) {
     LittleFS.remove("/config.json.tmp");
-    out("Failed to write config.json (fs full?)");
+    Shell::fail(out, "Failed to write config.json (fs full?)");
     return false;
   }
   if (bytes) *bytes = written;
@@ -797,7 +827,7 @@ static bool captureBootPrefix(BootPrefixKeep* kept, ShellOutput out) {
   kept->prefix[0] = '\0';
   if (!Config::topicPrefixHeld()) return true;
   if (!Config::copyBootTopicPrefix(kept->prefix, sizeof(kept->prefix))) {
-    out("Refused: boot topic prefix does not fit");
+    Shell::fail(out, "Refused: boot topic prefix does not fit");
     return false;
   }
   kept->keep = true;
@@ -814,31 +844,29 @@ static void restoreBootPrefix(const BootPrefixKeep* kept, const char* key) {
 }
 
 static void cmd_config_set(int argc, char** argv, ShellOutput out) {
-  if (argc < 3) { out("Usage: config.set <key> <value>  (then config.save to persist)"); return; }
+  if (argc < 3) { Shell::fail(out, "Usage: config.set <key> <value>  (then config.save to persist)"); return; }
+  char key[128];
+  if (!shellFits(argv[1], sizeof(key))) { Shell::fail(out, "Key too long (max 127 bytes)"); return; }
   BootPrefixKeep kept;
   if (!captureBootPrefix(&kept, out)) return;
 
-  String value;
-  for (int i = 2; i < argc; i++) {
-    if (i > 2) value += " ";
-    value += argv[i];
-  }
+  // Registered with restFrom 2: argv[2] is the value as typed.
+  String value(argv[2]);
   // Strip surrounding double quotes (MQTT CLI payloads often arrive quoted)
   if (value.length() >= 2 && value.charAt(0) == '"' && value.charAt(value.length() - 1) == '"') {
     value = value.substring(1, value.length() - 1);
   }
 
-  if (!LittleFS.exists("/config.json")) { out("config.json not found"); return; }
+  if (!LittleFS.exists("/config.json")) { Shell::fail(out, "config.json not found"); return; }
   File f = LittleFS.open("/config.json", "r");
-  if (!f) { out("Failed to read config.json"); return; }
+  if (!f) { Shell::fail(out, "Failed to read config.json"); return; }
   String json = f.readString();
   f.close();
 
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, json);
-  if (err) { out("JSON parse error in config.json"); return; }
+  if (err) { Shell::fail(out, "JSON parse error in config.json"); return; }
 
-  char key[128];
   strncpy(key, argv[1], sizeof(key) - 1);
   key[sizeof(key) - 1] = '\0';
 
@@ -860,7 +888,7 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
       size_t idx;
       if (parent.is<JsonArray>() && parseArrayIndex(token, idx)) {
         JsonArray arr = parent.as<JsonArray>();
-        if (idx >= arr.size()) { out("Parent array index out of range"); return; }
+        if (idx >= arr.size()) { Shell::fail(out, "Parent array index out of range"); return; }
         parent = arr[idx];
       } else if (parent.is<JsonObject>()) {
         // Auto-create missing intermediate objects so config.set can land
@@ -877,14 +905,14 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
             snprintf(msg, sizeof(msg),
                      "Parent path '%s' doesn't exist. Run config.set %s [] first.",
                      path.c_str(), path.c_str());
-            out(msg);
+            Shell::fail(out, msg);
             return;
           }
           parent[token].to<JsonObject>();
         }
         parent = parent[token];
       } else {
-        out("Parent key not found");
+        Shell::fail(out, "Parent key not found");
         return;
       }
       walked = walked.length() ? walked + "." + token : String(token);
@@ -911,13 +939,13 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
       snprintf(msg, sizeof(msg),
                "Parent path '%s' is not an array. Run config.set %s [] first.",
                parentPath.c_str(), parentPath.c_str());
-      out(msg);
+      Shell::fail(out, msg);
       return;
     }
     if (parent.is<JsonArray>() && parseArrayIndex(finalKey, finalIdx)) {
       JsonArray arr = parent.as<JsonArray>();
       if (finalIdx > arr.size()) {
-        out("Array index out of range (would leave hole)");
+        Shell::fail(out, "Array index out of range (would leave hole)");
         return;
       }
       if (finalIdx == arr.size()) {
@@ -939,7 +967,7 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
       }
       target = parent[finalKey];
     } else {
-      out("Parent is not an object or array");
+      Shell::fail(out, "Parent is not an object or array");
       return;
     }
 
@@ -991,7 +1019,7 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
     }
   } else {
     // Top-level key.
-    out("Cannot set top-level keys directly (use section.key format)");
+    Shell::fail(out, "Cannot set top-level keys directly (use section.key format)");
     return;
   }
 
@@ -1015,7 +1043,7 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
 static void cmd_config_save(int argc, char** argv, ShellOutput out) {
   JsonDocument dst;
   if (!Config::copyDiskDoc(dst)) {
-    out("Failed to snapshot config");
+    Shell::fail(out, "Failed to snapshot config");
     return;
   }
   size_t bytes = 0;
@@ -1031,20 +1059,20 @@ static void cmd_config_save(int argc, char** argv, ShellOutput out) {
 // for a key whose type changed between releases (e.g. bool -> object):
 // delete the stale node, then config.set recreates it with the new shape.
 static void cmd_config_del(int argc, char** argv, ShellOutput out) {
-  if (argc < 2) { out("Usage: config.del <key>  (dot notation; bare section name deletes the section)"); return; }
+  if (argc < 2) { Shell::fail(out, "Usage: config.del <key>  (dot notation; bare section name deletes the section)"); return; }
   BootPrefixKeep kept;
   if (!captureBootPrefix(&kept, out)) return;
 
   if (!strchr(argv[1], '.')) {
-    if (!LittleFS.exists("/config.json")) { out("config.json not found"); return; }
+    if (!LittleFS.exists("/config.json")) { Shell::fail(out, "config.json not found"); return; }
     File f = LittleFS.open("/config.json", "r");
-    if (!f) { out("Failed to read config.json"); return; }
+    if (!f) { Shell::fail(out, "Failed to read config.json"); return; }
     String json = f.readString();
     f.close();
     JsonDocument doc;
-    if (deserializeJson(doc, json)) { out("JSON parse error in config.json"); return; }
+    if (deserializeJson(doc, json)) { Shell::fail(out, "JSON parse error in config.json"); return; }
     JsonObject root = doc.as<JsonObject>();
-    if (root[argv[1]].isNull()) { out("Key not found"); return; }
+    if (root[argv[1]].isNull()) { Shell::fail(out, "Key not found"); return; }
     root.remove(argv[1]);
     if (!shellConfigWrite(doc.as<JsonVariantConst>(), out)) return;
     Config::load();
@@ -1333,12 +1361,9 @@ static void cmd_mqtt(int argc, char** argv, ShellOutput out) {
   snprintf(line, sizeof(line), "  broker: %s:%d  prefix: %s", broker, port, prefix);
   out(line);
 
-  // Surface which transport carries the session - cellular takes over
-  // when WiFi is down (see CellularModule's STANDBY/ACTIVE policy), so a
-  // debug session sees the carrier without grepping serial logs.
-  const Net::CellularProvider* cell = Net::cellular();
-  bool viaCellular = cell && cell->linkUp && cell->linkUp() && !WiFiManager::connected();
-  snprintf(line, sizeof(line), "  transport: %s", viaCellular ? "cellular" : "WiFi");
+  // Which transport carries the session - cellular takes over when WiFi
+  // is down (see CellularModule's STANDBY/ACTIVE policy).
+  snprintf(line, sizeof(line), "  transport: %s", MQTTClient::transportName());
   out(line);
 
   snprintf(line, sizeof(line), "  subs: %u/%u",
@@ -1473,8 +1498,8 @@ static void httpFetchTask(void* arg) {
 // HTTPS GET via whichever transport is up - the single HTTPS-GET shell
 // command, auto-routed. WiFi -> a deep-stack task running HTTPClient +
 // WiFiClientSecure (CA loaded from /ca.crt). WiFi down + cellular up ->
-// the modem SSL socket via the Net cellular provider (no ESP-side
-// mbedtls, so it runs inline). Output: status code, body length, first
+// Cellular::httpsGet via the Net cellular provider, inline on the loop
+// task like the MQTT handshake. Output: status code, body length, first
 // <=1 KB preview. HTTPS-only by default; plain HTTP needs --insecure.
 //
 // in:  argv - optional "--insecure", then the URL
@@ -1557,6 +1582,15 @@ static void cmd_http(int argc, char** argv, ShellOutput out) {
     const Net::CellularProvider* cell = Net::cellular();
     if (cell && cell->linkUp && cell->linkUp() && cell->httpsGet) {
       if (!https) { out("cellular path is HTTPS only"); free(job); return; }
+      // Same CA rule as the WiFi branch: /ca.crt, or --insecure to skip.
+      String pem;
+      File ca = LittleFS.open("/ca.crt", "r");
+      if (ca) { pem = ca.readString(); ca.close(); }
+      if (pem.isEmpty() && !job->insecure) {
+        out("net.http: no /ca.crt on flash - pass --insecure to skip verification");
+        free(job);
+        return;
+      }
       via = "cellular";
       // No ESP-side mbedtls on the cellular path (the modem does TLS), so
       // this runs inline on the main-loop task without the stack hit.
@@ -1569,7 +1603,8 @@ static void cmd_http(int argc, char** argv, ShellOutput out) {
         }
         return true;
       };
-      job->ok = cell->httpsGet(host, path, port, sink, &job->status);
+      job->ok = cell->httpsGet(host, path, port, pem.isEmpty() ? nullptr : pem.c_str(),
+                               sink, &job->status);
     } else {
       out("no transport up");
       free(job);
@@ -1728,8 +1763,7 @@ static void cmd_cert_clear(int argc, char** argv, ShellOutput out) {
 // telegram.bot_token, web.password, wifi.ap_password, wifi.password:<ssid>.
 static void cmd_secret_set(int argc, char** argv, ShellOutput out) {
   if (argc < 3) { out("Usage: secret.set <field> <value>"); return; }
-  String value;
-  for (int i = 2; i < argc; i++) { if (i > 2) value += " "; value += argv[i]; }
+  String value(argv[2]);  // restFrom 2: the rest of the line as typed
   if (value.length() >= 2 && value.charAt(0) == '"' &&
       value.charAt(value.length() - 1) == '"') {
     value = value.substring(1, value.length() - 1);
@@ -1737,7 +1771,8 @@ static void cmd_secret_set(int argc, char** argv, ShellOutput out) {
   bool ok = Secret::set(argv[1], value.c_str());
   // Wipe the plaintext secret from the String's heap buffer before it frees.
   mbedtls_platform_zeroize((void*)value.c_str(), value.length());
-  out(ok ? "secret stored in NVS" : "unknown field or NVS write failed");
+  if (ok) out("secret stored in NVS");
+  else Shell::fail(out, "unknown field or NVS write failed");
 }
 
 // Erase a secret from NVS; the read site falls back to config.json/empty.
@@ -2269,15 +2304,15 @@ void Shell::registerBuiltins() {
   registerCommand("fs.ls",         "List directory (fs.ls [path], glob ok)", cmd_ls);
   registerCommand("fs.cat",        "Print file contents",           cmd_cat);
   registerCommand("fs.rm",         "Remove a file (glob needs --yes)", cmd_rm);
-  registerCommand("fs.write",      "Write content to file",         cmd_write);
-  registerCommand("fs.append",     "Append content to file",        cmd_write);
+  registerCommand("fs.write",      "Write content to file",         cmd_write, 2);
+  registerCommand("fs.append",     "Append content to file",        cmd_write, 2);
   registerCommand("fs.mv",         "Rename/move a file",            cmd_mv);
   registerCommand("fs.df",         "Disk usage (LittleFS + SD)",    cmd_df);
   registerCommand("fs.format",     "Reformat LittleFS (fs.format --yes)", cmd_format);
 
   // Config
   registerCommand("config.get",    "Read config key (dot notation)",   cmd_config_get);
-  registerCommand("config.set",    "Set config key (saves + reloads)", cmd_config_set);
+  registerCommand("config.set",    "Set config key (saves + reloads)", cmd_config_set, 2);
   registerCommand("config.del",    "Delete config key or section",     cmd_config_del);
   registerCommand("config.save",   "Save current config to flash",     cmd_config_save);
   registerCommand("config.reload", "Reload config from flash",         cmd_config_reload);
@@ -2297,7 +2332,7 @@ void Shell::registerBuiltins() {
   registerCommand("cert.info",     "Show stored client cert metadata",  cmd_cert_info);
   registerCommand("cert.apply",    "Reconnect MQTT with stored cert",   cmd_cert_apply);
   registerCommand("cert.clear",    "Erase client cert from NVS",        cmd_cert_clear);
-  registerCommand("secret.set",    "Provision a secret into NVS",       cmd_secret_set);
+  registerCommand("secret.set",    "Provision a secret into NVS",       cmd_secret_set, 2);
   registerCommand("secret.info",   "Show which secrets are NVS-backed", cmd_secret_info);
   registerCommand("secret.clear",  "Erase a secret from NVS",           cmd_secret_clear);
   registerCommand("boot.info",     "Last reset reason + uptime",    cmd_boot_info);

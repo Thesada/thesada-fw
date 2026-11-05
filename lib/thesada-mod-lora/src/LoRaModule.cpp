@@ -75,10 +75,8 @@ void LoRaModule::begin() {
     "Transmit a text packet (lora.send <text>)",
     [this](int argc, char** argv, ShellOutput out) {
       if (argc < 2) { out("usage: lora.send <text>"); return; }
-      String msg;
-      for (int i = 1; i < argc; i++) { if (i > 1) msg += " "; msg += argv[i]; }
-      out(transmit(msg.c_str()) ? "TX_DONE" : "TX failed/timeout");
-    });
+      out(transmit(argv[1]) ? "TX_DONE" : "TX failed/timeout");
+    }, 1);
 
   Shell::registerCommand("lora.status",
     "Radio config + last RX stats",

@@ -25,7 +25,8 @@ if #remote > 0 then
     if not data or not data.sensors then return end
     temps = {}
     for i, s in ipairs(data.sensors) do
-      temps[i] = { name = s.name or "?", value = s.temp or -127 }
+      -- A stale probe has no temp; value stays nil and draws as "--".
+      temps[i] = { name = s.name or "?", value = s.temp }
     end
   end)
 
@@ -82,7 +83,12 @@ local function drawTemps()
   local y = 22
   for _, t in ipairs(temps) do
     if y > 62 then break end
-    Display.text(0, y, string.format("%-10s %6.1f%s", string.sub(t.name,1,10), t.value, unit))
+    local name = string.sub(t.name,1,10)
+    if t.value then
+      Display.text(0, y, string.format("%-10s %6.1f%s", name, t.value, unit))
+    else
+      Display.text(0, y, string.format("%-10s %6s", name, "--"))
+    end
     y = y + 12
   end
 end

@@ -1,14 +1,14 @@
 // thesada-fw - MQTTClient.h
 // MQTT with exponential backoff reconnect, ring buffer publish queue,
 // and topic-based subscription dispatch.
-// TLS-ready: set MQTT_TLS true in config.h to enable
+// One session over TlsClient on whichever transport is live: the WiFi
+// socket, or the modem socket while cellular has taken over.
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
 #include <Arduino.h>
 #include <PubSubClient.h>
 #include <WiFiClient.h>
-#include <WiFiClientSecure.h>
 #include <functional>
 #include <time.h>
 #include <vector>
@@ -74,8 +74,7 @@ public:
   // Cert/key are PEM-encoded. Max size per NVS blob: ~4000 B.
   // ECDSA P-256 certs ~800 B, keys ~250 B - well within limit.
   //
-  // Public so cellular and any other transport can size buffers passed
-  // into loadClientCert.
+  // Public so callers can size buffers passed into loadClientCert.
   static constexpr size_t CERT_MAX_LEN = 4000;
 
   // in:  certPEM / keyPEM  PEM strings; pass nullptr or empty to store only one half
@@ -86,16 +85,15 @@ public:
   // out: true if both are present in NVS
   static bool loadClientCert(char* cert, char* key, size_t maxLen);
 
-  // Clears both cert and key from NVS. Fires setOnClientCertCleared hook
-  // after a successful clear so transports holding a cached upload can drop it.
+  // Clears both cert and key from NVS.
   // out: true only when neither half is left in NVS
   static bool clearClientCert();
 
   // out: true if both cert and key are present in NVS
   static bool hasClientCert();
 
-  // A cert change applies only after a restart: WiFiClientSecure keeps sticky
-  // mbedtls state across a swap. The delay lets the shell reply go out first.
+  // A cert change applies only after a restart, so no session keeps running
+  // on the old identity. The delay lets the shell reply go out first.
   static constexpr uint32_t CERT_REBOOT_DELAY_MS = 3000;
 
   // in: reason for the log (static string). out: none.
@@ -111,69 +109,29 @@ public:
   // in: PEM cert + key. out: true when both parse and the key matches the cert.
   static bool clientCertPairValid(const char* certPEM, const char* keyPEM);
 
-  // out: true while the WiFi broker session is up and presented the client cert
+  // out: true while the broker session is up and presented the client cert
   static bool mtlsSessionUp();
 
-  // Hook fired from clearClientCert after NVS rows are gone.
-  // Cellular installs one so its modem-side cert cache invalidates and
-  // the active modem-MQTT session drops, forcing a reconnect under
-  // user/pass auth after the clear.
-  // in:  fn  closure, or nullptr to clear
-  static void setOnClientCertCleared(std::function<void()> fn);
+  // Offer the cellular link as the MQTT transport (WiFi down, modem
+  // ACTIVE) or withdraw it. WiFi always wins when it is up. On handoff the
+  // stale queue is dropped and the next loop dials the new transport.
+  // in: active. out: none.
+  static void setCellularTransport(bool active);
 
-  // Dispatch an inbound MQTT message into the registered subscription callbacks.
-  // Wildcard / exact match logic identical to the WiFi PubSubClient onMessage path.
-  // Tagged with the fallback session's auth mode, so a CLI command arriving
-  // here is judged on how THAT session authenticated.
-  // in:  topic / payload / length
-  // out: none
-  static void dispatchInbound(const char* topic, const char* payload, size_t length);
+  // out: "wifi", "cellular" or "none" for the live session.
+  static const char* transportName();
 
-  // How the fallback transport's own broker session authenticated. Its own
-  // session and its own credential, live at the same time as the WiFi one.
-  // in:  active  true = that session presented this device's client cert
-  static void setFallbackSessionMTLS(bool active);
-
-  // Whether the fallback transport's broker session checked the server
-  // certificate. Independent of the WiFi session's own check, and
-  // independent of client-cert mTLS. in: verified  true = CA was checked.
-  static void setFallbackTlsVerified(bool verified);
-
-  // Iterate active subscription topics.
-  // in:  fn  called with each topic string
-  // out: none
-  static void forEachSubscription(std::function<void(const char* topic)> fn);
-
-  // Optional forwarder installed by cellular so any subscribe() called at runtime
-  // also lands on the cellular MQTT session.
-  // in:  fn  closure, or nullptr to clear
-  static void setSubscribeForwarder(std::function<void(const char* topic)> fn);
-
-  // Fallback transport hint. When true, publish() routes to the registered
-  // publish-forwarder instead of enqueueing on a WiFi-side disconnect;
-  // the stale WiFi-side ring is dropped on handoff (level-triggered
-  // sensors refire) rather than replayed through the cellular forwarder.
-  // in:  active  true = cellular is publishing on this device's behalf
-  static void setFallbackPublishing(bool active);
+  // Disconnect and free the session's TLS buffers. loop() reconnects
+  // after the normal retry interval. in: none. out: none.
+  static void dropSession();
 
   // Publish the retained-state set this device owns: availability "online",
-  // HA discovery configs, /info, retained-topics manifest.
-  // Routes through publishRetained so the cellular forwarder picks it up
-  // when WiFi MQTT is down.
-  // The session-flag guards against republishing on every cellular
-  // STANDBY -> ACTIVE bounce within a single fallback window; it clears
-  // on setFallbackPublishing(false) so a new fallback window republishes.
-  // in:  force  skip the session-flag check (WiFi reconnect always republishes)
+  // HA discovery configs, /info, retained-topics manifest. connect() runs
+  // it with force on every new session; the session flag stops a
+  // non-forced caller from repeating it inside one session.
+  // in:  force  skip the session-flag check
   // out: none
   static void publishRetainedSet(bool force = false);
-
-  // Register a fallback publish forwarder. When WiFi MQTT is down and fallback
-  // publishing is active, publish() calls fn so every publish reaches the broker
-  // over a single canonical path. fn returns false if the transport is not ready;
-  // in that case publish() drops rather than enqueueing on the WiFi-side ring.
-  // in:  fn  forwarder closure, or nullptr to clear
-  // out: none
-  static void setPublishForwarder(std::function<bool(const char* topic, const char* payload, bool retain)> fn);
 
   // in:  cn / serial / notBefore / notAfter  caller-allocated, each >= maxLen bytes
   // out: true if cert parsed; never touches private key
@@ -187,8 +145,7 @@ private:
   static void onMessage(char* topic, uint8_t* payload, unsigned int length);
   // Capture topic in the rxRing and fire every active subscription whose
   // topic matches by exact string OR trailing /# (multi-level wildcard)
-  // OR trailing /+ (single-level wildcard). Shared by onMessage (WiFi)
-  // and dispatchInbound (cellular) so wildcard semantics stay in one place.
+  // OR trailing /+ (single-level wildcard).
   // payload must be null-terminated.
   static void matchAndDispatch(const char* topic, const char* payload);
   static void resubscribeAll();
@@ -203,7 +160,7 @@ private:
   static bool     _manifestPublished;     // initial manifest emitted at least once
   static bool     _manifestDirty;         // a topic was added after last emit
   static uint32_t _manifestDirtySinceMs;  // first dirty-set timestamp for debounce
-  static bool     _retainedPublishedThisSession;  // gate cellular republish bouncing
+  static bool     _retainedPublishedThisSession;  // retained set already sent this session
   static void recordRetainedTopic(const char* topic);
   static void publishRetainedManifest();
 
@@ -211,11 +168,6 @@ public:
   // Sampled at the most recent publishHeapStats() call, or live if never.
   static uint32_t currentFreeHeap();
 
-#ifdef MQTT_TLS
-  static WiFiClientSecure _wifiClient;
-#else
-  static WiFiClient       _wifiClient;
-#endif
   static PubSubClient  _client;
 
   static MQTTMessage   _queue[MQTT_QUEUE_SIZE];

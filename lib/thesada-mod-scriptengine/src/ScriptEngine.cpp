@@ -17,7 +17,7 @@
 //   Config.get(key)                    - read config value by dot-notation key
 //   Node.restart()                     - reboot the device
 //   Node.version()                     - returns FIRMWARE_VERSION string
-//   Node.uptime()                      - returns millis() as number
+//   Node.uptime()                      - ms since boot, 64-bit, never wraps
 //
 // Hot reload:
 //   ScriptEngine::reload() bumps generation counter, destroys Lua state,
@@ -36,6 +36,9 @@
 #include <ModuleRegistry.h>
 #include <Watchdog.h>
 #include <boot_wait_policy.h>
+#include <lua_timer_policy.h>
+
+#include <esp_timer.h>
 
 #include <LittleFS.h>
 #include <WiFi.h>
@@ -136,19 +139,26 @@ static const luaL_Reg mqttLib[] = {
 
 // Timer queue for Node.setTimeout
 struct LuaTimer {
-  uint32_t fireAt;
+  uint64_t fireAt;  // uptime ms, see lua_timer_policy.h
   int callbackRef;  // LUA_NOREF if unused
 };
 static constexpr int MAX_TIMERS = 8;
 static LuaTimer _timers[MAX_TIMERS] = {};
 
+static uint64_t uptimeMs() { return (uint64_t)(esp_timer_get_time() / 1000); }
+
 // Lua binding: Node.setTimeout(ms, callback) - queue a one-shot timer
 static int lua_node_setTimeout(lua_State* L) {
-  int ms = (int)luaL_checknumber(L, 1);
+  lua_Number ms = luaL_checknumber(L, 1);
   luaL_checktype(L, 2, LUA_TFUNCTION);
+  uint64_t fireAt = 0;
+  if (!luaTimerFireAt(uptimeMs(), (double)ms, &fireAt)) {
+    Log::kvfw("Lua", "script.timer_refused reason=nan_delay");
+    lua_pushboolean(L, false);
+    return 1;
+  }
   lua_pushvalue(L, 2);
   int ref = luaL_ref(L, LUA_REGISTRYINDEX);
-  uint32_t fireAt = millis() + (uint32_t)ms;
 
   for (int i = 0; i < MAX_TIMERS; i++) {
     if (_timers[i].callbackRef == LUA_NOREF) {
@@ -177,9 +187,10 @@ static int lua_node_version(lua_State* L) {
   return 1;
 }
 
-// Lua binding: Node.uptime() - return millis since boot
+// Lua binding: Node.uptime() - ms since boot from the 64-bit esp_timer.
+// LUA_32BITS makes it a float: monotonic, its step grows with uptime.
 static int lua_node_uptime(lua_State* L) {
-  lua_pushnumber(L, (lua_Number)millis());
+  lua_pushnumber(L, (lua_Number)uptimeMs());
   return 1;
 }
 
@@ -615,17 +626,12 @@ void ScriptEngine::begin() {
         if (argc < 2) { out("Usage: lua.exec <code>"); return; }
         extern lua_State* gL;
         if (!gL) { out("Lua state not initialized"); return; }
-        String code;
-        for (int i = 1; i < argc; i++) {
-          if (i > 1) code += " ";
-          code += argv[i];
-        }
-        int result = luaL_dostring(gL, code.c_str());
+        int result = luaL_dostring(gL, argv[1]);  // restFrom 1: code as typed
         if (result != LUA_OK) {
           const char* err = lua_tostring(gL, -1);
           char msg[196];
           snprintf(msg, sizeof(msg), "Error: %.180s", err ? err : "unknown");
-          out(msg);
+          Shell::fail(out, msg);
           lua_pop(gL, 1);
         } else {
           if (lua_gettop(gL) > 0) {
@@ -636,7 +642,7 @@ void ScriptEngine::begin() {
             out("OK");
           }
         }
-      });
+      }, 1);
 
   Shell::registerCommand("lua.load", "Execute a Lua file from LittleFS",
       [](int argc, char** argv, ShellOutput out) {
@@ -661,7 +667,7 @@ void ScriptEngine::begin() {
           const char* err = lua_tostring(gL, -1);
           char msg[196];
           snprintf(msg, sizeof(msg), "Error: %.180s", err ? err : "unknown");
-          out(msg);
+          Shell::fail(out, msg);
           lua_pop(gL, 1);
         } else {
           char msg[64];
@@ -705,10 +711,11 @@ uint32_t ScriptEngine::generation() {
 // Fire any expired Lua timers registered via Node.setTimeout
 void ScriptEngine::loop() {
   if (!gL) return;
-  uint32_t now = millis();
+  uint64_t upMs = uptimeMs();
 
   // Periodic full GC. See LUA_GC_INTERVAL_MS in thesada_config.h for rationale.
 #if LUA_GC_INTERVAL_MS > 0
+  uint32_t now = millis();
   static uint32_t lastGc = 0;
   if (now - lastGc >= LUA_GC_INTERVAL_MS) {
     lastGc = now;
@@ -717,7 +724,7 @@ void ScriptEngine::loop() {
 #endif
 
   for (int i = 0; i < MAX_TIMERS; i++) {
-    if (_timers[i].callbackRef != LUA_NOREF && now >= _timers[i].fireAt) {
+    if (_timers[i].callbackRef != LUA_NOREF && luaTimerDue(upMs, _timers[i].fireAt)) {
       int ref = _timers[i].callbackRef;
       _timers[i].callbackRef = LUA_NOREF;
       lua_rawgeti(gL, LUA_REGISTRYINDEX, ref);

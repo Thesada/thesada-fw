@@ -4,7 +4,7 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-10-26 (a Telegram or webhook POST resolves its host first, fed, skips on a failed resolve, and reads only the status line under a hard deadline after capped connect, handshake and write, so a stalled or slow-drip reply inside a boot script stays inside the task watchdog; a caught Lua budget error is re-raised by `pcall`/`xpcall` and fails the file, and the budget hook is inert after the file ends). Previously 2026-10-25 (MQTT dials the resolved broker address itself, so PubSubClient never repeats the lookup, and a DNS outage never spends the low-heap reboot budget; an SD directory named like a log holds its slot but is never resumed). Previously 2026-10-25 (no boot step blocks past the task watchdog without feeding it: the WiFi connect and NTP waits feed per poll step through `Watchdog::waitStep`, the OTA GET resolves and feeds before each redirect hop, and a boot Lua script is cut off after 10 s). Previously 2026-10-25 (the SD log to resume or open is picked from one root listing, so a card with hundreds of logs boots inside the 30 s watchdog). Previously 2026-10-25 (a failed healthy-uptime clear or USB mark is retried one hour after that failure, not on the next whole hour of uptime, so a first failure late in uptime does not retry on the next loop turn). Previously 2026-10-24 (a refused fled try puts back the age and try count its failed save overwrote in RAM, so a failed save spends no try; the age it holds is the 24 h cap, which adds no writes). Previously 2026-10-24 (a fled-release try whose save before the download fails does not download, so a lost write cannot let every boot install the build again). Previously 2026-10-24 (a fled release is refused for 24 h of skip age, then installed again, two tries before a new day starts, and the next switch starts a new record; the age is uptime carried over resets in RTC memory and saved at a boot's first refusal and at most every 10 min, and a synced clock adds at most an hour of time off per reset and is not read inside a boot, so a clock that jumps neither ends the skip more than an hour early nor makes it permanent). Previously 2026-10-24 (a slot switch from a confirmed image records its own `FIRMWARE_VERSION` as the fled release once the boot slot is set, and the update check refuses a manifest entry with that version as `fled-release`, so the image the switch booted does not pull the fled build straight back; another manifest version, `ota.check --force` and a firmware upload still install, and a power-on does not lift the refusal). Previously 2026-10-24 (the image a slot switch boots records the slot it came from by slot address and app ELF sha256, not by descriptor strings that match every build, and any boot of that slot removes the record, so a reinstalled build is a rollback target again and the old strings record blocks nothing; a switch target must verify as a whole image, and the rescue flag confirms only on a boot that no planned restart led to). Previously 2026-10-24 (a USB-flashed image that stays up an hour with a known crash streak is marked valid, so the first OTA after it can roll back to it; a switch target is still a valid slot only). Previously 2026-10-24 (the hourly healthy-uptime clear counts 64-bit uptime, so its retry still fires after the 49.7-day `millis()` wrap). Previously 2026-10-24 (a USB-flashed image, which otadata reads as undefined, counts as confirmed, so its operator restarts hold the crash streak; a failed healthy-uptime clear is tried again an hour later instead of settling). Previously 2026-10-23 (a CA, cert or key PEM handed to `WiFiClientSecure` is static, owned for the client's lifetime, or declared before the client in the same scope; `net.http` no longer drops its CA PEM before the handshake). Previously 2026-10-23 (an operator restart on a confirmed image holds the crash streak, and so does an MQTT budget reboot once that image has reached the broker since it was installed; a confirmed image that never reached the broker still counts its budget reboots and escapes to the other slot. A pending image counts every reset, and panic and watchdog resets always count). Previously 2026-10-22 (a valid image that stays up an hour clears its crash streak, so restarts weeks apart never add up to a slot switch; a loop that crashes within the hour still reaches the limit). Previously 2026-10-06 (a slot switch and a healthy confirm clear the crash streak, so the image that comes up next is not already at the limit). Previously 2026-10-06 (a pending image rolls back only when the other slot is a different valid image that is not the one just left; otherwise it is confirmed so the bootloader cannot boot that slot. A streak write that fails is treated as unread). Previously 2026-10-06 (a software reset counts toward the crash limit, so three restart loops abandon the image and one OTA reboot stays under it; power-on and deep sleep still clear the streak). Previously 2026-10-06 (three panic or watchdog resets abandon the running image: a pending image is marked invalid, a valid image boots the other valid slot and that slot is not the image just left, and a brownout holds the streak). Previously 2026-09-28 (a `cert.clear` that removed a cert reboots 3 s later, so the next boot starts enrollment; a unit that can re-enroll asks the app whether its cert serial is revoked and wipes only on an explicit, serial-matched "revoked"). Previously 2026-09-26 (a failed setup passphrase does not leave a station network, the claim link drops trailing slashes, and a timed-out enroll POST is reaped before the next one starts). Previously 2026-09-25 (the setup page exists only while the fallback AP is up and no station network is saved, unless a result from this boot is still on screen; the form is applied on the main loop and the claim link is text. A pending OTA image is marked valid after the first MQTT session or five minutes up, and a crash loop meets neither. Publish topic buffers are 160 bytes so a long tenant slug is not clipped. The enrollment claim code is an 8-digit serial-seeded
+Dated 2026-11-04 (one TLS stack on every transport: MQTT and HTTPS over cellular run `TlsClient`, mbedTLS on the ESP32, over a plain modem TCP socket, so the server chain and host name are checked exactly as on WiFi; the modem's own MQTT and SSL stacks are not used, and the modem sockets live for the whole program). Previously 2026-11-03 (cellular HTTPS binds a CA: OTA passes the WiFi CA to `Cellular::httpsGet`, which uploads, converts and binds it to the socket past TinyGSM's shadowed `certificates` array before connect and refuses on failure; `net.http` over cellular needs `/ca.crt` or `--insecure`). Previously 2026-11-03 (a POST body to `/api/config`, `/api/cmd` or `/api/file` is buffered per request in `req->_tempObject`, only after auth passes at chunk 0 and only up to the endpoint cap, and is acted on only when it arrived whole). Previously 2026-11-03 (an `ota.cmd_topic` publish only requests a check against `ota.manifest_url`; its payload never sets the manifest URL). Previously 2026-11-01 (HA discovery for a DS18B20 sets `expire_after` to three `temperature.interval_s`, so a stale probe, which skips its per-sensor topic, goes unavailable in HA instead of holding its last value). Previously 2026-11-01 (a shell error, an unknown command or a failed `config.set` / `config.del` / `config.save` / `secret.set` / `lua.exec` replies `ok:false` on `cli_response` and `/api/cmd`; a console line run while a command blocks parses into its own buffer and a deeper one is refused; `config.set`, `secret.set`, `fs.write`, `fs.append`, `cell.at`, `lora.send` and `lua.exec` take their value as the rest of the line, inner whitespace intact). Previously 2026-11-01 (the cellular `+SMPUB` command holds a full 159-byte topic, and a `+SMPUB`, `+CDNSGIP` or `+CNTP` command that does not fit its buffer is refused, never sent clipped). Previously 2026-11-01 (Lua `Node.uptime()` and `Node.setTimeout` deadlines count 64-bit `esp_timer` ms, so neither breaks at the 49.7-day `millis()` wrap; a NaN delay is refused, a negative one fires next pass, one past 30 days is capped). Previously 2026-11-01 (the shell refuses a line or a token it cannot hold instead of clipping it: the parser holds the 1023 bytes `runCli` accepts and 16 words, the WS terminal and serial console refuse a line past their 255-byte buffers, and shell `config.set` / `config.get` refuse a key past 127 bytes; `fs.mv` refuses a move between filesystems). Previously 2026-11-01 (a DS18B20 probe without a usable reading is published as `stale` with no `temp_c`/`temp` and no per-sensor value, never its last reading; a jump past `max_delta_c` is held and accepted when the next reading agrees with it, so one real step cannot lock a probe out). Previously 2026-11-01 (bearer-token and WS-grant expiry count 64-bit uptime, so an expired token or unused grant does not validate again 2^31 ms after it expired; the login lockout counts 64-bit uptime too, so no IP is locked out by the `millis()` wrap; after a lockout one wrong guess re-locks, an IP is forgotten on success or after 10 min with no failure, and a full table evicts the fewest-fails entry, else the soonest release, so a new IP is always counted). Previously 2026-10-26 (a Telegram or webhook POST resolves its host first, fed, skips on a failed resolve, and reads only the status line under a hard deadline after capped connect, handshake and write, so a stalled or slow-drip reply inside a boot script stays inside the task watchdog; a caught Lua budget error is re-raised by `pcall`/`xpcall` and fails the file, and the budget hook is inert after the file ends). Previously 2026-10-25 (MQTT dials the resolved broker address itself, so PubSubClient never repeats the lookup, and a DNS outage never spends the low-heap reboot budget; an SD directory named like a log holds its slot but is never resumed). Previously 2026-10-25 (no boot step blocks past the task watchdog without feeding it: the WiFi connect and NTP waits feed per poll step through `Watchdog::waitStep`, the OTA GET resolves and feeds before each redirect hop, and a boot Lua script is cut off after 10 s). Previously 2026-10-25 (the SD log to resume or open is picked from one root listing, so a card with hundreds of logs boots inside the 30 s watchdog). Previously 2026-10-25 (a failed healthy-uptime clear or USB mark is retried one hour after that failure, not on the next whole hour of uptime, so a first failure late in uptime does not retry on the next loop turn). Previously 2026-10-24 (a refused fled try puts back the age and try count its failed save overwrote in RAM, so a failed save spends no try; the age it holds is the 24 h cap, which adds no writes). Previously 2026-10-24 (a fled-release try whose save before the download fails does not download, so a lost write cannot let every boot install the build again). Previously 2026-10-24 (a fled release is refused for 24 h of skip age, then installed again, two tries before a new day starts, and the next switch starts a new record; the age is uptime carried over resets in RTC memory and saved at a boot's first refusal and at most every 10 min, and a synced clock adds at most an hour of time off per reset and is not read inside a boot, so a clock that jumps neither ends the skip more than an hour early nor makes it permanent). Previously 2026-10-24 (a slot switch from a confirmed image records its own `FIRMWARE_VERSION` as the fled release once the boot slot is set, and the update check refuses a manifest entry with that version as `fled-release`, so the image the switch booted does not pull the fled build straight back; another manifest version, `ota.check --force` and a firmware upload still install, and a power-on does not lift the refusal). Previously 2026-10-24 (the image a slot switch boots records the slot it came from by slot address and app ELF sha256, not by descriptor strings that match every build, and any boot of that slot removes the record, so a reinstalled build is a rollback target again and the old strings record blocks nothing; a switch target must verify as a whole image, and the rescue flag confirms only on a boot that no planned restart led to). Previously 2026-10-24 (a USB-flashed image that stays up an hour with a known crash streak is marked valid, so the first OTA after it can roll back to it; a switch target is still a valid slot only). Previously 2026-10-24 (the hourly healthy-uptime clear counts 64-bit uptime, so its retry still fires after the 49.7-day `millis()` wrap). Previously 2026-10-24 (a USB-flashed image, which otadata reads as undefined, counts as confirmed, so its operator restarts hold the crash streak; a failed healthy-uptime clear is tried again an hour later instead of settling). Previously 2026-10-23 (a CA, cert or key PEM handed to `WiFiClientSecure` is static, owned for the client's lifetime, or declared before the client in the same scope; `net.http` no longer drops its CA PEM before the handshake). Previously 2026-10-23 (an operator restart on a confirmed image holds the crash streak, and so does an MQTT budget reboot once that image has reached the broker since it was installed; a confirmed image that never reached the broker still counts its budget reboots and escapes to the other slot. A pending image counts every reset, and panic and watchdog resets always count). Previously 2026-10-22 (a valid image that stays up an hour clears its crash streak, so restarts weeks apart never add up to a slot switch; a loop that crashes within the hour still reaches the limit). Previously 2026-10-06 (a slot switch and a healthy confirm clear the crash streak, so the image that comes up next is not already at the limit). Previously 2026-10-06 (a pending image rolls back only when the other slot is a different valid image that is not the one just left; otherwise it is confirmed so the bootloader cannot boot that slot. A streak write that fails is treated as unread). Previously 2026-10-06 (a software reset counts toward the crash limit, so three restart loops abandon the image and one OTA reboot stays under it; power-on and deep sleep still clear the streak). Previously 2026-10-06 (three panic or watchdog resets abandon the running image: a pending image is marked invalid, a valid image boots the other valid slot and that slot is not the image just left, and a brownout holds the streak). Previously 2026-09-28 (a `cert.clear` that removed a cert reboots 3 s later, so the next boot starts enrollment; a unit that can re-enroll asks the app whether its cert serial is revoked and wipes only on an explicit, serial-matched "revoked"). Previously 2026-09-26 (a failed setup passphrase does not leave a station network, the claim link drops trailing slashes, and a timed-out enroll POST is reaped before the next one starts). Previously 2026-09-25 (the setup page exists only while the fallback AP is up and no station network is saved, unless a result from this boot is still on screen; the form is applied on the main loop and the claim link is text. A pending OTA image is marked valid after the first MQTT session or five minutes up, and a crash loop meets neither. Publish topic buffers are 160 bytes so a long tenant slug is not clipped. The enrollment claim code is an 8-digit serial-seeded
 secret that never rotates and that password-session `secret.set` refuses;
 enrollment only talks to an `https://` base. The cert arrives by HTTPS pull,
 not over the AP. A stored enrollment cert is never polled for again, a reply
@@ -89,12 +89,18 @@ Path validation via `Shell::pathSafe` runs BEFORE resolution - so
 filesystem the prefix would have routed to. Cross-FS escape via the
 prefix is structurally impossible.
 
+A command that takes two paths resolves both. `fs.mv` refuses with
+`Cannot move between filesystems` when they resolve to different
+filesystems: `rename` cannot cross mounts, and stripping both prefixes
+for the source's FS turned `fs.mv /data.csv /sd/data.csv` into a rename
+of `/data.csv` onto itself that replied `Renamed`.
+
 How enforced: core does not depend on the SD module (one-way: SD
 module depends on core). Modules call `Shell::registerFS` in their
 own `begin()` after mount; core never imports SD-mod headers.
 
 Source: `lib/thesada-core/src/Shell.cpp::resolveFS`, `stripPrefix`,
-`registerFS`; `lib/thesada-mod-sd/src/SDModule.cpp::begin` (caller);
+`registerFS`, `cmd_mv`; `lib/thesada-mod-sd/src/SDModule.cpp::begin` (caller);
 `lib/thesada-core/src/MQTTClient.cpp::runCli` (consumer).
 
 ---
@@ -142,8 +148,8 @@ Silent returns are a regression - any new bailout path in `check()` must
 add a matching `publishOtaRefusal` (or other state) call.
 
 `publishOtaRefusal` must NOT short-circuit on `!connected()`:
-`MQTTClient::publish` queues on the WiFi ring (or routes to the cellular
-forwarder) while the broker is down, so a refusal raised mid-outage is
+`MQTTClient::publish` queues on the ring while the broker is down, so a
+refusal raised mid-outage is
 still delivered on reconnect. A `connected()` guard there silently drops
 exactly the diagnostic an offline operator needs.
 
@@ -176,21 +182,82 @@ How enforced: host tests in `test/test_ota_verify`. Coverage floor 95% on
 
 Source: `lib/thesada-core/src/ota_verify_policy.h`.
 
+### An `ota.cmd_topic` publish never picks the manifest URL
+
+A message on `ota.cmd_topic` only requests a check against the configured
+`ota.manifest_url`; its payload is ignored and any pending override is
+cleared. The topic is not authz-gated, so a password, `allow_insecure` or
+unverified cellular session that can publish there would otherwise point the
+device at its own manifest, binary and sha256 under any publicly trusted
+cert. A URL override is `ota.check <url>`, which `cliAuthzPasswordCmdAllowed`
+keeps to mTLS, serial and HTTP.
+
+How enforced: code review of `OTAUpdate::registerCommandTopic`; the
+callback must not read `payload`.
+
+Source: `lib/thesada-core/src/OTAUpdate.cpp::registerCommandTopic`,
+`triggerCheck`.
+
 ### OTA-over-cellular shares the WiFi cert-verification gate
 
-The cellular OTA path (manifest fetch + binary fetch over the SIM7080
-HTTPS stack) is gated by the same `/ca.crt`-present-or-allow-insecure
-refusal as WiFi OTA. The check runs in `OTAUpdate::configureSecureClient`
-before any transport is selected, so cellular cannot quietly bypass
-the gate that was written for WiFi. `setInsecure()` on the cellular
-HTTPS client is rejected under the same rule.
+The cellular OTA path (manifest fetch + ranged binary fetch) verifies against
+the same CA as WiFi OTA: `otaCellularCa()` hands `Cellular::httpsGet` the
+`_otaCaCert` that `configureSecureClient` gives `WiFiClientSecure`
+(`/ca.crt`, else the PROGMEM bundle). `httpsGet` runs `TlsClient` over modem
+socket slot 1 with that bundle, so the check is the ESP32's own (next
+invariant). A null CA means no verification and is passed only when the CA
+is empty, which `begin()` / `check()` allow under `ota.allow_insecure` alone.
+`net.http` over cellular follows its WiFi rule: `/ca.crt`, or `--insecure`.
 
-How enforced: when a new transport gets added to OTA, route it through
-`configureSecureClient` rather than letting the transport hold its own
-TLS config.
+Fixed 2026-11-03 (fw#50): until then the cellular client never set a CA,
+so cellular OTA ran unverified TLS whatever the config said.
 
-Source: `lib/thesada-core/src/OTAUpdate.cpp::configureSecureClient`,
-`lib/thesada-mod-cellular/src/Cellular.cpp` HTTPS client wiring.
+How enforced: `httpsGet` takes the CA as a required argument with no
+default, so every caller states its choice and a new one does not compile
+without it. Code review keeps a non-null CA on every path that is not an
+explicit insecure opt-in. Bench check on owb-debug: `net.http` to a host
+whose cert names another domain is refused over cellular.
+
+Source: `lib/thesada-core/src/OTAUpdate.cpp` (`otaCellularCa`,
+`otaHttpGetCellular`, `downloadBinaryChunkedCellular`),
+`lib/thesada-mod-cellular/src/Cellular.cpp::httpsGet`,
+`lib/thesada-core/src/Shell.cpp` (`net.http` cellular branch),
+`lib/thesada-core/src/Net.h`.
+
+### Every TLS session on the modem checks chain and host name on the ESP32
+
+MQTT over cellular and `Cellular::httpsGet` run `TlsClient`: mbedTLS on the
+ESP32 over a plain modem TCP socket (`Cellular::tcpClient`). The host name
+is set on every session, sent as SNI and checked against the server
+certificate, and `TlsClient` refuses to start a session with a CA but no
+host name, or with neither a CA nor an explicit `setInsecure()`. The MQTT
+session is one `TlsClient` that rides on the WiFi socket or the modem
+socket, so WiFi and cellular apply the same chain, name and client-cert
+rules.
+
+The SIM7080's own TLS (`SMSSL` for MQTT, `CASSLCFG` sockets) checks the
+chain against an uploaded CA but never the host name, and no AT setting
+turns that on (SIM7080 AT manual V1.02). A valid chain to any root in the
+bundle passed for any name. The modem TLS stacks are therefore not used for
+anything that needs to know who answered.
+
+The two modem sockets are static `ModemClient`s for the program's lifetime.
+TinyGSM registers a client in `sockets[mux]` when it is constructed and
+never removes it, so a freed client would leave a dangling pointer that a
+later `+CASTATE` / `+CADATAIND` / `+CARECV` URC writes through. TinyGSM's
+`maintain()` refreshes buffered data only through `sockets[0]`, so slot 0
+must exist for any slot to read. Each socket call takes the AT bus guard
+for that exchange only, never for a whole transfer.
+
+How enforced: code review rejects a new modem TLS path (`SMSSL`,
+`CASSLCFG`, `TinyGsmClientSecure`) and a heap-allocated TinyGSM client.
+Bench check on owb-debug: MQTT and `net.http` to a name the broker cert
+does not cover are refused over cellular with
+`tls.handshake_failed ... verify=0x00000004` (CN mismatch).
+
+Source: `lib/thesada-core/src/TlsClient.{h,cpp}`,
+`lib/thesada-mod-cellular/src/Cellular.cpp` (`ModemSocket`, `ModemClient`,
+`tcpClient`, `httpsGet`), `lib/thesada-core/src/MQTTClient.cpp::connect`.
 
 ### MQTT TLS is always certificate-validated - no pre-NTP insecure window
 
@@ -359,10 +426,8 @@ string in the config image, so a fleet flashed from one image answers to one
 name. The MQTT clientId reads it, and two units answering to one clientId evict
 each other from the broker, so no broker path may run on the literal.
 `identityBrokerNameUsable(device_id)` is the gate: `setup()` clears
-`_mqttEnabled` (`boot.mqtt_disabled reason=node_name_not_unique`) and
-`Cellular::mqttConnect` refuses before configuring the modem session
-(`cellular.mqtt.refused`). The cellular recovery loop returns on that refusal
-rather than retrying, because it cannot clear without a reboot. `Shell` still
+`_mqttEnabled` (`boot.mqtt_disabled reason=node_name_not_unique`), so
+`MQTTClient` never starts and no transport carries a session. `Shell` still
 starts either way - serial is the recovery route.
 
 The gate reads the minted id only. A set `device.name` is not proof of a unique
@@ -494,8 +559,11 @@ the fled-release skip and its expiry are `otaFledAction` and the `otaFled*` help
 
 `Config::TOPIC_PREFIX_CAP` allows a prefix that, with `/sensor/battery/percent`, does not fit in a 64 or 96 byte topic. A clipped topic is a different topic. The queue slot, the subscription table, and the CLI topic buffers use the same 160 byte cap.
 
+The cellular `+CDNSGIP` and `+CNTP` commands refuse a host that does not fit their buffer (`cellular.resolve_skipped`, `cellular.ntp_skipped`), never sending it clipped.
+
 Source: `MQTTClient.h` `MQTT_TOPIC_CAP`, `cli_topics.h` `CLI_TOPIC_CAP`,
-`mqtt_sub_table.h`.
+`mqtt_sub_table.h`, `lib/thesada-mod-cellular/src/Cellular.cpp`
+(`resolveHost`, `ntpSync`).
 
 ### MQTT CLI commands are authorized against the session's auth mode
 
@@ -524,15 +592,12 @@ reach afterwards. The password row is exactly what the pair and recovery
 flows publish while a device is on the shared credential.
 
 The mode is a property of the session that carried the command, and it is
-frozen at dispatch, before the Shell deferred ring. Each transport owns its
-own answer: the WiFi session's is `_mtlsActive`, recomputed from scratch on
-every `connect()` attempt ahead of the early returns; the fallback
-transport's arrives through `MQTTClient::setFallbackSessionMTLS` and is set
-on every `Cellular::mqttConnect` outcome. One flag cannot serve both - the
-two sessions hold different credentials and stay live at the same time, so a
-device that failed over from WiFi mTLS to a cellular password session would
-otherwise carry the mTLS verdict onto the password path and leave the gate
-wide open. Password is the default in every ambiguous case.
+frozen at dispatch, before the Shell deferred ring. There is one session,
+on whichever transport is live, so one answer: `_mtlsActive`, recomputed
+from scratch on every `connect()` attempt ahead of the early returns. A move
+between WiFi and cellular is a new `connect()`, so the verdict never carries
+over from the other transport. Password is the default in every ambiguous
+case.
 
 Not device authentication. A leaked per-device cert still gets the full
 surface - the CLI carries no signature and no replay protection.
@@ -585,9 +650,7 @@ deferred reinit reconnect), never read out of `Config` at some other moment,
 so a reconnect on a changed port re-evaluates the verdict along with
 everything else `connect()` recomputes. On a non-matching port the client
 material is not attached either, so the session really is password auth and
-sends user/pass. The cellular session applies the same term to `wantMTLS`
-before `setFallbackSessionMTLS`, taken from the port it hands to
-`SMCONF="URL"`.
+sends user/pass. The same `connect()` serves WiFi and cellular.
 
 The check is positive and fail-closed: `== MQTT_MTLS_PORT`, never
 `!= password_port`. Some deployments run a plaintext listener, and "not the
@@ -603,8 +666,7 @@ override it per env. The broker listener and whatever pairs devices against it
 pin the same number; all of them move together or paired devices stop being
 judged as paired.
 
-Source: `src/thesada_config.h`, `lib/thesada-core/src/MQTTClient.cpp::connect`,
-`lib/thesada-mod-cellular/src/Cellular.cpp::mqttConnect`.
+Source: `src/thesada_config.h`, `lib/thesada-core/src/MQTTClient.cpp::connect`.
 
 ### `cert.clear` opens to a password session only on a broken stored cert
 
@@ -927,26 +989,37 @@ single backtrack point - no recursion, because this runs on the shell's
 Source: `lib/thesada-core/src/glob_policy.h`,
 `lib/thesada-core/src/Shell.cpp` (`cmd_rm`, `_rmGlob`, `cmd_ls`).
 
-### Auth-state TTLs compare rollover-safe, never `now < expiry`
+### Auth-state deadlines count 64-bit uptime, never `millis()`
 
-Bearer-token expiry, the 30 s WS pre-auth window, and the login
-rate-limit lockout are persistent auth state gated on `millis()`. A
-plain `now < expiry` flips its answer at the ~49.7 d wrap: expired
-entries spring back to life (stale WS grants, dead tokens) and
-lockouts re-open or extend (F4). All such compares go through the
-signed-subtraction helpers in `ttl_policy.h`; oldest-slot eviction
-compares remaining time, never raw expiry values, which sort wrongly
-across the wrap. Transient sub-minute `while (millis() < deadline)`
-poll loops (cellular AT, OTA pacing, shell drains) are exempt - worst
-case there is one early timeout at the wrap, self-healing on retry.
+Bearer-token expiry (1 h), the WS pre-auth grant (30 s) and the login
+lockout (30 s) are persistent auth state. They are stored and compared
+as 64-bit uptime ms (`esp_timer_get_time() / 1000`), which does not wrap,
+so a plain `now < expiry` is exact.
 
-How enforced: the helpers are pure and host-tested
-(`test/test_ttl_policy`, including both wrap directions). New
-`millis()`-based auth state must use `ttlActive` / `ttlReached` /
-`ttlRemaining`; reviewers grep new auth code for raw expiry compares.
+`millis()` is not safe here, signed subtraction included. Nothing clears
+a token or grant slot when it expires, and `(int32_t)(expiry - now) > 0`
+turns true again from 2^31 to 2^32 ms after expiry: an expired token, or
+an unused grant for its IP, validated for another 24.8 days unless a newer
+entry reused the slot. Signed subtraction is only correct while every
+compared value is within 2^31 ms of now, and a stale slot is not.
+
+Expiry `0` is the empty / consumed sentinel. Every expiry is uptime plus
+a nonzero TTL, so a live entry never lands on it. Token eviction compares
+raw expiry values directly, which is correct once nothing wraps.
+
+Transient sub-minute `while (millis() < deadline)` poll loops (cellular
+AT, OTA pacing, shell drains) and the `_warnDue` log throttle are exempt:
+worst case is one early timeout or one dropped warn at the wrap,
+self-healing on retry.
+
+How enforced: `ttlActive` (`ttl_policy.h`) takes 64-bit values and is
+host-tested in `test/test_ttl_policy` past 2^31 and 2^32 ms after expiry;
+the lockout lives in `login_rate_policy.h` (entry below). All three use
+the one `_uptimeMs()` clock in `HttpServer.cpp`. New auth state stores
+`uint64_t` deadlines from that clock; reviewers reject a `millis()` expiry.
 
 Source: `lib/thesada-core/src/ttl_policy.h`,
-`lib/thesada-mod-httpserver/src/HttpServer.cpp` (`_rlAllow`,
+`lib/thesada-mod-httpserver/src/HttpServer.cpp` (`_uptimeMs`,
 `_createToken`, `_validateToken`, `_grantWsAuth`, `_consumeWsAuth`).
 
 ### OTA upload chunks are auth-gated before any `Update` call
@@ -970,6 +1043,28 @@ reaches `Update`, not in a completion handler.
 Source: `lib/thesada-mod-httpserver/src/HttpServer.cpp` (`/ota` upload
 lambda).
 
+### A POST body is buffered per request, only after auth, and capped
+
+`/api/config`, `/api/cmd` and `/api/file` keep their body in
+`req->_tempObject`, one `malloc`'d `HttpBody` per request that the request
+destructor frees. `_bodyChunk` allocates it at chunk 0 only when
+`_checkAuth` passes and the declared total fits the endpoint cap (config and
+file 16 KB, cmd 2 KB); a chunk out of order or past the total poisons it.
+So another client's chunk 0 can neither reset nor write into an operator's
+upload, an unauthenticated `Content-Length` pins no heap, and the handler
+acts only on a body that arrived whole (`_bodyOrReply`: 401, 413, 400).
+`/api/file` reads the body before it opens the target, so a lost body does
+not truncate the file. Same chunk-before-completion ordering as the `/ota`
+rule above.
+
+How enforced: host tests in `test/test_http_body` over
+`http_body_policy.h`, coverage floor 95%. No body-taking handler keeps a
+file-scope buffer.
+
+Source: `lib/thesada-core/src/http_body_policy.h`,
+`lib/thesada-mod-httpserver/src/HttpServer.cpp` (`_bodyChunk`,
+`_bodyOrReply`, the three handlers).
+
 ### Bearer token comparison is constant-time
 
 `_validateToken` compares via `_constTimeEq` (no early return) and
@@ -981,8 +1076,26 @@ Source: `lib/thesada-mod-httpserver/src/HttpServer.cpp::_validateToken`.
 
 ### HTTP rate limiter: 5 fails -> 30 s lockout, 16 IP table, auto-reset on success
 
-Source: `lib/thesada-mod-httpserver/src/HttpServer.cpp::_rlCheck` /
-`_rlReset`.
+Five counted guesses (`webAuthCountsAsGuess`) from one source IP lock
+`/api/login` and `/api/auth/check` for 30 s. After that, one more
+wrong guess re-locks. A success, or 10 min with no failure, forgets the IP.
+
+| Rule | Why |
+|---|---|
+| Time is 64-bit uptime (`esp_timer_get_time`), not `millis()` | a `millis()` deadline goes stale: `until = 0` read as locked for 24.8 d once uptime passed 2^31 ms, and a passed lockout came back 2^31 ms later |
+| Fewer than 5 fails is always allowed | only a full count locks |
+| A passed lockout keeps the entry at 4 fails | the next wrong guess re-locks at once: a single-IP brute force gets 1 guess per 30 s, not 5 |
+| Success (`reset`) or `LOGIN_RATE_QUIET_MS` (10 min) with no failure clears the entry | an operator's old typos do not follow them; a quiet entry is a free slot |
+| A guess while locked changes nothing | cannot extend the lockout or overflow the count |
+| Full table: take a free or quiet slot, else the fewest fails, else the soonest release | a new IP is always counted; the old table stopped counting after 16 IPs. A released lockout is not free, it ranks at 4 fails |
+
+How enforced: `LoginRateTable` (`login_rate_policy.h`), host-tested in
+`test/test_login_rate` under a 95% floor, including both wrap cases, the
+re-lock after a lockout, the quiet period, and every eviction branch. `HttpServer.cpp` only supplies the IP and the clock.
+
+Source: `lib/thesada-core/src/login_rate_policy.h`,
+`lib/thesada-mod-httpserver/src/HttpServer.cpp` (`_rlAllow`, `_rlFail`,
+`_rlReset`, `_uptimeMs`).
 
 ---
 
@@ -1173,8 +1286,10 @@ Source: `lib/thesada-core/src/Config.cpp`,
 
 `ATGuard` is a recursive mutex wrapper around the SIM7080 AT
 serial line. Every AT exchange takes the guard for the duration of
-its `sendAT` / `waitResponse` pair so URC parsing and inbound
-`+SMSUB` handling cannot interleave with command dispatch. The guard
+its `sendAT` / `waitResponse` pair so URC parsing and socket reads
+cannot interleave with command dispatch. A socket takes it per call, and
+`available()` only tries it without waiting, so a transfer on one socket
+never locks out the health probe or the other socket. The guard
 has a `pause()` method that releases-sleeps-reacquires for long
 backoffs so other tasks (Shell over serial, network timeout polls)
 can preempt without starving.
@@ -1187,7 +1302,7 @@ Source: `lib/thesada-mod-cellular/src/Cellular.cpp::ATGuard`.
 
 Cellular bring-up must not run as a single blocking call. `Cellular::
 tickActivation()` advances at most one phase (`POWER_ON`, `SIM`,
-`RADIO_CFG`, `REGISTER`, `BEARER`, `MQTT`) per call and returns
+`RADIO_CFG`, `REGISTER`, `BEARER`) per call and returns
 `PENDING`; `CellularModule` polls it each loop while ACTIVATING so
 every other module loop keeps ticking between phases. Registration is
 polled ~1 Hz, never as one 30-180 s blocking wait.
@@ -1195,7 +1310,9 @@ polled ~1 Hz, never as one 30-180 s blocking wait.
 The whole cycle is bounded by `cellular.activation_timeout_ms`
 (default 30 min): on expiry the modem is hardware-reset and
 `tickActivation()` returns `FAILED`, dropping the module to STANDBY -
-a wedged modem or bad broker can never pin the device in ACTIVATING.
+a wedged modem can never pin the device in ACTIVATING. The broker is
+MQTTClient's business: an unreachable one retries with backoff on the
+cellular socket like it does on WiFi.
 
 Why: the old blocking `Cellular::begin()` froze MQTT keepalive,
 sensors, Telegram and the shell for 30-120 s during a WiFi-to-cellular
@@ -1208,25 +1325,6 @@ path only.
 
 Source: `lib/thesada-mod-cellular/src/Cellular.cpp::tickActivation`,
 `lib/thesada-mod-cellular/src/CellularModule.cpp::loop`.
-
-### Modem FS chunk uploads are bounded - no unbounded retry on the AT bus
-
-The CFSWFILE chunk loops (`writeCACert`, `writeModemFile`) abort after
-3 consecutive failed chunks, and a missing DOWNLOAD prompt is a hard
-failure (the payload is never written blind after a prompt timeout).
-Both paths CFSTERM and return false so the caller re-walks the state
-machine. Unbounded, a wedged modem FS session spun these loops forever
-while holding the AT-bus mutex - and because `waitChunked` feeds the
-TWDT internally, the watchdog never fired and the activation deadline
-(evaluated between `tickActivation` calls) never got the chance to:
-the whole main loop hung permanently with no recovery path.
-
-How enforced: every retry loop around a modem AT exchange carries a
-bounded failure counter and a hard-fail return; feeding the TWDT inside
-a loop obliges the loop to bound itself.
-
-Source: `lib/thesada-mod-cellular/src/Cellular.cpp::writeCACert`,
-`writeModemFile`.
 
 ---
 
@@ -1241,6 +1339,29 @@ firmware.
 
 Source: `lib/thesada-mod-scriptengine/src/ScriptEngine.cpp`
 `sandbox` setup.
+
+### Lua time does not wrap at 49.7 days
+
+`Node.uptime()` and `Node.setTimeout` deadlines both count
+`esp_timer_get_time()` in ms, 64-bit, so a script's `now - stamp` never goes
+negative after the `millis()` wrap and a timer fires on a plain
+`now >= fireAt`; the cooldown and sustain math in `rules.lua.example` relies
+on that. The Lua build is `LUA_32BITS`, so uptime reaches a script as a float:
+monotonic, but its step grows with uptime (512 ms past 49.7 d, 2 s past
+199 d), fine for second-scale cooldowns. The delay is a Lua float and is
+never cast raw: NaN is refused (`setTimeout` returns false,
+`script.timer_refused`), a negative delay fires next pass, and anything past
+30 days (`math.huge`, above `INT_MAX`) is capped there. A 32-bit deadline set
+across the wrap fired on every loop pass, and a raw `(int)` cast of a huge
+delay was undefined behaviour.
+
+How enforced: `test/test_lua_timer` covers a 1 h timer set 30 min before the
+32-bit wrap, uptime past the wrap, NaN, negative, infinite and above-`INT_MAX`
+delays.
+
+Source: `lib/thesada-core/src/lua_timer_policy.h`,
+`lib/thesada-mod-scriptengine/src/ScriptEngine.cpp`
+(`lua_node_uptime`, `lua_node_setTimeout`, `ScriptEngine::loop`).
 
 ---
 
@@ -1274,19 +1395,13 @@ Source: `lib/thesada-core/src/mqtt_sub_table.h`,
 `lib/thesada-core/src/MQTTClient.cpp` `begin()` / `reinitSubscriptions()`,
 `lib/thesada-core/src/OTAUpdate.cpp::registerCommandTopic`.
 
-### Cellular MQTT subscriptions mirror the WiFi-side `MQTTClient` registry
+### One MQTT session, one subscription table, on every transport
 
-`MQTTClient::subscribe` writes to a single subscription table. WiFi
-session subscribes from this table on connect; `Cellular::smsubAll`
-iterates the same table on cellular handoff. Adding a new subscribe
-goes via `MQTTClient::subscribe` only - never call `smsub` directly.
+`MQTTClient::subscribe` writes to a single subscription table and every
+session, WiFi or cellular, resubscribes all of it on connect. There is no
+per-transport cap: the modem only carries TCP bytes.
 
-Constraint: SIM7080 supports at most a handful of `+SMSUB` topics per
-session. Current cap = 4 (`MAX_SUBS` in `Cellular.cpp`). Above the cap
-extra subs run on WiFi only and are silently absent on cellular.
-
-Source: `lib/thesada-core/src/MQTTClient.cpp::subscribe`,
-`lib/thesada-mod-cellular/src/Cellular.cpp::smsubAll`.
+Source: `lib/thesada-core/src/MQTTClient.cpp::subscribe`, `resubscribeAll`.
 
 ### `<prefix>/info config_hash` is sha256 of `/config.json` on-disk bytes
 
@@ -1374,7 +1489,7 @@ Source: `lib/thesada-core/src/MQTTClient.cpp::runCli`.
 
 The general path builds the shell input as
 `snprintf(line, sizeof(line), "%s %s", cmd, payload)` into a fixed
-`line[1024]`. The `snprintf` return is captured in `lineN`; if it is
+`line[SHELL_LINE_MAX]` (1024). The `snprintf` return is captured in `lineN`; if it is
 negative or `>= sizeof(line)` the line would be clipped, so `runCli`
 publishes an error response (`ok: false`, `"Command line too long for
 shell - use chunked variant"`) and bails via `cleanup` instead of
@@ -1387,9 +1502,78 @@ carrying large JSON args would be bitten. This is the input-side
 counterpart to the output-side pagination invariant above.
 
 How enforced: both `snprintf` branches store into `lineN`; the length
-guard runs before the command reaches `Shell::enqueueDeferred`.
+guard runs before the line reaches `Shell::execute`. The shell parser
+buffer is the same `SHELL_LINE_MAX`, so a line this guard passes is
+never cut there (next entry).
 
 Source: `lib/thesada-core/src/MQTTClient.cpp::runCli`.
+
+### The shell refuses a line or a token it cannot hold, never clips it
+
+| Entry | Holds | Over the limit |
+|---|---|---|
+| `Shell::execute` (MQTT cli, `/api/cmd`, and every path below) | `_parseBuf[slot][SHELL_LINE_MAX]`: 1023 bytes, 16 words (`SHELL_ARGS_MAX`); a rest-of-line value is one word | replies `Line too long (max 1023 bytes) - not run` or `Too many arguments (max 16 words) - not run`, runs nothing |
+| `Shell::enqueue` (WS terminal) | ring slot `DEFERRED_LINE_LEN`: 255 bytes | returns false; the WS handler checks first and replies `[line too long - not run]` |
+| `Shell::pumpConsole` (serial) | 255 bytes | discards to the newline, replies `Line too long (max 255 bytes) - not run` plus the done marker |
+| shell `config.set`, `config.get`, `config.del <a.b>` | key `key[128]`: 127 bytes | `Key too long (max 127 bytes)` |
+
+The parser copied into a 256-byte buffer and kept 16 tokens, silently.
+An MQTT `config.set wifi.networks [...]` of about 300 bytes lost the end
+of its JSON, the literal parse failed, the stub was stored as a string
+and the reply said saved; a 17th word was dropped and the command ran on
+the rest. The parser buffer matches the 1024 `runCli` already accepts,
+since the app's config editor pushes JSON values through `cli/config.set`;
+that costs 768 bytes of `.bss`. The WS and serial buffers stay at 256:
+their input is typed, and they now refuse rather than grow.
+
+How enforced: `shell_line_policy.h` (`shellSplitLine`, `shellFits`) is the shell
+command-line tokenizer, host-tested in `test/test_shell_line` under a 95%
+coverage floor. Any new fixed-buffer copy of a shell argument checks
+`shellFits` first.
+
+Source: `lib/thesada-core/src/shell_line_policy.h`,
+`lib/thesada-core/src/Shell.cpp` (`execute`, `enqueue`, `pumpConsole`,
+`cmd_config_set`, `cmd_config_get`),
+`lib/thesada-mod-httpserver/src/HttpServer.cpp` (`/ws/serial`).
+
+### A shell command reports failure, nests one level, and keeps its value as typed
+
+`Shell::execute` returns a `ShellResult`. A refused line, an unknown
+command, or a handler that called `Shell::fail` is `Failed`, and
+`runCli` and `/api/cmd` reply `ok:false` with the output. `runCli`
+sets it on the last page (`more:false`); a page shipped mid-command
+says `ok:true`. Handlers that fail this way: `config.set`, `config.del`,
+`config.save` (and their shared write), `secret.set`, `lua.exec`.
+Other handlers still reply `ok:true` on their own error text.
+
+Each nesting level parses into its own buffer (`SHELL_NEST_MAX` = 2): the
+outer command, and one console line run while it blocks (OTA, `net.http`
+and cellular waits call `pumpConsole`). A third level is refused with
+`Shell busy (nested command) - not run`. `pumpConsole` resets its line
+before it runs one, so a line typed during the run starts clean. The second
+buffer costs 1024 bytes of `.bss`.
+
+A command registered with `restFrom` gets `argv[restFrom]` as the rest of
+the line, inner spaces and tabs kept, trailing ones cut: `config.set`,
+`secret.set`, `fs.write` and `fs.append` from argv[2], `cell.at`,
+`lora.send` and `lua.exec` from argv[1]. A value that must end in
+whitespace is quoted (`config.set` and `secret.set` strip one pair).
+
+Why: every error went out as `ok:true`, so the app's config editor showed
+"saved" for a rejected `config.set`. One static parse buffer let a nested
+console command overwrite the outer argv. The value was rebuilt from argv
+with single spaces, so a WiFi passphrase with two spaces or a tab was
+stored altered while the reply said saved.
+
+How enforced: `test/test_shell_line` (`shellDispatchResult`,
+`shellParseSlot`, `shellSplitLine` with `restFrom`) under the 95% floor
+on `shell_line_policy.h`. Not covered: the transports' mapping and the
+nested console path run only on hardware.
+
+Source: `lib/thesada-core/src/shell_line_policy.h`,
+`lib/thesada-core/src/Shell.cpp` (`execute`, `fail`, `pumpConsole`),
+`lib/thesada-core/src/MQTTClient.cpp::runCli`,
+`lib/thesada-mod-httpserver/src/HttpServer.cpp` (`/api/cmd`).
 
 ### The offline publish queue rejects oversized messages, never truncates
 
@@ -1424,8 +1608,10 @@ Source: `lib/thesada-core/src/meshtastic_frame.h::dataDecode`.
 
 ### `Config::set` rejects a dot-path it cannot store, never truncates it
 
-`config.set` (serial and MQTT cli) copies the dot-path into a fixed
-`buf[128]`. An empty or over-long path is rejected up front
+`Config::set` copies the dot-path into a fixed `buf[128]`. It has no
+caller today; the shell `config.set` edits `/config.json` itself and
+carries its own key guard ("The shell refuses a line or a token it
+cannot hold"). An empty or over-long path is rejected up front
 (`return false`) instead of being truncated: a silent truncation would
 resolve to a *different* key than the operator named and write the
 value there, corrupting config from a remote command. Config-write
@@ -1623,15 +1809,16 @@ handler); `lib/thesada-core/src/Shell.cpp` (`secret.*`);
 
 ## Transport abstraction
 
-### `net.*` shell commands reach cellular only through the `Net` provider hook
+### `net.*` shell commands and MQTT reach cellular only through the `Net` provider hook
 
-`net.ip` / `net.ping` / `net.ntp` / `net.http` live in `thesada-core`,
+`net.ip` / `net.ping` / `net.ntp` / `net.http` and `MQTTClient` live in `thesada-core`,
 which must not depend on the optional cellular module. The cellular
 module registers a `Net::CellularProvider` (function-pointer table) in
 its `begin()`; the `net.*` commands consult `Net::cellular()` and fall
 back to the modem path when WiFi is down. When no cellular module is
 compiled in, `Net::cellular()` returns `nullptr` and the commands stay
-WiFi-only with no dead code.
+WiFi-only with no dead code. `MQTTClient` takes its modem socket from
+`provider.tcp` the same way.
 
 Same one-way-dependency rule as the `Shell::FSMount` registry: core
 declares the hook, the module fills it, core never imports module
@@ -1640,7 +1827,8 @@ provider rather than `#include`-ing `Cellular.h`.
 
 Source: `lib/thesada-core/src/Net.h`, `Net.cpp`;
 `lib/thesada-core/src/Shell.cpp` (`cmd_ifconfig`, `cmd_ping`, `cmd_ntp`,
-`cmd_mqtt`, `cmd_http`);
+`cmd_mqtt`, `cmd_http`); `lib/thesada-core/src/MQTTClient.cpp`
+(`transportWanted`, `transportClient`);
 `lib/thesada-mod-cellular/src/CellularModule.cpp::begin` (registrant).
 
 ---
@@ -1819,9 +2007,9 @@ for the next restart.
 
 How enforced: `cmdConfigVerdict` (`cmd_config_policy.h`, host-tested in
 `test/test_cmd_config`) refuses an unverified session, a non-object, and a
-document with no non-empty `mqtt.broker`. WiFi sets the session bit only in
-the `setCACert` path. Cellular sets its own bit from the SMSSL choice, and
-`dispatchInbound` uses that bit rather than the WiFi one. `Config::replace`
+document with no non-empty `mqtt.broker`. The session bit is set only when
+a CA was configured and the live `TlsClient` session verified against it,
+on either transport. `Config::replace`
 reloads the on-disk file when the write fails and puts a held boot prefix
 back. The apply does not reconnect unless that write succeeded, and it
 refuses a prefix that cannot form `/cmd/config`, and a prefix that is
@@ -1830,18 +2018,59 @@ not a string. An omitted
 subscription table in place. `Config::save` and shell `config.save` write
 the prefix already on disk. Shell `config.set` and `config.del` put the
 boot prefix back unless the key is `mqtt` or `mqtt.topic_prefix`.
-`cmd/config` is registered after the OTA and CLI topics so those stay
-inside the cellular four-topic replay. A prefix that does not fit the
-CLI topic still subscribes `cmd/config`.
+A prefix that does not fit the CLI topic still subscribes `cmd/config`.
 
 Source: `lib/thesada-core/src/cmd_config_policy.h`,
 `lib/thesada-core/src/Config.cpp` (`replace`, `holdTopicPrefix`, `save`,
 `set`, `load`, `copyDiskDoc`),
 `lib/thesada-core/src/MQTTClient.cpp` (`mqttApplyCmdConfig`,
 `mqttSubscribeCmdConfig`, `begin`, `reconnectWithCurrentConfig`,
-`reinitSubscriptions`, `setFallbackTlsVerified`),
-`lib/thesada-core/src/Shell.cpp` (`config.set`, `config.save`, `config.del`),
-`lib/thesada-mod-cellular/src/Cellular.cpp` (`mqttConnect`).
+`reinitSubscriptions`, `onMessage`),
+`lib/thesada-core/src/Shell.cpp` (`config.set`, `config.save`, `config.del`).
+
+---
+
+## Sensors
+
+### A temperature probe never publishes a value it did not just read
+
+Every probe on the roster is listed in the `temperature` event and the
+combined `<prefix>/sensor/temperature` payload every cycle. A probe whose
+read failed, or whose reading the plausibility guard held back, is
+`{ name, address, stale: true }` with no `temp_c` or `temp`, and its
+per-sensor topic is not published that cycle; its HA discovery carries
+`expire_after` of three `temperature.interval_s` (`tempExpireAfterS`), so
+HA marks the entity unavailable instead of showing the last value. A live
+entry carries no `stale` key. Lua rules and every other consumer must handle the stale
+shape: a rule that compares or concatenates `temp_c`/`temp` unguarded
+throws, and the throw ends that callback's loop over the remaining probes.
+
+The plausibility guard (`temperature.max_delta_c`, 0 = off) holds a
+reading more than `max_delta_c` from the last accepted one. The next
+reading within `max_delta_c` of the held one is accepted
+(`temp.read_rebaselined`); a failed read in between keeps the held one.
+The first reading after boot is accepted unchecked.
+
+Why: the old fallback republished the last good value with no flag, so a
+House Supply lead that broke at 80 C would keep reading 80 C while the
+water cooled, and the fire-dying and freeze rules could never fire. A
+rejected reading never moved
+the baseline, so one real jump past `max_delta_c` (a probe returning
+mid fire-up) locked that probe out until reboot.
+
+How enforced: `test/test_temp_guard_policy` (the 5 C to 70 C return,
+a held reading across a failed read, lone and disagreeing outliers,
+library fault codes and NaN, guard off, the expiry of three intervals
+and its saturation); the coverage floor on
+`temp_guard_policy.h`; `tests/lua/test_rules_example.lua` (the example
+rules skip a stale probe, alert on it once sustained, and still judge
+the probes after it). Not covered: the module's payload assembly runs
+only on hardware.
+
+Source: `lib/thesada-core/src/temp_guard_policy.h`,
+`lib/thesada-mod-temperature/src/TemperatureModule.cpp` (`readSensorC`,
+`readAndPublish`), `lib/thesada-core/src/MQTTClient.cpp`
+(`publishDiscovery`), `examples/scripts/rules.lua.example`.
 
 ---
 

@@ -3,12 +3,13 @@
 // owns net.ip / net.ping / net.ntp / net.mqtt / net.http but must not
 // depend on the optional cellular module. The cellular module registers a
 // CellularProvider in its begin(); net.* commands consult it when WiFi is
-// down so they keep working on the cellular leg. Mirrors the
-// MQTTClient::setPublishForwarder pattern.
+// down so they keep working on the cellular leg, and MQTTClient takes its
+// modem socket from here.
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
 #include <Arduino.h>
+#include <Client.h>
 #include <functional>
 #include <cstddef>
 
@@ -36,12 +37,17 @@ struct CellularProvider {
   // in: NTP server, timeout ms. out: true once settimeofday() has been called.
   bool (*ntpSync)(const char* server, uint32_t timeoutMs);
 
-  // HTTPS GET via the modem SSL socket; callback receives body chunks.
-  // in: host, path, port, body chunk callback, http status output.
-  // out: true on success; httpStatus gets the wire status code.
+  // HTTPS GET over TLS on a modem socket; callback receives body chunks.
+  // in: host, path, port, CA PEM (nullptr = insecure), body chunk callback,
+  //     http status output. out: true on success; httpStatus = wire status.
   bool (*httpsGet)(const char* host, const char* path, uint16_t port,
+                   const char* caPem,
                    std::function<bool(const uint8_t*, size_t)> onBody,
                    int* httpStatus);
+
+  // Plain modem TCP socket for a TLS session to ride on. Slot 0 is the
+  // MQTT session. in: slot. out: client, or nullptr for an unknown slot.
+  Client* (*tcp)(uint8_t slot);
 };
 
 // Register the provider. Call once from the cellular module's begin().

@@ -14,6 +14,8 @@
 
 static const char* TAG = "Temp";
 
+static_assert(TEMP_NO_READING == DEVICE_DISCONNECTED_C, "guard sentinel must match the library");
+
 // Initialize OneWire bus, load/discover sensors, and log readiness
 void TemperatureModule::begin() {
   JsonObject cfg = Config::get();
@@ -173,7 +175,7 @@ void TemperatureModule::saveDiscovered() {
       if (strcmp(cs["address"] | "", s.addressStr) == 0) { found = true; break; }
     }
     if (!found) {
-      char autoName[16];
+      char autoName[20];
       snprintf(autoName, sizeof(autoName), "temp_%d", (int)cfgSensors.size() + 1);
       JsonObject ns  = cfgSensors.add<JsonObject>();
       ns["address"]  = s.addressStr;
@@ -302,20 +304,28 @@ void TemperatureModule::removeSensorsFromConfig(const std::vector<std::string>& 
   }
 }
 
-// Read one probe with library retries (CRC-validated) plus a plausibility
-// guard. Returns DEVICE_DISCONNECTED_C on read fail or implausible jump.
+// Read one probe with library retries (CRC-validated) plus the plausibility
+// guard (temp_guard_policy.h). Returns DEVICE_DISCONNECTED_C on read fail or
+// an unconfirmed jump.
 float TemperatureModule::readSensorC(TempSensor& s) {
   if (s.busIdx >= _buses.size()) return DEVICE_DISCONNECTED_C;
   float temp = _buses[s.busIdx].sensors->getTempC(s.address, _readRetries);
-  if (temp == DEVICE_DISCONNECTED_C) return DEVICE_DISCONNECTED_C;
-
-  if (_maxDeltaC > 0.0f && s.lastTemp != DEVICE_DISCONNECTED_C &&
-      fabsf(temp - s.lastTemp) > _maxDeltaC) {
-    Log::kvfw(TAG, "temp.read_rejected addr=%s last=%.2f got=%.2f reason=implausible",
-              s.addressStr, s.lastTemp, temp);
-    return DEVICE_DISCONNECTED_C;
+  float last = s.guard.accepted;
+  switch (tempGuardJudge(s.guard, temp, _maxDeltaC)) {
+    case TempVerdict::Accepted:
+      return temp;
+    case TempVerdict::Rebaselined:
+      Log::kvfw(TAG, "temp.read_rebaselined addr=%s last=%.2f got=%.2f",
+                s.addressStr, last, temp);
+      return temp;
+    case TempVerdict::Implausible:
+      Log::kvfw(TAG, "temp.read_rejected addr=%s last=%.2f got=%.2f reason=implausible",
+                s.addressStr, last, temp);
+      break;
+    case TempVerdict::NoReading:
+      break;
   }
-  return temp;
+  return DEVICE_DISCONNECTED_C;
 }
 
 // Read all sensors and publish temperatures via MQTT and EventBus
@@ -330,48 +340,37 @@ void TemperatureModule::readAndPublish() {
   delay(_conversionMs);
 
   JsonDocument doc;
-  JsonArray    arr      = doc["sensors"].to<JsonArray>();
-  bool         anyValid = false;
+  JsonArray    arr = doc["sensors"].to<JsonArray>();
 
   for (auto& s : _sensorList) {
     float temp = readSensorC(s);
 
+    JsonObject obj = arr.add<JsonObject>();
+    obj["name"]    = s.name;
+    obj["address"] = s.addressStr;
+
+    // Every probe is listed; one without a usable reading this cycle is
+    // stale and carries no value, never its last one.
     if (temp == DEVICE_DISCONNECTED_C) {
       Log::kvfw(TAG, "temp.sensor_disconnected addr=%s", s.addressStr);
-      // Still include sensor with last known value so HA discovery works
-      if (s.lastTemp != DEVICE_DISCONNECTED_C) {
-        float fallbackDisplay = _useFahrenheit ? (s.lastTemp * 9.0f / 5.0f + 32.0f) : s.lastTemp;
-        fallbackDisplay = roundf(fallbackDisplay * 100.0f) / 100.0f;
-        JsonObject obj = arr.add<JsonObject>();
-        obj["name"]    = s.name;
-        obj["address"] = s.addressStr;
-        obj["temp_c"]  = s.lastTemp;
-        obj["temp"]    = fallbackDisplay;
-        anyValid = true;
-      }
+      obj["stale"] = true;
       continue;
     }
 
     float tempC = roundf(temp * 100.0f) / 100.0f;
-    s.lastTemp = tempC;
     float display = _useFahrenheit ? (tempC * 9.0f / 5.0f + 32.0f) : tempC;
     display = roundf(display * 100.0f) / 100.0f;
 
-    JsonObject obj = arr.add<JsonObject>();
-    obj["name"]    = s.name;
-    obj["address"] = s.addressStr;
     obj["temp_c"]  = tempC;
     obj["temp"]    = display;
-    anyValid = true;
   }
-
-  if (!anyValid) return;
 
   JsonObject cfg = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
 
   // Per-sensor topics for HA discovery (simple value in configured unit)
   for (JsonObject s : arr) {
+    if (s["stale"] | false) continue;
     const char* sname = s["name"] | "unknown";
     float t = s["temp"] | -127.0f;
     if (t == -127.0f) continue;
@@ -420,7 +419,6 @@ void TemperatureModule::sensorRead(ShellOutput out) {
       float v = _useFahrenheit ? (c * 9.0f / 5.0f + 32.0f) : c;
       snprintf(line, sizeof(line), "  %-16s: %.2f %s",
                s.name, v, _useFahrenheit ? "F" : "C");
-      s.lastTemp = c;
     }
     out(line);
   }
