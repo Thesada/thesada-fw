@@ -604,10 +604,9 @@ static void loadCaCert() {
 }
 
 // Without this, every silent bailout looks identical to "device offline"
-// from the broker side. publish() queues on the WiFi ring (or routes to
-// the cellular forwarder) when the broker is down, so a refusal raised
-// while disconnected still reaches the operator on reconnect - do not
-// pre-empt that with a connected() guard here.
+// from the broker side. publish() queues on the ring when the broker is
+// down, so a refusal raised while disconnected still reaches the operator
+// on reconnect - do not pre-empt that with a connected() guard here.
 // in:  reason (short kebab-case identifier, e.g. "no-ca", "heap-low").
 // out: none.
 static void publishOtaRefusal(const char* reason) {
@@ -643,10 +642,9 @@ static void configureSecureClient(WiFiClientSecure& client) {
 // ---------------------------------------------------------------------------
 // Transport-agnostic HTTP GET
 //
-// OTA fallback over cellular when WiFi is down. The two
-// underlying paths are very different (Arduino HTTPClient/WiFiClientSecure
-// over WiFi vs SIM7080G modem-native SSL socket via TinyGsmClientSecure),
-// so we wrap both behind a single byte-stream callback API. Same /ca.crt
+// OTA fallback over cellular when WiFi is down. WiFi runs Arduino
+// HTTPClient/WiFiClientSecure, cellular runs Cellular::httpsGet (TlsClient
+// on a modem socket); both sit behind one byte-stream callback API. Same /ca.crt
 // validates the manifest origin on either path (public TLS roots covering
 // the common backends - GitHub Releases, Let's Encrypt fronted origins,
 // Sectigo, etc - are baked into the firmware via ota_ca_progmem.h).
@@ -746,6 +744,13 @@ static bool otaHttpGetWiFi(const char* url,
 }
 
 #ifdef ENABLE_CELLULAR
+// The CA the WiFi path verifies with. nullptr only when it is empty, which
+// begin() and check() allow under ota.allow_insecure alone.
+static const char* otaCellularCa() {
+  loadCaCert();
+  return _otaCaCert.isEmpty() ? nullptr : _otaCaCert.c_str();
+}
+
 // in:  url, writeCallback. out: outStatus, outLen.
 static bool otaHttpGetCellular(const char* url,
                                std::function<bool(const uint8_t*, size_t)> writeCallback,
@@ -770,7 +775,7 @@ static bool otaHttpGetCellular(const char* url,
     total += len;
     return writeCallback ? writeCallback(buf, len) : true;
   };
-  bool ok = Cellular::httpsGet(host, path, port, wrap, outStatus);
+  bool ok = Cellular::httpsGet(host, path, port, otaCellularCa(), wrap, outStatus);
   if (outLen) *outLen = total;
   return ok;
 }
@@ -801,67 +806,63 @@ static bool downloadBinaryChunkedCellular(
     return false;
   }
 
-  // MQTT (SMCONN) runs inside the modem fw and competes with our HTTPS
-  // chunks for the modem's TCP socket slots and the PDP context's
-  // bandwidth, even though our ATGuard blocks our own SMPUB traffic.
-  // Drop the modem-native MQTT session before the download so the chunks
-  // get the full bandwidth budget. Cellular::loop() detects the dropped
-  // session on its next tick after ATGuard releases and re-establishes
-  // MQTT automatically (existing recovery path), so no explicit SMCONN
-  // is needed here. On OTA success the device reboots and MQTT comes up
-  // fresh on the new fw anyway.
-  Cellular::atPassthrough("+SMDISC", 5000UL, [](const char*){});
+  // Drop the MQTT session before the download: it would share the link
+  // with the chunks and hold a second TLS session's heap. MQTTClient::loop
+  // reconnects afterwards; on success the device reboots anyway.
+  MQTTClient::dropSession();
 
-  // 64 KB chunk size. At ~8.4 KB/s LTE-M that is ~8 s per chunk, well
-  // under the empirically observed session-degradation threshold. For
-  // a 1.48 MB binary this is ~23 round trips.
-  static constexpr size_t   CHUNK             = 64UL * 1024UL;
-  // Inter-chunk pacing: lets the modem's internal TCP slots clear
-  // TIME_WAIT and the carrier's per-source-port rate-counter decay
-  // before the next handshake. Bench-tuned on LTE-M; trimmable if a
-  // future carrier handles back-to-back sockets cleanly.
-  static constexpr uint32_t CHUNK_GAP_MS      = 5000UL;
-  // Reset the PDP context every Nth chunk as a heavier escape hatch
-  // for the same problem class (modem-internal state accumulation).
-  // 8 chunks * 64 KB = 512 KB which is where the empirical stall
-  // showed up most consistently.
-  static constexpr int      CHUNK_BOUNCE_EVERY = 8;
+  // 256 KB per request: about 2 min at the ~2 KB/s an LTE-M link gives,
+  // inside httpsGet's 5 min cap, and each TLS handshake costs ~5 s.
+  static constexpr size_t   CHUNK             = 256UL * 1024UL;
+  // Short pause between requests so the modem closes the old socket first.
+  static constexpr uint32_t CHUNK_GAP_MS      = 1000UL;
+
+  // A chunk that fails part-way resumes from the last byte the writer took,
+  // once the link probe has the data context back: the modem drops it now
+  // and then on its own.
+  static constexpr int      CHUNK_TRIES       = 3;
+  static constexpr uint32_t LINK_WAIT_MS      = 90000UL;
 
   size_t offset    = 0;
-  int    chunkIdx  = 0;
   while (offset < expectedSize) {
-    size_t end = std::min(offset + CHUNK - 1, expectedSize - 1);
-    int status = 0;
-    bool ok = Cellular::httpsGet(host, path, port, writeCallback, &status,
-                                 offset, end);
-    if (!ok || (status != 206 && status != 200)) {
-      Log::kvfe(TAG, "ota.chunk_failed offset=%u status=%d ok=%d",
-                (unsigned)offset, status, (int)ok);
+    size_t end   = std::min(offset + CHUNK - 1, expectedSize - 1);
+    bool   done  = false;
+    for (int attempt = 1; attempt <= CHUNK_TRIES && !done; ++attempt) {
+      size_t got = 0;
+      auto counting = [&](const uint8_t* d, size_t n) {
+        if (!writeCallback(d, n)) return false;
+        got += n;
+        return true;
+      };
+      int  status = 0;
+      bool ok = Cellular::httpsGet(host, path, port, otaCellularCa(), counting,
+                                   &status, offset, end);
+      offset += got;
+      if (ok && (status == 206 || status == 200) && offset > end) { done = true; break; }
+      if (ok && status != 206 && status != 200) {
+        Log::kvfe(TAG, "ota.chunk_failed offset=%u status=%d", (unsigned)offset, status);
+        return false;
+      }
+      Log::kvfw(TAG, "ota.chunk_retry offset=%u attempt=%d got=%u", (unsigned)offset, attempt,
+                (unsigned)got);
+      if (offset > end) { done = true; break; }
+      // Let the cellular health probe run and recover the bearer.
+      uint32_t waitUntil = millis() + LINK_WAIT_MS;
+      do {
+        Cellular::loop();
+        Shell::pumpConsole();
+        esp_task_wdt_reset();
+        delay(200);
+      } while (!Cellular::connected() && millis() < waitUntil);
+    }
+    if (!done) {
+      Log::kvfe(TAG, "ota.chunk_failed offset=%u tries=%d", (unsigned)offset, CHUNK_TRIES);
       return false;
     }
     offset = end + 1;
-    chunkIdx++;
     if (totalOut) *totalOut = offset;
 
     if (offset >= expectedSize) break;
-
-    // Periodic CNACT bounce. Deactivate + reactivate the PDP context
-    // so the modem releases every TCP slot still in TIME_WAIT and the
-    // operator-side flow counters reset. Cheap (~1-2 s) compared to
-    // the recovery cost when a chunk eventually stalls without it.
-    if (chunkIdx % CHUNK_BOUNCE_EVERY == 0) {
-      Log::info(TAG, "ota.pdp_bounce method=cnact_cycle");
-      Cellular::atPassthrough("+CNACT=0,0", 5000UL, [](const char*){});
-      delay(500);
-      Cellular::atPassthrough("+CNACT=0,1", 10000UL, [](const char*){});
-      // CNACT activation completes asynchronously via +APP PDP URC;
-      // a short settle window before the next handshake is reliable.
-      for (int i = 0; i < 20; ++i) {
-        Shell::pumpConsole();
-        delay(100);
-        esp_task_wdt_reset();
-      }
-    }
 
     uint32_t paceUntil = millis() + CHUNK_GAP_MS;
     while (millis() < paceUntil) {
@@ -976,14 +977,12 @@ void OTAUpdate::registerCommandTopic() {
   strncpy(topic, customTopic, sizeof(topic) - 1);
   topic[sizeof(topic) - 1] = '\0';
 
+  // The payload is ignored: any session that can publish here could otherwise
+  // pick the manifest. A URL override stays on the authz-gated `ota.check <url>`.
   MQTTClient::subscribe(topic, [](const char* topic, const char* payload) {
     Log::info(TAG, "ota.trigger source=mqtt");
+    _pendingManifestUrl = "";
     _checkRequested = true;
-    if (payload && strlen(payload) > 8) {
-      _pendingManifestUrl = payload;
-    } else {
-      _pendingManifestUrl = "";
-    }
   });
 }
 
@@ -1093,19 +1092,19 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
   // MQTT to free TLS buffers, letting the manifest fetch succeed on a
   // clean heap. MQTT reconnect happens post-reboot if update applies, or
   // in loop() if we bail out.
-  // Only applies to the WiFi transport: cellular MQTT TLS runs inside
-  // the modem so it does not fragment ESP heap, and the manifest fetch
-  // goes through the modem's separate SSL socket layer regardless.
-  if (WiFiManager::connected() &&
-      MQTTClient::connected() && ESP.getMaxAllocHeap() < 40000) {
-    if (!force) {
+  // Applies to both transports: TLS runs on the ESP32 for either. On
+  // cellular a periodic check drops the session too instead of refusing:
+  // with the WiFi stack still loaded the heap sits under the gate for the
+  // whole failover, and the reconnect is a few seconds.
+  const bool onCellular = strcmp(MQTTClient::transportName(), "cellular") == 0;
+  if (MQTTClient::connected() && ESP.getMaxAllocHeap() < 40000) {
+    if (!force && !onCellular) {
       Log::kvfw(TAG, "ota.check_skipped reason=heap_low");
       publishOtaRefusal("heap-low");
       return;
     }
     Log::kvf(TAG, "ota.heap_low action=mqtt_disconnect");
-    MQTTClient::_client.disconnect();
-    MQTTClient::_wifiClient.stop();
+    MQTTClient::dropSession();
     delay(200);  // let TCP teardown + free mbedtls context
   }
 
@@ -1202,7 +1201,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
 // so a stall here (TLS handshake, hung socket read on a flaky upstream)
 // cannot block this task long enough to trip TWDT. Goes through the
 // unified otaHttpGet helper so the same call site works over WiFi or
-// the SIM7080G modem-native SSL socket.
+// a modem socket.
 bool OTAUpdate::fetchManifest(const char* url,
                                String& version, String& binUrl, String& sha256,
                                size_t& size) {

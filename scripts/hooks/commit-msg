@@ -1,10 +1,9 @@
 #!/bin/sh
-# thesada-fw commit-msg guard: keep private refs out of public commits.
+# thesada-fw commit-msg guard: keep private values out of commit subjects.
 #
 # Thin wrapper around scripts/check-commit-msg.sh. Refuses the commit when
-# the message contains internal issue-tracker refs, internal hostnames, or
-# RFC1918 IPs - all of which would be mirrored verbatim to the public
-# GitHub repo and its release notes.
+# the message contains internal hostnames or RFC1918 IPs; publish copies
+# subjects into the public GitHub release body.
 #
 # Bypass:
 #     MSG_OK=1 git commit ...

@@ -25,7 +25,7 @@ M.calls       = {}
 M.config      = {}
 -- Firmware identity reported by Node.version().
 M.version     = "0.0.0-test"
--- Fake millis() clock returned by Node.uptime(); advance with M.advance().
+-- Fake ms-since-boot clock returned by Node.uptime(); advance with M.advance().
 M.now_ms      = 0
 -- Set true once Node.restart() is called.
 M.restarted   = false
@@ -268,6 +268,7 @@ function M.install()
     ip         = function() record("Node.ip");      return "0.0.0.0" end,
     setTimeout = function(ms, callback)
       record("Node.setTimeout", ms)
+      if ms ~= ms then return false end  -- NaN refused, matches firmware
       if #M._timers >= MAX_TIMERS then
         return false  -- queue full, matches firmware
       end

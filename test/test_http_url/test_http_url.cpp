@@ -38,6 +38,21 @@ void test_split_refuses_junk(void) {
   TEST_ASSERT_TRUE(httpUrlSplit("https://h/", host, sizeof(host), &path, &port));
 }
 
+void test_split_root_query(void) {
+  char host[32]; const char* path; uint16_t port;
+  TEST_ASSERT_TRUE(httpUrlSplit("https://example.com?key=abc", host, sizeof(host), &path, &port));
+  TEST_ASSERT_EQUAL_STRING("example.com", host);
+  TEST_ASSERT_EQUAL_STRING("?key=abc", path);
+  TEST_ASSERT_EQUAL_STRING("/", httpTargetLead(path));
+  TEST_ASSERT_TRUE(httpUrlSplit("https://example.com:8443?a=/b", host, sizeof(host), &path, &port));
+  TEST_ASSERT_EQUAL_STRING("example.com", host);
+  TEST_ASSERT_EQUAL_STRING("?a=/b", path);
+  TEST_ASSERT_EQUAL_UINT16(8443, port);
+  TEST_ASSERT_TRUE(httpUrlSplit("https://example.com/hook?key=abc", host, sizeof(host), &path, &port));
+  TEST_ASSERT_EQUAL_STRING("/hook?key=abc", path);
+  TEST_ASSERT_EQUAL_STRING("", httpTargetLead(path));
+}
+
 void test_status_code(void) {
   TEST_ASSERT_EQUAL_INT(200, httpStatusCode("HTTP/1.1 200 OK"));
   TEST_ASSERT_EQUAL_INT(429, httpStatusCode("HTTP/1.0 429 Too Many Requests"));
@@ -53,6 +68,7 @@ int main(int, char**) {
   RUN_TEST(test_split_https_default_port);
   RUN_TEST(test_split_http_port_and_bare_host);
   RUN_TEST(test_split_refuses_junk);
+  RUN_TEST(test_split_root_query);
   RUN_TEST(test_status_code);
   return UNITY_END();
 }

@@ -12,12 +12,15 @@
 #include "mqtt_rollback_policy.h"
 #include "cmd_config_policy.h"
 #include "clock_floor_policy.h"
+#include "temp_guard_policy.h"
 #include "EventBus.h"
 #include "WiFiManager.h"
 #include "Log.h"
 #include "Shell.h"
 #include "OTAUpdate.h"
 #include "ota_ca_progmem.h"
+#include "TlsClient.h"
+#include "Net.h"
 #include <WiFi.h>
 #include <LittleFS.h>
 #include <Preferences.h>
@@ -68,17 +71,8 @@ static constexpr size_t LG_MAX_LEN = 384;
 // the system clock is set.
 static constexpr uint32_t RB_STALE_WINDOW_S = 6UL * 3600UL;
 
-// Cellular installs a hook so its cert cache and any live SMCONN session
-// drop when the cert is cleared. nullptr when unused.
-static std::function<void()> _onCertClearedHook = nullptr;
-
-// Auth mode of the fallback transport's broker session. Its own session, its
-// own credential: the WiFi flag says nothing about how it authenticated.
-static bool _fallbackMtls = false;
-static bool _fallbackTlsVerified = false;
-// Set for the duration of one inbound dispatch. WiFi and cellular each
-// write their own session's verdict so a verified WiFi CA cannot bless
-// an unverified cellular push.
+// Set for the duration of one inbound dispatch: did the session that
+// delivered it check the broker certificate?
 static bool _dispatchTlsVerified = false;
 
 // Did the stored client cert fail to load or validate at the last connect
@@ -102,14 +96,24 @@ static CliAuthMode cliAuthModeFor(bool mtls) {
 
 static const char* TAG = "MQTT";
 
+// One session, one TLS stack: TlsClient rides on the WiFi socket or on the
+// modem socket, whichever transport is live.
+static WiFiClient s_wifiTcp;
+enum class MqttTransport : uint8_t { NONE, WIFI, CELLULAR };
+static MqttTransport s_transport      = MqttTransport::NONE;
+static bool          s_cellularActive = false;
+
+static const char* transportName(MqttTransport t) {
+  return t == MqttTransport::WIFI ? "wifi" : t == MqttTransport::CELLULAR ? "cellular" : "none";
+}
+
 #ifdef MQTT_TLS
-WiFiClientSecure MQTTClient::_wifiClient;
-// Buffers held live across the TLS session; WiFiClientSecure stores the
-// raw pointer and dereferences it during the handshake.
+static TlsClient s_tls;
+// Buffers held live across the TLS session; TlsClient stores the raw
+// pointer and parses it on every handshake.
 static char*     _clientCert    = nullptr;
 static char*     _clientKey     = nullptr;
 static bool      _mtlsActive    = false;
-static bool      _mtlsWasActive = false;  // tracks whether last connect() used mTLS; need to clear WiFiClientSecure on fallback
 
 // Persistent broker hostname buffer. PubSubClient::setServer(const char*,
 // uint16_t) stores the pointer, not the contents, so we cannot hand it
@@ -124,9 +128,8 @@ static char      _brokerHost[96] = {0};
 // mqtt.port in Config can already hold a value no connect has applied yet.
 static uint16_t  _brokerPort = 0;
 
-// Validate a PEM cert + key pair via mbedtls. Prevents feeding a bad
-// buffer into WiFiClientSecure::setCertificate which would stick in the
-// TLS stack and break every future reconnect until restart. Also rejects
+// Validate a PEM cert + key pair via mbedtls before it reaches the TLS
+// client, so a bad pair is refused at the door. Also rejects
 // a mismatched pair (cert A + key B): each parses fine on its own, so
 // without the explicit pair check the mismatch only surfaces later as an
 // opaque "TLS handshake failed" instead of an immediate cert.set error.
@@ -190,13 +193,13 @@ static char*       _caHeap    = nullptr;
 static const char* _caCert    = nullptr;
 static size_t      _caCertLen = 0;
 static bool        _tlsRefused = false;
+PubSubClient MQTTClient::_client(s_tls);
 #else
-WiFiClient       MQTTClient::_wifiClient;
+PubSubClient MQTTClient::_client(s_wifiTcp);
 #endif
 // True only after setCACert. allow_insecure encrypts without checking the
 // broker, and that session must not accept a config push.
 static bool _tlsVerified = false;
-PubSubClient MQTTClient::_client(_wifiClient);
 
 MQTTMessage      MQTTClient::_queue[MQTT_QUEUE_SIZE];
 uint8_t          MQTTClient::_queueHead     = 0;
@@ -234,50 +237,60 @@ bool     MQTTClient::_manifestDirty        = false;
 uint32_t MQTTClient::_manifestDirtySinceMs = 0;
 bool     MQTTClient::_retainedPublishedThisSession = false;
 
-// When true, publish() routes to the cellular forwarder on WiFi disconnect
-// instead of enqueueing. See header.
-static bool s_fallbackPublishing = false;
+// Which transport the next session should use: WiFi whenever it is up,
+// the modem socket while CellularModule has the cellular link active.
+static MqttTransport transportWanted() {
+  if (WiFiManager::connected()) return MqttTransport::WIFI;
+  const Net::CellularProvider* cell = Net::cellular();
+  if (s_cellularActive && cell && cell->tcp && cell->tcp(0)) return MqttTransport::CELLULAR;
+  return MqttTransport::NONE;
+}
 
-// Mirrors new subscriptions onto the cellular MQTT session when installed.
-static std::function<void(const char*)> s_subForwarder;
-
-// Routes publishes to cellular when fallback is active. Returns false if
-// cellular is not ready (message drops).
-static std::function<bool(const char*, const char*, bool)> s_pubForwarder;
-
-// Timestamp of cellular handoff; heap-stats firing defers 30 s to avoid
-// crowding the modem AT bus during the initial post-ACTIVE burst.
-static uint32_t s_fallbackStartMs = 0;
-
-void MQTTClient::setFallbackPublishing(bool active) {
-  if (active && !s_fallbackPublishing) {
-    // Cellular took over from WiFi. The 8-slot WiFi ring queue holds
-    // stale (seconds-to-minutes old) battery/sensor samples buffered
-    // during the WiFi outage. Replaying them through the cellular
-    // forwarder right when battery + rssi telemetry is starting up
-    // would burst the modem AT bus precisely during the window we
-    // are most worried about. Drop the queue; sensors are level-
-    // triggered and will refire on their next module cycle if any
-    // alert condition still holds.
-    if (_queueCount > 0) {
-      Log::kvf(TAG, "mqtt.queue_dropped reason=cellular_handoff count=%d",
-               (int)_queueCount);
-      for (uint8_t i = 0; i < MQTT_QUEUE_SIZE; ++i) _queue[i].valid = false;
-      _queueHead  = 0;
-      _queueTail  = 0;
-      _queueCount = 0;
-    }
-    s_fallbackStartMs = millis();
-    OTAUpdate::noteMqttUp();
-  } else if (!active) {
-    s_fallbackStartMs = 0;
-    // Yielding back to WiFi: clear the cellular-side republish guard so
-    // the next cellular handoff republishes the retained set. WiFi
-    // reconnect will run publishRetainedSet(true) via connect() and
-    // re-set the flag.
-    _retainedPublishedThisSession = false;
+// Lower byte stream for a transport. in: transport. out: client or nullptr.
+static Client* transportClient(MqttTransport t) {
+  if (t == MqttTransport::WIFI) return &s_wifiTcp;
+  if (t == MqttTransport::CELLULAR) {
+    const Net::CellularProvider* cell = Net::cellular();
+    return (cell && cell->tcp) ? cell->tcp(0) : nullptr;
   }
-  s_fallbackPublishing = active;
+  return nullptr;
+}
+
+// Drop the live session and its socket, whatever carries it.
+static void closeSession() {
+#ifdef MQTT_TLS
+  s_tls.stop();
+#else
+  if (Client* c = transportClient(s_transport)) c->stop();
+#endif
+}
+
+void MQTTClient::setCellularTransport(bool active) {
+  if (active == s_cellularActive) return;
+  s_cellularActive = active;
+  if (active && _queueCount > 0) {
+    // Samples buffered during the WiFi outage are stale, and replaying
+    // them all at once would crowd the first seconds on the modem link.
+    // Sensors are level-triggered and refire on their next cycle.
+    Log::kvf(TAG, "mqtt.queue_dropped reason=cellular_handoff count=%d", (int)_queueCount);
+    for (uint8_t i = 0; i < MQTT_QUEUE_SIZE; ++i) _queue[i].valid = false;
+    _queueHead  = 0;
+    _queueTail  = 0;
+    _queueCount = 0;
+  }
+  Log::kvf(TAG, "mqtt.cellular_transport active=%d", active ? 1 : 0);
+  // Reconnect on the right transport at the next loop, not after backoff.
+  _retryInterval = RETRY_MIN_MS;
+  _lastAttempt   = millis() - RETRY_MIN_MS;
+}
+
+void MQTTClient::dropSession() {
+  _client.disconnect();
+  closeSession();
+}
+
+const char* MQTTClient::transportName() {
+  return _client.connected() ? ::transportName(s_transport) : "none";
 }
 
 // ---------------------------------------------------------------------------
@@ -507,14 +520,14 @@ void MQTTClient::begin() {
     }
   }
 
-  // _timeout bounds TCP connect and every TLS write; connect() dials, feeds,
-  // then PubSubClient's CONNECT write (10 s) + CONNACK (5 s) run unfed.
+  // Dial bounds: WiFi TCP connect 10 s, handshake 20 s (a modem link needs
+  // several seconds). TlsClient feeds the task watchdog while it waits.
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
-  _wifiClient.setConnectionTimeout(10000);  // ms
+  s_wifiTcp.setConnectionTimeout(10000);  // ms
 #else
-  _wifiClient.setTimeout(10);  // seconds
+  s_wifiTcp.setTimeout(10);  // seconds
 #endif
-  _wifiClient.setHandshakeTimeout(10);  // ssl handshake, always seconds
+  s_tls.setHandshakeTimeout(20000);
 
   // Load CA cert from LittleFS, else point straight at the baked bundle.
   // The bundle needs no copy: it is .rodata with static lifetime and
@@ -561,7 +574,7 @@ void MQTTClient::begin() {
     bool allowInsecure = cfg["mqtt"]["allow_insecure"] | false;
     if (allowInsecure) {
       Log::kvfw(TAG, "mqtt.tls_insecure reason=no_ca allow_insecure=set");
-      _wifiClient.setInsecure();
+      s_tls.setInsecure();
       _tlsVerified = false;
     } else {
       Log::error(TAG, "mqtt.tls_refused reason=no_ca allow_insecure=unset");
@@ -569,7 +582,7 @@ void MQTTClient::begin() {
       return;
     }
   } else {
-    _wifiClient.setCACert(_caCert);
+    s_tls.setCACert(_caCert);
     _tlsVerified = true;
   }
 #endif
@@ -612,8 +625,6 @@ void MQTTClient::begin() {
     }
   }
 
-  // After OTA and the CLI topic. Cellular replays only the first four
-  // registrations, and those two have to stay inside that budget.
   mqttSubscribeCmdConfig();
   connect();
 }
@@ -762,8 +773,11 @@ void MQTTClient::connect() {
 
   // begin() refused to configure TLS. Connecting anyway would hand the CLI
   // an unverified channel, which is the thing the refusal exists to stop.
+#ifdef MQTT_TLS
   if (_tlsRefused) return;
-  if (!WiFiManager::connected()) return;
+#endif
+  const MqttTransport transport = transportWanted();
+  if (transport == MqttTransport::NONE) return;
 
   JsonObject  cfg      = Config::get();
   const char* clientId = Identity::nodeName();
@@ -776,32 +790,20 @@ void MQTTClient::connect() {
   char availTopic[MQTT_TOPIC_CAP];
   snprintf(availTopic, sizeof(availTopic), "%s/status", prefix);
 
-  Log::kvf(TAG, "mqtt.connect_start client_id=%s", clientId);
+  Log::kvf(TAG, "mqtt.connect_start client_id=%s transport=%s", clientId, ::transportName(transport));
+
+  closeSession();
+  _client.connected();  // sees the stop(), so a stale CONNECTED state clears
 
 #ifdef MQTT_TLS
-  // Force a fresh mbedtls context on every connect attempt. When a
-  // prior connect failed mid-handshake, WiFiClientSecure retains the
-  // underlying mbedtls_ssl_context with whatever cert/key pointers were
-  // configured at that time. A subsequent setCACert / setCertificate /
-  // setPrivateKey on a still-allocated context is silently ignored - the
-  // next handshake reuses the stale config and the broker logs
-  // "peer did not return a certificate". stop() releases the context so
-  // PubSubClient's next _client.connect() call rebuilds it from scratch
-  // with whatever we configure below. Cost: ~one extra TLS handshake
-  // round trip on each reconnect, which we pay anyway because PubSubClient
-  // tears the connection down on any failure.
-  _wifiClient.stop();
-
   // No pre-NTP insecure fallback here: the boot clock floor in begin() keeps
   // the clock at a sane lower bound of real time, so cert validation works
   // from the first connect. A cert the floored clock rejects (e.g. NotBefore
   // ahead of a stale floor) fails closed and retries until NTP corrects.
 
-  // Load client cert from NVS into module-level buffers. WiFiClientSecure
-  // holds the raw pointer for the TLS session lifetime, so buffers must
-  // stay live across handshake. Validate via mbedtls before setCertificate:
-  // there is no clear-cert API, so a bad pointer breaks every future
-  // reconnect until restart.
+  // Load client cert from NVS into module-level buffers. TlsClient keeps
+  // the raw pointer and parses it on every handshake, so the buffers stay
+  // live. Validate via mbedtls first so a bad pair never reaches it.
   if (hasClientCert()) {
     if (!_clientCert) _clientCert = (char*)malloc(CERT_MAX_LEN);
     if (!_clientKey)  _clientKey  = (char*)malloc(CERT_MAX_LEN);
@@ -817,8 +819,6 @@ void MQTTClient::connect() {
         // A usable cert is not enough. mTLS follows the listener this session
         // actually dials, so a session on any other port stays password.
         if (_brokerPort == MQTT_MTLS_PORT) {
-          _wifiClient.setCertificate(_clientCert);
-          _wifiClient.setPrivateKey(_clientKey);
           _mtlsActive = true;
           Log::info(TAG, "mqtt.mtls_cert_loaded source=nvs");
         } else {
@@ -841,40 +841,44 @@ void MQTTClient::connect() {
     // Nothing stored cannot be broken, so cert.clear stays mTLS-only here.
     _storedCertBroken = false;
   }
-  // When dropping from mTLS to password auth, pass nullptr to evict the
-  // stale setCertificate pointer - it lingers and breaks future connect()s.
-  if (_mtlsWasActive && !_mtlsActive) {
-    _wifiClient.setCertificate(nullptr);
-    _wifiClient.setPrivateKey(nullptr);
-    Log::info(TAG, "mqtt.mtls_cleared cert_ptr=reset");
-  }
-  _mtlsWasActive = _mtlsActive;
+  s_tls.setCertificate(_mtlsActive ? _clientCert : nullptr);
+  s_tls.setPrivateKey(_mtlsActive ? _clientKey : nullptr);
+  s_tls.setTransport(transportClient(transport));
 #endif
 
-  // Core 3 DNS has no cap and hostByName returns the lwIP error, not 0, on failure.
-  // Resolve, then feed; each later phase is capped, see begin().
-  IPAddress brokerIp;
-  const bool resolved = WiFi.hostByName(_brokerHost, brokerIp) == 1;
-  esp_task_wdt_reset();
+  // The modem link idles out NAT state on some carriers within a minute, so
+  // its keepalive is short, but longer than one socket open on the other
+  // slot holds the AT bus (20 s). A modem round trip is slower too.
+  const bool cellular = transport == MqttTransport::CELLULAR;
+  _client.setKeepAlive(cellular ? 30 : 60);
+  _client.setSocketTimeout(cellular ? 10 : 5);  // CONNACK and read waits, s
 
-  // Dial the resolved address ourselves, so PubSubClient reuses the socket and
-  // never looks the name up again. TLS still verifies and sends SNI for the name.
-  bool dialed = false;
-  if (resolved) {
-#ifndef MQTT_TLS
-    _wifiClient.stop();
-#endif
-    _client.connected();  // sees the stop(), so a stale CONNECTED state clears
+  // WiFi: core 3 DNS has no cap and hostByName returns the lwIP error, not 0,
+  // on failure, so resolve and feed first, then dial the address. The modem
+  // resolves the name itself inside CAOPEN. TLS verifies and sends SNI for
+  // the configured name either way, and PubSubClient reuses the socket.
+  bool resolved = true;
+  bool dialed   = false;
+  if (cellular) {
 #ifdef MQTT_TLS
-    dialed = _wifiClient.connect(brokerIp, _brokerPort, _brokerHost,
-                                 _tlsVerified ? _caCert : nullptr,
-                                 _mtlsActive ? _clientCert : nullptr,
-                                 _mtlsActive ? _clientKey : nullptr) == 1;
+    dialed = s_tls.connect(_brokerHost, _brokerPort) == 1;
 #else
-    dialed = _wifiClient.connect(brokerIp, _brokerPort) == 1;
+    dialed = transportClient(transport)->connect(_brokerHost, _brokerPort) == 1;
 #endif
+  } else {
+    IPAddress brokerIp;
+    resolved = WiFi.hostByName(_brokerHost, brokerIp) == 1;
     esp_task_wdt_reset();
+    if (resolved) {
+#ifdef MQTT_TLS
+      dialed = s_tls.connect(brokerIp, _brokerPort, _brokerHost) == 1;
+#else
+      dialed = s_wifiTcp.connect(brokerIp, _brokerPort) == 1;
+#endif
+    }
   }
+  esp_task_wdt_reset();
+  s_transport = transport;
 
   // Broker uses CN as username (use_identity_as_username) when mTLS is
   // active - sending user/pass alongside is redundant and confusing.
@@ -900,10 +904,11 @@ void MQTTClient::connect() {
     snapshotGoodConfig();
     _lastSuccessMs    = millis();
     _connectedSinceMs = millis();
-    Log::kvf(TAG, "mqtt.state_change from=disconnected to=connected broker=%s", _brokerHost);
+    Log::kvf(TAG, "mqtt.state_change from=disconnected to=connected broker=%s transport=%s",
+             _brokerHost, ::transportName(transport));
 
     // TCP keepalive catches dead connections faster than MQTT-level keepalive.
-    int fd = _wifiClient.fd();
+    int fd = cellular ? -1 : s_wifiTcp.fd();
     if (fd >= 0) {
       int keepAlive    = 1;
       int keepIdle     = 30;   // seconds before first probe
@@ -929,7 +934,7 @@ void MQTTClient::connect() {
   } else {
     // A failed resolve or dial never reached PubSubClient, so its state() is stale.
     const int rc = dialed ? _client.state() : MQTT_CONNECT_FAILED;
-    if (dialed) _wifiClient.stop();
+    if (dialed) closeSession();
     Log::kvfw(TAG, "mqtt.connect_failed rc=%d retry_ms=%lu",
               rc, (unsigned long)_retryInterval);
     _retryCount++;
@@ -1054,14 +1059,9 @@ void MQTTClient::loop() {
   }
 
 
-  // Transport-agnostic heap telemetry. Defers 30 s after cellular handoff
-  // (see s_fallbackStartMs) so the post-ACTIVE AT burst clears first.
   {
     uint32_t hpNow = millis();
-    bool eligible = _client.connected() ||
-                    (s_fallbackPublishing && s_fallbackStartMs != 0 &&
-                     (hpNow - s_fallbackStartMs) >= 30000UL);
-    if (eligible &&
+    if (_client.connected() &&
         (_lastHeapPublishMs == 0 || (hpNow - _lastHeapPublishMs) >= HEAP_PUBLISH_MS)) {
       publishHeapStats();
     }
@@ -1090,6 +1090,19 @@ void MQTTClient::loop() {
     connect();
   }
 
+  // WiFi came back under a cellular session, or the cellular link was
+  // withdrawn: move the session to the transport that should carry it.
+  if (_client.connected() && transportWanted() != s_transport) {
+    Log::kvf(TAG, "mqtt.transport_switch from=%s to=%s",
+             ::transportName(s_transport), ::transportName(transportWanted()));
+    _client.disconnect();
+    closeSession();
+    _lastSuccessMs    = 0;
+    _connectedSinceMs = 0;
+    _retryInterval    = RETRY_MIN_MS;
+    _lastAttempt      = millis() - RETRY_MIN_MS;
+  }
+
   if (_client.connected()) {
     uint32_t now = millis();
     if (_lastSuccessMs > 0 && (now - _lastSuccessMs > WATCHDOG_MS)) {
@@ -1097,7 +1110,7 @@ void MQTTClient::loop() {
       Log::kvfw(TAG, "mqtt.state_change from=connected to=disconnected reason=watchdog_no_activity idle_s=%lu uptime_s=%lu",
                 (unsigned long)(WATCHDOG_MS / 1000), (unsigned long)uptime);
       _client.disconnect();
-      _wifiClient.stop();
+      closeSession();
       _lastSuccessMs = 0;
       _connectedSinceMs = 0;
       _retryInterval = RETRY_MIN_MS;
@@ -1132,7 +1145,7 @@ void MQTTClient::loop() {
     _connectedSinceMs = 0;
   }
 
-  if (!WiFiManager::connected()) return;
+  if (transportWanted() == MqttTransport::NONE) return;
 
   uint32_t now = millis();
   if (now - _lastAttempt >= _retryInterval) {
@@ -1158,29 +1171,16 @@ void MQTTClient::publish(const char* topic, const char* payload) {
     _lastPublishTime = time(nullptr);
     return;
   }
-  // WiFi MQTT is down. Route to cellular forwarder when active - do NOT
-  // enqueue on the WiFi ring or it fills 8/8 and every publish triggers
-  // "Queue full - dropping oldest".
-  if (s_fallbackPublishing) {
-    if (s_pubForwarder) s_pubForwarder(topic, payload, false);
-    return;
-  }
   enqueue(topic, payload);
 }
 
 // Publish retained. Records the topic in the manifest so a device-delete
-// sweep can clear it. Routes to the cellular forwarder when WiFi is down.
+// sweep can clear it. Dropped while no session is up: the retained set is
+// republished in full on every connect.
 void MQTTClient::publishRetained(const char* topic, const char* payload) {
-  if (_client.connected()) {
-    _client.publish(topic, (const uint8_t*)payload, strlen(payload), true);
-    recordRetainedTopic(topic);
-    return;
-  }
-  if (s_fallbackPublishing && s_pubForwarder) {
-    if (s_pubForwarder(topic, payload, true)) {
-      recordRetainedTopic(topic);
-    }
-  }
+  if (!_client.connected()) return;
+  _client.publish(topic, (const uint8_t*)payload, strlen(payload), true);
+  recordRetainedTopic(topic);
 }
 
 // Dedupe-append topic to the retained manifest. Manifest resets each
@@ -1204,7 +1204,7 @@ void MQTTClient::recordRetainedTopic(const char* topic) {
 // sweep also clears this entry.
 // in: none. out: none.
 void MQTTClient::publishRetainedManifest() {
-  if (!_client.connected() && !s_fallbackPublishing) return;
+  if (!_client.connected()) return;
 
   JsonObject cfg = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
@@ -1221,13 +1221,7 @@ void MQTTClient::publishRetainedManifest() {
   String payload;
   serializeJson(doc, payload);
 
-  bool ok = false;
-  if (_client.connected()) {
-    ok = _client.publish(topic, (const uint8_t*)payload.c_str(), payload.length(), true);
-  } else if (s_pubForwarder) {
-    ok = s_pubForwarder(topic, payload.c_str(), true);
-  }
-  if (!ok) return;
+  if (!_client.publish(topic, (const uint8_t*)payload.c_str(), payload.length(), true)) return;
   _manifestPublished    = true;
   _manifestDirty        = false;
   _manifestDirtySinceMs = 0;
@@ -1237,12 +1231,12 @@ void MQTTClient::publishRetainedManifest() {
 // ---------------------------------------------------------------------------
 
 // Republish retained state: availability, discovery, /info, manifest.
-// Session flag prevents repeat on cellular STANDBY->ACTIVE bounces within
-// one fallback window; setFallbackPublishing(false) resets it.
+// connect() runs it with force on every new session; the session flag
+// stops a non-forced caller from repeating it inside one session.
 // in: force - bypass the session flag.
 // out: none.
 void MQTTClient::publishRetainedSet(bool force) {
-  if (!_client.connected() && !s_fallbackPublishing) return;
+  if (!_client.connected()) return;
   if (!force && _retainedPublishedThisSession) return;
 
   JsonObject cfg = Config::get();
@@ -1276,14 +1270,11 @@ void MQTTClient::subscribe(const char* topic, MQTTCallback callback) {
     _client.subscribe(topic);
     _client.loop();
   }
-
-  if (s_subForwarder) s_subForwarder(topic);
 }
 
 // ---------------------------------------------------------------------------
 
-// Match and fire subscriptions: exact, /#, /+ wildcard. Shared between
-// WiFi (onMessage) and cellular (dispatchInbound) to keep semantics identical.
+// Match and fire subscriptions: exact, /#, /+ wildcard.
 // in: topic, payload. out: none.
 void MQTTClient::matchAndDispatch(const char* topic, const char* payload) {
   strncpy(_rxRing[_rxRingHead], topic, sizeof(_rxRing[0]) - 1);
@@ -1295,42 +1286,6 @@ void MQTTClient::matchAndDispatch(const char* topic, const char* payload) {
   _subs.dispatch(topic, payload);
 }
 
-// Public entry for Cellular::pumpInbound: routes +SMSUB URCs through the
-// same callbacks as the WiFi path.
-void MQTTClient::dispatchInbound(const char* topic, const char* payload, size_t length) {
-  _inboundAuth = cliAuthModeFor(_fallbackMtls);
-  _dispatchTlsVerified = _fallbackTlsVerified;
-  matchAndDispatch(topic, payload);
-  (void)length;  // payload is null-terminated by caller
-}
-
-void MQTTClient::setFallbackSessionMTLS(bool active) {
-  if (_fallbackMtls == active) return;
-  _fallbackMtls = active;
-  Log::kvf(TAG, "mqtt.session_auth transport=fallback mode=%s",
-           active ? "mtls" : "password");
-}
-
-void MQTTClient::setFallbackTlsVerified(bool verified) {
-  if (_fallbackTlsVerified == verified) return;
-  _fallbackTlsVerified = verified;
-  Log::kvf(TAG, "mqtt.session_tls transport=fallback verified=%s",
-           verified ? "true" : "false");
-}
-
-// Cellular bring-up uses this to replay AT+SMSUB for every WiFi-side entry.
-void MQTTClient::forEachSubscription(std::function<void(const char*)> fn) {
-  _subs.forEachActive(fn);
-}
-
-void MQTTClient::setSubscribeForwarder(std::function<void(const char*)> fn) {
-  s_subForwarder = fn;
-}
-
-void MQTTClient::setPublishForwarder(std::function<bool(const char*, const char*, bool)> fn) {
-  s_pubForwarder = fn;
-}
-
 void MQTTClient::onMessage(char* topic, uint8_t* payload, unsigned int length) {
   // Heap-allocate: stack overflow on WROOM-32 with large payloads.
   size_t bufSize = length + 1;
@@ -1340,7 +1295,11 @@ void MQTTClient::onMessage(char* topic, uint8_t* payload, unsigned int length) {
   payloadBuf[length] = '\0';
 
   _inboundAuth = cliAuthModeFor(_mtlsActive);
-  _dispatchTlsVerified = _tlsVerified;
+#ifdef MQTT_TLS
+  _dispatchTlsVerified = _tlsVerified && s_tls.verified();
+#else
+  _dispatchTlsVerified = false;
+#endif
   matchAndDispatch(topic, payloadBuf);
   free(payloadBuf);
 }
@@ -1672,10 +1631,10 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
     }
 
     // Build "<cmd> <payload>" for Shell::execute. "{}" is a no-arg sentinel
-    // (SIM7080G drops empty SMSUB URCs; platform substitutes "{}") and
+    // (the platform sends it for a command without arguments) and
     // req_id-only envelopes are also no-arg. Commands needing structured
     // JSON cannot use this path - add them as special cases above.
-    char line[1024];
+    char line[SHELL_LINE_MAX];
     bool isEmptyJson =
       payload && plen == 2 && payload[0] == '{' && payload[1] == '}';
     // {"req_id": ...} with no other keys is also a no-arg invocation -
@@ -1689,8 +1648,8 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
       lineN = snprintf(line, sizeof(line), "%s", cmd);
     }
     if (lineN < 0 || (size_t)lineN >= sizeof(line)) {
-      // cmd + payload exceeds the 1024-byte shell line buffer; report and
-      // bail out rather than silently truncating the command string.
+      // cmd + payload exceeds the shell line buffer; report and bail out
+      // rather than silently truncating the command string.
       JsonDocument resp;
       resp["cmd"] = cmd;
       if (hasReqId) resp["req_id"] = reqId;
@@ -1731,7 +1690,8 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
 
     JsonArray output = startPage();
 
-    Shell::execute(line, [&](const char* outLine) {
+    // A page shipped mid-command says ok:true; the last page carries the result.
+    ShellResult result = Shell::execute(line, [&](const char* outLine) {
       // +8 slack covers ASCII output; pathological escape-heavy lines may
       // truncate one page rather than drop silently.
       size_t lineCost = strlen(outLine) + 8;
@@ -1743,6 +1703,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
       output.add(outLine);
     });
 
+    resp["ok"] = (result == ShellResult::Ok);
     publishPage(false);
   }
 
@@ -1834,7 +1795,7 @@ void MQTTClient::publishDiscovery() {
   auto disc = [&](const char* component, const char* uid, const char* name,
                   const char* stateTopic,
                   const char* unit, const char* devClass, const char* stateClass,
-                  const char* entityCategory = nullptr) {
+                  const char* entityCategory = nullptr, uint32_t expireAfterS = 0) {
     JsonDocument doc;
     doc["name"] = name;
     doc["stat_t"] = stateTopic;
@@ -1844,6 +1805,7 @@ void MQTTClient::publishDiscovery() {
     if (devClass && strlen(devClass) > 0) doc["dev_cla"] = devClass;
     if (stateClass && strlen(stateClass) > 0) doc["stat_cla"] = stateClass;
     if (entityCategory && strlen(entityCategory) > 0) doc["ent_cat"] = entityCategory;
+    if (expireAfterS > 0) doc["exp_aft"] = expireAfterS;
 
     JsonObject dev = doc["dev"].to<JsonObject>();
     dev["ids"] = devId;
@@ -1870,12 +1832,13 @@ void MQTTClient::publishDiscovery() {
   if (sensors) {
     const char* tunit = cfg["temperature"]["unit"] | "C";
     const char* haUnit = (tunit[0] == 'F' || tunit[0] == 'f') ? "\xC2\xB0""F" : "\xC2\xB0""C";
+    uint32_t expS = tempExpireAfterS(cfg["temperature"]["interval_s"] | 60);
     for (JsonObject s : sensors) {
       const char* sname = s["name"] | "unknown";
       makeSlug(sname, slug, sizeof(slug));
       snprintf(uid, sizeof(uid), "%s_%s_temp", devId, slug);
       snprintf(stBuf, sizeof(stBuf), "%s/sensor/temperature/%s", prefix, slug);
-      disc("sensor", uid, sname, stBuf, haUnit, "temperature", "measurement");
+      disc("sensor", uid, sname, stBuf, haUnit, "temperature", "measurement", nullptr, expS);
     }
   }
 
@@ -1970,7 +1933,7 @@ void MQTTClient::publishDiscovery() {
 // tagging. Routes through publish() so cellular deployments get the same
 // telemetry.
 void MQTTClient::publishHeapStats() {
-  if (!_client.connected() && !s_fallbackPublishing) return;
+  if (!_client.connected()) return;
 
   JsonObject cfg = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
@@ -2064,7 +2027,7 @@ static void sha256File(const char* path, char* out) {
 }
 
 void MQTTClient::publishDeviceInfo() {
-  if (!_client.connected() && !s_fallbackPublishing) return;
+  if (!_client.connected()) return;
 
   JsonObject cfg = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
@@ -2200,9 +2163,7 @@ void MQTTClient::flushQueue() {
 // ---------------------------------------------------------------------------
 
 bool MQTTClient::connected() {
-  // _client is WiFi only. s_fallbackPublishing is the connected signal when
-  // cellular has taken over (same pattern as the publish guards).
-  return _client.connected() || s_fallbackPublishing;
+  return _client.connected();
 }
 
 bool MQTTClient::mtlsSessionUp() {
@@ -2291,7 +2252,6 @@ bool MQTTClient::clearClientCert() {
   }
   // The broken cert is gone, so the recovery permission it granted goes too.
   _storedCertBroken = false;
-  if (_onCertClearedHook) _onCertClearedHook();
   return true;
 }
 
@@ -2308,10 +2268,6 @@ void MQTTClient::serviceCertReboot() {
   Log::kvfw(TAG, "mqtt.cert_reboot reason=%s", _certRebootReason);
   delay(100);
   OTAUpdate::plannedRestart();
-}
-
-void MQTTClient::setOnClientCertCleared(std::function<void()> fn) {
-  _onCertClearedHook = fn;
 }
 
 bool MQTTClient::hasClientCert() {

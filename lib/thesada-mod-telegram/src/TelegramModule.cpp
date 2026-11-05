@@ -89,7 +89,7 @@ void TelegramModule::begin() {
     // fails closed. Refusing to send beats leaking the token insecurely.
     Log::error(TAG, "telegram.ca_missing sends=fail_closed");
   }
-  _secClient.setTimeout(TELEGRAM_IO_MS / 1000);  // seconds: TCP connect and each write
+  _secClient.setConnectionTimeout(TELEGRAM_IO_MS);  // ms: TCP connect and each write
   _secClient.setHandshakeTimeout(TELEGRAM_HANDSHAKE_S);
 
   // Webhook client: /webhook-ca.crt on LittleFS enables verified TLS
@@ -119,7 +119,7 @@ void TelegramModule::begin() {
       Log::warn(TAG, "telegram.webhook_ca_missing tls=unverified");
     }
   }
-  _webhookClient.setTimeout(TELEGRAM_IO_MS / 1000);
+  _webhookClient.setConnectionTimeout(TELEGRAM_IO_MS);
   _webhookClient.setHandshakeTimeout(TELEGRAM_HANDSHAKE_S);
 
   Log::kvf(TAG, "telegram.ready token=%s chats=%d", hasToken ? "yes" : "no", nChats);
@@ -166,7 +166,7 @@ static bool resolveFed(const char* host) {
 static int boundedPost(Client& c, const char* host, uint16_t port, bool tls, const char* path,
                        const String& body) {
   if (!c.connect(host, port)) { c.stop(); return -1; }
-  String req = String("POST ") + path + " HTTP/1.1\r\nHost: " + host;
+  String req = String("POST ") + httpTargetLead(path) + path + " HTTP/1.1\r\nHost: " + host;
   if (port != (tls ? 443 : 80)) { req += ':'; req += String(port); }
   req += "\r\nContent-Type: application/json\r\nContent-Length: " + String(body.length()) +
          "\r\nConnection: close\r\n\r\n";
@@ -294,7 +294,7 @@ bool TelegramModule::send(const char* message) {
         Log::warn(TAG, "telegram.webhook_post_failed reason=dns");
       } else {
         WiFiClient pc;
-        pc.setTimeout(TELEGRAM_IO_MS / 1000);
+        pc.setConnectionTimeout(TELEGRAM_IO_MS);
         if (isHttps) _webhookClient.stop();
         int code = isHttps ? boundedPost(_webhookClient, host, port, true, wpath, postBody)
                            : boundedPost(pc, host, port, false, wpath, postBody);

@@ -164,8 +164,8 @@ void setup() {
     OTAUpdate::begin();
     OTAUpdate::checkNow();  // immediate check while heap is clean
   }
-  // Registers the subscription set that Cellular::smsubAll mirrors onto the
-  // cellular MQTT session on failover. connect() is a no-op if WiFi is down.
+  // Registers the subscription set every session resubscribes. connect() is
+  // a no-op until a transport is up.
   if (_mqttEnabled) {
     // Roll back mqtt.* to last-good if a bad config rebooted us without ever
     // connecting; no-op otherwise. Must precede the first connect attempt.

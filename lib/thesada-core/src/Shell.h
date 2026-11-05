@@ -7,6 +7,7 @@
 #include <Arduino.h>
 #include <functional>
 #include "shell_mode_policy.h"
+#include "shell_line_policy.h"
 
 namespace fs { class FS; }
 
@@ -27,6 +28,7 @@ struct ShellEntry {
   const char* name;
   const char* help;
   ShellCommand handler;
+  int restFrom;  // >0: argv[restFrom] is the raw rest of the line
 };
 
 class Shell {
@@ -41,14 +43,22 @@ public:
   // Run a command line synchronously on the caller's task. Callers in a
   // non-main context (AsyncTCP, PubSubClient callback) MUST use enqueue()
   // instead: running here from those task stacks risks overflow on commands
-  // that touch fs / MQTT / TLS.
-  // in: command line, output callback. out: none.
-  static void execute(const char* line, ShellOutput out);
+  // that touch fs / MQTT / TLS. One console line may run while a command
+  // blocks (SHELL_NEST_MAX); a deeper one is refused.
+  // in: command line, output callback.
+  // out: Failed on a refused line, an unknown command or a handler fail().
+  static ShellResult execute(const char* line, ShellOutput out);
+
+  // Print msg and mark the running command failed, so the transport replies
+  // ok:false. Outside execute() it only prints.
+  // in: output callback, message. out: none.
+  static void fail(ShellOutput out, const char* msg);
 
   // Stage a command for the main-loop drain. false if the ring is full (caller
-  // surfaces "shell busy"). sink fires once per output line during execute().
+  // surfaces "shell busy") or the line does not fit DEFERRED_LINE_LEN, which is
+  // refused, never clipped. sink fires once per output line during execute().
   // Safe from any task; copies happen under a brief critical section.
-  // in: command, output sink. out: true if accepted, false if ring full.
+  // in: command, output sink. out: true if accepted, false if full or too long.
   static bool enqueue(const char* line, ShellOutput sink);
 
   // Stage an arbitrary callable for the main-loop drain - for transports whose
@@ -63,8 +73,10 @@ public:
   // in: none. out: none.
   static void loop();
 
-  // Register a command (name, one-line help, handler).
-  static void registerCommand(const char* name, const char* help, ShellCommand handler);
+  // Register a command (name, one-line help, handler). restFrom > 0 hands the
+  // handler argv[restFrom] as the rest of the line, inner whitespace intact.
+  static void registerCommand(const char* name, const char* help, ShellCommand handler,
+                              int restFrom = 0);
 
   // Map a mount prefix to a filesystem; modules with their own storage call
   // this after a successful mount. fs.* routes by leading path segment, with
@@ -136,11 +148,13 @@ public:
 
 private:
   static void registerBuiltins();
-  static int parse(const char* line, char** argv, int maxArgs);
 
   static ShellEntry _commands[MAX_COMMANDS];
   static int _commandCount;
-  static char _parseBuf[256];  // mutable copy for tokenization
+  // One parse buffer and fail flag per nesting level (shellParseSlot).
+  static char _parseBuf[SHELL_NEST_MAX][SHELL_LINE_MAX];
+  static bool _failed[SHELL_NEST_MAX];
+  static int  _depth;
 
   // FS mount registry, walked in registration order by resolveFS.
   static constexpr int FS_MOUNTS_MAX = 4;
