@@ -44,11 +44,8 @@
 #include <WiFi.h>
 #include <ArduinoJson.h>
 
-extern "C" {
-#include <lua/lua.h>
-#include <lua/lualib.h>
-#include <lua/lauxlib.h>
-}
+#include "lua_stdlibs.h"
+#include "lua_budget_hooks.h"
 
 static const char* TAG = "Lua";
 
@@ -56,6 +53,18 @@ lua_State* gL = nullptr;
 uint32_t ScriptEngine::_generation = 0;
 LuaBindingRegistrar ScriptEngine::_registrars[ScriptEngine::MAX_REGISTRARS] = {};
 uint8_t ScriptEngine::_registrarCount = 0;
+
+// ---------------------------------------------------------------------------
+// Script budget: every call from C into Lua shares one wall-clock budget
+// ---------------------------------------------------------------------------
+
+static uint32_t budgetNow() { return millis(); }
+static LuaBudgetHost _budget = {{0, 0, 0, false}, budgetNow, Watchdog::feed};
+
+// Time a binding spent blocked is not script time. in: ms. out: none.
+void ScriptEngine::creditNative(uint32_t ms) {
+  luaBudgetCredit(_budget.budget, ms);
+}
 
 // ---------------------------------------------------------------------------
 // Lua binding: Log
@@ -98,7 +107,9 @@ static const luaL_Reg logLib[] = {
 static int lua_mqtt_publish(lua_State* L) {
   const char* topic   = luaL_checkstring(L, 1);
   const char* payload = luaL_checkstring(L, 2);
+  const uint32_t t0 = millis();
   MQTTClient::publish(topic, payload);
+  ScriptEngine::creditNative(millis() - t0);
   return 0;
 }
 
@@ -115,7 +126,7 @@ static int lua_mqtt_subscribe(lua_State* L) {
     lua_rawgeti(gL, LUA_REGISTRYINDEX, ref);
     lua_pushstring(gL, topic);
     lua_pushstring(gL, payload);
-    if (lua_pcall(gL, 2, 0, 0) != LUA_OK) {
+    if (luaBudgetedCall(gL, 2, 0) != LUA_OK) {
       const char* err = lua_tostring(gL, -1);
       Log::kvfe("Lua", "script.callback_error source=mqtt_sub err=\"%.100s\"",
                 err ? err : "unknown");
@@ -338,7 +349,7 @@ static int lua_eventbus_subscribe(lua_State* L) {
     }
 
     jsonObjectToLuaTable(gL, data);
-    if (lua_pcall(gL, 1, 0, 0) != LUA_OK) {
+    if (luaBudgetedCall(gL, 1, 0) != LUA_OK) {
       const char* err = lua_tostring(gL, -1);
       Log::kvfe("Lua", "script.callback_error source=eventbus err=\"%.100s\"",
                 err ? err : "unknown");
@@ -414,13 +425,10 @@ void ScriptEngine::createState() {
     Log::error(TAG, "script.state_create_failed reason=oom");
     return;
   }
+  // Before any coroutine exists, so every thread inherits it.
+  luaBudgetInstall(gL, &_budget);
 
-  luaL_openlibs(gL);
-
-  // ESP-Arduino-Lua may not fully load all standard libs. Ensure they exist.
-  luaL_requiref(gL, "math",   luaopen_math,   1); lua_pop(gL, 1);
-  luaL_requiref(gL, "table",  luaopen_table,  1); lua_pop(gL, 1);
-  luaL_requiref(gL, "string", luaopen_string, 1); lua_pop(gL, 1);
+  luaOpenLibs(gL);
 
   // Sandbox: nil out dangerous globals. MQTT broker creds =
   // device root, so cli/lua.exec must NOT see io/os/debug/package. Native
@@ -480,55 +488,11 @@ void ScriptEngine::addBindings(LuaBindingRegistrar fn) {
 }
 
 // Call all registered binding functions (core + module)
-static void wrapProtectedCalls(lua_State* L);
-
 void ScriptEngine::callAllRegistrars() {
   registerCoreBindings();
-  wrapProtectedCalls(gL);
+  luaBudgetWrapProtectedCalls(gL);
   for (uint8_t i = 0; i < _registrarCount; i++) {
     if (_registrars[i]) _registrars[i](gL);
-  }
-}
-
-static uint32_t _scriptStartMs = 0;
-static bool _budgetActive = false;  // a file is running under the budget
-static bool _budgetHit = false;     // its budget ran out
-
-// Count hook while a script file runs: feed until the budget is spent, then
-// raise. Coroutines keep the hook after the file ends; it is inert then.
-static void scriptBudgetHook(lua_State* L, lua_Debug*) {
-  if (!_budgetActive) return;
-  if (waitBudgetSpent(_scriptStartMs, millis(), LUA_SCRIPT_BUDGET_MS)) {
-    _budgetHit = true;
-    luaL_error(L, "script.budget_exceeded budget_ms=%d", (int)LUA_SCRIPT_BUDGET_MS);
-    return;
-  }
-  Watchdog::feed();
-}
-
-// pcall/xpcall wrapper: once the budget is spent, re-raise after the protected
-// call, so a caught budget error climbs every pcall up to executeFile.
-static int budgetSafeCall(lua_State* L) {
-  const int n = lua_gettop(L);
-  lua_pushvalue(L, lua_upvalueindex(1));
-  lua_insert(L, 1);
-  lua_call(L, n, LUA_MULTRET);
-  if (_budgetActive && _budgetHit) {
-    return luaL_error(L, "script.budget_exceeded budget_ms=%d", (int)LUA_SCRIPT_BUDGET_MS);
-  }
-  return lua_gettop(L);
-}
-
-static void wrapProtectedCalls(lua_State* L) {
-  static const char* const names[] = {"pcall", "xpcall"};
-  for (const char* name : names) {
-    lua_getglobal(L, name);
-    if (lua_isfunction(L, -1)) {
-      lua_pushcclosure(L, budgetSafeCall, 1);
-      lua_setglobal(L, name);
-    } else {
-      lua_pop(L, 1);
-    }
   }
 }
 
@@ -563,20 +527,7 @@ bool ScriptEngine::executeFile(const char* path) {
 
   int result = lua_load(gL, reader, &ctx, path, nullptr);
   f.close();
-  if (result == LUA_OK) {
-    _scriptStartMs = millis();
-    _budgetHit = false;
-    _budgetActive = true;
-    Watchdog::feed();
-    lua_sethook(gL, scriptBudgetHook, LUA_MASKCOUNT, LUA_HOOK_COUNT);
-    result = lua_pcall(gL, 0, LUA_MULTRET, 0);
-    lua_sethook(gL, nullptr, 0, 0);
-    _budgetActive = false;
-    if (result == LUA_OK && _budgetHit) {
-      Log::kvfe(TAG, "script.exec_failed path=%s err=\"script.budget_exceeded caught\"", path);
-      return false;
-    }
-  }
+  if (result == LUA_OK) result = luaBudgetedCall(gL, 0, 0);
   if (result != LUA_OK) {
     const char* err = lua_tostring(gL, -1);
     Log::kvfe(TAG, "script.exec_failed path=%s err=\"%.160s\"",
@@ -604,21 +555,18 @@ void ScriptEngine::begin() {
   // Subscribe to MQTT reload trigger.
   JsonObject cfg = Config::get();
   const char* customTopic = cfg["lua"]["reload_topic"] | "";
+  // subscribe() copies a custom topic and refuses one past MQTT_TOPIC_CAP.
+  const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
   char topic[MQTT_TOPIC_CAP];
-  if (strlen(customTopic) > 0) {
-    strncpy(topic, customTopic, sizeof(topic) - 1);
-    topic[sizeof(topic) - 1] = '\0';
-  } else {
-    const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-    snprintf(topic, sizeof(topic), "%s/cmd/lua/reload", prefix);
-  }
+  const char* reloadTopic = *customTopic ? customTopic
+      : (MQTTClient::formatTopic(topic, sizeof(topic), "%s/cmd/lua/reload", prefix) ? topic : nullptr);
 
-  MQTTClient::subscribe(topic, [](const char* topic, const char* payload) {
+  if (reloadTopic) MQTTClient::subscribe(reloadTopic, [](const char* topic, const char* payload) {
     Log::info(TAG, "script.reload_trigger source=mqtt");
     ScriptEngine::reload();
   });
 
-  Log::kvf(TAG, "script.ready reload_topic=%s", topic);
+  Log::kvf(TAG, "script.ready reload_topic=%s", reloadTopic ? reloadTopic : "");
 
   // Register Lua shell commands
   Shell::registerCommand("lua.exec", "Execute inline Lua code",
@@ -626,7 +574,8 @@ void ScriptEngine::begin() {
         if (argc < 2) { out("Usage: lua.exec <code>"); return; }
         extern lua_State* gL;
         if (!gL) { out("Lua state not initialized"); return; }
-        int result = luaL_dostring(gL, argv[1]);  // restFrom 1: code as typed
+        int result = luaL_loadstring(gL, argv[1]);  // restFrom 1: code as typed
+        if (result == LUA_OK) result = luaBudgetedCall(gL, 0, LUA_MULTRET);
         if (result != LUA_OK) {
           const char* err = lua_tostring(gL, -1);
           char msg[196];
@@ -662,7 +611,8 @@ void ScriptEngine::begin() {
         if (!f) { out("Failed to open file"); return; }
         String script = f.readString();
         f.close();
-        int result = luaL_dostring(gL, script.c_str());
+        int result = luaL_loadstring(gL, script.c_str());
+        if (result == LUA_OK) result = luaBudgetedCall(gL, 0, 0);
         if (result != LUA_OK) {
           const char* err = lua_tostring(gL, -1);
           char msg[196];
@@ -728,7 +678,7 @@ void ScriptEngine::loop() {
       int ref = _timers[i].callbackRef;
       _timers[i].callbackRef = LUA_NOREF;
       lua_rawgeti(gL, LUA_REGISTRYINDEX, ref);
-      if (lua_pcall(gL, 0, 0, 0) != LUA_OK) {
+      if (luaBudgetedCall(gL, 0, 0) != LUA_OK) {
         const char* err = lua_tostring(gL, -1);
         Log::kvfe("Lua", "script.timer_error err=\"%.100s\"",
                   err ? err : "unknown");

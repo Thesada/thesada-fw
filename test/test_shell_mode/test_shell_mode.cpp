@@ -104,6 +104,34 @@ void test_present_string_parses_normally(void) {
   TEST_ASSERT_EQUAL(SHELL_MODE_OFF,         shellModeResolve(true, "nonsense"));
 }
 
+// --- shellModeHttpSurfaceAllowed (#15) ---------------------------------------
+
+// POST and DELETE /api/file are fs.write / fs.rm over HTTP, so a narrowed mode
+// closes them with the command surface.
+void test_narrowed_modes_close_http_file_writes(void) {
+  const ShellMode narrowed[] = {SHELL_MODE_SERIAL_ONLY, SHELL_MODE_MQTT_ONLY, SHELL_MODE_OFF};
+  for (ShellMode m : narrowed) {
+    TEST_ASSERT_FALSE(shellModeHttpSurfaceAllowed(m, HTTP_SURFACE_FILE_WRITE));
+    TEST_ASSERT_FALSE(shellModeHttpSurfaceAllowed(m, HTTP_SURFACE_CMD));
+    TEST_ASSERT_FALSE(shellModeHttpSurfaceAllowed(m, HTTP_SURFACE_TERMINAL));
+  }
+}
+
+// Config push and OTA are how a narrowed device is changed back.
+void test_config_push_and_ota_stay_open_in_every_mode(void) {
+  const ShellMode all[] = {SHELL_MODE_FULL, SHELL_MODE_SERIAL_ONLY, SHELL_MODE_MQTT_ONLY, SHELL_MODE_OFF};
+  for (ShellMode m : all) {
+    TEST_ASSERT_TRUE(shellModeHttpSurfaceAllowed(m, HTTP_SURFACE_CONFIG_PUSH));
+    TEST_ASSERT_TRUE(shellModeHttpSurfaceAllowed(m, HTTP_SURFACE_OTA));
+  }
+}
+
+void test_full_opens_every_http_surface(void) {
+  TEST_ASSERT_TRUE(shellModeHttpSurfaceAllowed(SHELL_MODE_FULL, HTTP_SURFACE_FILE_WRITE));
+  TEST_ASSERT_TRUE(shellModeHttpSurfaceAllowed(SHELL_MODE_FULL, HTTP_SURFACE_CMD));
+  TEST_ASSERT_TRUE(shellModeHttpSurfaceAllowed(SHELL_MODE_FULL, HTTP_SURFACE_TERMINAL));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_each_mode_name_parses);
@@ -119,5 +147,8 @@ int main(int, char**) {
   RUN_TEST(test_missing_key_resolves_full);
   RUN_TEST(test_present_non_string_resolves_off);
   RUN_TEST(test_present_string_parses_normally);
+  RUN_TEST(test_narrowed_modes_close_http_file_writes);
+  RUN_TEST(test_config_push_and_ota_stay_open_in_every_mode);
+  RUN_TEST(test_full_opens_every_http_surface);
   return UNITY_END();
 }

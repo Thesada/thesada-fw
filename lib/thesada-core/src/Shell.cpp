@@ -14,8 +14,11 @@
 #include "SensorRegistry.h"
 #include "Net.h"
 #include "path_safety_policy.h"
+#include "cell_ntp_policy.h"
 #include "ap_policy.h"
 #include "glob_policy.h"
+#include "http_fetch_policy.h"
+#include "cert_policy.h"
 #include <thesada_config.h>
 #include <mbedtls/platform_util.h>
 #include <esp_ota_ops.h>
@@ -34,6 +37,8 @@
 #include <ArduinoJson.h>
 #include <sys/time.h>
 #include <algorithm>
+#include <atomic>
+#include <new>
 
 ShellEntry Shell::_commands[MAX_COMMANDS];
 int Shell::_commandCount = 0;
@@ -207,9 +212,13 @@ void Shell::loop() {
   }
 }
 
+// Console owner, set by begin(). A worker task (net.http) skips the pump.
+static TaskHandle_t s_consoleTask = nullptr;
+
 // Single console - safe to share static buffer state because there is only
-// one host typing at the other end.
+// one host typing at the other end, and one task reading it.
 void Shell::pumpConsole() {
+  if (!shellPumpAllowed(xTaskGetCurrentTaskHandle(), s_consoleTask)) return;
   static char  buf[Shell::DEFERRED_LINE_LEN];
   static int   pos = 0;
   static bool  overflow = false;
@@ -795,22 +804,13 @@ static void cmd_config_get(int argc, char** argv, ShellOutput out) {
   }
 }
 
-// Persist a document to /config.json via tmp + rename - same policy as
-// Config::save(), so a short write (fs full) never destroys the last
-// good config. Reports failure to the shell caller.
+// Persist a document through Config::writeFile (tmp + rename), so a short
+// write (fs full) never destroys the last good config. Reports failure.
 static bool shellConfigWrite(JsonVariantConst src, ShellOutput out, size_t* bytes = nullptr) {
-  File wf = LittleFS.open("/config.json.tmp", "w");
-  if (!wf) { Shell::fail(out, "Failed to write config.json"); return false; }
-  size_t written  = serializeJsonPretty(src, wf);
-  size_t expected = measureJsonPretty(src);
-  wf.close();
-  if (written < expected ||
-      !LittleFS.rename("/config.json.tmp", "/config.json")) {
-    LittleFS.remove("/config.json.tmp");
+  if (!Config::writeFile(src, true, bytes)) {
     Shell::fail(out, "Failed to write config.json (fs full?)");
     return false;
   }
-  if (bytes) *bytes = written;
   return true;
 }
 
@@ -854,7 +854,8 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
   String value(argv[2]);
   // Strip surrounding double quotes (MQTT CLI payloads often arrive quoted)
   if (value.length() >= 2 && value.charAt(0) == '"' && value.charAt(value.length() - 1) == '"') {
-    value = value.substring(1, value.length() - 1);
+    value.remove(value.length() - 1);
+    value.remove(0, 1);
   }
 
   if (!LittleFS.exists("/config.json")) { Shell::fail(out, "config.json not found"); return; }
@@ -1297,30 +1298,36 @@ static void cmd_ntp(int argc, char** argv, ShellOutput out) {
   }
 
   // ntp sync - force a sync now. Over WiFi the SNTP client runs in the
-  // background already; over cellular nothing syncs the clock unless the
-  // modem is asked (AT+CNTP), so this is the recovery path for the
-  // "WiFi never associated, clock stuck at 1970" case.
+  // background already. Over cellular CellularModule syncs on a backoff
+  // schedule, and this asks the modem (AT+CNTP) right away.
   if (argc >= 2 && strcmp(argv[1], "sync") == 0) {
-    JsonObject  scfg   = Config::get();
-    const char* server = scfg["ntp"]["server"] | "pool.ntp.org";
+    JsonObject scfg = Config::get();
     if (WiFiManager::connected()) {
       out("WiFi up - SNTP client already syncing in background");
       return;
     }
     const Net::CellularProvider* cell = Net::cellular();
     if (cell && cell->linkUp && cell->linkUp() && cell->ntpSync) {
-      uint32_t timeoutMs = (scfg["ntp"]["cell_timeout_s"] | 60) * 1000UL;
+      uint32_t    timeoutMs = (scfg["ntp"]["cell_timeout_s"] | 60) * 1000UL;
+      const char* cand[CELL_NTP_PER_TRY];
+      uint8_t     n = cellNtpCandidates(scfg["ntp"]["server"] | "pool.ntp.org",
+                                        scfg["ntp"]["server2"] | "time.cloudflare.com", cand);
+      // Copies: ntpSync pumps the console, and a config.set there reloads the doc.
+      char host[CELL_NTP_PER_TRY][CELL_NTP_HOST_MAX + 1];
+      for (uint8_t i = 0; i < n; i++) snprintf(host[i], sizeof(host[i]), "%s", cand[i]);
       out("Syncing clock via cellular NTP...");
-      if (cell->ntpSync(server, timeoutMs)) {
+      for (uint8_t i = 0; i < n; i++) {
+        if (!cell->ntpSync(host[i], timeoutMs)) continue;
         time_t now = time(nullptr);
         struct tm* t = gmtime(&now);
         char ts[32];
         strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", t);
         snprintf(line, sizeof(line), "Synced via cellular - UTC: %s", ts);
         out(line);
-      } else {
-        out("Cellular NTP sync failed");
+        out(host[i]);
+        return;
       }
+      out("Cellular NTP sync failed");
       return;
     }
     out("No transport up - cannot sync");
@@ -1394,30 +1401,32 @@ static void cmd_mqtt(int argc, char** argv, ShellOutput out) {
   }
 }
 
-// net.http body-preview cap: the first N bytes of the response body are
-// echoed back to the shell; the rest is counted but discarded.
-static const size_t HTTP_PREVIEW_CAP = 1024;
-static const size_t HTTP_URL_MAX     = 256;
+// net.http URL cap. Preview size and the read and wait bounds are in
+// http_fetch_policy.h.
+static const size_t HTTP_URL_MAX = 256;
 
-// One net.http WiFi fetch. Heap-allocated by cmd_http and handed to
-// httpFetchTask; cmd_http owns it and frees it once `done` is observed.
+// One net.http fetch, heap-allocated by cmd_http and run by httpFetchTask.
+// cmd_http frees it, unless httpJobAbandon handed it to the task.
 struct HttpFetchJob {
   // in
   char          url[HTTP_URL_MAX];
   bool          https;
   bool          insecure;
+  // in, cellular only: provider GET and the split URL
+  decltype(Net::CellularProvider::httpsGet) cellGet;
+  char          host[128];
+  const char*   path;       // into url, or the literal "/"
+  uint16_t      port;
   // out
-  char          preview[HTTP_PREVIEW_CAP];
-  size_t        previewLen;
-  size_t        totalLen;
+  HttpPreview   body;
   int           status;
   bool          ok;
   const char*   err;        // static message, nullptr on success
-  volatile bool done;       // task sets this last; cmd_http polls it
+  std::atomic<uint32_t> state;  // HTTP_JOB_*, the task's last write
 };
 
-// The fetch itself. Every local, the CA PEM included, lives until return.
-// in:  job. out: job fields filled except done.
+// The WiFi fetch. Every local, the CA PEM included, lives until return.
+// in:  job. out: job fields filled except state.
 static void httpFetchRun(HttpFetchJob* job) {
   String           pem;  // setCACert keeps the pointer, not a copy
   WiFiClientSecure tls;
@@ -1453,54 +1462,70 @@ static void httpFetchRun(HttpFetchJob* job) {
   job->status = http.GET();
   if (job->status > 0) {
     job->ok = true;
-    int         len      = http.getSize();  // -1 when chunked / unknown
-    WiFiClient* s        = http.getStreamPtr();
+    int         len = http.getSize();  // -1 when chunked / unknown
+    WiFiClient* s   = http.getStreamPtr();
     uint8_t     chunk[512];
-    uint32_t    deadline = millis() + 20000UL;
-    while (millis() < deadline) {
+    uint32_t    t0  = millis();
+    while (millis() - t0 < HTTP_WIFI_READ_MS) {
       if (!s->connected() && !s->available()) break;
       int avail = s->available();
       if (avail <= 0) { delay(10); continue; }
       int n = s->readBytes(chunk, std::min((size_t)avail, sizeof(chunk)));
       if (n <= 0) break;
-      job->totalLen += n;
-      if (job->previewLen < HTTP_PREVIEW_CAP) {
-        size_t copy = std::min((size_t)n, HTTP_PREVIEW_CAP - job->previewLen);
-        memcpy(job->preview + job->previewLen, chunk, copy);
-        job->previewLen += copy;
-      }
-      if (len > 0 && (int)job->totalLen >= len) break;
+      httpPreviewKeep(job->body, chunk, n);
+      if (len > 0 && (int)job->body.total >= len) break;
     }
   }
   http.end();
 }
 
-// Run the WiFi HTTPS fetch on a dedicated deep-stack task.
-//
-// Why a task: the mbedtls TLS handshake needs ~6 KB of stack, and
-// net.http executes deep in the deferred-CLI call chain on the main-loop
-// task (loop -> Shell::loop -> deferred drain -> execute -> cmd_http).
-// Doing the handshake there overflows the 8 KB loop-task stack - the
-// board resets silently (panic out the other UART, USB-CDC dead). This
-// task gets its own 12 KB stack; cmd_http blocks on job->done.
-//
-// The task is not subscribed to the task watchdog, so it does not feed
-// it - the main-loop task keeps feeding its own wdt from cmd_http's wait
-// loop. Every exit path sets job->done and self-deletes.
-// in:  arg - HttpFetchJob* (owned by cmd_http). out: job fields filled.
+// The cellular fetch: TlsClient on modem socket slot 1, same CA rule as WiFi.
+// in:  job. out: job fields filled except state.
+static void httpFetchRunCellular(HttpFetchJob* job) {
+  String pem;  // TlsClient keeps the pointer for the whole GET
+  File ca = LittleFS.open("/ca.crt", "r");
+  if (ca) { pem = ca.readString(); ca.close(); }
+  if (pem.isEmpty() && !job->insecure) {
+    job->err = "no /ca.crt on flash - pass --insecure to skip verification";
+    return;
+  }
+  auto sink = [job](const uint8_t* buf, size_t len) -> bool {
+    httpPreviewKeep(job->body, buf, len);
+    return true;
+  };
+  bool got = job->cellGet(job->host, job->path, job->port, pem.isEmpty() ? nullptr : pem.c_str(),
+                          sink, &job->status, HTTP_CELL_READ_MS, &job->body.cut);
+  job->ok = got || (job->body.cut && job->status > 0);
+}
+
+// One net.http fetch on its own 12 KB stack: a TLS handshake deep in the CLI
+// chain overflows the 8 KB loop task, and the board resets silently.
+// in:  arg - HttpFetchJob*. out: job filled, freed here once abandoned.
 static void httpFetchTask(void* arg) {
   HttpFetchJob* job = static_cast<HttpFetchJob*>(arg);
-  httpFetchRun(job);
-  job->done = true;
+  if (job->cellGet) {
+    // The modem socket and TlsClient feed the watchdog, and IDF logs every
+    // feed from a task it does not watch.
+    const bool watched = esp_task_wdt_add(nullptr) == ESP_OK;
+    httpFetchRunCellular(job);
+    if (watched) esp_task_wdt_delete(nullptr);
+  } else {
+    httpFetchRun(job);
+  }
+  Log::kvf("Shell", "shell.http_done via=%s status=%d body=%u cut=%d stack_free=%u",
+           job->cellGet ? "cellular" : "wifi", job->status, (unsigned)job->body.total,
+           (int)job->body.cut, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+  if (httpJobFinish(job->state)) delete job;
   vTaskDelete(nullptr);
 }
 
 // HTTPS GET via whichever transport is up - the single HTTPS-GET shell
-// command, auto-routed. WiFi -> a deep-stack task running HTTPClient +
-// WiFiClientSecure (CA loaded from /ca.crt). WiFi down + cellular up ->
-// Cellular::httpsGet via the Net cellular provider, inline on the loop
-// task like the MQTT handshake. Output: status code, body length, first
-// <=1 KB preview. HTTPS-only by default; plain HTTP needs --insecure.
+// command, auto-routed. Both fetches run on the net.http task: WiFi as
+// HTTPClient + WiFiClientSecure (CA from /ca.crt), cellular as the Net
+// provider's httpsGet. The wait feeds the loop watchdog, pumps the console,
+// ticks MQTT, and gives the loop back at the transport's ceiling.
+// Output: status code, body length, first <=1 KB preview. HTTPS-only by
+// default, plain HTTP needs --insecure.
 //
 // in:  argv - optional "--insecure", then the URL
 // out: status / length / preview lines via the shell sink
@@ -1544,108 +1569,100 @@ static void cmd_http(int argc, char** argv, ShellOutput out) {
            https ? "https" : "http", host, port, path);
   out(msg);
 
-  HttpFetchJob* job = static_cast<HttpFetchJob*>(calloc(1, sizeof(HttpFetchJob)));
+  HttpFetchJob* job = new (std::nothrow) HttpFetchJob();
   if (!job) { out("net.http: out of memory"); return; }
   strncpy(job->url, url, sizeof(job->url) - 1);
   job->https    = https;
   job->insecure = insecure;
 
-  const char* via = "?";
-
-  if (WiFiManager::connected()) {
-    via = "WiFi";
-    // The WiFi HTTPS path runs on a dedicated deep-stack task (see
-    // httpFetchTask); cmd_http blocks here feeding the main-task
-    // watchdog and pumping the console while it waits.
-    if (xTaskCreate(httpFetchTask, "net.http", 12288, job,
-                    tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
-      out("net.http: failed to spawn fetch task");
-      free(job);
-      return;
-    }
-    // The task's own bounds are ~8 s connect + 8 s handshake + 20 s read;
-    // 60 s is a comfortable ceiling. job is freed only after done is
-    // observed, so the task cannot write into freed memory on this path.
-    uint32_t deadline = millis() + 60000UL;
-    while (!job->done && millis() < deadline) {
-      esp_task_wdt_reset();
-      Shell::pumpConsole();
-      delay(20);
-    }
-    if (!job->done) {
-      // Unreachable given the task's internal bounds. Leak the job rather
-      // than free it - the task may still hold the pointer.
-      out("net.http: fetch task overran - leaking job buffer");
-      return;
-    }
-  } else {
+  const char* via    = "WiFi";
+  uint32_t    waitMs = HTTP_WIFI_WAIT_MS;
+  if (!WiFiManager::connected()) {
     const Net::CellularProvider* cell = Net::cellular();
-    if (cell && cell->linkUp && cell->linkUp() && cell->httpsGet) {
-      if (!https) { out("cellular path is HTTPS only"); free(job); return; }
-      // Same CA rule as the WiFi branch: /ca.crt, or --insecure to skip.
-      String pem;
-      File ca = LittleFS.open("/ca.crt", "r");
-      if (ca) { pem = ca.readString(); ca.close(); }
-      if (pem.isEmpty() && !job->insecure) {
-        out("net.http: no /ca.crt on flash - pass --insecure to skip verification");
-        free(job);
-        return;
-      }
-      via = "cellular";
-      // No ESP-side mbedtls on the cellular path (the modem does TLS), so
-      // this runs inline on the main-loop task without the stack hit.
-      auto sink = [&](const uint8_t* buf, size_t len) -> bool {
-        job->totalLen += len;
-        if (job->previewLen < HTTP_PREVIEW_CAP) {
-          size_t copy = std::min(len, HTTP_PREVIEW_CAP - job->previewLen);
-          memcpy(job->preview + job->previewLen, buf, copy);
-          job->previewLen += copy;
-        }
-        return true;
-      };
-      job->ok = cell->httpsGet(host, path, port, pem.isEmpty() ? nullptr : pem.c_str(),
-                               sink, &job->status);
-    } else {
+    if (!cell || !cell->linkUp || !cell->linkUp() || !cell->httpsGet) {
       out("no transport up");
-      free(job);
+      delete job;
       return;
     }
+    if (!https) { out("cellular path is HTTPS only"); delete job; return; }
+    via          = "cellular";
+    waitMs       = HTTP_CELL_WAIT_MS;
+    job->cellGet = cell->httpsGet;
+    strncpy(job->host, host, sizeof(job->host) - 1);
+    job->path    = slash ? job->url + (slash - url) : "/";
+    job->port    = port;
+  }
+
+  if (xTaskCreate(httpFetchTask, "net.http", 12288, job,
+                  tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
+    out("net.http: failed to spawn fetch task");
+    delete job;
+    return;
+  }
+  // MQTT is ticked once a second, so its keepalive pings go out on time.
+  const uint32_t t0       = millis();
+  uint32_t       lastTick = t0;
+  unsigned       ticks    = 0;
+  while (job->state.load() != HTTP_JOB_DONE && millis() - t0 < waitMs) {
+    esp_task_wdt_reset();
+    Shell::pumpConsole();
+    if (httpWaitTickDue(lastTick, millis())) {
+      MQTTClient::tick();
+      lastTick = millis();
+      ++ticks;
+    }
+    delay(20);
+  }
+  Log::kvf("Shell", "shell.http_wait via=%s waited_ms=%u mqtt_ticks=%u loop_stack_free=%u", via,
+           (unsigned)(millis() - t0), ticks, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+  if (job->state.load() != HTTP_JOB_DONE && !httpJobAbandon(job->state)) {
+    // The task owns the job now and frees it when its own bounds end the GET.
+    Log::kvfw("Shell", "shell.http_abandoned via=%s wait_ms=%u", via, (unsigned)waitMs);
+    snprintf(msg, sizeof(msg), "net.http: no result after %u s, the fetch ends on its task (see log)",
+             (unsigned)(waitMs / 1000));
+    out(msg);
+    return;
   }
 
   if (job->err) {
     out(job->err);
-    free(job);
+    delete job;
     return;
   }
 
   snprintf(msg, sizeof(msg),
            "status=%d ok=%d body=%u bytes (preview <=%u, via %s)",
-           job->status, (int)job->ok, (unsigned)job->totalLen,
-           (unsigned)job->previewLen, via);
+           job->status, (int)job->ok, (unsigned)job->body.total,
+           (unsigned)job->body.len, via);
   out(msg);
+  if (job->body.cut) {
+    snprintf(msg, sizeof(msg), "read stopped at the %u s budget", (unsigned)(HTTP_CELL_READ_MS / 1000));
+    out(msg);
+  }
 
-  size_t start = 0;
-  for (size_t i = 0; i < job->previewLen; ++i) {
-    if (job->preview[i] == '\n' || job->preview[i] == '\r') {
+  const char* preview = job->body.data;
+  size_t      start   = 0;
+  for (size_t i = 0; i < job->body.len; ++i) {
+    if (preview[i] == '\n' || preview[i] == '\r') {
       if (i > start) {
         char l[256];
         size_t n = std::min(i - start, sizeof(l) - 1);
-        memcpy(l, job->preview + start, n);
+        memcpy(l, preview + start, n);
         l[n] = '\0';
         out(l);
       }
       start = i + 1;
     }
   }
-  if (start < job->previewLen) {
+  if (start < job->body.len) {
     char l[256];
-    size_t n = std::min(job->previewLen - start, sizeof(l) - 1);
-    memcpy(l, job->preview + start, n);
+    size_t n = std::min(job->body.len - start, sizeof(l) - 1);
+    memcpy(l, preview + start, n);
     l[n] = '\0';
     out(l);
   }
   out("--- done ---");
-  free(job);
+  delete job;
 }
 
 // ---------------------------------------------------------------------------
@@ -1725,13 +1742,26 @@ static void cmd_cert_info(int argc, char** argv, ShellOutput out) {
   }
 }
 
-// Apply a newly-pushed client cert by disconnecting MQTT. The loop() path
-// then reconnects and (if both cert + key are now in NVS) sets up mTLS.
+// Apply a newly-pushed client cert by rebooting onto it, once both halves are
+// stored and the key is the private half of the cert (certApplyVerdict).
 // in: argc, argv, out. out: status line
 static void cmd_cert_apply(int argc, char** argv, ShellOutput out) {
-  if (!MQTTClient::hasClientCert()) {
-    out("No cert + key in NVS - push both via cli/cert.set before apply");
-    return;
+  const bool stored = MQTTClient::hasClientCert();
+  const PairCheck pair = stored ? MQTTClient::checkStoredClientCert() : PairCheck::Invalid;
+  switch (certApplyVerdict(stored, pair)) {
+    case CertApply::Missing:
+      Shell::fail(out, "No cert + key in NVS - push both via cli/cert.set before apply");
+      return;
+    case CertApply::Mismatch:
+      Log::warn("Shell", "shell.cert_apply_refused reason=pair_invalid");
+      Shell::fail(out, "Stored cert + key do not validate as a pair - not applied");
+      return;
+    case CertApply::LowHeap:
+      Log::warn("Shell", "shell.cert_apply_refused reason=low_heap");
+      Shell::fail(out, "Low heap - stored pair not checked, retry cert.apply");
+      return;
+    case CertApply::Reboot:
+      break;
   }
   // Disconnect alone is not enough on classic-platform boards: WiFiClientSecure
   // holds sticky mbedtls state across the cert swap and the next handshake
@@ -1766,7 +1796,9 @@ static void cmd_secret_set(int argc, char** argv, ShellOutput out) {
   String value(argv[2]);  // restFrom 2: the rest of the line as typed
   if (value.length() >= 2 && value.charAt(0) == '"' &&
       value.charAt(value.length() - 1) == '"') {
-    value = value.substring(1, value.length() - 1);
+    // In place: a substring() temporary would free a copy of the secret unwiped.
+    value.remove(value.length() - 1);
+    value.remove(0, 1);
   }
   bool ok = Secret::set(argv[1], value.c_str());
   // Wipe the plaintext secret from the String's heap buffer before it frees.
@@ -2356,6 +2388,7 @@ ShellMode Shell::mode() {
 }
 
 void Shell::begin() {
+  s_consoleTask = xTaskGetCurrentTaskHandle();
   registerBuiltins();
 
   JsonVariantConst modeVal = Config::get()["shell"]["mode"];

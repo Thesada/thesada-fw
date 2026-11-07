@@ -145,11 +145,22 @@ void test_for_each_active_walks_registration_order(void) {
   TEST_ASSERT_EQUAL_STRING("one,two,", seen);
 }
 
-// A topic longer than the slot is truncated, not overflowed.
-void test_long_topic_is_truncated(void) {
+// A topic longer than the slot is refused, not clipped: the clipped filter
+// would be resubscribed on every reconnect as a different topic.
+void test_long_topic_is_refused_not_clipped(void) {
   MqttSubTable<Cb, 2, 8> t;
-  TEST_ASSERT_TRUE(t.add("abcdefghijkl", hitA));
+  TEST_ASSERT_FALSE(t.add("abcdefgh", hitA));
+  TEST_ASSERT_FALSE(t.isRegistered("abcdefg"));
+  TEST_ASSERT_EQUAL_UINT8(0, t.count());
+  TEST_ASSERT_TRUE(t.add("abcdefg", hitA));
   TEST_ASSERT_TRUE(t.isRegistered("abcdefg"));
+}
+
+void test_empty_topic_is_refused(void) {
+  Table t;
+  TEST_ASSERT_FALSE(t.add("", hitA));
+  TEST_ASSERT_FALSE(t.add(nullptr, hitA));
+  TEST_ASSERT_EQUAL_UINT8(0, t.count());
 }
 
 int main(int, char**) {
@@ -164,6 +175,7 @@ int main(int, char**) {
   RUN_TEST(test_dispatch_fires_all_matching_slots);
   RUN_TEST(test_dispatch_skips_non_matching);
   RUN_TEST(test_for_each_active_walks_registration_order);
-  RUN_TEST(test_long_topic_is_truncated);
+  RUN_TEST(test_long_topic_is_refused_not_clipped);
+  RUN_TEST(test_empty_topic_is_refused);
   return UNITY_END();
 }

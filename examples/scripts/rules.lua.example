@@ -18,7 +18,7 @@ local TEMP_SUSTAIN    = 5        -- 5 readings OR 5 minutes, whichever is less
 local TEMP_SUSTAIN_MS = 300000   -- 5 minutes max wait
 
 -- Check if enough time has passed since last alert for this key.
--- Does NOT set cooldown - caller must call set_cooldown() after successful send.
+-- Does NOT set cooldown - notify() does.
 local function can_alert(key)
   local now = Node.uptime()
   if cooldown[key] and (now - cooldown[key]) < COOLDOWN_MS then
@@ -32,20 +32,38 @@ local function set_cooldown(key)
   cooldown[key] = Node.uptime()
 end
 
--- Send alert to all channels: log, Telegram, MQTT.
--- Only sets cooldown if Telegram send succeeds. If it fails 3 times in a
--- row (heap too low, network), reboot to clear fragmentation. The boot
--- alert confirms the node is back, and the alert re-fires after sustain.
+-- JSON string literal. String methods only, no table or math calls: older
+-- firmware leaves those globals as plain strings.
+local JSON_ESC = { ['"'] = '\\"', ['\\'] = '\\\\', ['\n'] = '\\n', ['\r'] = '\\r', ['\t'] = '\\t' }
+local function json_str(v)
+  local s = tostring(v):gsub('[%c"\\]', function(c)
+    return JSON_ESC[c] or ("\\u%04x"):format(c:byte())
+  end)
+  return '"' .. s .. '"'
+end
+
+-- The <prefix>/alert payload the app stores. code is the key's kind, e.g. "freeze".
+local function alert_json(msg, key)
+  return '{"severity":"warn","code":' .. json_str(key:match("^[^:]+")) ..
+         ',"message":' .. json_str(msg) .. '}'
+end
+
+-- Send alert to all channels: log, MQTT, Telegram.
+-- MQTT and the cooldown come before the slow Telegram send, so a callback
+-- cut off during it has still alerted the app and does not re-alert on every
+-- reading. A failed send drops the cooldown, so the alert re-fires after
+-- sustain. If it fails 3 times in a row (heap too low, network), reboot to
+-- clear fragmentation. The boot alert confirms the node is back.
 local send_failures = 0
 
 local function notify(msg, key)
   Log.warn(msg)
-  local ok = Telegram.broadcast(msg)
-  MQTT.publish(prefix .. "/alert", msg)
-  if ok then
-    set_cooldown(key)
+  MQTT.publish(prefix .. "/alert", alert_json(msg, key))
+  set_cooldown(key)
+  if Telegram.broadcast(msg) then
     send_failures = 0
   else
+    cooldown[key] = nil
     send_failures = send_failures + 1
     Log.error("Telegram failed (" .. send_failures .. "/3)")
     if send_failures >= 3 then
@@ -87,21 +105,24 @@ EventBus.subscribe("temperature", function(data)
   if not data.sensors then return end
   for _, s in ipairs(data.sensors) do
 
+    -- Streaks key by address: two probes can share a name
+    local id = s.address or s.name
+
     -- Probe not reading (sustained): the checks below cannot see this probe
-    local st_key = "stale:" .. (s.address or s.name)
+    local st_key = "stale:" .. id
     if s.stale then
       if temp_sustained(st_key) then
         notify(s.name .. ": probe not reading", st_key)
       end
-      temp_clear("overheat:" .. s.name)
-      temp_clear("low_temp:" .. s.name)
-      temp_clear("freeze:" .. s.name)
+      temp_clear("overheat:" .. id)
+      temp_clear("low_temp:" .. id)
+      temp_clear("freeze:" .. id)
       goto continue
     end
     temp_clear(st_key)
 
     -- Overheat: specific sensor >= threshold (sustained)
-    local oh_key = "overheat:" .. s.name
+    local oh_key = "overheat:" .. id
     if s.name == "House Supply" and s.temp_c >= 75 then
       if temp_sustained(oh_key) then
         notify(s.name .. ": " .. s.temp .. unit .. " - Overheat!", oh_key)
@@ -111,7 +132,7 @@ EventBus.subscribe("temperature", function(data)
     end
 
     -- Low temp: specific sensor <= threshold (sustained)
-    local lt_key = "low_temp:" .. s.name
+    local lt_key = "low_temp:" .. id
     if s.name == "House Supply" and s.temp_c <= 55 then
       if temp_sustained(lt_key) then
         notify(s.name .. ": " .. s.temp .. unit .. " - Low temp, fire dying", lt_key)
@@ -121,7 +142,7 @@ EventBus.subscribe("temperature", function(data)
     end
 
     -- Freeze: any sensor <= 2C (sustained)
-    local fr_key = "freeze:" .. s.name
+    local fr_key = "freeze:" .. id
     if s.temp_c <= 2.0 then
       if temp_sustained(fr_key) then
         notify(s.name .. ": " .. s.temp .. unit .. " - Freeze risk!", fr_key)

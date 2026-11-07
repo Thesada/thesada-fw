@@ -21,7 +21,7 @@ static const int32_t  WIFI_CANDIDATES_MAX      = 8;
 static const uint32_t NTP_POLL_STEP_MS = 200;
 static const uint32_t NTP_WAIT_MS      = 15000;
 
-// main.lua / rules.lua: abort after this long, check every N VM instructions.
+// Any call from C into Lua: abort after this long, check every N VM instructions.
 static const uint32_t LUA_SCRIPT_BUDGET_MS = 10000;
 static const int      LUA_HOOK_COUNT       = 1000;
 
@@ -60,4 +60,11 @@ inline uint32_t wifiConnectBudgetMs(int32_t retries, int32_t ssids, int32_t time
 // Rollover-safe. in: start and now millis, budget. out: true once spent.
 inline bool waitBudgetSpent(uint32_t startMs, uint32_t nowMs, uint32_t budgetMs) {
   return (uint32_t)(nowMs - startMs) >= budgetMs;
+}
+
+// The next fed step of a wait inside its budget. Rollover-safe.
+// in: start and now millis, budget. out: 0 once spent, else 1..WAIT_STEP_MAX_MS.
+inline uint32_t waitSliceMs(uint32_t startMs, uint32_t nowMs, uint32_t budgetMs) {
+  const uint32_t spent = (uint32_t)(nowMs - startMs);
+  return spent >= budgetMs ? 0 : waitStepMs(budgetMs - spent);
 }

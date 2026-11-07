@@ -24,8 +24,10 @@ public:
   // Recursive: nested helpers can re-acquire without self-deadlock.
   //
   // Default 30 s acquire window: a wedged AT bus surfaces as a returnable
-  // failure rather than an infinite block. Pass 0 for a non-blocking
-  // try-acquire (socket available() polls step aside that way).
+  // failure rather than an infinite block. The wait is fed in 1 s slices,
+  // so a long hold on another task never trips this task's watchdog.
+  // Pass 0 for a non-blocking try-acquire (socket available() polls step
+  // aside that way).
   class ATGuard {
   public:
     explicit ATGuard(uint32_t timeoutMs = 30000);
@@ -136,7 +138,8 @@ public:
   //
   // Pre-conditions: connected(). `caPem` is the PEM bundle the server
   // must chain to; nullptr skips verification, so only pass it when the
-  // caller's own insecure opt-in allows that.
+  // caller's own insecure opt-in allows that. One call at a time owns
+  // slot 1: a second caller, from any task, gets false and status 0.
   //
   // `writeCallback` is invoked with each chunk of the response BODY
   // (status line + headers are parsed away). Returning false from the
@@ -152,19 +155,30 @@ public:
   //                   `Range: bytes=<start>-<end>` to the GET and
   //                   expects a 206 response. Used by the cellular OTA
   //                   path so each chunk is its own short-lived socket.
+  //      budgetMs     measured from just before connect and checked on each
+  //                   read pass after the request is sent, headers and body
+  //                   alike. DNS, the socket open and the TLS handshake run
+  //                   to their own bounds first. 0 = the 5 min read cap only
   // out: httpStatus   HTTP response status code on the wire, or 0 on
   //                   transport failure (connect / TLS handshake / EOF
   //                   before status line)
+  //      budgetCut    true when budgetMs ended the GET (may be nullptr)
   // returns: true if the request completed and (when a Content-Length
   //          was advertised) at least that many body bytes reached the
-  //          callback. false on transport failure, callback abort, or
-  //          short body.
+  //          callback. false on transport failure, callback abort, a
+  //          spent budget, or short body.
   static bool httpsGet(const char* host, const char* path, uint16_t port,
                        const char* caPem,
                        std::function<bool(const uint8_t*, size_t)> writeCallback,
                        int* httpStatus,
                        size_t rangeStart = 0,
-                       size_t rangeEndInclusive = 0);
+                       size_t rangeEndInclusive = 0,
+                       uint32_t budgetMs = 0,
+                       bool* budgetCut = nullptr);
+
+  // True while an httpsGet holds slot 1. A caller that retries on a
+  // refusal waits this out instead of spending a try.
+  static bool httpsBusy();
 
   // GNSS fix acquisition. The SIM7080G time-shares its radio
   // between LTE and GNSS - while CGNSPWR=1 the LTE data path is suspended,
@@ -219,11 +233,6 @@ public:
 private:
   static void initPMU();
   static bool wakeModem();
-  // Synchronous network bring-up (radio config + blocking registration
-  // poll + bearer). Used by the steady-state recovery path in
-  // Cellular::loop(). The incremental tickActivation() uses the three helpers below directly
-  // so it can yield between phases instead of blocking.
-  static bool networkConnect();
   // Radio configuration block: CFUN power-cycle, network/preferred mode,
   // APN (CGDCONT/CNCFG), CEREG/CGREG URC enable, RF-settle delay. Caller
   // owns the AT bus.

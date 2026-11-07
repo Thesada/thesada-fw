@@ -13,6 +13,7 @@
 #include <time.h>
 #include <vector>
 #include <thesada_config.h>
+#include "cert_policy.h"
 #include "cli_authz_policy.h"
 #include "mqtt_sub_table.h"
 
@@ -54,10 +55,20 @@ public:
   // clear the subscription table.
   static void reconnectWithCurrentConfig();
   static void loop();
-  static void tick();  // lightweight keepalive - call during long init phases
+  static void tick();  // keepalive for long init phases and blocking shell waits
   static void publish(const char* topic, const char* payload);
   static void publishRetained(const char* topic, const char* payload);
+  // Publish outside mqtt.send_interval_s: a CLI reply answers a request now.
+  // Queued only while no session is up. out: true when the session took it.
+  static bool publishNow(const char* topic, const char* payload);
+  // Format a topic into out[cap]. A topic that does not fit is logged and left
+  // empty, never clipped. out: true when the whole topic fitted.
+  static bool formatTopic(char* out, size_t cap, const char* fmt, ...)
+      __attribute__((format(printf, 3, 4)));
   static bool   connected();
+  // Any task: the main loop's last connected() answer. Never touches the client,
+  // whose connected() can stop() the TLS session the main loop is using.
+  static bool   connectedCached();
   static time_t lastPublishTime();  // UTC epoch of last successful publish; 0 if never
 
   // Subscribe to a topic with a callback. Re-applied on every reconnect.
@@ -108,6 +119,10 @@ public:
 
   // in: PEM cert + key. out: true when both parse and the key matches the cert.
   static bool clientCertPairValid(const char* certPEM, const char* keyPEM);
+
+  // Pair check on the stored halves, copies wiped on free. Records the broken
+  // verdict as connect() does. out: Valid, Invalid (will not load or pair), NoHeap.
+  static PairCheck checkStoredClientCert();
 
   // out: true while the broker session is up and presented the client cert
   static bool mtlsSessionUp();

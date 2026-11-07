@@ -59,8 +59,36 @@ void test_defrag_reboot_other_gates(void) {
   TEST_ASSERT_FALSE(mqttDefragRebootDue(3, true, -2, 20000, true));
 }
 
+// --- mqttSnapshotProven ------------------------------------------------------
+
+void test_snapshot_when_session_dialed_the_config_broker(void) {
+  TEST_ASSERT_TRUE(mqttSnapshotProven("mqtt.thesada.app", 8884, "mqtt.thesada.app", 8884));
+}
+
+// thesada-fw#78: a refused host keeps the session on the previous broker. That
+// connect must not commit the refused config as last-good, or no rollback is left.
+void test_no_snapshot_when_host_was_refused(void) {
+  TEST_ASSERT_FALSE(mqttSnapshotProven("a-host-too-long-for-the-buffer.invalid", 8884,
+                                       "mqtt.thesada.app", 8884));
+}
+
+// mqtt.port written but not yet applied: the session still dials the old port.
+void test_no_snapshot_when_port_not_applied(void) {
+  TEST_ASSERT_FALSE(mqttSnapshotProven("mqtt.thesada.app", 8883, "mqtt.thesada.app", 8884));
+}
+
+void test_no_snapshot_without_a_live_broker(void) {
+  TEST_ASSERT_FALSE(mqttSnapshotProven("", 8884, "", 8884));
+  TEST_ASSERT_FALSE(mqttSnapshotProven(nullptr, 8884, "mqtt.thesada.app", 8884));
+  TEST_ASSERT_FALSE(mqttSnapshotProven("mqtt.thesada.app", 8884, nullptr, 8884));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
+  RUN_TEST(test_snapshot_when_session_dialed_the_config_broker);
+  RUN_TEST(test_no_snapshot_when_host_was_refused);
+  RUN_TEST(test_no_snapshot_when_port_not_applied);
+  RUN_TEST(test_no_snapshot_without_a_live_broker);
   RUN_TEST(test_bad_config_that_rebooted_rolls_back);
   RUN_TEST(test_offline_good_broker_does_not_roll_back);
   RUN_TEST(test_recovery_edit_after_streak_does_not_roll_back);

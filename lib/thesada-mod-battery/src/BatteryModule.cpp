@@ -23,10 +23,8 @@ void BatteryModule::begin() {
 
   JsonObject cfg = Config::get();
   _intervalMs    = (uint32_t)(cfg["battery"]["interval_s"] | 60) * 1000;
-  _lowPct        = cfg["battery"]["low_pct"] | 20;
 
-  Log::kvf(TAG, "battery.ready interval_s=%lu low_alert_pct=%d",
-           (unsigned long)(_intervalMs / 1000), _lowPct);
+  Log::kvf(TAG, "battery.ready interval_s=%lu", (unsigned long)(_intervalMs / 1000));
 
   // Register under the unified `sensors` CLI. Use `sensors battery`.
   SensorRegistry::add("battery", "voltage, percent, charging state (PMU)",
@@ -78,26 +76,29 @@ void BatteryModule::readAndPublish() {
   // Per-sensor topics for HA discovery
   if (present) {
     char perTopic[MQTT_TOPIC_CAP], val[16];
-    snprintf(perTopic, sizeof(perTopic), "%s/sensor/battery/percent", prefix);
-    snprintf(val, sizeof(val), "%d", percent);
-    MQTTClient::publish(perTopic, val);
+    if (MQTTClient::formatTopic(perTopic, sizeof(perTopic), "%s/sensor/battery/percent", prefix)) {
+      snprintf(val, sizeof(val), "%d", percent);
+      MQTTClient::publish(perTopic, val);
+    }
 
-    snprintf(perTopic, sizeof(perTopic), "%s/sensor/battery/voltage", prefix);
-    snprintf(val, sizeof(val), "%.2f", voltage);
-    MQTTClient::publish(perTopic, val);
+    if (MQTTClient::formatTopic(perTopic, sizeof(perTopic), "%s/sensor/battery/voltage", prefix)) {
+      snprintf(val, sizeof(val), "%.2f", voltage);
+      MQTTClient::publish(perTopic, val);
+    }
 
-    snprintf(perTopic, sizeof(perTopic), "%s/sensor/battery/charging", prefix);
-    MQTTClient::publish(perTopic, charging ? "Charging" : "Discharging");
+    if (MQTTClient::formatTopic(perTopic, sizeof(perTopic), "%s/sensor/battery/charging", prefix))
+      MQTTClient::publish(perTopic, charging ? "Charging" : "Discharging");
   }
 
   // Combined JSON topic (for Lua EventBus, backwards compat)
   char topic[MQTT_TOPIC_CAP];
-  snprintf(topic, sizeof(topic), "%s/sensor/battery", prefix);
-  char payload[128];
-  serializeJson(doc, payload, sizeof(payload));
-  MQTTClient::publish(topic, payload);
+  if (MQTTClient::formatTopic(topic, sizeof(topic), "%s/sensor/battery", prefix)) {
+    char payload[128];
+    serializeJson(doc, payload, sizeof(payload));
+    MQTTClient::publish(topic, payload);
+  }
 
-  // EventBus - lets TelegramModule fire low battery alerts
+  // EventBus - Lua rules read it for low-battery alerts
   EventBus::publish("battery", doc.as<JsonObject>());
 
   // Log summary

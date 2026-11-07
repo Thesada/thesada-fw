@@ -41,6 +41,7 @@ enum OtaResetClass : uint8_t {
   OTA_RESET_CLEAR = 0,
   OTA_RESET_HOLD  = 1,
   OTA_RESET_CRASH = 2,
+  OTA_RESET_FRESH = 3,  // the restart into a written image: its own streak of one
 };
 
 // Classify one reset. Power-on and deep sleep clear. Software reset counts
@@ -89,10 +90,11 @@ inline bool otaHealthStateConfirmed(uint32_t state) {
   return state == OTA_IMG_VALID || state == OTA_IMG_UNDEFINED;
 }
 
-// Operator restarts, and MQTT budget reboots of a proven image, hold on a
-// confirmed image. in: reason, marker, confirmed, proven. out: reset class.
+// Planned restarts hold on a confirmed image, broker ones once proven, and start
+// a pending one afresh. in: reason, marker, confirmed, proven, pending. out: class.
 inline OtaResetClass otaHealthBootClass(int reason, OtaPlanned planned, bool confirmed,
-                                        bool proven) {
+                                        bool proven, bool pending) {
+  if (reason == OTA_RST_SW && planned != OTA_PLANNED_NONE && pending) return OTA_RESET_FRESH;
   if (reason == OTA_RST_SW && confirmed &&
       (planned == OTA_PLANNED_OPERATOR || (planned == OTA_PLANNED_BROKER && proven))) {
     return OTA_RESET_HOLD;
@@ -125,6 +127,7 @@ inline bool otaHealthImageProven(const uint8_t* stored, size_t storedLen, const 
 // Next streak after this boot. in: previous, class. out: new streak.
 inline uint32_t otaHealthNextCrashStreak(uint32_t previous, OtaResetClass kind) {
   if (kind == OTA_RESET_CLEAR) return 0;
+  if (kind == OTA_RESET_FRESH) return 1;
   if (kind == OTA_RESET_CRASH) return previous + 1;
   return previous;
 }

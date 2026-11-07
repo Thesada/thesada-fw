@@ -45,12 +45,13 @@ class MqttSubTable {
     _count = 0;
   }
 
-  // false when the table is full; the caller logs.
+  // false when the table is full, or the topic is empty or does not fit a slot.
+  // A clipped filter resubscribes a different topic. The caller logs.
   bool add(const char* topic, CB cb) {
     if (_count >= N) return false;
+    if (!topic || !*topic || strnlen(topic, TOPIC_CAP) >= TOPIC_CAP) return false;
     Slot& s = _slots[_count];
-    strncpy(s.topic, topic, TOPIC_CAP - 1);
-    s.topic[TOPIC_CAP - 1] = '\0';
+    memcpy(s.topic, topic, strlen(topic) + 1);
     s.callback             = cb;
     s.active               = true;
     _count++;

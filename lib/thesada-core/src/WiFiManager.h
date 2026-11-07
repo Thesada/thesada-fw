@@ -30,6 +30,8 @@ public:
   // in: none. out: true once NTP has set the clock this boot. The boot clock
   // floor keeps time() plausible without it, but not current.
   static bool       ntpSynced();
+  // Another source (cellular NTP) set the clock: ntpSynced() reads true.
+  static void       noteNtpSync();
 
   // in: none. out: true when fallback AP is active.
   static bool       isAPActive();

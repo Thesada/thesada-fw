@@ -7,8 +7,8 @@
 //     "sha256": "e3b0c44298fc1c149afbf4c8996fb924..."
 //   }
 //
-// TLS: uses /ca.crt from LittleFS (same file as MQTTClient and Cellular).
-// If /ca.crt is not present, falls back to setInsecure().
+// TLS: /ca.crt from LittleFS (same file as MQTTClient and Cellular), else the
+// PROGMEM bundle. Unverified TLS or an http:// URL needs ota.allow_insecure.
 //
 // SPDX-License-Identifier: GPL-3.0-only
 
@@ -199,18 +199,26 @@ static void putFledUnsaved(uint32_t s) {
   _otaFledUnsaved[1] = ~s;
 }
 
+// A fresh day for one version. Age first: a lost version write then leaves the
+// old release a fresh day. in: version. out: true when both writes landed.
+static bool putFledRecord(const char* version) {
+  Preferences prefs;
+  bool wrote = prefs.begin("boot", false) &&
+               prefs.putULong64("fled_age", otaFledPack({0, 0, 0})) != 0 &&
+               prefs.putString("fled_ver", version) != 0;
+  prefs.end();
+  putFledUnsaved(0);
+  return wrote;
+}
+
 // Written after the boot slot is set, so a failed switch leaves no skip. A
 // lost write costs one more download of this release. in: none. out: none.
 static void recordFledRelease() {
-  Preferences prefs;
-  // Age first: a lost version write then leaves the old release a fresh day.
-  bool wrote = prefs.begin("boot", false) &&
-               prefs.putULong64("fled_age", otaFledPack({0, 0, 0})) != 0 &&
-               prefs.putString("fled_ver", FIRMWARE_VERSION) != 0;
-  prefs.end();
-  putFledUnsaved(0);
-  if (wrote) Log::kvfw(TAG, "ota.fled_release_recorded version=%s", FIRMWARE_VERSION);
-  else Log::kvfe(TAG, "ota.fled_release_unrecorded reason=nvs_write");
+  if (putFledRecord(FIRMWARE_VERSION)) {
+    Log::kvfw(TAG, "ota.fled_release_recorded version=%s", FIRMWARE_VERSION);
+  } else {
+    Log::kvfe(TAG, "ota.fled_release_unrecorded reason=nvs_write");
+  }
 }
 
 // An unread record skips nothing: it must not hold back every update. The
@@ -258,6 +266,27 @@ static bool saveFled(uint32_t ageS, uint8_t tries) {
   _fled.markMs = millis();
   putFledUnsaved(0);
   return wrote;
+}
+
+// Written once the update has set the boot slot. The build stays recorded until
+// it confirms, so an abort or rollback is not pulled again. in: manifest version.
+static void recordInstalledBuild(const char* version) {
+  loadFled();
+  if (!otaFledRecordsInstall(_fled.ver, version)) return;
+  if (putFledRecord(version)) Log::kvf(TAG, "ota.install_recorded version=%s", version);
+  else Log::kvfe(TAG, "ota.install_unrecorded reason=nvs_write");
+}
+
+// A record naming the running build is the install record. Once this image is
+// confirmed it would only refuse this build after another one runs. out: none.
+static void dropOwnFledRecord() {
+  if (!otaSameVersion(_fled.ver, FIRMWARE_VERSION)) return;
+  Preferences prefs;
+  bool removed = prefs.begin("boot", false) && prefs.remove("fled_ver");
+  prefs.end();
+  _fled.ver[0] = '\0';
+  if (removed) Log::kvf(TAG, "ota.install_record_cleared version=%s", FIRMWARE_VERSION);
+  else Log::kvfe(TAG, "ota.install_record_kept reason=nvs_write");
 }
 
 // RTC memory holds the unsaved seconds each turn and NVS gets them every 10
@@ -361,6 +390,7 @@ uint32_t OTAUpdate::recordBootStreak(int resetReason, uint32_t* brownoutsOut) {
   OtaPlanned planned = otaHealthTakePlanned(&_otaPlannedRestart);
   // Only a confirmed image may hold a planned restart; unknown counts.
   bool confirmed = planned != OTA_PLANNED_NONE && runningImageConfirmed();
+  bool pending = planned != OTA_PLANNED_NONE && runningImageIs(ESP_OTA_IMG_PENDING_VERIFY);
   uint8_t id[OTA_IMAGE_ID_LEN];
   bool haveId = runningImageId(id);
   Preferences prefs;
@@ -390,8 +420,9 @@ uint32_t OTAUpdate::recordBootStreak(int resetReason, uint32_t* brownoutsOut) {
       prefs.isKey("proven_id") ? prefs.getBytes("proven_id", stored, sizeof(stored)) : 0;
   bool proven = haveId && otaHealthImageProven(stored, storedLen, id);
   _otaProvenDone = proven;
-  OtaResetClass kind = otaHealthBootClass(resetReason, planned, confirmed, proven);
-  uint32_t crashes = otaHealthNextCrashStreak(prefs.getUInt("crash_n", 0), kind);
+  OtaResetClass kind = otaHealthBootClass(resetReason, planned, confirmed, proven, pending);
+  uint32_t previous = prefs.getUInt("crash_n", 0);
+  uint32_t crashes = otaHealthNextCrashStreak(previous, kind);
   // A failed write must not look stored. Confirm would keep a bad image.
   if (prefs.putUInt("crash_n", crashes) == 0) {
     prefs.end();
@@ -412,6 +443,9 @@ uint32_t OTAUpdate::recordBootStreak(int resetReason, uint32_t* brownoutsOut) {
   } else if (resetReason == OTA_RST_SW && confirmed && planned == OTA_PLANNED_BROKER) {
     Log::kvfw(TAG, "ota.crash_streak_counted reason=broker_restart_unproven streak=%lu",
               (unsigned long)crashes);
+  } else if (kind == OTA_RESET_FRESH) {
+    Log::kvf(TAG, "ota.crash_streak_restarted reason=install previous=%lu streak=%lu",
+             (unsigned long)previous, (unsigned long)crashes);
   }
   return crashes;
 }
@@ -532,6 +566,7 @@ void OTAUpdate::confirmIfHealthy() {
     _otaPending = state == ESP_OTA_IMG_PENDING_VERIFY;
     _otaRunState = (uint32_t)state;
     _otaStateKnown = true;
+    if (!_otaPending) dropOwnFledRecord();
   }
   if (!_otaPending) {
     const bool usb = _otaRunState == ESP_OTA_IMG_UNDEFINED;
@@ -566,6 +601,7 @@ void OTAUpdate::confirmIfHealthy() {
   }
   _otaImageSettled = true;
   Log::info(TAG, "ota.state_change from=pending to=valid reason=healthy");
+  dropOwnFledRecord();
 }
 
 uint32_t OTAUpdate::_lastCheck       = 0;
@@ -613,7 +649,7 @@ static void publishOtaRefusal(const char* reason) {
   JsonObject  cfg    = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
   char topic[MQTT_TOPIC_CAP];
-  snprintf(topic, sizeof(topic), "%s/status/ota", prefix);
+  if (!MQTTClient::formatTopic(topic, sizeof(topic), "%s/status/ota", prefix)) return;
   char payload[160];
   snprintf(payload, sizeof(payload),
            "{\"state\":\"refused\",\"reason\":\"%s\",\"version\":\"%s\"}",
@@ -828,28 +864,41 @@ static bool downloadBinaryChunkedCellular(
     size_t end   = std::min(offset + CHUNK - 1, expectedSize - 1);
     bool   done  = false;
     for (int attempt = 1; attempt <= CHUNK_TRIES && !done; ++attempt) {
-      size_t got = 0;
+      // A console net.http can hold slot 1 past its shell wait. Its refusal
+      // would spend this try, so wait it out first.
+      for (uint32_t w = millis(); Cellular::httpsBusy() && millis() - w < LINK_WAIT_MS;) {
+        Shell::pumpConsole();
+        esp_task_wdt_reset();
+        delay(200);
+      }
+      size_t got    = 0;
+      int    status = 0;
+      // Only the requested range reaches flash: a 206, or a 200 that is the
+      // whole image from byte 0. Anything past `end` is dropped.
+      const bool whole = (offset == 0 && end == expectedSize - 1);
       auto counting = [&](const uint8_t* d, size_t n) {
-        if (!writeCallback(d, n)) return false;
+        if (status != 206 && !(status == 200 && whole)) return false;
+        size_t room = end + 1 - (offset + got);
+        bool   over = n > room;
+        if (over) n = room;
+        if (n && !writeCallback(d, n)) return false;
         got += n;
-        return true;
+        return !over;
       };
-      int  status = 0;
-      bool ok = Cellular::httpsGet(host, path, port, otaCellularCa(), counting,
-                                   &status, offset, end);
+      Cellular::httpsGet(host, path, port, otaCellularCa(), counting, &status, offset, end);
       offset += got;
-      if (ok && (status == 206 || status == 200) && offset > end) { done = true; break; }
-      if (ok && status != 206 && status != 200) {
+      if (offset > end) { done = true; break; }
+      if (status != 0 && status != 206 && !(status == 200 && whole)) {
         Log::kvfe(TAG, "ota.chunk_failed offset=%u status=%d", (unsigned)offset, status);
         return false;
       }
       Log::kvfw(TAG, "ota.chunk_retry offset=%u attempt=%d got=%u", (unsigned)offset, attempt,
                 (unsigned)got);
-      if (offset > end) { done = true; break; }
-      // Let the cellular health probe run and recover the bearer.
+      // Probe the link, and re-run activation once the probe has dropped it.
       uint32_t waitUntil = millis() + LINK_WAIT_MS;
       do {
-        Cellular::loop();
+        if (Cellular::activated()) Cellular::loop();
+        else Cellular::tickActivation();
         Shell::pumpConsole();
         esp_task_wdt_reset();
         delay(200);
@@ -973,13 +1022,10 @@ void OTAUpdate::registerCommandTopic() {
   const char* customTopic = cfg["ota"]["cmd_topic"] | "";
   if (strlen(customTopic) == 0) return;
 
-  char topic[MQTT_TOPIC_CAP];
-  strncpy(topic, customTopic, sizeof(topic) - 1);
-  topic[sizeof(topic) - 1] = '\0';
-
   // The payload is ignored: any session that can publish here could otherwise
   // pick the manifest. A URL override stays on the authz-gated `ota.check <url>`.
-  MQTTClient::subscribe(topic, [](const char* topic, const char* payload) {
+  // subscribe() copies the topic, and refuses one past MQTT_TOPIC_CAP.
+  MQTTClient::subscribe(customTopic, [](const char* topic, const char* payload) {
     Log::info(TAG, "ota.trigger source=mqtt");
     _pendingManifestUrl = "";
     _checkRequested = true;
@@ -1081,6 +1127,12 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
     publishOtaRefusal("no-ca");
     return;
   }
+  // Redirects keep the scheme, so this and the binary check cover every hop.
+  if (!otaUrlAllowed(url, allowInsecure)) {
+    Log::kvfe(TAG, "ota.check_refused reason=insecure_url url=%.80s", url);
+    publishOtaRefusal("insecure-url");
+    return;
+  }
 
   Log::kvf(TAG, "ota.phase_change from=idle to=check force=%d", (int)force);
 
@@ -1127,12 +1179,19 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
     // "device offline" or "silent refusal" from the broker side.
     const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
     char topic[MQTT_TOPIC_CAP];
-    snprintf(topic, sizeof(topic), "%s/status/ota", prefix);
+    if (!MQTTClient::formatTopic(topic, sizeof(topic), "%s/status/ota", prefix)) return;
     char payload[160];
     snprintf(payload, sizeof(payload),
              "{\"state\":\"up-to-date\",\"version\":\"%s\",\"remote\":\"%s\"}",
              FIRMWARE_VERSION, remoteVersion.c_str());
     MQTTClient::publish(topic, payload);
+    return;
+  }
+  // Before the fled gate, so no try is spent on a binary that is never fetched.
+  if (!otaUrlAllowed(binUrl.c_str(), allowInsecure)) {
+    Log::kvfe(TAG, "ota.phase_change from=fetch_manifest to=idle reason=insecure_url url=%.80s",
+              binUrl.c_str());
+    publishOtaRefusal("insecure-url");
     return;
   }
   // Without this the image a switch booted pulls the fled build straight back.
@@ -1174,16 +1233,19 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
            remoteVersion.c_str(), binUrl.c_str());
 
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+  // A status topic that does not fit skips the status publishes, not the update.
   char statusTopic[MQTT_TOPIC_CAP];
-  snprintf(statusTopic, sizeof(statusTopic), "%s/status/ota", prefix);
+  bool haveStatus =
+      MQTTClient::formatTopic(statusTopic, sizeof(statusTopic), "%s/status/ota", prefix);
   char statusPayload[128];
   snprintf(statusPayload, sizeof(statusPayload),
            "{\"state\":\"updating\",\"from\":\"%s\",\"to\":\"%s\"}",
            FIRMWARE_VERSION, remoteVersion.c_str());
-  MQTTClient::publish(statusTopic, statusPayload);
+  if (haveStatus) MQTTClient::publish(statusTopic, statusPayload);
   delay(100);
 
   if (applyUpdate(binUrl, sha256, binSize)) {
+    recordInstalledBuild(remoteVersion.c_str());
     Log::kvf(TAG, "ota.phase_change from=apply to=reboot version=%s", remoteVersion.c_str());
     delay(500);
     plannedRestart();
@@ -1191,7 +1253,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
     Log::error(TAG, "ota.update_failed");
     snprintf(statusPayload, sizeof(statusPayload),
              "{\"state\":\"failed\",\"version\":\"%s\"}", FIRMWARE_VERSION);
-    MQTTClient::publish(statusTopic, statusPayload);
+    if (haveStatus) MQTTClient::publish(statusTopic, statusPayload);
   }
 }
 

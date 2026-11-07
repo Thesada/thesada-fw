@@ -183,11 +183,13 @@ jobs:
             echo "found=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Self-test the ledger gate
+        run: ./tests/test_invariant_ledger.sh
+
+      # The gate runs git diff itself, so a range it cannot diff fails the job.
       - name: Run ledger check
         if: steps.bypass.outputs.found != 'true'
-        run: |
-          git diff --name-only "${{ steps.range.outputs.base }}..${{ steps.range.outputs.head }}" \
-            | ./scripts/check-invariant-ledger.sh
+        run: ./scripts/check-invariant-ledger.sh --range "${{ steps.range.outputs.base }}...${{ steps.range.outputs.head }}"
 
       - name: Note bypass
         if: steps.bypass.outputs.found == 'true'

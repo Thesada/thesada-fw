@@ -2,10 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "Config.h"
 #include "Log.h"
-#include "log_kv_policy.h"
+#include "config_write_policy.h"
 #include <LittleFS.h>
-#include <cmath>
-#include <climits>
 
 static const char* TAG = "Config";
 
@@ -17,6 +15,24 @@ static char _diskTopicPrefix[Config::TOPIC_PREFIX_CAP];
 static bool _diskTopicPrefixPresent = false;
 static bool _topicPrefixHeld = false;
 
+// Bumped, and the hooks run, after every call that rebuilt or edited _doc.
+static uint32_t _revision = 0;
+static void (*_changeHooks[4])() = {};
+uint32_t Config::revision() { return _revision; }
+
+bool Config::onChange(void (*fn)()) {
+  for (auto& h : _changeHooks) {
+    if (!h) { h = fn; return true; }
+  }
+  return false;
+}
+
+// Main loop only, like every mutator that calls it. in: none. out: none.
+static void configChanged() {
+  _revision++;
+  for (auto h : _changeHooks) if (h) h();
+}
+
 // Drop the boot-prefix overlay.
 // in: none. out: none.
 static void clearHeldTopicPrefix() {
@@ -26,18 +42,22 @@ static void clearHeldTopicPrefix() {
 }
 
 void Config::load() {
-  clearHeldTopicPrefix();
-  if (!LittleFS.begin()) return;
-  File f = LittleFS.open("/config.json", "r");
-  if (!f) return;
-  DeserializationError err = deserializeJson(_doc, f);
-  f.close();
-  // A malformed file would otherwise leave _doc half-parsed; clear to a
-  // clean empty doc so get() returns defaults, not garbage.
-  if (err) {
-    _doc.clear();
-    Log::kvfe(TAG, "config.parse_failed err=%s action=use_defaults", err.c_str());
-  }
+  auto read = [&]() {
+    clearHeldTopicPrefix();
+    if (!LittleFS.begin()) return;
+    File f = LittleFS.open("/config.json", "r");
+    if (!f) return;
+    DeserializationError err = deserializeJson(_doc, f);
+    f.close();
+    // A malformed file would otherwise leave _doc half-parsed; clear to a
+    // clean empty doc so get() returns defaults, not garbage.
+    if (err) {
+      _doc.clear();
+      Log::kvfe(TAG, "config.parse_failed err=%s action=use_defaults", err.c_str());
+    }
+  };
+  read();
+  configChanged();
 }
 
 // Persist the in-memory doc to /config.json. out: true on success;
@@ -45,8 +65,8 @@ void Config::load() {
 // LittleFS full) so callers never report a save that did not happen.
 // Writes go to a temp file first, then rename over config.json - lfs
 // rename atomically replaces the destination, so a short write never
-// destroys the last good config and the load() rollback in set()/
-// replace() genuinely restores it.
+// destroys the last good config and the load() rollback in replace()
+// genuinely restores it.
 bool Config::save() {
   char livePrefix[Config::TOPIC_PREFIX_CAP];
   bool swapped = false;
@@ -73,30 +93,39 @@ bool Config::save() {
   auto restoreLivePrefix = [&]() {
     if (swapped) _doc["mqtt"]["topic_prefix"] = livePrefix;
   };
+  bool ok = writeFile(_doc.as<JsonVariantConst>(), false);
+  restoreLivePrefix();
+  return ok;
+}
+
+// The one tmp + rename writer for /config.json. lfs rename replaces the
+// destination atomically, so a failure leaves the last good file in place.
+bool Config::writeFile(JsonVariantConst src, bool pretty, size_t* bytes) {
   File f = LittleFS.open("/config.json.tmp", "w");
   if (!f) {
     Log::error(TAG, "config.save_failed reason=tmp_open");
-    restoreLivePrefix();
     return false;
   }
-  size_t written  = serializeJson(_doc, f);
-  size_t expected = measureJson(_doc);
+  size_t written  = pretty ? serializeJsonPretty(src, f) : serializeJson(src, f);
+  size_t expected = pretty ? measureJsonPretty(src) : measureJson(src);
   f.close();
-  if (written < expected) {
-    Log::kvfe(TAG, "config.save_failed reason=short_write written=%u expected=%u",
-              (unsigned)written, (unsigned)expected);
+  // The real lfs write is inside fclose and its result is dropped. Read back.
+  size_t onDisk = 0;
+  File chk = LittleFS.open("/config.json.tmp", "r");
+  if (chk) { onDisk = chk.size(); chk.close(); }
+  if (!configWriteLanded(written, onDisk, expected)) {
+    Log::kvfe(TAG, "config.save_failed reason=short_write written=%u on_disk=%u expected=%u",
+              (unsigned)written, (unsigned)onDisk, (unsigned)expected);
     LittleFS.remove("/config.json.tmp");
-    restoreLivePrefix();
     return false;
   }
   if (!LittleFS.rename("/config.json.tmp", "/config.json")) {
     Log::error(TAG, "config.save_failed reason=rename");
     LittleFS.remove("/config.json.tmp");
-    restoreLivePrefix();
     return false;
   }
-  Log::kvf(TAG, "config.saved path=/config.json bytes=%u", (unsigned)written);
-  restoreLivePrefix();
+  Log::kvf(TAG, "config.saved path=/config.json bytes=%u", (unsigned)onDisk);
+  if (bytes) *bytes = onDisk;
   return true;
 }
 
@@ -130,6 +159,7 @@ bool Config::replace(const char* json) {
     return false;
   }
   Log::info(TAG, "config.replaced source=mqtt");
+  configChanged();
   return true;
 }
 
@@ -192,73 +222,15 @@ bool Config::copyBootTopicPrefix(char* out, size_t cap) {
 
 bool Config::copyDiskDoc(JsonDocument& dst) {
   dst.clear();
-  if (!dst.set(_doc.as<JsonObjectConst>())) return false;
+  // Through text: dst.set() deep-copies recursively at about 1 KB of stack
+  // per nesting level and overflowed the 8 KB loop task on config.save.
+  String text;
+  if (serializeJson(_doc, text) == 0) return false;
+  if (deserializeJson(dst, text) != DeserializationError::Ok) return false;
+  if (!dst.is<JsonObject>()) return false;
   if (_topicPrefixHeld) {
     if (_diskTopicPrefixPresent) dst["mqtt"]["topic_prefix"] = _diskTopicPrefix;
     else dst["mqtt"].as<JsonObject>().remove("topic_prefix");
-  }
-  return true;
-}
-
-// Set one value by dot-path (e.g. "telegram.cooldown_s"), preserving
-// JSON type (bool/int/double/string). in: dot-path, value string.
-// out: false if a parent key is missing or not an object, value is
-// null, or the persist fails (in which case _doc is rolled back).
-bool Config::set(const char* path, const char* value) {
-  if (path && strcmp(path, "mqtt.topic_prefix") == 0) clearHeldTopicPrefix();
-  char buf[128];
-  // Reject empty/over-long paths (truncation would rewrite a different
-  // key) and a null value (the strcmp/strtod below would deref it).
-  if (!path || !*path || !value || strlen(path) >= sizeof(buf)) return false;
-  JsonVariant node = _doc.as<JsonVariant>();
-  strncpy(buf, path, sizeof(buf) - 1);
-  buf[sizeof(buf) - 1] = '\0';
-
-  char* lastDot = strrchr(buf, '.');
-  const char* finalKey = buf;
-  if (lastDot) {
-    *lastDot = '\0';
-    finalKey = lastDot + 1;
-    char* tok = strtok(buf, ".");
-    while (tok) {
-      // Parent must exist AND be an object - traversing into a scalar
-      // (or absent) key would silently write nowhere.
-      if (!node[tok].is<JsonObject>()) return false;
-      node = node[tok];
-      tok = strtok(nullptr, ".");
-    }
-  }
-
-  if (strcmp(value, "true") == 0)       node[finalKey] = true;
-  else if (strcmp(value, "false") == 0) node[finalKey] = false;
-  else {
-    char* end;
-    double num = strtod(value, &end);
-    // Whole string parsed as a finite number stores numerically; the int
-    // cast is gated by an explicit range check so inf/nan/overflow (where
-    // (int)num is UB) fall through to string storage instead.
-    if (*end == '\0' && end != value && isfinite(num)) {
-      if (!strchr(value, '.') &&
-          num >= (double)INT_MIN && num <= (double)INT_MAX && num == (int)num)
-        node[finalKey] = (int)num;
-      else
-        node[finalKey] = num;
-    } else {
-      node[finalKey] = value;
-    }
-  }
-
-  if (!save()) {
-    // Persist failed - roll _doc back to the on-disk state so get()
-    // never returns a value that was never written.
-    load();
-    return false;
-  }
-  if (logPathIsSensitive(path)) {
-    Log::kvf(TAG, "config.set path=%s value=<redacted> value_len=%u",
-             path, (unsigned)strlen(value));
-  } else {
-    Log::kvf(TAG, "config.set path=%s value=%s", path, value);
   }
   return true;
 }

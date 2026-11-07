@@ -1,6 +1,7 @@
 // Host-native unit tests for ota_verify_policy.h - the OTA verification path
 // decisions: TLS insecure guard, manifest validation, version predicate, the
-// fled-release skip and its expiry, digest compare.
+// fled-release skip and its expiry, the install record, digest compare and the
+// URL scheme gate.
 // SPDX-License-Identifier: GPL-3.0-only
 #include <unity.h>
 #include "ota_verify_policy.h"
@@ -190,8 +191,8 @@ void test_fled_skip_expires_at_24h(void) {
   TEST_ASSERT_EQUAL(144, saves);
 }
 
-// The guard rolls back the first try when the running image hands it a crash
-// streak, so one more try, then the day starts over.
+// An older build inherits a crash-looping installer's streak and its guard rolls
+// the first try back, so one more try, then the day starts over.
 void test_fled_second_try_restarts_the_day(void) {
   TEST_ASSERT_EQUAL(OTA_FLED_RETRY, otaFledAction(FLED, FLED, OTA_FLED_SKIP_S, 0, false));
   TEST_ASSERT_EQUAL(OTA_FLED_LAST, otaFledAction(FLED, FLED, OTA_FLED_SKIP_S, 1, false));
@@ -241,6 +242,52 @@ void test_fled_failed_try_save_spends_no_try(void) {
   const OtaFledAge last = otaFledAfterTry(OTA_FLED_LAST, OTA_FLED_SKIP_S, 1, false);
   TEST_ASSERT_EQUAL_UINT32(OTA_FLED_SKIP_S, last.ageS);
   TEST_ASSERT_EQUAL_UINT8(1, last.tries);
+}
+
+// ---- Install record ------------------------------------------------------
+
+// The installer records the build it boots pending, so the image an abort or
+// rollback falls back to skips it for a day instead of at every check.
+void test_an_unconfirmed_install_is_skipped_for_a_day(void) {
+  const char* next = "26.10.5";
+  const char* fled = "";
+  TEST_ASSERT_TRUE(otaShouldUpdate(next, RUNNING, false));
+  // Negative control: without the record every check installs it again.
+  TEST_ASSERT_EQUAL(OTA_FLED_NONE, otaFledAction(next, fled, 0, 0, false));
+  TEST_ASSERT_TRUE(otaFledRecordsInstall(fled, next));
+  fled = next;
+  const OtaFledAge fresh = otaFledUnpack(otaFledPack({0, 0, 0}));
+  TEST_ASSERT_TRUE(otaFledAges(fled, RUNNING, fresh.ageS));
+  TEST_ASSERT_EQUAL(OTA_FLED_SKIP, otaFledAction(next, fled, fresh.ageS, fresh.tries, false));
+  TEST_ASSERT_EQUAL(OTA_FLED_SKIP, otaFledAction(next, fled, OTA_FLED_SKIP_S - 1, 0, false));
+  TEST_ASSERT_EQUAL(OTA_FLED_RETRY, otaFledAction(next, fled, OTA_FLED_SKIP_S, 0, false));
+  // The pending build does not age its own record, and confirms it away.
+  TEST_ASSERT_FALSE(otaFledAges(fled, next, 0));
+  TEST_ASSERT_TRUE(otaSameVersion(fled, next));
+}
+
+// A record that already names the build keeps its age and tries, so an expired
+// fled build that aborts twice costs two installs, then a new day.
+void test_install_record_keeps_a_fled_try(void) {
+  TEST_ASSERT_FALSE(otaFledRecordsInstall(FLED, FLED));
+  TEST_ASSERT_FALSE(otaFledRecordsInstall("26.10.04", FLED));
+  TEST_ASSERT_TRUE(otaFledRecordsInstall(RUNNING, FLED));
+  TEST_ASSERT_TRUE(otaFledRecordsInstall("garbage", FLED));
+  TEST_ASSERT_TRUE(otaFledRecordsInstall(nullptr, FLED));
+  // A version that does not parse would refuse nothing, so the old record stays.
+  TEST_ASSERT_FALSE(otaFledRecordsInstall(FLED, "dev"));
+  TEST_ASSERT_FALSE(otaFledRecordsInstall(FLED, nullptr));
+  OtaFledAge rec = {OTA_FLED_SKIP_S, 0, 0};
+  int installs = 0;
+  for (int check = 0; check < 4; check++) {
+    const OtaFledAction a = otaFledAction(FLED, FLED, rec.ageS, rec.tries, false);
+    if (a == OTA_FLED_SKIP) break;
+    rec = otaFledAfterTry(a, rec.ageS, rec.tries, true);
+    TEST_ASSERT_FALSE(otaFledRecordsInstall(FLED, FLED));
+    installs++;
+  }
+  TEST_ASSERT_EQUAL(OTA_FLED_TRIES, installs);
+  TEST_ASSERT_EQUAL_UINT32(0, rec.ageS);
 }
 
 void test_fled_age_survives_reboot(void) {
@@ -395,6 +442,32 @@ void test_null_digest_rejects(void) {
   TEST_ASSERT_FALSE(otaShaMatches(SHA_OK, nullptr));
 }
 
+// ---- URL scheme gate -----------------------------------------------------
+
+void test_https_url_is_always_allowed(void) {
+  TEST_ASSERT_TRUE(otaUrlAllowed("https://example.com/firmware.json", false));
+  TEST_ASSERT_TRUE(otaUrlAllowed("https://example.com/firmware.json", true));
+}
+
+// Plain http lets an on-path host pick the binary and its sha256 together.
+void test_http_url_needs_the_insecure_optin(void) {
+  TEST_ASSERT_FALSE(otaUrlAllowed("http://example.com/firmware.json", false));
+  TEST_ASSERT_FALSE(otaUrlAllowed("http://10.0.0.5:8080/firmware.bin", false));
+  // Negative control: the opt-in lets it through.
+  TEST_ASSERT_TRUE(otaUrlAllowed("http://example.com/firmware.json", true));
+}
+
+void test_other_schemes_are_never_allowed(void) {
+  const char* bad[] = {"",           "ftp://example.com/f", "HTTPS://example.com/f",
+                       "https:/x/f", "httpss://x/f",        "example.com/f",
+                       " https://example.com/f"};
+  for (const char* u : bad) {
+    TEST_ASSERT_FALSE(otaUrlAllowed(u, true));
+    TEST_ASSERT_FALSE(otaUrlAllowed(u, false));
+  }
+  TEST_ASSERT_FALSE(otaUrlAllowed(nullptr, true));
+}
+
 void test_redirect_codes(void) {
   const int yes[] = {301, 302, 303, 307, 308};
   for (int c : yes) TEST_ASSERT_TRUE(otaIsRedirect(c));
@@ -443,6 +516,8 @@ int main(int, char**) {
   RUN_TEST(test_fled_second_try_restarts_the_day);
   RUN_TEST(test_fled_try_downloads_only_once_saved);
   RUN_TEST(test_fled_failed_try_save_spends_no_try);
+  RUN_TEST(test_an_unconfirmed_install_is_skipped_for_a_day);
+  RUN_TEST(test_install_record_keeps_a_fled_try);
   RUN_TEST(test_fled_age_survives_reboot);
   RUN_TEST(test_fled_carry_is_capped);
   RUN_TEST(test_fled_unsynced_clock_counts_uptime);
@@ -457,6 +532,9 @@ int main(int, char**) {
   RUN_TEST(test_mismatched_digest_rejects);
   RUN_TEST(test_wrong_length_digest_rejects);
   RUN_TEST(test_null_digest_rejects);
+  RUN_TEST(test_https_url_is_always_allowed);
+  RUN_TEST(test_http_url_needs_the_insecure_optin);
+  RUN_TEST(test_other_schemes_are_never_allowed);
   RUN_TEST(test_redirect_codes);
   RUN_TEST(test_redirect_keeps_scheme);
   RUN_TEST(test_redirect_refuses_relative_and_junk);

@@ -1,5 +1,6 @@
-// Host-native unit tests for cert_policy.h - PEM structural pre-flight and CN
-// extraction. Does not cover the mbedtls pair check, which stays on-target.
+// Host-native unit tests for cert_policy.h - PEM structural pre-flight, CN
+// extraction and the cert.apply verdict. Does not cover the mbedtls pair
+// check, which stays on-target.
 // SPDX-License-Identifier: GPL-3.0-only
 #include <unity.h>
 #include "cert_policy.h"
@@ -140,6 +141,46 @@ void test_cn_with_comma_truncates(void) {
   TEST_ASSERT_EQUAL_STRING("node\\", cn);
 }
 
+// ---- cert.apply ----------------------------------------------------------
+
+// cert.set stores halves unchecked: a mismatched pair must not be applied (#58).
+void test_cert_apply_refuses_a_mismatched_pair(void) {
+  TEST_ASSERT_TRUE(certApplyVerdict(true, PairCheck::Invalid) == CertApply::Mismatch);
+}
+
+void test_cert_apply_reboots_onto_a_valid_pair(void) {
+  TEST_ASSERT_TRUE(certApplyVerdict(true, PairCheck::Valid) == CertApply::Reboot);
+}
+
+// A check the heap could not run is neither a pass nor a mismatch.
+void test_cert_apply_low_heap_is_not_a_mismatch(void) {
+  TEST_ASSERT_TRUE(certApplyVerdict(true, PairCheck::NoHeap) == CertApply::LowHeap);
+}
+
+// A missing half wins over any pair verdict.
+void test_cert_apply_needs_both_halves(void) {
+  TEST_ASSERT_TRUE(certApplyVerdict(false, PairCheck::Invalid) == CertApply::Missing);
+  TEST_ASSERT_TRUE(certApplyVerdict(false, PairCheck::Valid) == CertApply::Missing);
+  TEST_ASSERT_TRUE(certApplyVerdict(false, PairCheck::NoHeap) == CertApply::Missing);
+}
+
+// A refused cert.apply must open cert.clear on the same password session.
+void test_invalid_pair_marks_the_stored_cert_broken(void) {
+  TEST_ASSERT_TRUE(storedCertBrokenAfter(PairCheck::Invalid, false));
+  TEST_ASSERT_TRUE(storedCertBrokenAfter(PairCheck::Invalid, true));
+}
+
+void test_valid_pair_clears_the_broken_verdict(void) {
+  TEST_ASSERT_FALSE(storedCertBrokenAfter(PairCheck::Valid, true));
+  TEST_ASSERT_FALSE(storedCertBrokenAfter(PairCheck::Valid, false));
+}
+
+// A full heap must not open cert.clear while a good cert sits in NVS.
+void test_low_heap_keeps_the_last_verdict(void) {
+  TEST_ASSERT_FALSE(storedCertBrokenAfter(PairCheck::NoHeap, false));
+  TEST_ASSERT_TRUE(storedCertBrokenAfter(PairCheck::NoHeap, true));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_well_formed_cert_recognised);
@@ -160,5 +201,12 @@ int main(int, char**) {
   RUN_TEST(test_null_dn_and_zero_len_handled);
   RUN_TEST(test_cn_substring_in_earlier_field_wins);
   RUN_TEST(test_cn_with_comma_truncates);
+  RUN_TEST(test_cert_apply_refuses_a_mismatched_pair);
+  RUN_TEST(test_cert_apply_reboots_onto_a_valid_pair);
+  RUN_TEST(test_cert_apply_low_heap_is_not_a_mismatch);
+  RUN_TEST(test_cert_apply_needs_both_halves);
+  RUN_TEST(test_invalid_pair_marks_the_stored_cert_broken);
+  RUN_TEST(test_valid_pair_clears_the_broken_verdict);
+  RUN_TEST(test_low_heap_keeps_the_last_verdict);
   return UNITY_END();
 }

@@ -34,6 +34,7 @@
 #include <ctime>
 #include <cstring>
 #include <MQTTClient.h>
+#include <cell_ntp_policy.h>
 
 static const char* TAG = "CellularModule";
 
@@ -51,7 +52,11 @@ static constexpr uint32_t TELEMETRY_INTERVAL_MS = 60UL * 1000UL;
 CellularModule::State CellularModule::_state           = CellularModule::State::STANDBY;
 uint32_t              CellularModule::_wifiDownSince   = 0;
 uint32_t              CellularModule::_wifiUpSince     = 0;
+uint8_t               CellularModule::_actFails        = 0;
 uint32_t              CellularModule::_lastTelemetryMs = 0;
+uint8_t               CellularModule::_ntpTries        = 0;
+uint32_t              CellularModule::_ntpAt           = 0;
+uint8_t               CellularModule::_ntpIdx          = 0;
 
 // ---------------------------------------------------------------------------
 
@@ -102,8 +107,9 @@ void CellularModule::begin() {
   provider.httpsGet = [](const char* host, const char* path, uint16_t port,
                          const char* caPem,
                          std::function<bool(const uint8_t*, size_t)> onBody,
-                         int* httpStatus) {
-    return Cellular::httpsGet(host, path, port, caPem, onBody, httpStatus);
+                         int* httpStatus, uint32_t budgetMs, bool* budgetCut) {
+    return Cellular::httpsGet(host, path, port, caPem, onBody, httpStatus, 0, 0,
+                              budgetMs, budgetCut);
   };
   provider.tcp = [](uint8_t slot) { return Cellular::tcpClient(slot); };
   Net::setCellularProvider(provider);
@@ -147,27 +153,17 @@ void CellularModule::loop() {
 
         case Cellular::ActStatus::DONE: {
           Log::kvf(TAG, "cellular.state_change from=activating to=active");
+          _actFails        = 0;
           _state           = State::ACTIVE;
           _wifiUpSince     = 0;
           _lastTelemetryMs = 0;
 
-          // Clock recovery: when WiFi never associated, the SNTP client
-          // in WiFiManager never ran and the system clock is stuck
-          // pre-2023. Sync it off the modem now that the data context is
-          // up, so log timestamps and TLS validity windows are correct
-          // on a cellular-only boot.
-          if (time(nullptr) < 1700000000L) {
-            JsonObject  ncfg = Config::get();
-            const char* nsrv = ncfg["ntp"]["server"]         | "pool.ntp.org";
-            uint32_t    nto  = (ncfg["ntp"]["cell_timeout_s"] | 60) * 1000UL;
-            if (Cellular::ntpSync(nsrv, nto)) {
-              Log::info(TAG, "cellular.ntp_synced");
-            } else {
-              Log::warn(TAG, "cellular.ntp_sync_failed clock=unset");
-            }
-          }
+          // Clock recovery runs from ACTIVE: right after activation the
+          // modem cannot resolve yet, so the first try waits.
+          _ntpTries = 0;
+          _ntpIdx   = 0;
+          _ntpAt    = millis() + cellNtpDelayMs(0);  // after the bearer phase
 
-          // After the clock fix: certificate checks want a sane clock.
           // The session's connect republishes the retained set.
           MQTTClient::setCellularTransport(true);
           break;
@@ -178,6 +174,12 @@ void CellularModule::loop() {
           // STANDBY and reset the down-hold so we do not retry on every
           // loop tick - the next 60 s WiFi-down hold re-arms activation.
           Log::kvfw(TAG, "cellular.state_change from=activating to=standby reason=activation_failed");
+          // A modem state no phase clears must not fail the same way forever.
+          if (++_actFails >= 3) {
+            Log::kvfw(TAG, "cellular.activation_fail_streak count=%u action=hard_reset", (unsigned)_actFails);
+            _actFails = 0;
+            Cellular::hardReset();
+          }
           _wifiDownSince = now;
           _state         = State::STANDBY;
           break;
@@ -186,21 +188,21 @@ void CellularModule::loop() {
     }
 
     case State::ACTIVE: {
-      // Cellular::hardReset() (shell or watchdog) drops _started back to
-      // false. Detect that and re-walk bring-up; Cellular::loop is a
-      // no-op while _started=false and would otherwise leave us stuck.
-      // A hard reset that succeeds leaves the modem alive but not
-      // activated, so both are checked.
+      // A hard reset or a lost link (Cellular::loop) drops _started.
+      // Re-walk bring-up, which is bounded by the activation deadline.
       if (!Cellular::isModemAlive() || !Cellular::activated()) {
-        Log::kvfw(TAG, "cellular.state_change from=active to=activating reason=modem_hard_reset");
+        Log::kvfw(TAG, "cellular.state_change from=active to=activating reason=%s",
+                  Cellular::isModemAlive() ? "link_lost" : "modem_hard_reset");
         MQTTClient::setCellularTransport(false);
         _state           = State::ACTIVATING;
         _lastTelemetryMs = 0;
         break;
       }
 
-      // Run cellular-side recovery (re-register, re-open the bearer).
+      // Health probe. On link loss it clears activated() for next loop.
       Cellular::loop();
+
+      if (!WiFiManager::ntpSynced() && cellNtpDue(now, _ntpAt)) syncClock();
 
       if (wifiUp) {
         if (_wifiUpSince == 0) _wifiUpSince = now;
@@ -223,6 +225,7 @@ void CellularModule::loop() {
           _state         = State::STANDBY;
           _wifiDownSince = 0;
           _wifiUpSince   = 0;
+          break;
         }
       } else {
         _wifiUpSince = 0;
@@ -242,6 +245,46 @@ void CellularModule::loop() {
 
 // ---------------------------------------------------------------------------
 
+// One cellular NTP try against one server from the pair WiFi SNTP uses,
+// minus hosts a carrier cannot reach. One host per loop pass and a capped
+// wait keep each AT-bus hold under the cellular MQTT keepalive.
+//
+// In:  none (reads ntp.server, ntp.server2, ntp.cell_timeout_s)
+// Out: system clock set on success, _ntpIdx/_ntpTries/_ntpAt advanced
+void CellularModule::syncClock() {
+  JsonObject  ncfg = Config::get();
+  uint32_t    nto  = cellNtpWaitMs(ncfg["ntp"]["cell_timeout_s"] | 60);
+  const char* cand[CELL_NTP_PER_TRY];
+  uint8_t     n = cellNtpCandidates(ncfg["ntp"]["server"] | "pool.ntp.org",
+                                    ncfg["ntp"]["server2"] | "time.cloudflare.com", cand);
+  if (_ntpIdx >= n) _ntpIdx = 0;
+  bool ok = false;
+  // Copy: ntpSync pumps the console, and a config.set there reloads the doc.
+  char host[CELL_NTP_HOST_MAX + 1] = "";
+  if (n > 0) {
+    snprintf(host, sizeof(host), "%s", cand[_ntpIdx]);
+    uint32_t t0 = millis();
+    ok = Cellular::ntpSync(host, nto);
+    if (ok) {
+      Log::kvf(TAG, "cellular.ntp_synced attempt=%u server=%s ms=%lu", (unsigned)(_ntpTries + 1),
+               host, (unsigned long)(millis() - t0));
+      return;
+    }
+  }
+  if (++_ntpIdx < n) {
+    _ntpAt = millis() + CELL_NTP_NEXT_HOST_MS;
+    return;
+  }
+  _ntpIdx = 0;
+  if (_ntpTries < 255) _ntpTries++;
+  uint32_t next = cellNtpDelayMs(_ntpTries);
+  Log::kvfw(TAG, "cellular.ntp_sync_failed clock=unsynced attempt=%u next_s=%lu",
+            (unsigned)_ntpTries, (unsigned long)(next / 1000));
+  _ntpAt = millis() + next;
+}
+
+// ---------------------------------------------------------------------------
+
 // Publish <prefix>/cellular/active with "1" or "0" on activation/yield.
 //
 // In:  active - 1 on activation, 0 on yield
@@ -250,7 +293,7 @@ void CellularModule::emitActive(int active) {
   JsonObject  cfg = Config::get();
   const char* pfx = cfg["mqtt"]["topic_prefix"] | "thesada/node";
   char topic[MQTT_TOPIC_CAP];
-  snprintf(topic, sizeof(topic), "%s/cellular/active", pfx);
+  if (!MQTTClient::formatTopic(topic, sizeof(topic), "%s/cellular/active", pfx)) return;
   MQTTClient::publish(topic, active ? "1" : "0");
 }
 
@@ -266,7 +309,7 @@ void CellularModule::emitRssi() {
   JsonObject  cfg = Config::get();
   const char* pfx = cfg["mqtt"]["topic_prefix"] | "thesada/node";
   char topic[MQTT_TOPIC_CAP], val[8];
-  snprintf(topic, sizeof(topic), "%s/cellular/rssi", pfx);
+  if (!MQTTClient::formatTopic(topic, sizeof(topic), "%s/cellular/rssi", pfx)) return;
   snprintf(val, sizeof(val), "%d", Cellular::getSignalQuality());
   MQTTClient::publish(topic, val);
 }

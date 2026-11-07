@@ -18,10 +18,10 @@
 
 ## Invariant ledger
 
-- [ ] Touches load-bearing source (OTA, MQTT, Shell, Config, HttpServer, Cellular)
+- [ ] Touches a file `docs/invariants.md` cites on a `Source:` line (`scripts/check-invariant-ledger.sh --list`)
 - [ ] `docs/invariants.md` updated (and `Dated` line bumped) in this PR
 - [ ] OR: bypass justified - explain why no invariant is established or relied on
 
-The `invariant-ledger` CI job enforces this for the listed paths.
+The `invariant-ledger` CI job enforces this for every cited file.
 Bypass with `INVARIANT_OK: 1` as a commit trailer if the touch genuinely
 does not affect any invariant.

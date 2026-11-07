@@ -7,13 +7,16 @@
 // Single-task invariant: every method reads or writes the one _doc with no
 // locking, and ArduinoJson is not thread-safe. Every caller must run on the
 // main loop task: module begin()/loop(), Shell handlers, MQTT callbacks all
-// do today. Do NOT call from an ISR or a secondary FreeRTOS task. If a second
-// task ever needs config, add a recursive mutex here first, as EventBus.h
-// says for the bus.
+// do today. Do NOT call from an ISR or a secondary FreeRTOS task. A second
+// task reads a copy the main loop refreshes from onChange(), as HttpServer's
+// web snapshot does for the async_tcp handlers.
 class Config {
 public:
   static void load();
   static bool save();   // false if the on-disk write failed (open or short write)
+  // tmp + rename into /config.json, live doc untouched. Main loop only: every
+  // writer shares /config.json.tmp. out: false if the old file stayed, bytes on disk.
+  static bool writeFile(JsonVariantConst src, bool pretty, size_t* bytes = nullptr);
   // false on parse or persist failure. Either failure reloads the on-disk file
   // and puts a held boot prefix back.
   static bool replace(const char* json);
@@ -31,7 +34,11 @@ public:
   // Copy the doc a save should write. A held boot prefix stays out of the copy.
   // in: destination document. out: false if the copy did not land.
   static bool copyDiskDoc(JsonDocument& dst);
-  static bool set(const char* path, const char* value);
+  // Changes after every load, replace or set that rebuilt or edited the doc.
+  static uint32_t revision();
+  // Run fn on the main loop after each such change, before the caller resumes.
+  // in: hook. out: false when all 4 slots are taken.
+  static bool onChange(void (*fn)());
   static JsonObject get();
 private:
   static JsonDocument _doc;

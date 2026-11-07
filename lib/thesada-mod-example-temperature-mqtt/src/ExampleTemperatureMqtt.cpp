@@ -70,15 +70,13 @@ void ExampleTemperatureMqtt::readAndPublish() {
   // rules and the SD logger see it without knowing about MQTT.
   JsonObject  cfg    = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+  // formatTopic logs and refuses a topic that does not fit, never clips it.
   char topic[MQTT_TOPIC_CAP];
-  int n = snprintf(topic, sizeof(topic), "%s/sensor/temperature/%s", prefix, _name);
-  if (n < 0 || n >= (int)sizeof(topic)) {
-    Log::kvfw(TAG, "example_temp.topic_too_long prefix_len=%u", (unsigned)strlen(prefix));
-    return;
+  if (MQTTClient::formatTopic(topic, sizeof(topic), "%s/sensor/temperature/%s", prefix, _name)) {
+    char val[16];
+    snprintf(val, sizeof(val), "%.2f", _lastC);
+    MQTTClient::publish(topic, val);
   }
-  char val[16];
-  snprintf(val, sizeof(val), "%.2f", _lastC);
-  MQTTClient::publish(topic, val);
 
   JsonDocument doc;
   JsonObject s = doc["sensors"].add<JsonObject>();
