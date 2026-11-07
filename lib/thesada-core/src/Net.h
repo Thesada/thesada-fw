@@ -39,11 +39,12 @@ struct CellularProvider {
 
   // HTTPS GET over TLS on a modem socket; callback receives body chunks.
   // in: host, path, port, CA PEM (nullptr = insecure), body chunk callback,
-  //     http status output. out: true on success; httpStatus = wire status.
+  //     http status output, budget ms (0 = none), budget-cut output.
+  // out: true on success, httpStatus = wire status, budgetCut = the budget ended it.
   bool (*httpsGet)(const char* host, const char* path, uint16_t port,
                    const char* caPem,
                    std::function<bool(const uint8_t*, size_t)> onBody,
-                   int* httpStatus);
+                   int* httpStatus, uint32_t budgetMs, bool* budgetCut);
 
   // Plain modem TCP socket for a TLS session to ride on. Slot 0 is the
   // MQTT session. in: slot. out: client, or nullptr for an unknown slot.

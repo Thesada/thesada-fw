@@ -19,6 +19,14 @@ inline bool mqttRollbackShould(const char* lg, bool haveLg,
   return true;
 }
 
+// A connect proves only the broker it dialed. A config whose host or port is not
+// the live one (a refused host, a port not applied yet) is not snapshot as last-good.
+inline bool mqttSnapshotProven(const char* cfgHost, unsigned cfgPort,
+                               const char* liveHost, unsigned livePort) {
+  if (!cfgHost || !liveHost || !*liveHost) return false;
+  return cfgPort == livePort && strcmp(cfgHost, liveHost) == 0;
+}
+
 // Low-heap defrag reboot: three straight failures that resolved the broker
 // and died before it answered (rc -2) on a heap under 40 KB, budget not
 // halted. A DNS outage never reached TLS, so it never qualifies.

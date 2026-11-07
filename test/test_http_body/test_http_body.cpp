@@ -66,6 +66,49 @@ void test_two_requests_do_not_share(void) {
   free(atk);
 }
 
+// --- one file cap, both directions (#66) --------------------------------------
+
+// The dashboard editor loads up to HTTP_FILE_MAX, so what it loaded fits a POST back.
+void test_file_body_cap_matches_the_read_cap(void) {
+  TEST_ASSERT_EQUAL_UINT32(HTTP_FILE_MAX, HTTP_BODY_FILE_MAX);
+  TEST_ASSERT_EQUAL_UINT32(65536, HTTP_FILE_MAX);
+  HttpBody* b = httpBodyBegin(HTTP_FILE_MAX, HTTP_BODY_FILE_MAX);
+  TEST_ASSERT_NOT_NULL(b);
+  free(b);
+  TEST_ASSERT_NULL(httpBodyBegin(HTTP_FILE_MAX + 1, HTTP_BODY_FILE_MAX));
+}
+
+// --- httpBodyVerdict (#67) ----------------------------------------------------
+
+// A chunked request has Content-Length 0 and nothing buffered. Read as an
+// empty body it truncated the target, so it must be refused first.
+void test_chunked_is_length_required_not_empty(void) {
+  TEST_ASSERT_EQUAL(HTTP_BODY_LENGTH_REQUIRED,
+                    httpBodyVerdict(true, true, 0, HTTP_BODY_FILE_MAX, nullptr));
+  TEST_ASSERT_EQUAL(HTTP_BODY_LENGTH_REQUIRED,
+                    httpBodyVerdict(true, true, 10, HTTP_BODY_FILE_MAX, nullptr));
+}
+
+void test_unauthorized_wins_over_everything(void) {
+  TEST_ASSERT_EQUAL(HTTP_BODY_UNAUTHORIZED,
+                    httpBodyVerdict(false, true, 0, HTTP_BODY_FILE_MAX, nullptr));
+  TEST_ASSERT_EQUAL(HTTP_BODY_UNAUTHORIZED,
+                    httpBodyVerdict(false, false, 99999, HTTP_BODY_FILE_MAX, nullptr));
+}
+
+void test_plain_bodies_keep_their_verdicts(void) {
+  TEST_ASSERT_EQUAL(HTTP_BODY_EMPTY, httpBodyVerdict(true, false, 0, HTTP_BODY_FILE_MAX, nullptr));
+  TEST_ASSERT_EQUAL(HTTP_BODY_TOO_LARGE,
+                    httpBodyVerdict(true, false, HTTP_BODY_CFG_MAX + 1, HTTP_BODY_CFG_MAX, nullptr));
+  TEST_ASSERT_EQUAL(HTTP_BODY_INCOMPLETE, httpBodyVerdict(true, false, 4, HTTP_BODY_CMD_MAX, nullptr));
+  HttpBody* b = httpBodyBegin(4, HTTP_BODY_CMD_MAX);
+  TEST_ASSERT_TRUE(httpBodyAppend(b, U("ab"), 2, 0));
+  TEST_ASSERT_EQUAL(HTTP_BODY_INCOMPLETE, httpBodyVerdict(true, false, 4, HTTP_BODY_CMD_MAX, b));
+  TEST_ASSERT_TRUE(httpBodyAppend(b, U("cd"), 2, 2));
+  TEST_ASSERT_EQUAL(HTTP_BODY_OK, httpBodyVerdict(true, false, 4, HTTP_BODY_CMD_MAX, b));
+  free(b);
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_whole_body_in_chunks);
@@ -73,5 +116,9 @@ int main(int, char**) {
   RUN_TEST(test_null_buffer_takes_nothing);
   RUN_TEST(test_overrun_and_gap_refused);
   RUN_TEST(test_two_requests_do_not_share);
+  RUN_TEST(test_file_body_cap_matches_the_read_cap);
+  RUN_TEST(test_chunked_is_length_required_not_empty);
+  RUN_TEST(test_unauthorized_wins_over_everything);
+  RUN_TEST(test_plain_bodies_keep_their_verdicts);
   return UNITY_END();
 }

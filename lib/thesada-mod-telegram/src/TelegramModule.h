@@ -1,8 +1,6 @@
 // thesada-fw - TelegramModule.h
-// Alert module: evaluates temperature thresholds and low-battery rules.
-// On alert, publishes to EventBus ("alert") and optionally sends directly
-// via Telegram Bot API if telegram.bot_token and telegram.chat_ids are
-// set in config.json. Also supports webhook.url.
+// Telegram Bot API and webhook.url sender for Lua alert rules. send()
+// also publishes the message to EventBus ("alert").
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 

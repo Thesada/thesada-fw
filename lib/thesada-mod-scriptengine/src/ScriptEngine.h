@@ -25,6 +25,10 @@ public:
   // Registrars are stored persistently and re-called on lua.reload.
   static void addBindings(LuaBindingRegistrar fn);
 
+  // A binding that blocks (a network send) gives its time back to the
+  // running script's budget, capped per call. in: ms it took. out: none.
+  static void creditNative(uint32_t ms);
+
 private:
   static void createState();
   static void destroyState();

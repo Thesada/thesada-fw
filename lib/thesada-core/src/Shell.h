@@ -136,7 +136,8 @@ public:
   // Read Serial and execute newline-terminated lines. The console buffer is a
   // shared singleton (USB-CDC / UART0), so this is safe to call from
   // main.loop() and from blocking inner loops that must keep the shell live
-  // (e.g. cellular connect polling).
+  // (e.g. cellular connect polling). Only the task that ran begin() pumps.
+  // A call from any other task returns at once.
   static void pumpConsole();
 
   static constexpr int MAX_COMMANDS = 60;

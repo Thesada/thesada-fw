@@ -10,10 +10,12 @@ static const char* TAG = "Enroll";
 #ifdef ENABLE_IDENTITY
 
 #include "enroll_policy.h"
+#include "mqtt_topic_policy.h"
 #include "Config.h"
 #include "Identity.h"
 #include "MQTTClient.h"
 #include "Secret.h"
+#include "SecretJson.h"
 #include "WiFiManager.h"
 #include "ota_ca_progmem.h"
 #include <Arduino.h>
@@ -24,6 +26,9 @@ static const char* TAG = "Enroll";
 #include <WiFiClientSecure.h>
 #include <mbedtls/platform_util.h>
 #include <new>
+
+static_assert(ENROLL_HOST_CAP <= MQTT_BROKER_HOST_CAP,
+              "an enrolled broker host must fit MQTTClient's host buffer");
 
 static const char* NS    = "thesada-enroll";
 static const char* K_ACK = "ack_pending";
@@ -207,7 +212,7 @@ static bool onChallenge(const String& reply) {
 // Store a cert reply only when every field is usable. NVS ack, then mqtt, then cert.
 // in: reply body. out: true when it was stored.
 static bool onCert(const String& reply) {
-  JsonDocument doc;
+  JsonDocument doc(secretJsonAllocator());  // key_pem: blocks wiped on free
   if (deserializeJson(doc, reply)) return false;
   const char* cert   = doc["cert_pem"]     | "";
   const char* key    = doc["key_pem"]      | "";

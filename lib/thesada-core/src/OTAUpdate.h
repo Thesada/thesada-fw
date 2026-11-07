@@ -47,9 +47,11 @@ public:
   static void confirmIfHealthy();
 
   // Fetch manifest, compare version, download, verify SHA256, flash, reboot.
-  // A manifest version a guard switch fled is refused as fled-release for
-  // 24 h, then installed again. force=true bypasses isNewer() and that
-  // refusal - re-flashes even when remote == local.
+  // A manifest version a guard switch fled, or one installed that never
+  // confirmed, is refused as fled-release for 24 h, then installed again.
+  // An http:// manifest or binary URL is refused as insecure-url unless
+  // ota.allow_insecure is set. force=true bypasses isNewer() and the
+  // fled-release refusal - re-flashes even when remote == local.
   // Useful for dev iteration without bumping FIRMWARE_VERSION each cycle.
   //
   // WARNING: synchronous - blocks on fetch + download + flash + ESP.restart().

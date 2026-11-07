@@ -1,8 +1,8 @@
 // thesada-fw - ota_verify_policy.h
 // Pure decisions on the OTA verification path: the TLS insecure-fallback guard,
 // manifest field validation, the version-update predicate, the fled-release
-// skip and its expiry, and the SHA256 digest compare. No HTTPClient, no
-// Update, no mbedtls, so host unit-testable.
+// skip and its expiry, the SHA256 digest compare and the URL scheme gate. No
+// HTTPClient, no Update, no mbedtls, so host unit-testable.
 //
 // SCOPE: only these predicates moved. fetchManifest's HTTP and JSON handling,
 // and the streaming mbedtls_sha256 accumulation in applyUpdate, stay in
@@ -123,8 +123,8 @@ inline bool otaSameVersion(const char* a, const char* b) {
 
 // A release a guard switch fled is refused for this long, then installed again.
 #define OTA_FLED_SKIP_S (24u * 60u * 60u)
-// Installs per expired skip. A crash-looping image hands its streak to the
-// image it installs, and the guard rolls that one back at its first boot.
+// Installs per expired skip. An older build that a crash-looping image installs
+// inherits that streak, and its guard rolls it back at its first boot.
 #define OTA_FLED_TRIES 2u
 // After a boot's first save the skip age is saved at most this often.
 #define OTA_FLED_SAVE_S (10u * 60u)
@@ -225,6 +225,14 @@ inline OtaFledAge otaFledAfterTry(OtaFledAction action, uint32_t ageS, uint8_t t
   return {ageS, tries, 0};
 }
 
+// Record the build an install boots pending as fled, unless the record names it
+// already, so a fled try keeps its age. in: record, installed version. out: write.
+inline bool otaFledRecordsInstall(const char* fled, const char* installing) {
+  int major = 0, minor = 0, patch = 0;
+  if (!otaParseVersion(installing, &major, &minor, &patch)) return false;
+  return !otaSameVersion(fled, installing);
+}
+
 // Digest compare. Case-insensitive because the manifest may carry either case,
 // but length-checked first so a truncated or padded digest is rejected outright
 // rather than leaning on the compare.
@@ -233,6 +241,14 @@ inline bool otaShaMatches(const char* computedHex, const char* expectedHex) {
   if (strlen(computedHex) != OTA_SHA256_HEX_LEN) return false;
   if (strlen(expectedHex) != OTA_SHA256_HEX_LEN) return false;
   return strcasecmp(computedHex, expectedHex) == 0;
+}
+
+// Plain http lets an on-path host pick both the binary and its sha256, so it
+// needs ota.allow_insecure. in: manifest or binary URL, opt-in. out: may fetch.
+inline bool otaUrlAllowed(const char* url, bool allowInsecure) {
+  if (!url) return false;
+  if (strncmp(url, "https://", 8) == 0) return true;
+  return allowInsecure && strncmp(url, "http://", 7) == 0;
 }
 
 // OTA GETs follow redirects by hand, one fed hop at a time.

@@ -20,7 +20,14 @@ fi
 [ -f "$UNITY/unity.h" ] || { echo "tidy-check: Unity missing under $UNITY after pio test"; exit 2; }
 
 shopt -s nullglob
-units=(test/test_*/test_*.cpp)
+units=()
+for u in test/test_*/test_*.cpp; do
+  # Need the Lua fork, built only in [env:native-lua].
+  case "$u" in
+    test/test_lua_stdlibs/*|test/test_lua_budget_hooks/*) continue ;;
+  esac
+  units+=("$u")
+done
 [ ${#units[@]} -gt 0 ] || { echo "tidy-check: no test units found"; exit 2; }
 
 echo "tidy-check: $TIDY over ${#units[@]} test units, headers lib/thesada-core/src"

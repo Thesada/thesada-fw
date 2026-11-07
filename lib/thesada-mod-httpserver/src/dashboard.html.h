@@ -198,6 +198,7 @@ function authSubmit() {
       return r.json();
     })
     .then(data => {
+      if (data && !data.token && data.error) { err.textContent = data.error; return; }
       if (!data || !data.token) return;
       _authHeader = 'Bearer ' + data.token;
       sessionStorage.setItem('thesada_token', data.token);
@@ -517,6 +518,7 @@ async function refreshFiles() {
       files.filter(f => !f.dir).sort((a,b) => a.name.localeCompare(b.name)).forEach(f => {
         const opt = document.createElement('option');
         opt.value = f.name.startsWith('/') ? f.name : '/' + f.name;
+        opt.dataset.size = f.size;
         opt.textContent = (f.name.startsWith('/') ? f.name : '/' + f.name) +
                           '  (' + (f.size >= 1024 ? (f.size/1024).toFixed(1)+' KB' : f.size+' B') + ')';
         if (opt.value === cur) opt.selected = true;
@@ -525,20 +527,65 @@ async function refreshFiles() {
       document.getElementById('fileMsg').textContent = files.length + ' file(s)';
     });
 }
+// The editor and POST /api/file hold 64 KB. GET streams any size.
+const EDIT_MAX = 65536;
+function downloadFile(path, src, auth) {
+  fetch('/api/file?path=' + encodeURIComponent(path) + src, { headers: { 'Authorization': auth } })
+    .then(r => { if (r.status === 401) { clearAuth(); return null; } return r.ok ? r.blob() : null; })
+    .then(b => {
+      if (!b) return;
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(b);
+      a.download = path.split('/').pop();
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    });
+}
 async function loadFile() {
   const path = document.getElementById('fileList').value;
   if (!path) return;
   const auth = await authHeader();
   if (!auth) return;
-  fetch('/api/file?path=' + encodeURIComponent(path) + fileSourceParam(), { headers: { 'Authorization': auth } })
-    .then(r => { if (r.status === 401) { clearAuth(); return null; } return r.text(); })
-    .then(t => { if (t !== null) document.getElementById('fileContent').value = t; });
+  const box = document.getElementById('fileContent');
+  const msg = document.getElementById('fileMsg');
+  box.dataset.loaded = '';
+  // Source read once, so a switch mid-load cannot relabel what arrives.
+  const src = fileSourceParam();
+  const opt = document.getElementById('fileList').selectedOptions[0];
+  if (opt && Number(opt.dataset.size) > EDIT_MAX) {
+    box.value = '';
+    msg.textContent = 'Too large to edit here (max 64 KB), downloading it instead';
+    downloadFile(path, src, auth);
+    return;
+  }
+  fetch('/api/file?path=' + encodeURIComponent(path) + src, { headers: { 'Authorization': auth } })
+    .then(async r => {
+      if (r.status === 401) { clearAuth(); return; }
+      const t = await r.text();
+      if (!r.ok) {
+        box.value = '';
+        let e = t; try { e = JSON.parse(t).error || t; } catch (x) {}
+        msg.textContent = 'Error: ' + e;
+        return;
+      }
+      if (new Blob([t]).size > EDIT_MAX) {
+        box.value = '';
+        msg.textContent = 'Too large to edit here (max 64 KB)';
+        return;
+      }
+      box.value = t;
+      box.dataset.loaded = path + src;
+    });
 }
 async function saveFile() {
   const path = document.getElementById('fileList').value;
   const content = document.getElementById('fileContent').value;
   const msg = document.getElementById('fileMsg');
   if (!path) { msg.textContent = 'Select a file first'; return; }
+  // Only text that was loaded from this file goes back to it.
+  if (document.getElementById('fileContent').dataset.loaded !== path + fileSourceParam()) {
+    msg.textContent = 'Load the file first'; return;
+  }
   const auth = await authHeader();
   if (!auth) return;
   fetch('/api/file?path=' + encodeURIComponent(path) + fileSourceParam(), {
@@ -562,7 +609,7 @@ async function deleteFile() {
     .then(r => {
       if (!r) return;
       msg.textContent = r.ok ? 'Deleted' : ('Error: ' + r.error);
-      if (r.ok) { document.getElementById('fileContent').value = ''; refreshFiles(); }
+      if (r.ok) { const b = document.getElementById('fileContent'); b.value = ''; b.dataset.loaded = ''; refreshFiles(); }
     });
 }
 async function copyFileToOther() {
@@ -578,9 +625,13 @@ async function copyFileToOther() {
                         { headers: { 'Authorization': auth } });
   if (r.status === 401) { clearAuth(); return; }
   const content = await r.text();
+  if (!r.ok) {
+    let e = content; try { e = JSON.parse(content).error || content; } catch (x) {}
+    msg.textContent = 'Copy failed: ' + e; return;
+  }
   const w = await fetch('/api/file?path=' + encodeURIComponent(path) + '&source=' + dest,
                         { method: 'POST', body: content,
-                          headers: { 'Content-Type': 'text/plain', 'Authorization': auth } });
+                          headers: { 'Content-Type': 'application/octet-stream', 'Authorization': auth } });
   if (w.status === 401) { clearAuth(); return; }
   const j = await w.json();
   msg.textContent = j.ok ? ('Copied to ' + dest) : ('Copy failed: ' + j.error);
@@ -595,15 +646,20 @@ async function uploadFile() {
   if (!auth) return;
   msg.textContent = 'Uploading…';
   const text = await file.text();
-  fetch('/api/file?path=' + encodeURIComponent(path) + fileSourceParam(), {
+  const src = fileSourceParam();
+  fetch('/api/file?path=' + encodeURIComponent(path) + src, {
     method: 'POST', body: text,
-    headers: { 'Content-Type': 'text/plain', 'Authorization': auth }
+    headers: { 'Content-Type': 'application/octet-stream', 'Authorization': auth }
   })
     .then(r => { if (r.status === 401) { clearAuth(); return null; } return r.json(); })
     .then(r => {
       if (!r) return;
       msg.textContent = r.ok ? ('Uploaded: ' + path) : ('Error: ' + r.error);
-      if (r.ok) { input.value = ''; refreshFiles(); }
+      if (!r.ok) return;
+      // The editor now shows an older version of this file: drop it, so Save cannot undo the upload.
+      const b = document.getElementById('fileContent');
+      if (b.dataset.loaded === path + src) { b.value = ''; b.dataset.loaded = ''; }
+      input.value = ''; refreshFiles();
     });
 }
 

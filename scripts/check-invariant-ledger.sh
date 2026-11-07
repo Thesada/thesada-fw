@@ -1,36 +1,107 @@
 #!/bin/sh
-# Invariant-ledger discipline check (shared between pre-commit + CI).
-#
-# Refuses when load-bearing source files are touched without an update to
-# docs/invariants.md. Two call sites:
-#
-#   1. scripts/hooks/pre-commit
-#        Operates on staged files. Aborts the local commit.
-#
-#   2. .github/workflows/ci.yml
-#        Operates on the push or PR commit range. Fails the workflow.
-#
-# Both pass the file list via stdin (one path per line) so the matching
-# logic stays identical regardless of how the caller enumerates files.
-#
-# Bypass: either set INVARIANT_OK=1 in the environment, or add the trailer
-# `INVARIANT_OK: 1` to a commit message in the range. Both leave a trail.
-#
-# Usage:
-#   git diff --cached --name-only | scripts/check-invariant-ledger.sh
-#   git diff --name-only A...B     | scripts/check-invariant-ledger.sh
+# Invariant-ledger gate (pre-commit and CI). Run with --help for the contract.
 
 set -eu
 
-# ScriptEngine registers lua.load, a path-taking shell command.
-SENSITIVE_REGEX='^(lib/thesada-core/src/(OTAUpdate|MQTTClient|Shell|Config|Enroll|SetupPortal)\.cpp|lib/thesada-mod-httpserver/src/[^/]+\.cpp|lib/thesada-mod-cellular/src/Cellular\.cpp|lib/thesada-mod-scriptengine/src/ScriptEngine\.cpp)$'
+usage() {
+  cat >&2 <<'EOF'
+usage: git diff --cached --name-only | check-invariant-ledger.sh
+       check-invariant-ledger.sh --range BASE...HEAD
+       check-invariant-ledger.sh --list
 
-files="$(cat)"
+A change to a file that docs/invariants.md cites on a Source: line must also
+change the ledger. Citing a file there puts it under the gate. --list prints
+the gated files in the work tree, tracked or not ignored.
+Bypass: INVARIANT_OK=1, or an `INVARIANT_OK: 1` trailer in the CI range.
+Exit 0 clean, 1 ledger not in the change (--list: a cited name matches no
+file), 2 the ledger or the range could not be read.
+EOF
+  exit 2
+}
 
-touched_sensitive="$(printf '%s\n' "$files" | grep -E "$SENSITIVE_REGEX" || true)"
-touched_ledger="$(printf '%s\n' "$files" | grep -E '^docs/invariants\.md$' || true)"
+root="$(cd "$(dirname "$0")/.." && pwd)"
+ledger="${INVARIANT_LEDGER:-$root/docs/invariants.md}"
+if [ ! -r "$ledger" ]; then
+  echo "invariant-ledger check: cannot read $ledger" >&2
+  exit 2
+fi
 
-if [ -n "$touched_sensitive" ] && [ -z "$touched_ledger" ]; then
+# Print the stdin paths the ledger cites, a bare name matching any path ending
+# in /name. With $1=1 a cited name that no path matches fails.
+gated() {
+  awk -v ledger="$ledger" -v list="$1" '
+    function cite(tok,   stem, n, i, ext) {
+      if (match(tok, /[{][a-z,]+[}]$/)) {
+        stem = substr(tok, 1, RSTART - 1)
+        n = split(substr(tok, RSTART + 1, RLENGTH - 2), ext, ",")
+        for (i = 1; i <= n; i++) names[stem ext[i]] = 0
+      } else {
+        names[tok] = 0
+      }
+    }
+    BEGIN {
+      re = "[A-Za-z0-9_./-]+[.](cpp|c|h|hpp|ino|ini|sh|py|lua|html|js|txt|csv|yml|example|[{][a-z,]+[}])[^A-Za-z0-9_]"
+      while ((getline line < ledger) > 0) {
+        if (line ~ /^Source:/) on = 1
+        if (line ~ /^[ \t\r]*$/) on = 0
+        if (!on) continue
+        s = line " "
+        while (match(s, re)) {
+          tok = substr(s, RSTART, RLENGTH - 1)
+          s = substr(s, RSTART + RLENGTH - 1)
+          cite(tok)
+        }
+      }
+      for (k in names) count++
+      if (!count) {
+        print "invariant-ledger check: no Source: citations in " ledger > "/dev/stderr"
+        dead = 1
+        exit
+      }
+    }
+    {
+      hit = 0
+      for (k in names) {
+        if ($0 == k || substr($0, length($0) - length(k)) == "/" k) { names[k]++; hit = 1 }
+      }
+      if (hit) print
+    }
+    END {
+      if (dead) exit 2
+      if (list != 1) exit 0
+      for (k in names) {
+        if (!names[k]) {
+          print "invariant-ledger check: cited name matches no file: " k > "/dev/stderr"
+          bad = 1
+        }
+      }
+      exit bad
+    }'
+}
+
+case "${1:-}" in
+  --list)
+    git -C "$root" ls-files --cached --others --exclude-standard | gated 1
+    exit 0
+    ;;
+  --range)
+    [ -n "${2:-}" ] || usage
+    if ! files="$(git -C "$root" diff --name-only "$2")"; then
+      echo "invariant-ledger check: cannot diff $2" >&2
+      exit 2
+    fi
+    ;;
+  "")
+    files="$(cat)"
+    ;;
+  *)
+    usage
+    ;;
+esac
+
+touched_sensitive="$(printf '%s\n' "$files" | gated 0)" || exit 2
+
+if [ -n "$touched_sensitive" ] && ! printf '%s\n' "$files" | grep -qxF docs/invariants.md; then
   if [ "${INVARIANT_OK:-}" = "1" ]; then
     echo "invariant-ledger check: INVARIANT_OK=1 set, skipping." >&2
     exit 0
@@ -38,7 +109,7 @@ if [ -n "$touched_sensitive" ] && [ -z "$touched_ledger" ]; then
   cat >&2 <<EOF
 invariant-ledger check: load-bearing source touched without docs/invariants.md update.
 
-Sensitive files in this change:
+Sensitive files in this change (cited on a Source: line of the ledger):
 $touched_sensitive
 
 If this change establishes or relies on a new invariant, update

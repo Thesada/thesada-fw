@@ -1,14 +1,12 @@
 // thesada-fw - TelegramModule.cpp
-// Telegram Bot API and webhook integration.
-// Alert logic has moved to Lua scripts (data/scripts/alerts.lua).
-// This module only provides the send functions:
-//
+// Telegram Bot API and webhook send functions. Alert rules live in Lua
+// (/scripts/rules.lua, see examples/scripts/rules.lua.example).
 #include <thesada_config.h>
 #ifdef ENABLE_TELEGRAM
 //
 //   TelegramModule::send(message)          - send to all configured chat_ids
 //   TelegramModule::sendTo(chatId, message) - send to a specific chat_id
-// Both also publish to EventBus("alert") for MQTT and cellular relay.
+// send() also publishes to EventBus("alert") for MQTT and cellular relay.
 // SPDX-License-Identifier: GPL-3.0-only
 #include "TelegramModule.h"
 #include <Config.h>
@@ -129,12 +127,19 @@ void TelegramModule::begin() {
   ScriptEngine::addBindings([](lua_State* L) {
     static const luaL_Reg telegramLib[] = {
       {"send", [](lua_State* L) -> int {
-        bool ok = TelegramModule::sendTo(luaL_checkstring(L, 1), luaL_checkstring(L, 2));
+        const char* chatId = luaL_checkstring(L, 1);
+        const char* msg = luaL_checkstring(L, 2);
+        const uint32_t t0 = millis();
+        bool ok = TelegramModule::sendTo(chatId, msg);
+        ScriptEngine::creditNative(millis() - t0);
         lua_pushboolean(L, ok);
         return 1;
       }},
       {"broadcast", [](lua_State* L) -> int {
-        bool ok = TelegramModule::send(luaL_checkstring(L, 1));
+        const char* msg = luaL_checkstring(L, 1);
+        const uint32_t t0 = millis();
+        bool ok = TelegramModule::send(msg);
+        ScriptEngine::creditNative(millis() - t0);
         lua_pushboolean(L, ok);
         return 1;
       }},

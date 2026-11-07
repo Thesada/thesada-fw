@@ -205,8 +205,9 @@ Install the local git hooks once after clone:
 
 This symlinks `scripts/hooks/pre-commit`, `commit-msg`, and `pre-push`
 into `.git/hooks/`. The pre-commit hook refuses a commit that touches
-load-bearing source files (OTA, MQTT, Shell, Config, HttpServer,
-Cellular) without an update to [docs/invariants.md](docs/invariants.md).
+a file [docs/invariants.md](docs/invariants.md) cites on a `Source:` line
+(`scripts/check-invariant-ledger.sh --list`) without an update to the
+ledger.
 The same check runs server side in CI (`.github/workflows/ci.yml` job
 `invariant-ledger`).
 

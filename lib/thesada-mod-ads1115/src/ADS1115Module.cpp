@@ -1,9 +1,11 @@
 // thesada-fw - ADS1115Module.cpp
 // Reads device + channel lists from config.json at boot. Each channel specifies
 // a mux pair (e.g. "A0_A1" for differential, "A0_GND" for single-ended), a PGA
-// gain in volts (e.g. 1.024), and a CT clamp ratio "clamp_a_per_v" (amps per
-// 1 V, default 30). Multiple ADS1115 chips on the shared I2C bus are supported
-// via ads1115.devices[]; the scalar ads1115.address form is one device.
+// gain in volts rounded up to an ADS1115 range, and a CT clamp ratio
+// "clamp_a_per_v" (amps per 1 V, default 30). Readings are AC RMS, so a
+// single-ended CT needs a mid-rail bias. "dc": true reads the mean instead, for
+// a DC sensor. Multiple chips go in ads1115.devices[], the scalar
+// ads1115.address form is one device.
 // Readings are published as a JSON array <topic_prefix>/sensor/current and as
 // one combined "current" EventBus event for Lua rules.
 // SPDX-License-Identifier: GPL-3.0-only
@@ -19,8 +21,41 @@
 #include <Wire.h>
 #include <ModuleRegistry.h>
 #include <SensorRegistry.h>
+#include <ads_sample_policy.h>
 
 static const char* TAG = "ADS1115";
+
+static const int RMS_SAMPLES = 30;
+
+// adsGain_t per ADS_PGA_FS_V index.
+static const adsGain_t GAIN_BY_PGA[ADS_PGA_RANGES] = {
+  GAIN_SIXTEEN, GAIN_EIGHT, GAIN_FOUR, GAIN_TWO, GAIN_ONE, GAIN_TWOTHIRDS};
+
+// Zero-length write. out: true if the chip ACKed its address.
+static bool ack(uint8_t address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
+}
+
+static bool isSingleEnded(ADS1115Mux m) {
+  return m == ADS1115Mux::SINGLE_0 || m == ADS1115Mux::SINGLE_1 ||
+         m == ADS1115Mux::SINGLE_2 || m == ADS1115Mux::SINGLE_3;
+}
+
+// Config register mux field for a channel's mux mode.
+static uint16_t muxBits(ADS1115Mux m) {
+  switch (m) {
+    case ADS1115Mux::DIFF_0_3: return ADS1X15_REG_CONFIG_MUX_DIFF_0_3;
+    case ADS1115Mux::DIFF_1_3: return ADS1X15_REG_CONFIG_MUX_DIFF_1_3;
+    case ADS1115Mux::DIFF_2_3: return ADS1X15_REG_CONFIG_MUX_DIFF_2_3;
+    case ADS1115Mux::SINGLE_0: return ADS1X15_REG_CONFIG_MUX_SINGLE_0;
+    case ADS1115Mux::SINGLE_1: return ADS1X15_REG_CONFIG_MUX_SINGLE_1;
+    case ADS1115Mux::SINGLE_2: return ADS1X15_REG_CONFIG_MUX_SINGLE_2;
+    case ADS1115Mux::SINGLE_3: return ADS1X15_REG_CONFIG_MUX_SINGLE_3;
+    case ADS1115Mux::DIFF_0_1:
+    default:                   return ADS1X15_REG_CONFIG_MUX_DIFF_0_1;
+  }
+}
 
 // ---------------------------------------------------------------------------
 
@@ -56,7 +91,7 @@ void ADS1115Module::begin() {
 // ---------------------------------------------------------------------------
 
 // Bring up one ADS1115 at the given address and load its channel list. A chip
-// that fails to init is kept (channels visible in status) but skipped on read.
+// that fails to init is kept (channels visible in status) and probed each read.
 void ADS1115Module::addDevice(uint8_t address, JsonArray channels) {
   ADS1115Device dev;
   dev.address = address;
@@ -71,7 +106,7 @@ void ADS1115Module::addDevice(uint8_t address, JsonArray channels) {
 
 // ---------------------------------------------------------------------------
 
-// Parse channel definitions (mux pair, gain, clamp ratio) into dst.
+// Parse channel definitions (mux pair, gain, clamp ratio, coupling) into dst.
 void ADS1115Module::loadChannels(JsonArray src, std::vector<ADS1115Channel>& dst, uint8_t address) {
   if (src.isNull()) return;
 
@@ -89,13 +124,17 @@ void ADS1115Module::loadChannels(JsonArray src, std::vector<ADS1115Channel>& dst
     strncpy(c.name, cname, sizeof(c.name) - 1);
     c.name[sizeof(c.name) - 1] = '\0';
     c.mux        = muxFromString(muxS);
-    c.gain       = gain;
-    c.gainEnum   = gainFromFloat(gain);
+    c.gain       = adsPgaFullScaleV(gain);
+    c.gainEnum   = GAIN_BY_PGA[adsPgaIndex(gain)];
     c.clampAPerV = clamp;
+    c.dc         = ch["dc"] | false;
     dst.push_back(c);
 
-    Log::kvf(TAG, "ads.channel addr=0x%02X name=%s mux=%s gain=%.3f clamp=%g",
-             address, cname, muxS, gain, clamp);
+    if (c.gain != gain) {
+      Log::kvfw(TAG, "ads.gain_rounded name=%s requested=%.3f fs=%.3f", cname, gain, c.gain);
+    }
+    Log::kvf(TAG, "ads.channel addr=0x%02X name=%s mux=%s gain=%.3f clamp=%g coupling=%s",
+             address, cname, muxS, c.gain, clamp, c.dc ? "dc" : "ac");
   }
 }
 
@@ -127,18 +166,21 @@ void ADS1115Module::sensorRead(ShellOutput out) {
   if (channelCount() == 0) { out("  no channels configured"); return; }
   char line[128];
   for (auto& dev : _devices) {
+    bool up = true;
     for (auto& ch : dev.channels) {
-      if (!dev.ok) {
+      float   rmsV = 0.0f;
+      int16_t raw  = 0;
+      if (up) up = readChannelRms(dev, ch, rmsV, raw);
+      if (!up) {
         snprintf(line, sizeof(line), "  %-12s: device 0x%02X offline", ch.name, dev.address);
         out(line);
         continue;
       }
-      float rmsV    = readRmsVoltage(*dev.ads, ch, 30);
       float current = rmsV * ch.clampAPerV;
       float power   = current * _lineVoltage;
       snprintf(line, sizeof(line),
-               "  %-12s: %.4f V rms  %.2f A  %.1f W",
-               ch.name, rmsV, current, power);
+               "  %-12s: %.4f V %s  %.2f A  %.1f W",
+               ch.name, rmsV, ch.dc ? "mean" : "rms", current, power);
       out(line);
     }
   }
@@ -146,7 +188,7 @@ void ADS1115Module::sensorRead(ShellOutput out) {
 
 // ---------------------------------------------------------------------------
 
-// Read every channel on every live device and publish current/power.
+// Read every channel on every answering device and publish current/power.
 void ADS1115Module::readAndPublish() {
   if (channelCount() == 0) return;
 
@@ -154,13 +196,15 @@ void ADS1115Module::readAndPublish() {
   JsonArray    arr = doc["channels"].to<JsonArray>();
 
   for (auto& dev : _devices) {
-    if (!dev.ok) continue;
+    bool up = true;
     for (auto& ch : dev.channels) {
-      float rmsV    = readRmsVoltage(*dev.ads, ch, 30);
+      float   rmsV = 0.0f;
+      int16_t raw  = 0;
+      if (up) up = readChannelRms(dev, ch, rmsV, raw);
+      if (!up) continue;
       // Clamp ratio is amps per 1 V output (e.g. SCT-013-030 = 30, SCT-013-005 = 5).
       float current = rmsV * ch.clampAPerV;
       float power   = current * _lineVoltage;
-      int16_t raw   = dev.ads->getLastConversionResults();
 
       JsonObject obj    = arr.add<JsonObject>();
       obj["name"]       = ch.name;
@@ -187,73 +231,90 @@ void ADS1115Module::readAndPublish() {
     for (char* p = slug; *p; p++) { if (*p == ' ') *p = '_'; *p = tolower(*p); }
 
     char perTopic[MQTT_TOPIC_CAP], val[16];
-    snprintf(perTopic, sizeof(perTopic), "%s/sensor/current/%s", prefix, slug);
-    snprintf(val, sizeof(val), "%.2f", (float)(ch["current_a"] | 0.0f));
-    MQTTClient::publish(perTopic, val);
+    if (MQTTClient::formatTopic(perTopic, sizeof(perTopic), "%s/sensor/current/%s", prefix, slug)) {
+      snprintf(val, sizeof(val), "%.2f", (float)(ch["current_a"] | 0.0f));
+      MQTTClient::publish(perTopic, val);
+    }
 
-    snprintf(perTopic, sizeof(perTopic), "%s/sensor/power/%s", prefix, slug);
-    snprintf(val, sizeof(val), "%.1f", (float)(ch["power_w"] | 0.0f));
-    MQTTClient::publish(perTopic, val);
+    if (MQTTClient::formatTopic(perTopic, sizeof(perTopic), "%s/sensor/power/%s", prefix, slug)) {
+      snprintf(val, sizeof(val), "%.1f", (float)(ch["power_w"] | 0.0f));
+      MQTTClient::publish(perTopic, val);
+    }
   }
 
   // Combined JSON topic (for Lua EventBus, SD logging, backwards compat).
   // Dynamic buffer - 8 channels across two devices outgrow any fixed size and
   // a truncated payload would publish malformed JSON.
   char topic[MQTT_TOPIC_CAP];
-  snprintf(topic, sizeof(topic), "%s/sensor/current", prefix);
-  String payload;
-  payload.reserve(measureJson(doc) + 1);
-  serializeJson(doc, payload);
-  MQTTClient::publish(topic, payload.c_str());
+  if (MQTTClient::formatTopic(topic, sizeof(topic), "%s/sensor/current", prefix)) {
+    String payload;
+    payload.reserve(measureJson(doc) + 1);
+    serializeJson(doc, payload);
+    MQTTClient::publish(topic, payload.c_str());
+  }
 
   EventBus::publish("current", doc.as<JsonObject>());
 }
 
 // ---------------------------------------------------------------------------
 
-// Sample N readings over ~2 full 60Hz cycles and return RMS voltage.
-// ADS1115 at 860 SPS: 30 samples takes ~35ms (covers ~2 cycles at 60Hz).
-float ADS1115Module::readRmsVoltage(Adafruit_ADS1115& ads, ADS1115Channel& ch, int samples) {
+// Probe, sample, probe again, and re-probe a timeout to tell a NACK from a stuck
+// conversion. out: true with the reading in V and last raw count, false = offline.
+bool ADS1115Module::readChannelRms(ADS1115Device& dev, ADS1115Channel& ch,
+                                   float& rmsV, int16_t& raw) {
+  const char* lost = nullptr;
+  if (!ack(dev.address))                                       lost = "nack";
+  else if (!sampleRms(*dev.ads, ch, RMS_SAMPLES, rmsV, raw))   lost = ack(dev.address) ? "timeout" : "nack";
+  else if (!ack(dev.address))                                  lost = "nack";
+  markOnline(dev, lost == nullptr, lost);
+  return lost == nullptr;
+}
+
+// N single-shot conversions at 860 SPS (30 cover ~2 cycles at 60 Hz), each
+// waited on bounded: a NACKed read never sets the bit readADC_* spins on.
+bool ADS1115Module::sampleRms(Adafruit_ADS1115& ads, ADS1115Channel& ch,
+                              int samples, float& rmsV, int16_t& raw) {
   ads.setGain(ch.gainEnum);
   ads.setDataRate(RATE_ADS1115_860SPS);
 
-  float sumSq = 0.0f;
-  float scale = ch.gain / 32768.0f;
-
+  AdsRms acc;
   for (int i = 0; i < samples; i++) {
-    int16_t raw = readChannel(ads, ch);
-    float v = raw * scale;
-    sumSq += v * v;
+    ads.startADCReading(muxBits(ch.mux), /*continuous=*/false);
+    bool done = adsWaitReady([&ads]() { return ads.conversionComplete(); },
+                             []() { return (uint32_t)micros(); },
+                             ADS_CONVERSION_TIMEOUT_US);
+    if (!done) return false;
+    raw = ads.getLastConversionResults();
+    adsRmsAdd(acc, raw);
   }
-
-  return sqrtf(sumSq / (float)samples);
+  if (ch.dc) {
+    rmsV = adsMeanVolts(acc, ch.gain);
+    return true;
+  }
+  rmsV = adsRmsAcVolts(acc, ch.gain);
+  const AdsClip clip = isSingleEnded(ch.mux) ? adsClipAtGround(acc) : AdsClip::Unknown;
+  if (clip != AdsClip::Unknown) markClipped(ch, clip == AdsClip::Clipped);
+  return true;
 }
 
-// ---------------------------------------------------------------------------
-
-// Adafruit ADS1X15 exposes separate named methods per mux pair.
-int16_t ADS1115Module::readChannel(Adafruit_ADS1115& ads, const ADS1115Channel& ch) {
-  switch (ch.mux) {
-    case ADS1115Mux::DIFF_0_1: return ads.readADC_Differential_0_1();
-    case ADS1115Mux::DIFF_0_3: return ads.readADC_Differential_0_3();
-    case ADS1115Mux::DIFF_1_3: return ads.readADC_Differential_1_3();
-    case ADS1115Mux::DIFF_2_3: return ads.readADC_Differential_2_3();
-    case ADS1115Mux::SINGLE_0: return ads.readADC_SingleEnded(0);
-    case ADS1115Mux::SINGLE_1: return ads.readADC_SingleEnded(1);
-    case ADS1115Mux::SINGLE_2: return ads.readADC_SingleEnded(2);
-    case ADS1115Mux::SINGLE_3: return ads.readADC_SingleEnded(3);
-    default:                   return 0;
+// Record a read result in dev.ok, logging only a change of state.
+void ADS1115Module::markOnline(ADS1115Device& dev, bool up, const char* reason) {
+  if (dev.ok == up) return;
+  dev.ok = up;
+  if (up) {
+    Log::kvf(TAG, "ads.device.state_change addr=0x%02X from=offline to=online", dev.address);
+  } else {
+    Log::kvfw(TAG, "ads.device.state_change addr=0x%02X from=online to=offline reason=%s",
+              dev.address, reason);
   }
 }
 
-// Map a gain voltage to the nearest ADS1115 PGA enum value
-adsGain_t ADS1115Module::gainFromFloat(float g) {
-  if (g <= 0.256f) return GAIN_SIXTEEN;    // ±0.256 V
-  if (g <= 0.512f) return GAIN_EIGHT;      // ±0.512 V
-  if (g <= 1.024f) return GAIN_FOUR;       // ±1.024 V
-  if (g <= 2.048f) return GAIN_TWO;        // ±2.048 V
-  if (g <= 4.096f) return GAIN_ONE;        // ±4.096 V
-  return GAIN_TWOTHIRDS;                    // ±6.144 V
+// Record a swing's ground clipping in ch.clipped, logging only a change.
+void ADS1115Module::markClipped(ADS1115Channel& ch, bool clipped) {
+  if (ch.clipped == clipped) return;
+  ch.clipped = clipped;
+  if (clipped) Log::kvfw(TAG, "ads.clipped name=%s reason=single_ended_no_bias", ch.name);
+  else         Log::kvf(TAG, "ads.clip_cleared name=%s", ch.name);
 }
 
 // Convert a mux config string like "A0_A1" to the corresponding enum

@@ -1241,6 +1241,13 @@ def test_lua(r):
     else:
         r.fail("lua.exec error handling", f"expected Error:, got: {lines}")
 
+    # string, table and math are the library tables, not their names
+    lines = sh.cmd("lua.exec return type(math)..type(table)..type(string)..table.concat({math.floor(2.7)})")
+    if lines and lines[0] == "tabletabletable2":
+        r.ok("lua stdlib globals", "math, table, string are tables")
+    else:
+        r.fail("lua stdlib globals", f"expected tabletabletable2, got: {lines}")
+
     # reload
     lines = sh.cmd("lua.reload", wait=4.0)
     if lines and "reloaded" in lines[-1].lower():
@@ -1527,25 +1534,20 @@ def test_manual_config_mqtt(r):
         r.skip("MQTT config set/push (skipped)")
         return
 
-    # Test config/set
-    lines = sh.cmd("config.get telegram.cooldown_s")
-    original = lines[0].strip('"') if lines else "300"
-    print(f"  {DIM}Current telegram.cooldown_s: {original}{RESET}")
-
-    if r.ask(f"Publish cli/config.set to change cooldown_s to 999?"):
+    # Test config/set on a scratch section, deleted afterwards
+    if r.ask("Publish cli/config.set to set test.mqtt_set to 999?"):
         r.man("config/set", f"Publish to {prefix}/cli/config.set with payload: "
-              'telegram.cooldown_s 999')
+              'test.mqtt_set 999')
         r.pause("Publish the message, then press Enter")
-        lines = sh.cmd("config.get telegram.cooldown_s")
+        lines = sh.cmd("config.get test.mqtt_set")
         val = lines[0].strip('"') if lines else ""
         if val == "999":
-            r.ok("config/set verify", f"cooldown_s changed to {val}")
+            r.ok("config/set verify", f"test.mqtt_set set to {val}")
         else:
             r.fail("config/set verify", f"expected 999, got {val}")
 
-        # Restore
-        sh.cmd(f'lua.exec Config.set("telegram.cooldown_s","{original}")')
-        r.ok("config/set restore", f"cooldown_s restored to {original}")
+        sh.cmd("config.del test")
+        r.ok("config/set cleanup", "test section deleted")
 
 
 def test_manual_fallback_ap(r):

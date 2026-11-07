@@ -60,6 +60,12 @@ inline int shellParseSlot(int depth) {
   return (depth >= 0 && depth < SHELL_NEST_MAX) ? depth : -1;
 }
 
+// The console line buffer and the nesting depth belong to one task.
+// in: calling task, owner (nullptr before Shell::begin). out: may pump.
+inline bool shellPumpAllowed(const void* task, const void* owner) {
+  return owner == nullptr || task == owner;
+}
+
 enum class ShellResult { Ok, Failed };
 
 // Outcome of one execute(); transports report it as ok.
