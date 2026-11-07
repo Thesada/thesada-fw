@@ -25,9 +25,11 @@ enum class ADS1115Mux : uint8_t {
 struct ADS1115Channel {
   char        name[32];    // human label, e.g. "pump_a" or "ct1"
   ADS1115Mux  mux;         // resolved mux mode
-  float       gain;        // PGA full-scale in V (e.g. 1.024)
+  float       gain;        // PGA full scale in V the chip runs at (config rounded up)
   adsGain_t   gainEnum;    // resolved Adafruit gain constant
   float       clampAPerV;  // CT clamp ratio, amps per 1 V output (default 30)
+  bool        dc      = false;  // "dc": true reads the mean (a DC sensor), else AC RMS
+  bool        clipped = false;  // last swing touched ground on a single-ended mux
 };
 
 // One physical ADS1115 chip at a fixed I2C address with its own channel list.
@@ -35,7 +37,7 @@ struct ADS1115Device {
   uint8_t                     address;
   Adafruit_ADS1115*           ads = nullptr;  // heap, lives until reboot
   std::vector<ADS1115Channel> channels;
-  bool                        ok  = false;     // begin() succeeded
+  bool                        ok  = false;     // last read answered, begin() before one
 };
 
 class ADS1115Module : public Module {
@@ -54,9 +56,10 @@ private:
   void        addDevice(uint8_t address, JsonArray channels);
   void        loadChannels(JsonArray src, std::vector<ADS1115Channel>& dst, uint8_t address);
   void        readAndPublish();
-  int16_t     readChannel(Adafruit_ADS1115& ads, const ADS1115Channel& ch);
-  float       readRmsVoltage(Adafruit_ADS1115& ads, ADS1115Channel& ch, int samples = 30);
-  adsGain_t   gainFromFloat(float g);
+  bool        readChannelRms(ADS1115Device& dev, ADS1115Channel& ch, float& rmsV, int16_t& raw);
+  bool        sampleRms(Adafruit_ADS1115& ads, ADS1115Channel& ch, int samples, float& rmsV, int16_t& raw);
+  void        markOnline(ADS1115Device& dev, bool up, const char* reason);
+  void        markClipped(ADS1115Channel& ch, bool clipped);
   ADS1115Mux  muxFromString(const char* s);
   size_t      channelCount() const;
 

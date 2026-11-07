@@ -5,7 +5,7 @@
 //   GET  /api/info      - firmware version + build info (no auth)
 //   GET  /api/state     - latest sensor readings as JSON (auth required)
 //   GET  /api/config    - current config.json (auth required)
-//   POST /api/config    - write new config.json, restart (auth required)
+//   POST /api/config    - write config.json (tmp + rename), restart on success (auth required)
 //   POST /api/backup    - copy config.json to SD card (auth required)
 //   POST /api/restart   - reboot device (auth required)
 //   POST /ota           - accept firmware binary upload (auth required)

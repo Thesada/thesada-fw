@@ -34,6 +34,9 @@
 #include <mbedtls/platform_util.h>
 #include <esp_timer.h>
 #include <enroll_policy.h>
+#include <config_write_policy.h>
+#include <web_snapshot_policy.h>
+#include <shell_mode_policy.h>
 #include <string.h>
 
 static const char* TAG = "WebServer";
@@ -149,14 +152,75 @@ static bool _warnDue(uint32_t& lastMs) {
   return true;
 }
 
-// True while web.password is still the shipped default (or empty). Resolved
-// per call so secret.set / secret.clear web.password take effect immediately.
-static bool _defaultPassActive() {
+// What the async_tcp handlers read from config, copied on the main loop. A doc
+// rebuild there frees strings, so no handler may walk Config itself.
+static_assert(WEB_SNAP_PASS_CAP == Secret::MAX_LEN, "snapshot holds what Secret::resolve copies");
+static WebSnap      _webSnap = {};
+static portMUX_TYPE _webSnapMux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t     _webSnapRev = 0;
+static bool         _webSnapSet = false;
+
+// Main loop only, run from Config::onChange and loop(). in: none. out: none.
+static void _webSnapRefresh() {
   JsonObject cfg = Config::get();
+  WebSnap s;
+  webSnapFill(s, cfg["web"]["user"] | "admin", cfg["web"]["password"] | "changeme",
+              cfg["device"]["friendly_name"] | cfg["device"]["name"] | WEB_SNAP_NAME_DEFAULT);
+  taskENTER_CRITICAL(&_webSnapMux);
+  _webSnap = s;
+  taskEXIT_CRITICAL(&_webSnapMux);
+  mbedtls_platform_zeroize(s.passCfg, sizeof(s.passCfg));
+  _webSnapRev = Config::revision();
+  _webSnapSet = true;
+  if (!s.userFits || !s.passFits) {
+    Log::kvfw(TAG, "web.credential_too_long user_fits=%d password_fallback_fits=%d",
+              s.userFits ? 1 : 0, s.passFits ? 1 : 0);
+  }
+}
+
+// Any task. in: destination. out: a consistent copy, zeroize passCfg after use.
+static void _webSnapRead(WebSnap& out) {
+  taskENTER_CRITICAL(&_webSnapMux);
+  out = _webSnap;
+  taskEXIT_CRITICAL(&_webSnapMux);
+}
+
+// Snapshot user plus the effective password, resolved per call so secret.set /
+// secret.clear web.password apply at once. in: buffers. out: credential state.
+static WebCredState _webCred(char* user, size_t userCap, char* pass, size_t passCap) {
+  WebSnap snap;
+  _webSnapRead(snap);
+  const char* p = Secret::resolve("web_password", snap.passCfg, pass, passCap);
+  WebCredState st = webCredState(snap, p);
+  mbedtls_platform_zeroize(snap.passCfg, sizeof(snap.passCfg));
+  if (user) webSnapCopy(user, userCap, snap.user);
+  return st;
+}
+
+// in: none. out: why nothing can authenticate, WEB_CRED_OK when something can.
+static WebCredState _webCredLock() {
   char passBuf[Secret::MAX_LEN];
-  const char* webPass = Secret::resolve("web_password", cfg["web"]["password"] | "changeme",
-                                        passBuf, sizeof(passBuf));
-  return webAuthPassIsDefault(webPass);
+  WebCredState st = _webCred(nullptr, 0, passBuf, sizeof(passBuf));
+  mbedtls_platform_zeroize(passBuf, sizeof(passBuf));
+  return st;
+}
+
+// 403 naming the lock, for the login routes. in: request, state. out: true if sent.
+static bool _sendCredLocked(AsyncWebServerRequest* req, WebCredState st) {
+  if (st == WEB_CRED_DEFAULT) {
+    req->send(403, "application/json",
+              "{\"ok\":false,\"error\":\"web.password is default/empty - admin locked. "
+              "Set it via 'secret.set web.password' on the serial console\"}");
+    return true;
+  }
+  if (st == WEB_CRED_TOO_LONG) {
+    req->send(403, "application/json",
+              "{\"ok\":false,\"error\":\"web.user (max 63) or the config web.password "
+              "(max 159) is too long - admin locked. Shorten it, or set the password "
+              "via 'secret.set web.password'\"}");
+    return true;
+  }
+  return false;
 }
 
 // Check auth: Basic Auth OR Bearer token. Returns true if authorized.
@@ -172,18 +236,24 @@ static bool _defaultPassActive() {
 static bool _checkAuth(AsyncWebServerRequest* req, bool hasSideEffect = false,
                        bool* guessed = nullptr) {
   if (guessed) *guessed = false;
-  JsonObject cfg = Config::get();
-  const char* webUser = cfg["web"]["user"] | "admin";
+  char webUser[WEB_SNAP_USER_CAP];
   char passBuf[Secret::MAX_LEN];
-  const char* webPass = Secret::resolve("web_password", cfg["web"]["password"] | "changeme",
-                                        passBuf, sizeof(passBuf));
+  const WebCredState cred = _webCred(webUser, sizeof(webUser), passBuf, sizeof(passBuf));
+  const char* webPass = passBuf;
 
-  const bool passIsDefault = webAuthPassIsDefault(webPass);
-  if (passIsDefault) {
+  // A default or a too-long credential vetoes everything, Bearer included.
+  const bool passIsDefault = cred != WEB_CRED_OK;
+  if (cred == WEB_CRED_DEFAULT) {
     static uint32_t lastWarnMs = 0;
     if (_warnDue(lastWarnMs)) {
       Log::warn(TAG, "web.admin_refused reason=default_password "
                      "hint=\"set via secret.set web.password or config.json\"");
+    }
+  } else if (cred == WEB_CRED_TOO_LONG) {
+    static uint32_t lastLongWarnMs = 0;
+    if (_warnDue(lastLongWarnMs)) {
+      Log::warn(TAG, "web.admin_refused reason=credential_too_long "
+                     "hint=\"web.user max 63, config web.password max 159\"");
     }
   }
 
@@ -216,9 +286,12 @@ static bool _checkAuth(AsyncWebServerRequest* req, bool hasSideEffect = false,
   // Skip the Basic check when Bearer already verified (or a veto decides).
   const bool basicOk = !passIsDefault && !bearerValid && basicAllowed &&
                        req->authenticate(webUser, webPass);
+  mbedtls_platform_zeroize(passBuf, sizeof(passBuf));
   const bool allowed = webAuthAllowed(passIsDefault, bearerValid, basicOk);
+  // A policy veto is not a wrong guess: the right credential gets it too.
   if (guessed) {
-    *guessed = webAuthCountsAsGuess(allowed, basicAllowed, basicOffered || bearerOffered);
+    *guessed = webAuthCountsAsGuess(allowed, basicAllowed && !passIsDefault,
+                                    basicOffered || bearerOffered);
   }
   return allowed;
 }
@@ -234,21 +307,115 @@ static void _bodyChunk(AsyncWebServerRequest* req, uint8_t* data, size_t len,
 // The whole body ("" for Content-Length 0), or nullptr after replying 401,
 // 413 past the cap, or 400 when it did not arrive whole.
 static const char* _bodyOrReply(AsyncWebServerRequest* req, size_t maxBytes) {
-  if (!_checkAuth(req)) {
-    req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}");
-    return nullptr;
-  }
-  if (req->contentLength() == 0) return "";
-  if (req->contentLength() > maxBytes) {
-    req->send(413, "application/json", "{\"ok\":false,\"error\":\"body too large\"}");
-    return nullptr;
-  }
   const HttpBody* b = (const HttpBody*)req->_tempObject;
-  if (!httpBodyComplete(b)) {
-    req->send(400, "application/json", "{\"ok\":false,\"error\":\"body not received\"}");
-    return nullptr;
+  switch (httpBodyVerdict(_checkAuth(req), req->hasHeader("Transfer-Encoding"),
+                          req->contentLength(), maxBytes, b)) {
+    case HTTP_BODY_OK:
+      return b->data;
+    case HTTP_BODY_EMPTY:
+      return "";
+    case HTTP_BODY_UNAUTHORIZED:
+      req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}");
+      return nullptr;
+    case HTTP_BODY_LENGTH_REQUIRED:
+      req->send(411, "application/json", "{\"ok\":false,\"error\":\"Content-Length required, chunked bodies are refused\"}");
+      return nullptr;
+    case HTTP_BODY_TOO_LARGE:
+      req->send(413, "application/json", "{\"ok\":false,\"error\":\"body too large\"}");
+      return nullptr;
+    case HTTP_BODY_INCOMPLETE:
+      break;
   }
-  return b->data;
+  req->send(400, "application/json", "{\"ok\":false,\"error\":\"body not received\"}");
+  return nullptr;
+}
+
+// Write len bytes to path through ".upload.tmp" in the same directory, so a
+// failed write leaves the old file. in: fs, path, body. out: bytes on disk.
+static bool _fileWriteAtomic(bool lfs, const char* path, const char* data, size_t len,
+                             size_t* onDisk) {
+  char tmp[192];
+  char bak[192];
+  if (!uploadTmpPath(tmp, sizeof(tmp), path) ||
+      !uploadStagePath(bak, sizeof(bak), path, UPLOAD_BAK_NAME)) return false;
+  File f = lfs ? LittleFS.open(tmp, FILE_WRITE) : SD_MMC.open(tmp, FILE_WRITE);
+  if (!f) return false;
+  size_t written = len ? f.write((const uint8_t*)data, len) : 0;
+  f.close();
+  // fclose does the real write and drops its result. Read the size back.
+  size_t got = 0;
+  File chk = lfs ? LittleFS.open(tmp, FILE_READ) : SD_MMC.open(tmp, FILE_READ);
+  if (chk) { got = chk.size(); chk.close(); }
+  if (!fileWriteLanded(written, got, len)) {
+    if (lfs) LittleFS.remove(tmp); else SD_MMC.remove(tmp);
+    return false;
+  }
+  if (lfs) {
+    // lfs rename replaces the target atomically.
+    if (!LittleFS.rename(tmp, path)) { LittleFS.remove(tmp); return false; }
+    *onDisk = got;
+    return true;
+  }
+  // FAT cannot rename onto an existing name, so the old file is parked as
+  // .upload.bak first (fatCommit). Some copy survives every failing step.
+  struct SdOps {
+    bool exists(const char* p) { return SD_MMC.exists(p); }
+    bool remove(const char* p) { return SD_MMC.remove(p); }
+    bool rename(const char* a, const char* b) { return SD_MMC.rename(a, b); }
+  } sd;
+  switch (fatCommit(sd, tmp, bak, path)) {
+    case FAT_COMMIT_OK:
+      break;
+    case FAT_COMMIT_OK_BAK_LEFT:
+      Log::kvfw(TAG, "web.file_bak_left path=%s", bak);
+      break;
+    case FAT_COMMIT_STRANDED:
+      Log::kvfe(TAG, "web.file_restore_failed path=%s old=%s new=%s", path, bak, tmp);
+      return false;
+    case FAT_COMMIT_KEPT_OLD:
+      return false;
+  }
+  *onDisk = got;
+  return true;
+}
+
+// Parse-check a config body, then write the file only (tmp + rename) on the
+// main loop task. Replies on failure. out: bytes on disk, 0 if nothing landed.
+static size_t _configWriteOrReply(AsyncWebServerRequest* req, const char* body, bool restart) {
+  // One config cap for every route, /api/file buffers up to the file cap.
+  if (req->contentLength() > HTTP_BODY_CFG_MAX) {
+    req->send(413, "application/json", "{\"ok\":false,\"error\":\"config larger than 16 KB\"}");
+    return 0;
+  }
+  auto doc = std::make_shared<JsonDocument>();
+  if (deserializeJson(*doc, body) || !doc->is<JsonObject>()) {
+    req->send(400, "application/json", "{\"ok\":false,\"error\":\"config must be a JSON object\"}");
+    return 0;
+  }
+  auto done  = std::make_shared<bool>(false);
+  auto bytes = std::make_shared<size_t>(0);
+  bool queued = Shell::enqueueDeferred([doc, done, bytes, restart]() {
+    bool ok = Config::writeFile(doc->as<JsonVariantConst>(), true, bytes.get());
+    if (!ok) *bytes = 0;
+    // Set here, not after the wait, so a 504 still restarts into what landed.
+    if (ok && restart) _restartPending = true;
+    *done = true;
+  });
+  if (!queued) {
+    req->send(503, "application/json", "{\"ok\":false,\"error\":\"shell busy\"}");
+    return 0;
+  }
+  // Same 5 s spin-yield as /api/cmd while the main loop drains the ring.
+  for (uint32_t i = 0; i < 1000 && !*done; i++) delay(5);
+  if (!*done) {
+    req->send(504, "application/json", "{\"ok\":false,\"error\":\"config write timeout, result unknown\"}");
+    return 0;
+  }
+  if (*bytes == 0) {
+    req->send(500, "application/json", "{\"ok\":false,\"error\":\"config write failed\"}");
+    return 0;
+  }
+  return *bytes;
 }
 
 // IP-based WS pre-auth: GET /api/ws/token (auth-gated) marks the caller's IP as
@@ -296,6 +463,9 @@ void HttpServer::begin() {
   // Relay log lines to WebSocket terminal clients.
   Log::setRemoteHandler(&HttpServer::broadcastLog);
 
+  _webSnapRefresh();
+  // pumpConsole can run config.set deep inside OTA or modem waits, far from loop().
+  if (!Config::onChange(_webSnapRefresh)) Log::error(TAG, "web.snapshot_hook_failed");
   subscribeToEvents();
   setupRoutes();
 
@@ -330,6 +500,7 @@ void HttpServer::printState() {
 
 // Clean up WS clients and handle deferred restart requests
 void HttpServer::loop() {
+  if (!_webSnapSet || Config::revision() != _webSnapRev) _webSnapRefresh();
   SetupPortal::loop();
   if (!_serverStarted) {
     if (!netifUp()) return;
@@ -461,8 +632,10 @@ static void sendSetupPage(AsyncWebServerRequest* req) {
 void HttpServer::setupRoutes() {
   // Credentials are resolved per request in _checkAuth; check once here only
   // for the boot-time default-password warning.
-  if (_defaultPassActive()) {
-    Log::kvfw(TAG, "web.admin_locked reason=default_password");
+  const WebCredState bootCred = _webCredLock();
+  if (bootCred != WEB_CRED_OK) {
+    Log::kvfw(TAG, "web.admin_locked reason=%s",
+              bootCred == WEB_CRED_TOO_LONG ? "credential_too_long" : "default_password");
   }
 
   // ── Dashboard HTML - public (sensor data is read-only) ────────────────────
@@ -512,12 +685,7 @@ void HttpServer::setupRoutes() {
     // Say WHY when the admin surface is locked by the default password -
     // otherwise the login modal just loops with no way to tell. 403 (not
     // 401): no credentials can succeed until web.password is set.
-    if (_defaultPassActive()) {
-      req->send(403, "application/json",
-                "{\"ok\":false,\"error\":\"web.password is default/empty - admin locked. "
-                "Set it via 'secret.set web.password' on the serial console\"}");
-      return;
-    }
+    if (_sendCredLocked(req, _webCredLock())) return;
     // Side-effect GET: answers "are these cached credentials valid here" and
     // moves the rate-limit counter, so a cross-site caller gets no oracle.
     bool guessed = false;
@@ -537,6 +705,7 @@ void HttpServer::setupRoutes() {
       req->send(429, "application/json", "{\"ok\":false,\"error\":\"Too many attempts - wait 30s\"}");
       return;
     }
+    if (_sendCredLocked(req, _webCredLock())) return;
     bool guessed = false;
     if (!_checkAuth(req, /*hasSideEffect=*/false, &guessed)) {
       if (guessed) _rlFail(ip);
@@ -568,8 +737,10 @@ void HttpServer::setupRoutes() {
 
   // ── GET /api/info - firmware version + build info (no auth) ──────────────
   server.on("/api/info", HTTP_GET, [](AsyncWebServerRequest* req) {
-    JsonObject cfg = Config::get();
-    const char* devName = cfg["device"]["friendly_name"] | cfg["device"]["name"] | "thesada-node";
+    WebSnap snap;
+    _webSnapRead(snap);
+    mbedtls_platform_zeroize(snap.passCfg, sizeof(snap.passCfg));
+    const char* devName = snap.devName;
     bool sdAvail = false;
 #ifdef ENABLE_SD
     sdAvail = SD_MMC.cardType() != CARD_NONE;
@@ -590,7 +761,7 @@ void HttpServer::setupRoutes() {
       resp[kv.key()] = kv.value();
     }
     JsonObject mqttMeta = resp["_mqtt"].to<JsonObject>();
-    mqttMeta["connected"] = MQTTClient::connected();
+    mqttMeta["connected"] = MQTTClient::connectedCached();
     time_t lp = MQTTClient::lastPublishTime();
     if (lp > 1700000000UL) {
       char ts[22];
@@ -616,8 +787,8 @@ void HttpServer::setupRoutes() {
   });
 
   // ── POST /api/config - write config.json (auth required) ──────────────────
-  // Body is buffered per request after auth on chunk 0; file is only written
-  // once onRequest has the whole body.
+  // Body is buffered per request after auth on chunk 0. Only a whole body
+  // that parses as an object is written, and only a written one restarts.
   AsyncCallbackWebHandler* cfgHandler = new AsyncCallbackWebHandler();
   cfgHandler->setUri("/api/config");
   cfgHandler->setMethod(HTTP_POST);
@@ -628,12 +799,8 @@ void HttpServer::setupRoutes() {
   cfgHandler->onRequest([](AsyncWebServerRequest* req) {
     const char* body = _bodyOrReply(req, HTTP_BODY_CFG_MAX);
     if (!body) return;
-    if (*body) {
-      File f = LittleFS.open("/config.json", "w");
-      if (f) { f.print(body); f.close(); }
-    }
+    if (_configWriteOrReply(req, body, /*restart=*/true) == 0) return;
     req->send(200, "application/json", "{\"ok\":true}");
-    _restartPending = true;
   });
   server.addHandler(cfgHandler);
 
@@ -688,7 +855,7 @@ void HttpServer::setupRoutes() {
       return;
     }
     String cmdStr = doc["cmd"].as<String>();
-    if (!shellModeHttpAllowed(Shell::mode())) {
+    if (!shellModeHttpSurfaceAllowed(Shell::mode(), HTTP_SURFACE_CMD)) {
       req->send(403, "application/json",
                 "{\"ok\":false,\"error\":\"shell.mode closes the HTTP command surface\"}");
       return;
@@ -841,7 +1008,7 @@ void HttpServer::setupRoutes() {
     req->send(200, "application/json", json);
   });
 
-  // ── GET /api/file?path=...&source=sd|littlefs|scripts - read file (auth, max 64 KB)
+  // ── GET /api/file?path=...&source=sd|littlefs|scripts - stream a file, any size (auth)
   server.on("/api/file", HTTP_GET, [](AsyncWebServerRequest* req) {
     if (!_checkAuth(req)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
     if (!req->hasParam("path")) { req->send(400, "text/plain", "missing path"); return; }
@@ -853,19 +1020,17 @@ void HttpServer::setupRoutes() {
     if (useScripts) path = "/scripts" + path;
     File f = (useLFS || useScripts) ? LittleFS.open(path.c_str(), FILE_READ) : SD_MMC.open(path.c_str(), FILE_READ);
     if (!f || f.isDirectory()) { req->send(404, "text/plain", "not found"); return; }
-    const size_t MAX_READ = 65536;
-    String content;
-    content.reserve(min((size_t)f.size(), MAX_READ));
-    while (f.available() && content.length() < MAX_READ) {
-      content += (char)f.read();
-    }
-    f.close();
-    req->send(200, "text/plain", content);
+    // Streamed whole, never clipped. The response owns f and closes it.
+    req->send(f, path, "text/plain");
   });
 
   // ── DELETE /api/file?path=...&source=sd|littlefs|scripts - delete file (auth)
   server.on("/api/file", HTTP_DELETE, [](AsyncWebServerRequest* req) {
     if (!_checkAuth(req)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
+    if (!shellModeHttpSurfaceAllowed(Shell::mode(), HTTP_SURFACE_FILE_WRITE)) {
+      req->send(403, "application/json", "{\"ok\":false,\"error\":\"shell.mode closes file writes over HTTP\"}");
+      return;
+    }
     if (!req->hasParam("path")) { req->send(400, "application/json", "{\"error\":\"missing path\"}"); return; }
     String path = req->getParam("path")->value();
     if (!_pathSafe(path)) { req->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid path\"}"); return; }
@@ -877,7 +1042,7 @@ void HttpServer::setupRoutes() {
     req->send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"delete failed\"}");
   });
 
-  // ── POST /api/file?path=... - write SD file (auth required) ──────────────
+  // ── POST /api/file?path=... - write a file, tmp + rename (auth required) ─
   AsyncCallbackWebHandler* fileHandler = new AsyncCallbackWebHandler();
   fileHandler->setUri("/api/file");
   fileHandler->setMethod(HTTP_POST);
@@ -889,6 +1054,10 @@ void HttpServer::setupRoutes() {
     // Body before the open: a body that did not arrive must not truncate the file.
     const char* body = _bodyOrReply(req, HTTP_BODY_FILE_MAX);
     if (!body) return;
+    if (!shellModeHttpSurfaceAllowed(Shell::mode(), HTTP_SURFACE_FILE_WRITE)) {
+      req->send(403, "application/json", "{\"ok\":false,\"error\":\"shell.mode closes file writes over HTTP\"}");
+      return;
+    }
     if (!req->hasParam("path")) {
       req->send(400, "application/json", "{\"error\":\"missing path\"}");
       return;
@@ -902,17 +1071,23 @@ void HttpServer::setupRoutes() {
     bool   useLFS     = (src == "littlefs");
     bool   useScripts = (src == "scripts");
     if (useScripts) path = "/scripts" + path;
-    File f = (useLFS || useScripts) ? LittleFS.open(path.c_str(), FILE_WRITE)
-                                    : SD_MMC.open(path.c_str(), FILE_WRITE);
-    if (!f) {
+    // The config file never takes an in-place write. Live config is untouched.
+    if (useLFS && configPathIsLive(path.c_str())) {
+      size_t n = _configWriteOrReply(req, body, /*restart=*/false);
+      if (n == 0) return;
+      char cmsg[64];
+      snprintf(cmsg, sizeof(cmsg), "{\"ok\":true,\"bytes\":%u}", (unsigned)n);
+      req->send(200, "application/json", cmsg);
+      return;
+    }
+    // Content-Length 0 is a legitimate empty file (editor cleared and saved).
+    // The declared length, not strlen, so a NUL in the body is written too.
+    size_t written = 0;
+    if (!_fileWriteAtomic(useLFS || useScripts, path.c_str(), body, req->contentLength(), &written)) {
       req->send(200, "application/json", (useLFS || useScripts) ? "{\"ok\":false,\"error\":\"LittleFS write failed\"}"
                                                                  : "{\"ok\":false,\"error\":\"SD write failed\"}");
       return;
     }
-    // Content-Length 0 is a legitimate empty file (editor cleared and saved).
-    f.print(body);
-    size_t written = f.size();
-    f.close();
     char rmsg[64];
     snprintf(rmsg, sizeof(rmsg), "{\"ok\":true,\"bytes\":%d}", (int)written);
     req->send(200, "application/json", rmsg);
@@ -932,7 +1107,7 @@ void HttpServer::setupRoutes() {
       // AsyncClient::getRemoteAddress().
       // Before the grant is spent and before any log replay: a narrowed
       // shell.mode must not leave an interactive session or its output up.
-      if (!shellModeHttpAllowed(Shell::mode())) {
+      if (!shellModeHttpSurfaceAllowed(Shell::mode(), HTTP_SURFACE_TERMINAL)) {
         Log::kvfw(TAG, "web.ws_rejected reason=shell_mode");
         client->close();
         return;
@@ -979,7 +1154,7 @@ void HttpServer::setupRoutes() {
         // disconnect mid-execute degrades to a no-op (the AsyncWebSocket
         // returns nullptr for the closed id) instead of UAF on a stale
         // AsyncWebSocketClient* pointer captured here.
-        if (!shellModeHttpAllowed(Shell::mode())) {
+        if (!shellModeHttpSurfaceAllowed(Shell::mode(), HTTP_SURFACE_TERMINAL)) {
           client->text("[shell.mode closes the HTTP command surface]");
           return;
         }

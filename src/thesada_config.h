@@ -38,7 +38,7 @@
 
 // ── Optional core services ──────────────────────────────────────────────────
 #define ENABLE_WEBSERVER     // Web UI, REST API, dashboard, OTA upload
-#define ENABLE_SCRIPTENGINE  // Lua scripting (alerts.lua, rules.lua)
+#define ENABLE_SCRIPTENGINE  // Lua scripting (main.lua, rules.lua)
 
 // ── Example modules ─────────────────────────────────────────────────────────
 // Minimal modules that show the pattern, not deployment hardware. Off in every

@@ -14,10 +14,14 @@ struct HttpBody {
   char   data[1];  // cap bytes + NUL
 };
 
+// Largest file /api/file writes and the dashboard editor loads (reads stream any
+// size). Bodies past 4 KB malloc into PSRAM on every shipped board, after auth.
+static const size_t HTTP_FILE_MAX = 65536;
+
 // Body caps per endpoint, bytes.
 static const size_t HTTP_BODY_CFG_MAX  = 16384;
 static const size_t HTTP_BODY_CMD_MAX  = 2048;
-static const size_t HTTP_BODY_FILE_MAX = 16384;
+static const size_t HTTP_BODY_FILE_MAX = HTTP_FILE_MAX;
 
 // in: declared total, cap. out: a buffer for exactly total bytes, or nullptr
 // when total is 0, past the cap, or the alloc fails.
@@ -48,4 +52,25 @@ inline bool httpBodyAppend(HttpBody* b, const uint8_t* data, size_t len, size_t 
 // True once every declared byte arrived and no chunk was refused.
 inline bool httpBodyComplete(const HttpBody* b) {
   return b && b->len == b->cap;
+}
+
+enum HttpBodyVerdict {
+  HTTP_BODY_OK = 0,             // whole body buffered
+  HTTP_BODY_EMPTY,              // Content-Length 0, a legitimate empty body
+  HTTP_BODY_UNAUTHORIZED,       // 401
+  HTTP_BODY_LENGTH_REQUIRED,    // 411, chunked: nothing was buffered
+  HTTP_BODY_TOO_LARGE,          // 413
+  HTTP_BODY_INCOMPLETE,         // 400, body did not arrive whole
+};
+
+// A chunked body has Content-Length 0 and onBody total 0, so it is never
+// buffered. Checked before the empty case, or it would read as an empty body.
+inline HttpBodyVerdict httpBodyVerdict(bool authed, bool chunked, size_t contentLength,
+                                       size_t maxBytes, const HttpBody* b) {
+  if (!authed) return HTTP_BODY_UNAUTHORIZED;
+  if (chunked) return HTTP_BODY_LENGTH_REQUIRED;
+  if (contentLength == 0) return HTTP_BODY_EMPTY;
+  if (contentLength > maxBytes) return HTTP_BODY_TOO_LARGE;
+  if (!httpBodyComplete(b)) return HTTP_BODY_INCOMPLETE;
+  return HTTP_BODY_OK;
 }

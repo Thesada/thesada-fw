@@ -173,6 +173,21 @@ void test_nesting_past_the_slots_is_refused(void) {
   TEST_ASSERT_EQUAL(-1, shellParseSlot(-1));
 }
 
+// --- shellPumpAllowed (#69) -------------------------------------------------------
+
+// The net.http task can reach a console pump in a modem hard reset. It must
+// not run lines on the static buffer and depth the loop task is using.
+void test_pump_runs_only_on_the_console_task(void) {
+  int loopTask = 0, fetchTask = 0;
+  TEST_ASSERT_TRUE(shellPumpAllowed(&loopTask, &loopTask));
+  TEST_ASSERT_FALSE(shellPumpAllowed(&fetchTask, &loopTask));
+}
+
+void test_pump_runs_before_the_owner_is_known(void) {
+  int loopTask = 0;
+  TEST_ASSERT_TRUE(shellPumpAllowed(&loopTask, nullptr));
+}
+
 // --- shellDispatchResult (#33) ----------------------------------------------------
 
 // Every shell error went out on cli/response as ok:true.
@@ -208,6 +223,8 @@ int main(int, char**) {
   RUN_TEST(test_rest_from_one_splits_off_the_name);
   RUN_TEST(test_nested_command_gets_its_own_parse_slot);
   RUN_TEST(test_nesting_past_the_slots_is_refused);
+  RUN_TEST(test_pump_runs_only_on_the_console_task);
+  RUN_TEST(test_pump_runs_before_the_owner_is_known);
   RUN_TEST(test_shell_errors_are_not_ok);
   RUN_TEST(test_a_command_that_ran_clean_is_ok);
   return UNITY_END();

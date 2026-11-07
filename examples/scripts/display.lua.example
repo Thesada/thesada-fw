@@ -5,7 +5,7 @@
 
 Log.info("Display script loaded - waiting for hardware init")
 
--- Integer division (math.floor not available on all ESP32 Lua builds)
+-- Integer division (older firmware has no math library)
 local function floor(n) return n - n % 1 end
 
 -- ── Cached sensor data ──────────────────────────────────────────────────────

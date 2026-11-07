@@ -37,6 +37,21 @@ inline bool shellModeHttpAllowed(ShellMode m) {
   return m == SHELL_MODE_FULL;
 }
 
+enum HttpSurface {
+  HTTP_SURFACE_CMD = 0,      // POST /api/cmd
+  HTTP_SURFACE_TERMINAL,     // /ws/serial
+  HTTP_SURFACE_FILE_WRITE,   // POST and DELETE /api/file, the fs.write / fs.rm twin
+  HTTP_SURFACE_CONFIG_PUSH,  // POST /api/config
+  HTTP_SURFACE_OTA,          // POST /ota
+};
+
+// Config push and OTA stay open in every mode: they are how a narrowed device
+// is changed back. Everything that reaches Shell or its fs commands closes.
+inline bool shellModeHttpSurfaceAllowed(ShellMode m, HttpSurface s) {
+  if (s == HTTP_SURFACE_CONFIG_PUSH || s == HTTP_SURFACE_OTA) return true;
+  return shellModeHttpAllowed(m);
+}
+
 // Resolve from the two facts the config layer can see. A key that is present
 // but not a string (a bool, a number, an object) is a hardening request we
 // cannot read, so it closes - only a genuinely absent key means full.

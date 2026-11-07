@@ -2,11 +2,15 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "MQTTClient.h"
 #include "cert_policy.h"
+#include "secret_heap.h"
+#include "SecretJson.h"
 #include <thesada_config.h>
 #include "Config.h"
 #include "Secret.h"
 #include "cli_payload.h"
+#include "cli_page_policy.h"
 #include "cli_topics.h"
+#include "mqtt_topic_policy.h"
 #include "cli_authz_policy.h"
 #include "Identity.h"
 #include "mqtt_rollback_policy.h"
@@ -20,6 +24,7 @@
 #include "OTAUpdate.h"
 #include "ota_ca_progmem.h"
 #include "TlsClient.h"
+#include <mbedtls/net_sockets.h>
 #include "Net.h"
 #include <WiFi.h>
 #include <LittleFS.h>
@@ -122,17 +127,23 @@ static bool      _mtlsActive    = false;
 // reconnects then feed garbage into WiFi.hostByName() and the DNS lookup
 // fails with the previous buffer bytes as the "hostname". Copy once into
 // this buffer on each read.
-static char      _brokerHost[96] = {0};
+static char      _brokerHost[MQTT_BROKER_HOST_CAP] = {0};
 
 // Port last handed to setServer, i.e. the one the session actually uses.
 // mqtt.port in Config can already hold a value no connect has applied yet.
 static uint16_t  _brokerPort = 0;
 
+// A host past _brokerHost is refused, never dialed clipped (mqttHostCopy).
+static void logBrokerRefused(const char* host, const char* action) {
+  Log::kvfw(TAG, "mqtt.broker_refused reason=too_long len=%u cap=%u action=%s",
+            (unsigned)strlen(host), (unsigned)sizeof(_brokerHost), action);
+}
+
 // Validate a PEM cert + key pair via mbedtls before it reaches the TLS
 // client, so a bad pair is refused at the door. Also rejects
 // a mismatched pair (cert A + key B): each parses fine on its own, so
 // without the explicit pair check the mismatch only surfaces later as an
-// opaque "TLS handshake failed" instead of an immediate cert.set error.
+// opaque "TLS handshake failed".
 // in: cert (PEM string), key (PEM string).
 // out: true if both parse AND the key is the private half of the cert's
 //      public key.
@@ -200,6 +211,14 @@ PubSubClient MQTTClient::_client(s_wifiTcp);
 // True only after setCACert. allow_insecure encrypts without checking the
 // broker, and that session must not accept a config push.
 static bool _tlsVerified = false;
+
+// Calls into PubSubClient under way on the loop task. A modem wait inside one
+// can run a console net.http, whose tick() must not re-enter the client.
+static int s_clientCalls = 0;
+struct ClientCall {
+  ClientCall()  { ++s_clientCalls; }
+  ~ClientCall() { --s_clientCalls; }
+};
 
 MQTTMessage      MQTTClient::_queue[MQTT_QUEUE_SIZE];
 uint8_t          MQTTClient::_queueHead     = 0;
@@ -285,6 +304,7 @@ void MQTTClient::setCellularTransport(bool active) {
 }
 
 void MQTTClient::dropSession() {
+  ClientCall c;
   _client.disconnect();
   closeSession();
 }
@@ -314,12 +334,10 @@ static void cliInboundHandler(const char* topic, const char* payload) {
   const char* cmd = topic + prefixLen;
   if (strlen(cmd) == 0 || strcmp(cmd, "response") == 0) return;
 
-  // Copy cmd + payload onto the heap so the lambda owns them past the
-  // lifetime of this callback. std::string capture handles destruction
-  // when the slot's DeferredFn is reset on drain.
+  // Heap copies the lambda owns past this callback. The payload copy is wiped
+  // when the slot's DeferredFn is reset on drain, or dropped unrun.
   std::string cmdCopy(cmd);
-  size_t plen = payload ? strlen(payload) : 0;
-  std::string payloadCopy(payload ? payload : "", plen);
+  SecretString payloadCopy(payload, payload ? strlen(payload) : 0);
 
   // Frozen here, not read at drain time: the transport can fail over
   // between the two and the gate must judge the session that spoke.
@@ -397,6 +415,11 @@ static void mqttApplyCmdConfig(const char* json) {
   const char* broker = doc["mqtt"]["broker"] | "";
   if (!broker[0]) {
     Log::warn(TAG, "mqtt.cmd_config_refused reason=broker");
+    return;
+  }
+  if (!mqttHostFits(broker, MQTT_BROKER_HOST_CAP)) {
+    Log::kvfw(TAG, "mqtt.cmd_config_refused reason=broker_too_long len=%u cap=%u",
+              (unsigned)strlen(broker), (unsigned)MQTT_BROKER_HOST_CAP);
     return;
   }
   char prefixLive[Config::TOPIC_PREFIX_CAP];
@@ -487,11 +510,14 @@ void MQTTClient::begin() {
   if (_bufferOut < 512)  _bufferOut = 512;
   if (_bufferOut > 8192) _bufferOut = 8192;
 
-  // Copy into persistent buffer - see _brokerHost comment above.
-  strncpy(_brokerHost, host, sizeof(_brokerHost) - 1);
-  _brokerHost[sizeof(_brokerHost) - 1] = '\0';
-  _brokerPort = port;
-  _client.setServer(_brokerHost, port);
+  // Copy into persistent buffer - see _brokerHost comment above. A refused
+  // host leaves it empty: connects fail and the budget rolls back to last-good.
+  if (mqttHostCopy(_brokerHost, sizeof(_brokerHost), host)) {
+    _brokerPort = port;
+    _client.setServer(_brokerHost, port);
+  } else {
+    logBrokerRefused(host, "no_broker");
+  }
   _client.setKeepAlive(60);
   _client.setSocketTimeout(5);  // CONNACK and read waits, s (default 15)
   _client.setBufferSize(_bufferIn);
@@ -596,7 +622,7 @@ void MQTTClient::begin() {
     JsonObject  cfg    = Config::get();
     const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
     char topic[MQTT_TOPIC_CAP];
-    snprintf(topic, sizeof(topic), "%s/alert", prefix);
+    if (!MQTTClient::formatTopic(topic, sizeof(topic), "%s/alert", prefix)) return;
     char payload[256];
     serializeJson(data, payload, sizeof(payload));
     MQTTClient::publish(topic, payload);
@@ -710,6 +736,11 @@ static size_t mqttCriticalJson(char* out, size_t maxLen) {
 // Snapshot the connection-critical mqtt config as last-good. Writes NVS only
 // when it changed (flash wear).
 void MQTTClient::snapshotGoodConfig() {
+  JsonObject m = Config::get()["mqtt"];
+  if (!mqttSnapshotProven(m["broker"] | "", m["port"] | 8883, _brokerHost, _brokerPort)) {
+    Log::kvfw(TAG, "mqtt.config_commit_skipped reason=broker_not_live");
+    return;
+  }
   char cur[LG_MAX_LEN];
   if (mqttCriticalJson(cur, sizeof(cur)) == 0) return;
 
@@ -787,8 +818,10 @@ void MQTTClient::connect() {
                                          passwordBuf, sizeof(passwordBuf));
   const char* prefix   = cfg["mqtt"]["topic_prefix"] | "thesada/node";
 
+  // A will topic that does not fit connects without a will, never a clipped one.
   char availTopic[MQTT_TOPIC_CAP];
-  snprintf(availTopic, sizeof(availTopic), "%s/status", prefix);
+  const char* willTopic =
+      formatTopic(availTopic, sizeof(availTopic), "%s/status", prefix) ? availTopic : nullptr;
 
   Log::kvf(TAG, "mqtt.connect_start client_id=%s transport=%s", clientId, ::transportName(transport));
 
@@ -805,13 +838,13 @@ void MQTTClient::connect() {
   // the raw pointer and parses it on every handshake, so the buffers stay
   // live. Validate via mbedtls first so a bad pair never reaches it.
   if (hasClientCert()) {
-    if (!_clientCert) _clientCert = (char*)malloc(CERT_MAX_LEN);
-    if (!_clientKey)  _clientKey  = (char*)malloc(CERT_MAX_LEN);
+    if (!_clientCert) _clientCert = (char*)secretAlloc(CERT_MAX_LEN);
+    if (!_clientKey)  _clientKey  = (char*)secretAlloc(CERT_MAX_LEN);
     if (!_clientCert || !_clientKey) {
       // Heap pressure says nothing about the cert: keep the last broken
       // verdict so a full heap cannot open cert.clear to a password session.
-      free(_clientCert); _clientCert = nullptr;
-      free(_clientKey);  _clientKey  = nullptr;
+      secretFree(_clientCert); _clientCert = nullptr;
+      secretFree(_clientKey);  _clientKey  = nullptr;
       Log::warn(TAG, "mqtt.mtls_load_oom fallback=password");
     } else if (loadClientCert(_clientCert, _clientKey, CERT_MAX_LEN)) {
       if (validateClientCertKey(_clientCert, _clientKey)) {
@@ -832,8 +865,8 @@ void MQTTClient::connect() {
     } else {
       // NVS rows exist but will not load: that is a broken pair. Free the
       // buffers - a stranded 4 KB pair starves the next connect attempt.
-      free(_clientCert); _clientCert = nullptr;
-      free(_clientKey);  _clientKey  = nullptr;
+      secretFree(_clientCert); _clientCert = nullptr;
+      secretFree(_clientKey);  _clientKey  = nullptr;
       _storedCertBroken = true;
       Log::warn(TAG, "mqtt.mtls_load_failed fallback=password");
     }
@@ -855,13 +888,15 @@ void MQTTClient::connect() {
 
   // WiFi: core 3 DNS has no cap and hostByName returns the lwIP error, not 0,
   // on failure, so resolve and feed first, then dial the address. The modem
-  // resolves the name itself inside CAOPEN. TLS verifies and sends SNI for
+  // socket resolves the name itself (CDNSGIP). TLS verifies and sends SNI for
   // the configured name either way, and PubSubClient reuses the socket.
   bool resolved = true;
   bool dialed   = false;
   if (cellular) {
 #ifdef MQTT_TLS
     dialed = s_tls.connect(_brokerHost, _brokerPort) == 1;
+    // A failed DNS or socket open is no TLS failure: keep it off the heap budget.
+    if (!dialed && s_tls.lastError() == MBEDTLS_ERR_NET_CONNECT_FAILED) resolved = false;
 #else
     dialed = transportClient(transport)->connect(_brokerHost, _brokerPort) == 1;
 #endif
@@ -884,11 +919,11 @@ void MQTTClient::connect() {
   // active - sending user/pass alongside is redundant and confusing.
   bool ok = false;
   if (dialed && _mtlsActive) {
-    ok = _client.connect(clientId, nullptr, nullptr, availTopic, 0, true, "offline");
+    ok = _client.connect(clientId, nullptr, nullptr, willTopic, 0, true, "offline");
   } else if (dialed) {
     ok = (strlen(user) > 0)
-      ? _client.connect(clientId, user, password, availTopic, 0, true, "offline")
-      : _client.connect(clientId, availTopic, 0, true, "offline");
+      ? _client.connect(clientId, user, password, willTopic, 0, true, "offline")
+      : _client.connect(clientId, willTopic, 0, true, "offline");
   }
 
   if (ok) {
@@ -996,10 +1031,11 @@ void MQTTClient::connect() {
 
 // ---------------------------------------------------------------------------
 
-// Run PubSubClient::loop() to service keepalive. Safe to call from
-// beginAll() between module inits so long init sequences don't drop
-// the broker connection.
+// PubSubClient::loop() for the keepalive, between module inits and in a
+// blocking shell wait. Inside another call into the client it does nothing.
 void MQTTClient::tick() {
+  if (s_clientCalls > 0) return;
+  ClientCall c;
   if (_client.connected()) {
     _client.loop();
   }
@@ -1008,6 +1044,8 @@ void MQTTClient::tick() {
 // ---------------------------------------------------------------------------
 
 void MQTTClient::loop() {
+  ClientCall call;
+  connected();  // refreshes _connCache once per tick
   if (_cmdConfigPending) {
     _cmdConfigPending = false;
     mqttApplyCmdConfig(_cmdConfigBuf);
@@ -1081,11 +1119,14 @@ void MQTTClient::loop() {
     JsonObject  cfgR = Config::get();
     const char* host = cfgR["mqtt"]["broker"] | "";
     uint16_t    port = cfgR["mqtt"]["port"]   | 8883;
-    // Refresh persistent buffer; re-parsed pool invalidates prior pointer.
-    strncpy(_brokerHost, host, sizeof(_brokerHost) - 1);
-    _brokerHost[sizeof(_brokerHost) - 1] = '\0';
-    _brokerPort = port;
-    _client.setServer(_brokerHost, port);
+    // Refresh persistent buffer, as the re-parsed pool invalidates the prior
+    // pointer. A host that does not fit keeps the previous broker and port.
+    if (mqttHostCopy(_brokerHost, sizeof(_brokerHost), host)) {
+      _brokerPort = port;
+    } else {
+      logBrokerRefused(host, "keep_previous");
+    }
+    _client.setServer(_brokerHost, _brokerPort);
     _retryInterval = RETRY_MIN_MS;
     connect();
   }
@@ -1157,6 +1198,12 @@ void MQTTClient::loop() {
 // ---------------------------------------------------------------------------
 
 void MQTTClient::publish(const char* topic, const char* payload) {
+  // An empty topic is a protocol error the broker answers by disconnecting.
+  if (!topic || !*topic) {
+    Log::warn(TAG, "mqtt.publish_refused reason=empty_topic");
+    return;
+  }
+  ClientCall c;
   if (_client.connected()) {
     if (_minIntervalMs > 0) {
       uint32_t now = millis();
@@ -1178,9 +1225,44 @@ void MQTTClient::publish(const char* topic, const char* payload) {
 // sweep can clear it. Dropped while no session is up: the retained set is
 // republished in full on every connect.
 void MQTTClient::publishRetained(const char* topic, const char* payload) {
+  if (!topic || !*topic) {
+    Log::warn(TAG, "mqtt.publish_refused reason=empty_topic");
+    return;
+  }
+  ClientCall c;
   if (!_client.connected()) return;
   _client.publish(topic, (const uint8_t*)payload, strlen(payload), true);
   recordRetainedTopic(topic);
+}
+
+bool MQTTClient::publishNow(const char* topic, const char* payload) {
+  if (!topic || !*topic) {
+    Log::warn(TAG, "mqtt.publish_refused reason=empty_topic");
+    return false;
+  }
+  if (!_client.connected()) {
+    enqueue(topic, payload);
+    return false;
+  }
+  if (!_client.publish(topic, payload)) {
+    Log::kvfw(TAG, "mqtt.publish_failed payload_b=%u topic=%s",
+              (unsigned)strlen(payload), topic);
+    return false;
+  }
+  _lastPublishTime = time(nullptr);
+  return true;
+}
+
+bool MQTTClient::formatTopic(char* out, size_t cap, const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  bool fit = mqttTopicVfmt(out, cap, fmt, ap);
+  va_end(ap);
+  if (!fit) {
+    Log::kvfw(TAG, "mqtt.topic_refused reason=too_long cap=%u fmt=%s",
+              (unsigned)cap, fmt ? fmt : "");
+  }
+  return fit;
 }
 
 // Dedupe-append topic to the retained manifest. Manifest resets each
@@ -1210,7 +1292,7 @@ void MQTTClient::publishRetainedManifest() {
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
 
   char topic[MQTT_TOPIC_CAP];
-  snprintf(topic, sizeof(topic), "%s/info/retained_topics", prefix);
+  if (!formatTopic(topic, sizeof(topic), "%s/info/retained_topics", prefix)) return;
 
   recordRetainedTopic(topic);
 
@@ -1243,8 +1325,9 @@ void MQTTClient::publishRetainedSet(bool force) {
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
 
   char availTopic[MQTT_TOPIC_CAP];
-  snprintf(availTopic, sizeof(availTopic), "%s/status", prefix);
-  publishRetained(availTopic, "online");
+  if (formatTopic(availTopic, sizeof(availTopic), "%s/status", prefix)) {
+    publishRetained(availTopic, "online");
+  }
 
   publishDiscovery();
   publishDeviceInfo();
@@ -1256,6 +1339,11 @@ void MQTTClient::publishRetainedSet(bool force) {
 // ---------------------------------------------------------------------------
 
 void MQTTClient::subscribe(const char* topic, MQTTCallback callback) {
+  if (!mqttTopicFits(topic, MQTT_TOPIC_CAP)) {
+    Log::kvfw(TAG, "mqtt.sub_rejected reason=topic_length len=%u cap=%u",
+              topic ? (unsigned)strlen(topic) : 0u, (unsigned)MQTT_TOPIC_CAP);
+    return;
+  }
   if (!_subs.add(topic, callback)) {
     Log::kvfe(TAG, "mqtt.sub_rejected reason=max_subs max=%d", MQTT_MAX_SUBS);
     return;
@@ -1287,12 +1375,14 @@ void MQTTClient::matchAndDispatch(const char* topic, const char* payload) {
 }
 
 void MQTTClient::onMessage(char* topic, uint8_t* payload, unsigned int length) {
-  // Heap-allocate: stack overflow on WROOM-32 with large payloads.
+  // Heap copy (a large payload overflows the stack), wiped on free since cert.set
+  // and secret.set carry keys. PubSubClient reads no more of its buffer: wipe it.
   size_t bufSize = length + 1;
-  char* payloadBuf = (char*)malloc(bufSize);
+  char* payloadBuf = (char*)secretAlloc(bufSize);
   if (!payloadBuf) return;
   memcpy(payloadBuf, payload, length);
   payloadBuf[length] = '\0';
+  mbedtls_platform_zeroize(payload, length);
 
   _inboundAuth = cliAuthModeFor(_mtlsActive);
 #ifdef MQTT_TLS
@@ -1301,7 +1391,7 @@ void MQTTClient::onMessage(char* topic, uint8_t* payload, unsigned int length) {
   _dispatchTlsVerified = false;
 #endif
   matchAndDispatch(topic, payloadBuf);
-  free(payloadBuf);
+  secretFree(payloadBuf);
 }
 
 // ---------------------------------------------------------------------------
@@ -1310,19 +1400,28 @@ void MQTTClient::onMessage(char* topic, uint8_t* payload, unsigned int length) {
 // unlike the old one it does not echo back as an inbound URC.
 // The platform reads both topics, so it must be deployed before firmware
 // carrying this change or those devices go mute on CLI.
-// in: prefix, resp, out-buffer size. out: none.
+// A reply over cap is refused and logged: clipped JSON reaches nobody intact.
+// in: prefix, resp, payload byte cap (cliReplyCap). out: none.
 static void publishCliResponse(const char* prefix, JsonDocument& resp,
-                               size_t bufSz) {
-  if (bufSz == 0) bufSz = 4096;
+                               size_t cap) {
   char topic[CLI_TOPIC_CAP];
   if (!cliResponseTopic(topic, sizeof(topic), prefix)) {
     Log::kvf("MQTT", "mqtt.cli_topic_truncated prefix=%s", prefix);
     return;
   }
-  char* rp = (char*)malloc(bufSz);
-  if (!rp) return;
-  serializeJson(resp, rp, bufSz);
-  MQTTClient::publish(topic, rp);
+  size_t need = measureJson(resp);
+  if (need >= cap) {
+    Log::kvfw("MQTT", "mqtt.cli_response_refused reason=oversize bytes=%u cap=%u cmd=%s",
+              (unsigned)need, (unsigned)cap, resp["cmd"] | "?");
+    return;
+  }
+  char* rp = (char*)malloc(need + 1);
+  if (!rp) {
+    Log::kvfw("MQTT", "mqtt.cli_response_refused reason=malloc bytes=%u", (unsigned)need);
+    return;
+  }
+  serializeJson(resp, rp, need + 1);
+  MQTTClient::publishNow(topic, rp);
   free(rp);
 }
 
@@ -1337,6 +1436,8 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
 
   JsonObject cfg = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+  const size_t replyCap = cliReplyCap(_bufferOut, _bufferIn, CLI_TOPIC_CAP - 1);
+  const size_t pageLimit = cliPageLimit(replyCap);
 
   // Optional envelope: {"req_id":<id>, "args":<string>}. req_id is echoed
   // on every cli/response for request/response matching on the shared topic.
@@ -1344,8 +1445,8 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
   // binary-protocol special cases (fs.write, cert.set) and Shell::execute
   // all see the inner string. Non-envelope payloads fall through untouched.
   // reqDoc stays in scope so reqId and the args view stay valid at every
-  // publish site.
-  JsonDocument reqDoc;
+  // publish site. Its blocks are wiped on free: args may carry a key.
+  JsonDocument reqDoc(secretJsonAllocator());
   JsonVariantConst reqId;
   bool hasReqId = false;
   bool reqIdOnlyPayload = false;
@@ -1381,7 +1482,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
       if (hasReqId) resp["req_id"] = reqId;
       resp["ok"] = false;
       resp["output"][0] = "Denied: not permitted on this connection";
-      publishCliResponse(prefix, resp, _bufferOut);
+      publishCliResponse(prefix, resp, replyCap);
       return;
     }
   }
@@ -1417,7 +1518,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
         if (!Shell::pathSafe(path)) {
           resp["ok"] = false;
           resp["output"][0] = "Invalid path";
-          publishCliResponse(prefix, resp, _bufferOut);
+          publishCliResponse(prefix, resp, replyCap);
           goto cleanup;
         }
 
@@ -1439,7 +1540,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
           resp["output"][0] = "Failed to open file";
         }
       }
-      publishCliResponse(prefix, resp, _bufferOut);
+      publishCliResponse(prefix, resp, replyCap);
       goto cleanup;
     }
 
@@ -1455,7 +1556,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
         if (hasReqId) resp["req_id"] = reqId;
         resp["ok"] = false;
         resp["output"][0] = "Args too long";
-        publishCliResponse(prefix, resp, _bufferOut);
+        publishCliResponse(prefix, resp, replyCap);
         goto cleanup;
       }
       strncpy(pbuf, payload, min(plen, sizeof(pbuf) - 1));
@@ -1480,7 +1581,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
         if (!Shell::pathSafe(path)) {  // same attack surface as fs.write
           resp["ok"] = false;
           resp["output"][0] = "Invalid path";
-          publishCliResponse(prefix, resp, _bufferOut);
+          publishCliResponse(prefix, resp, replyCap);
           goto cleanup;
         }
 
@@ -1507,10 +1608,24 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
             char* buf = (char*)malloc(toRead + 1);
             if (buf) {
               size_t got = f.read((uint8_t*)buf, toRead);
-              buf[got] = '\0';
+              // Size the reply around empty data, then send only the bytes
+              // whose escaped form fits. length tells the caller where to resume.
               resp["length"] = (int)got;
-              resp["done"] = (offset + got >= total);
-              resp["data"] = buf;  // ArduinoJson escapes on serialise
+              resp["done"] = false;
+              resp["data"] = "";
+              size_t env = measureJson(resp);
+              size_t n = cliJsonFit(buf, got, replyCap > env + 1 ? replyCap - env - 1 : 0);
+              if (n == 0) {
+                resp.remove("length");
+                resp.remove("done");
+                resp.remove("data");
+                resp["ok"] = false;
+                resp["output"][0] = got ? "Chunk does not fit the reply buffer" : "Read failed";
+              } else {
+                resp["length"] = (int)n;
+                resp["done"] = (offset + n >= total);
+                resp["data"] = JsonString(buf, n);  // by length: a NUL byte is sent, not a cut
+              }
               free(buf);
             } else {
               resp["ok"] = false;
@@ -1520,7 +1635,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
           f.close();
         }
 
-        publishCliResponse(prefix, resp, _bufferOut);
+        publishCliResponse(prefix, resp, replyCap);
         goto cleanup;
       }
       // No offset/length: fall through to Shell::execute.
@@ -1585,7 +1700,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
         }
       }
 
-      publishCliResponse(prefix, resp, _bufferOut);
+      publishCliResponse(prefix, resp, replyCap);
       goto cleanup;
     }
 
@@ -1626,7 +1741,7 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
         }
       }
 
-      publishCliResponse(prefix, resp, _bufferOut);
+      publishCliResponse(prefix, resp, replyCap);
       goto cleanup;
     }
 
@@ -1655,21 +1770,18 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
       if (hasReqId) resp["req_id"] = reqId;
       resp["ok"] = false;
       resp["output"][0] = "Command line too long for shell - use chunked variant";
-      publishCliResponse(prefix, resp, _bufferOut);
+      publishCliResponse(prefix, resp, replyCap);
       goto cleanup;
     }
 
-    // Paginate: when the next output line would overflow the publish buffer,
-    // ship with more=true and start a fresh page. Final page is more=false.
+    // Paginate: when the next output line would overflow the page, ship it
+    // with more=true and start a fresh page. Final page is more=false.
     // Single-page (common case) is page 0/more=false, same shape old
-    // consumers already handle.
-    size_t bufSz = _bufferOut > 0 ? _bufferOut : 4096;
-    // Headroom for envelope keys (cmd, req_id, ok, page, more) + NUL.
-    const size_t PAGE_MARGIN = 160;
-    size_t pageLimit = bufSz > PAGE_MARGIN ? bufSz - PAGE_MARGIN : bufSz / 2;
-
+    // consumers already handle. A line no page holds goes out in pieces, and
+    // a page whose last string continues on the next page carries cont=true.
     JsonDocument resp;
     int pageNum = 0;
+    bool lineDropped = false;
 
     auto startPage = [&]() -> JsonArray {
       resp.clear();
@@ -1685,25 +1797,42 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
       // Re-read prefix: config.reload mid-command invalidates the old pool.
       JsonObject cfgAfter = Config::get();
       const char* pfxAfter = cfgAfter["mqtt"]["topic_prefix"] | "thesada/node";
-      publishCliResponse(pfxAfter, resp, bufSz);
+      publishCliResponse(pfxAfter, resp, replyCap);
     };
 
     JsonArray output = startPage();
 
     // A page shipped mid-command says ok:true; the last page carries the result.
+    // cliNextPiece sizes each piece, test/test_cli_page runs this loop's model.
     ShellResult result = Shell::execute(line, [&](const char* outLine) {
-      // +8 slack covers ASCII output; pathological escape-heavy lines may
-      // truncate one page rather than drop silently.
-      size_t lineCost = strlen(outLine) + 8;
-      if (output.size() > 0 && measureJson(resp) + lineCost > pageLimit) {
+      size_t len = strlen(outLine);
+      for (;;) {
+        bool split = false;
+        size_t n = cliNextPiece(outLine, len, measureJson(resp), pageLimit, &split);
+        if (split && output.size() > 0) {
+          publishPage(true);
+          pageNum++;
+          output = startPage();
+          continue;
+        }
+        if (split && n == 0) {
+          Log::kvfw(TAG, "mqtt.cli_line_dropped reason=no_room cmd=%s bytes=%u",
+                    cmd, (unsigned)len);
+          lineDropped = true;
+          return;
+        }
+        output.add(JsonString(outLine, n));
+        if (!split) return;
+        resp["cont"] = true;
         publishPage(true);
         pageNum++;
         output = startPage();
+        outLine += n;
+        len     -= n;
       }
-      output.add(outLine);
     });
 
-    resp["ok"] = (result == ShellResult::Ok);
+    resp["ok"] = (result == ShellResult::Ok) && !lineDropped;
     publishPage(false);
   }
 
@@ -1784,7 +1913,7 @@ void MQTTClient::publishDiscovery() {
   }
 
   char availTopic[MQTT_TOPIC_CAP];
-  snprintf(availTopic, sizeof(availTopic), "%s/status", prefix);
+  if (!formatTopic(availTopic, sizeof(availTopic), "%s/status", prefix)) return;
 
   auto makeSlug = [](const char* name, char* slug, size_t sz) {
     strncpy(slug, name, sz - 1);
@@ -1796,6 +1925,12 @@ void MQTTClient::publishDiscovery() {
                   const char* stateTopic,
                   const char* unit, const char* devClass, const char* stateClass,
                   const char* entityCategory = nullptr, uint32_t expireAfterS = 0) {
+    char topic[MQTT_TOPIC_CAP];
+    if (!formatTopic(topic, sizeof(topic), "homeassistant/%s/%s/%s/config",
+                     component, devId, uid)) {
+      return;
+    }
+
     JsonDocument doc;
     doc["name"] = name;
     doc["stat_t"] = stateTopic;
@@ -1814,19 +1949,31 @@ void MQTTClient::publishDiscovery() {
     dev["mdl"] = "Base Node";
     dev["sw"] = FIRMWARE_VERSION;
 
-    char topic[128];
-    snprintf(topic, sizeof(topic), "homeassistant/%s/%s/%s/config", component, devId, uid);
-
-    char payload[640];
-    serializeJson(doc, payload, sizeof(payload));
-    publishRetained(topic, payload);
+    String payload;
+    serializeJson(doc, payload);
+    publishRetained(topic, payload.c_str());
     // Drain TCP between retained publishes; CYD 1024 B buffers overflow
     // without this and spam EAGAIN. No-op but harmless on cellular path.
     if (_client.connected()) _client.loop();
     yield();
   };
 
-  char slug[32], uid[48], stBuf[MQTT_TOPIC_CAP];
+  // uid is a topic segment: sized for the device id, a full slug and the
+  // longest suffix (_current), so no two entities clip onto one topic.
+  char slug[32], uid[IDENTITY_ID_CAP + sizeof(slug) + sizeof("_current")];
+  char stBuf[MQTT_TOPIC_CAP];
+
+  // 26.11.1 clipped a long slug's uid at 48 bytes. That config topic is cleared
+  // after this pass, so HA drops the old entity, unless this session publishes it.
+  std::vector<String> legacyTopics;
+  auto noteLegacy = [&]() {
+    char legacy[HA_LEGACY_UID_CAP];
+    char t[MQTT_TOPIC_CAP];
+    if (haLegacyUid(legacy, sizeof(legacy), uid) &&
+        formatTopic(t, sizeof(t), "homeassistant/sensor/%s/%s/config", devId, legacy)) {
+      legacyTopics.emplace_back(t);
+    }
+  };
 
   JsonArray sensors = cfg["temperature"]["sensors"].as<JsonArray>();
   if (sensors) {
@@ -1837,8 +1984,9 @@ void MQTTClient::publishDiscovery() {
       const char* sname = s["name"] | "unknown";
       makeSlug(sname, slug, sizeof(slug));
       snprintf(uid, sizeof(uid), "%s_%s_temp", devId, slug);
-      snprintf(stBuf, sizeof(stBuf), "%s/sensor/temperature/%s", prefix, slug);
-      disc("sensor", uid, sname, stBuf, haUnit, "temperature", "measurement", nullptr, expS);
+      noteLegacy();
+      if (formatTopic(stBuf, sizeof(stBuf), "%s/sensor/temperature/%s", prefix, slug))
+        disc("sensor", uid, sname, stBuf, haUnit, "temperature", "measurement", nullptr, expS);
     }
   }
 
@@ -1849,77 +1997,92 @@ void MQTTClient::publishDiscovery() {
       makeSlug(cname, slug, sizeof(slug));
 
       snprintf(uid, sizeof(uid), "%s_%s_current", devId, slug);
-      snprintf(stBuf, sizeof(stBuf), "%s/sensor/current/%s", prefix, slug);
-      disc("sensor", uid, cname, stBuf, "A", "current", "measurement");
+      noteLegacy();
+      if (formatTopic(stBuf, sizeof(stBuf), "%s/sensor/current/%s", prefix, slug))
+        disc("sensor", uid, cname, stBuf, "A", "current", "measurement");
 
       char pname[64];
       snprintf(pname, sizeof(pname), "%s Power", cname);
       snprintf(uid, sizeof(uid), "%s_%s_power", devId, slug);
-      snprintf(stBuf, sizeof(stBuf), "%s/sensor/power/%s", prefix, slug);
-      disc("sensor", uid, pname, stBuf, "W", "power", "measurement");
+      noteLegacy();
+      if (formatTopic(stBuf, sizeof(stBuf), "%s/sensor/power/%s", prefix, slug))
+        disc("sensor", uid, pname, stBuf, "W", "power", "measurement");
     }
   }
 
   bool battEnabled = cfg["battery"]["enabled"] | true;
   if (battEnabled) {
     snprintf(uid, sizeof(uid), "%s_battery_percent", devId);
-    snprintf(stBuf, sizeof(stBuf), "%s/sensor/battery/percent", prefix);
-    disc("sensor", uid, "Battery", stBuf, "%", "battery", "measurement");
+    if (formatTopic(stBuf, sizeof(stBuf), "%s/sensor/battery/percent", prefix))
+      disc("sensor", uid, "Battery", stBuf, "%", "battery", "measurement");
 
     snprintf(uid, sizeof(uid), "%s_battery_voltage", devId);
-    snprintf(stBuf, sizeof(stBuf), "%s/sensor/battery/voltage", prefix);
-    disc("sensor", uid, "Battery Voltage", stBuf, "V", "voltage", "measurement");
+    if (formatTopic(stBuf, sizeof(stBuf), "%s/sensor/battery/voltage", prefix))
+      disc("sensor", uid, "Battery Voltage", stBuf, "V", "voltage", "measurement");
 
     snprintf(uid, sizeof(uid), "%s_battery_charging", devId);
-    snprintf(stBuf, sizeof(stBuf), "%s/sensor/battery/charging", prefix);
-    disc("sensor", uid, "Battery Charge State", stBuf, "", "", "");
+    if (formatTopic(stBuf, sizeof(stBuf), "%s/sensor/battery/charging", prefix))
+      disc("sensor", uid, "Battery Charge State", stBuf, "", "", "");
   }
 
   snprintf(uid, sizeof(uid), "%s_wifi_rssi", devId);
-  snprintf(stBuf, sizeof(stBuf), "%s/sensor/wifi/rssi", prefix);
-  disc("sensor", uid, "WiFi RSSI", stBuf, "dBm", "signal_strength", "measurement", "diagnostic");
+  if (formatTopic(stBuf, sizeof(stBuf), "%s/sensor/wifi/rssi", prefix))
+    disc("sensor", uid, "WiFi RSSI", stBuf, "dBm", "signal_strength", "measurement", "diagnostic");
 
   snprintf(uid, sizeof(uid), "%s_wifi_ssid", devId);
-  snprintf(stBuf, sizeof(stBuf), "%s/sensor/wifi/ssid", prefix);
-  disc("sensor", uid, "WiFi SSID", stBuf, "", "", "", "diagnostic");
+  if (formatTopic(stBuf, sizeof(stBuf), "%s/sensor/wifi/ssid", prefix))
+    disc("sensor", uid, "WiFi SSID", stBuf, "", "", "", "diagnostic");
 
   snprintf(uid, sizeof(uid), "%s_wifi_ip", devId);
-  snprintf(stBuf, sizeof(stBuf), "%s/sensor/wifi/ip", prefix);
-  disc("sensor", uid, "WiFi IP", stBuf, "", "", "", "diagnostic");
+  if (formatTopic(stBuf, sizeof(stBuf), "%s/sensor/wifi/ip", prefix))
+    disc("sensor", uid, "WiFi IP", stBuf, "", "", "", "diagnostic");
 
   {
     char t[MQTT_TOPIC_CAP], v[32];
-    snprintf(t, sizeof(t), "%s/sensor/wifi/rssi", prefix);
-    snprintf(v, sizeof(v), "%d", (int)WiFi.RSSI());
-    _client.publish(t, v);
-
-    snprintf(t, sizeof(t), "%s/sensor/wifi/ssid", prefix);
-    _client.publish(t, WiFi.SSID().c_str());
-
-    snprintf(t, sizeof(t), "%s/sensor/wifi/ip", prefix);
-    _client.publish(t, WiFi.localIP().toString().c_str());
+    if (formatTopic(t, sizeof(t), "%s/sensor/wifi/rssi", prefix)) {
+      snprintf(v, sizeof(v), "%d", (int)WiFi.RSSI());
+      _client.publish(t, v);
+    }
+    if (formatTopic(t, sizeof(t), "%s/sensor/wifi/ssid", prefix))
+      _client.publish(t, WiFi.SSID().c_str());
+    if (formatTopic(t, sizeof(t), "%s/sensor/wifi/ip", prefix))
+      _client.publish(t, WiFi.localIP().toString().c_str());
   }
 
 
   snprintf(uid, sizeof(uid), "%s_heap_free", devId);
-  snprintf(stBuf, sizeof(stBuf), "%s/sensor/heap/free", prefix);
-  disc("sensor", uid, "Free Heap", stBuf, "B", "", "measurement", "diagnostic");
+  if (formatTopic(stBuf, sizeof(stBuf), "%s/sensor/heap/free", prefix))
+    disc("sensor", uid, "Free Heap", stBuf, "B", "", "measurement", "diagnostic");
 
   snprintf(uid, sizeof(uid), "%s_heap_min_free", devId);
-  snprintf(stBuf, sizeof(stBuf), "%s/sensor/heap/min_free", prefix);
-  disc("sensor", uid, "Min Free Heap", stBuf, "B", "", "measurement", "diagnostic");
+  if (formatTopic(stBuf, sizeof(stBuf), "%s/sensor/heap/min_free", prefix))
+    disc("sensor", uid, "Min Free Heap", stBuf, "B", "", "measurement", "diagnostic");
 
   snprintf(uid, sizeof(uid), "%s_heap_max_alloc_block", devId);
-  snprintf(stBuf, sizeof(stBuf), "%s/sensor/heap/max_alloc_block", prefix);
-  disc("sensor", uid, "Max Alloc Block", stBuf, "B", "", "measurement", "diagnostic");
+  if (formatTopic(stBuf, sizeof(stBuf), "%s/sensor/heap/max_alloc_block", prefix))
+    disc("sensor", uid, "Max Alloc Block", stBuf, "B", "", "measurement", "diagnostic");
 
   snprintf(uid, sizeof(uid), "%s_heap_psram_free", devId);
-  snprintf(stBuf, sizeof(stBuf), "%s/sensor/heap/psram_free", prefix);
-  disc("sensor", uid, "Free PSRAM", stBuf, "B", "", "measurement", "diagnostic");
+  if (formatTopic(stBuf, sizeof(stBuf), "%s/sensor/heap/psram_free", prefix))
+    disc("sensor", uid, "Free PSRAM", stBuf, "B", "", "measurement", "diagnostic");
 
   snprintf(uid, sizeof(uid), "%s_uptime", devId);
-  snprintf(stBuf, sizeof(stBuf), "%s/sensor/uptime", prefix);
-  disc("sensor", uid, "Uptime", stBuf, "s", "duration", "total_increasing", "diagnostic");
+  if (formatTopic(stBuf, sizeof(stBuf), "%s/sensor/uptime", prefix))
+    disc("sensor", uid, "Uptime", stBuf, "s", "duration", "total_increasing", "diagnostic");
+
+  // Zero-length retained clears it at the broker and in HA. Not in the manifest.
+  unsigned legacyCleared = 0;
+  for (const auto& t : legacyTopics) {
+    bool live = false;
+    for (const auto& r : _retainedTopics) {
+      if (r == t) { live = true; break; }
+    }
+    if (live || !_client.connected()) continue;
+    if (_client.publish(t.c_str(), (const uint8_t*)"", 0, true)) legacyCleared++;
+    _client.loop();
+    yield();
+  }
+  if (legacyCleared > 0) Log::kvf(TAG, "mqtt.ha_legacy_cleared count=%u", legacyCleared);
 
   publishHeapStats();
 
@@ -1949,38 +2112,42 @@ void MQTTClient::publishHeapStats() {
 
   char topic[MQTT_TOPIC_CAP], value[16];
 
-  snprintf(topic, sizeof(topic), "%s/sensor/heap/free", prefix);
-  snprintf(value, sizeof(value), "%lu", (unsigned long)freeHeap);
-  publish(topic, value);
+  if (formatTopic(topic, sizeof(topic), "%s/sensor/heap/free", prefix)) {
+    snprintf(value, sizeof(value), "%lu", (unsigned long)freeHeap);
+    publish(topic, value);
+  }
 
-  snprintf(topic, sizeof(topic), "%s/sensor/heap/min_free", prefix);
-  snprintf(value, sizeof(value), "%lu", (unsigned long)minFree);
-  publish(topic, value);
+  if (formatTopic(topic, sizeof(topic), "%s/sensor/heap/min_free", prefix)) {
+    snprintf(value, sizeof(value), "%lu", (unsigned long)minFree);
+    publish(topic, value);
+  }
 
-  snprintf(topic, sizeof(topic), "%s/sensor/heap/max_alloc_block", prefix);
-  snprintf(value, sizeof(value), "%lu", (unsigned long)maxAlloc);
-  publish(topic, value);
+  if (formatTopic(topic, sizeof(topic), "%s/sensor/heap/max_alloc_block", prefix)) {
+    snprintf(value, sizeof(value), "%lu", (unsigned long)maxAlloc);
+    publish(topic, value);
+  }
 
-  snprintf(topic, sizeof(topic), "%s/sensor/heap/psram_free", prefix);
-  snprintf(value, sizeof(value), "%lu", (unsigned long)freePsram);
-  publish(topic, value);
+  if (formatTopic(topic, sizeof(topic), "%s/sensor/heap/psram_free", prefix)) {
+    snprintf(value, sizeof(value), "%lu", (unsigned long)freePsram);
+    publish(topic, value);
+  }
 
-  snprintf(topic, sizeof(topic), "%s/sensor/uptime", prefix);
-  snprintf(value, sizeof(value), "%lu", (unsigned long)(millis() / 1000));
-  publish(topic, value);
+  if (formatTopic(topic, sizeof(topic), "%s/sensor/uptime", prefix)) {
+    snprintf(value, sizeof(value), "%lu", (unsigned long)(millis() / 1000));
+    publish(topic, value);
+  }
 
   // WiFi diagnostics only. publishDiscovery seeds them on connect; without
   // this refresh they drift stale during long stable sessions.
   if (WiFi.status() == WL_CONNECTED) {
-    snprintf(topic, sizeof(topic), "%s/sensor/wifi/rssi", prefix);
-    snprintf(value, sizeof(value), "%d", (int)WiFi.RSSI());
-    publish(topic, value);
-
-    snprintf(topic, sizeof(topic), "%s/sensor/wifi/ssid", prefix);
-    publish(topic, WiFi.SSID().c_str());
-
-    snprintf(topic, sizeof(topic), "%s/sensor/wifi/ip", prefix);
-    publish(topic, WiFi.localIP().toString().c_str());
+    if (formatTopic(topic, sizeof(topic), "%s/sensor/wifi/rssi", prefix)) {
+      snprintf(value, sizeof(value), "%d", (int)WiFi.RSSI());
+      publish(topic, value);
+    }
+    if (formatTopic(topic, sizeof(topic), "%s/sensor/wifi/ssid", prefix))
+      publish(topic, WiFi.SSID().c_str());
+    if (formatTopic(topic, sizeof(topic), "%s/sensor/wifi/ip", prefix))
+      publish(topic, WiFi.localIP().toString().c_str());
   }
 
   _lastHeapPublishMs = millis();
@@ -2101,7 +2268,7 @@ void MQTTClient::publishDeviceInfo() {
     rulesHash);
 
   char topic[MQTT_TOPIC_CAP];
-  snprintf(topic, sizeof(topic), "%s/info", prefix);
+  if (!formatTopic(topic, sizeof(topic), "%s/info", prefix)) return;
   publishRetained(topic, payload);
 }
 
@@ -2162,9 +2329,16 @@ void MQTTClient::flushQueue() {
 
 // ---------------------------------------------------------------------------
 
+// Last connected() answer from the main loop, for readers on other tasks.
+static volatile bool _connCache = false;
+
 bool MQTTClient::connected() {
-  return _client.connected();
+  bool up = _client.connected();
+  _connCache = up;
+  return up;
 }
+
+bool MQTTClient::connectedCached() { return _connCache; }
 
 bool MQTTClient::mtlsSessionUp() {
   return _client.connected() && _mtlsActive;
@@ -2177,6 +2351,21 @@ bool MQTTClient::clientCertPairValid(const char* certPEM, const char* keyPEM) {
   (void)certPEM; (void)keyPEM;
   return false;
 #endif
+}
+
+PairCheck MQTTClient::checkStoredClientCert() {
+  char* cert = (char*)secretAlloc(CERT_MAX_LEN);
+  char* key  = (char*)secretAlloc(CERT_MAX_LEN);
+  PairCheck res = PairCheck::NoHeap;
+  if (cert && key) {
+    res = loadClientCert(cert, key, CERT_MAX_LEN) && clientCertPairValid(cert, key)
+              ? PairCheck::Valid : PairCheck::Invalid;
+  }
+  secretFree(key);
+  secretFree(cert);
+  // A refused pair opens cert.clear on this session, not only after the next connect().
+  _storedCertBroken = storedCertBrokenAfter(res, _storedCertBroken);
+  return res;
 }
 
 time_t MQTTClient::lastPublishTime() {

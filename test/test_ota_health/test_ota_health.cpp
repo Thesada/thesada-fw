@@ -148,31 +148,32 @@ static uint32_t afterRestarts(uint32_t streak, int n, OtaPlanned kind, bool conf
                               bool proven) {
   for (int i = 0; i < n; i++) {
     streak = otaHealthNextCrashStreak(
-        streak, otaHealthBootClass(OTA_RST_SW, kind, confirmed, proven));
+        streak, otaHealthBootClass(OTA_RST_SW, kind, confirmed, proven, false));
   }
   return streak;
 }
 
 void test_operator_restart_on_a_confirmed_image_holds(void) {
-  TEST_ASSERT_EQUAL(OTA_RESET_HOLD, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_OPERATOR, true, false));
-  TEST_ASSERT_EQUAL(OTA_RESET_HOLD, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_OPERATOR, true, true));
+  TEST_ASSERT_EQUAL(OTA_RESET_HOLD, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_OPERATOR, true, false, false));
+  TEST_ASSERT_EQUAL(OTA_RESET_HOLD, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_OPERATOR, true, true, false));
   TEST_ASSERT_EQUAL_UINT32(2, afterRestarts(2, 10, OTA_PLANNED_OPERATOR, true, false));
   // Negative control: the same restarts with no marker reach the limit.
   TEST_ASSERT_TRUE(otaHealthShouldRollback(afterRestarts(2, 1, OTA_PLANNED_NONE, true, false)));
 }
 
 void test_proven_image_holds_broker_outage_reboots(void) {
-  TEST_ASSERT_EQUAL(OTA_RESET_HOLD, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_BROKER, true, true));
+  TEST_ASSERT_EQUAL(OTA_RESET_HOLD, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_BROKER, true, true, false));
   uint32_t streak = afterRestarts(0, 10, OTA_PLANNED_BROKER, true, true);
   TEST_ASSERT_EQUAL_UINT32(0, streak);
   TEST_ASSERT_FALSE(otaHealthShouldRollback(streak));
   // Negative control: the same image not yet proven counts them.
-  TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_BROKER, true, false));
+  TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_BROKER, true, false, false));
 }
 
 void test_unproven_confirmed_image_escapes_on_broker_reboots(void) {
   // OTA reboot into the pending image, then the five-minute confirm.
-  uint32_t streak = afterRestarts(0, 1, OTA_PLANNED_OPERATOR, false, false);
+  uint32_t streak = otaHealthNextCrashStreak(
+      0, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_OPERATOR, false, false, true));
   TEST_ASSERT_EQUAL_UINT32(1, streak);
   TEST_ASSERT_TRUE(otaHealthShouldMark(true, false, OTA_HEALTH_MIN_MS, streak));
   streak = 0;
@@ -225,10 +226,11 @@ void test_usb_flashed_image_holds_operator_restarts(void) {
                            afterRestarts(0, 3, OTA_PLANNED_NONE, usb, false));
 }
 
-void test_pending_image_counts_every_restart(void) {
-  TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_OPERATOR, false, true));
-  TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_BROKER, false, true));
-  TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_NONE, false, true));
+// An image state that does not read confirmed or pending is unread.
+void test_unconfirmed_image_counts_every_restart(void) {
+  TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_OPERATOR, false, true, false));
+  TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_BROKER, false, true, false));
+  TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_NONE, false, true, false));
   TEST_ASSERT_TRUE(otaHealthShouldRollback(
       afterRestarts(0, OTA_HEALTH_CRASH_LIMIT, OTA_PLANNED_OPERATOR, false, true)));
   // Negative control: the same restarts on a confirmed image hold.
@@ -236,14 +238,32 @@ void test_pending_image_counts_every_restart(void) {
       afterRestarts(0, OTA_HEALTH_CRASH_LIMIT, OTA_PLANNED_OPERATOR, true, true)));
 }
 
+// The planned restart into a written image, which boots it pending, starts that
+// image's own streak: the crashes before it were the installer's.
+void test_install_restart_starts_a_new_streak(void) {
+  TEST_ASSERT_EQUAL(OTA_RESET_FRESH, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_OPERATOR, false, false, true));
+  TEST_ASSERT_EQUAL(OTA_RESET_FRESH, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_BROKER, false, false, true));
+  uint32_t streak = otaHealthNextCrashStreak(OTA_HEALTH_CRASH_LIMIT + 4, OTA_RESET_FRESH);
+  TEST_ASSERT_EQUAL_UINT32(1, streak);
+  TEST_ASSERT_FALSE(otaHealthShouldRollback(streak));
+  TEST_ASSERT_TRUE(otaHealthShouldMark(true, true, 0, streak));
+  // From a clean streak the OTA reboot still counts once, as it did before.
+  TEST_ASSERT_EQUAL_UINT32(1, otaHealthNextCrashStreak(0, OTA_RESET_FRESH));
+  // Negative controls: an unplanned reset into a pending image, as an image of
+  // 26.10.2 or older applies an update, inherits the streak, and so does a crash.
+  TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_NONE, false, false, true));
+  TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(OTA_RST_PANIC, OTA_PLANNED_OPERATOR, false, false, true));
+  TEST_ASSERT_EQUAL(OTA_RESET_CLEAR, otaHealthBootClass(OTA_RST_POWERON, OTA_PLANNED_OPERATOR, false, false, true));
+}
+
 void test_panic_and_watchdogs_count_even_when_planned(void) {
   const int crashes[] = {OTA_RST_PANIC, OTA_RST_INT_WDT, OTA_RST_TASK_WDT, OTA_RST_WDT};
   for (int reason : crashes) {
-    TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(reason, OTA_PLANNED_OPERATOR, true, true));
-    TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(reason, OTA_PLANNED_BROKER, true, true));
+    TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(reason, OTA_PLANNED_OPERATOR, true, true, false));
+    TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(reason, OTA_PLANNED_BROKER, true, true, false));
   }
   // Negative control: a software reset with the same marker holds.
-  TEST_ASSERT_EQUAL(OTA_RESET_HOLD, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_OPERATOR, true, true));
+  TEST_ASSERT_EQUAL(OTA_RESET_HOLD, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_OPERATOR, true, true, false));
 }
 
 void test_stale_marker_after_power_on_is_ignored(void) {
@@ -251,10 +271,10 @@ void test_stale_marker_after_power_on_is_ignored(void) {
   OtaPlanned planned = otaHealthTakePlanned(&marker);
   // Negative control: the magic itself reads as planned.
   TEST_ASSERT_EQUAL(OTA_PLANNED_OPERATOR, planned);
-  TEST_ASSERT_EQUAL(OTA_RESET_CLEAR, otaHealthBootClass(OTA_RST_POWERON, planned, true, true));
+  TEST_ASSERT_EQUAL(OTA_RESET_CLEAR, otaHealthBootClass(OTA_RST_POWERON, planned, true, true, false));
   TEST_ASSERT_EQUAL_UINT32(0, marker);
   TEST_ASSERT_EQUAL(OTA_PLANNED_NONE, otaHealthTakePlanned(&marker));
-  TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_NONE, true, true));
+  TEST_ASSERT_EQUAL(OTA_RESET_CRASH, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_NONE, true, true, false));
   marker = OTA_PLANNED_BROKER_MAGIC;
   TEST_ASSERT_EQUAL(OTA_PLANNED_BROKER, otaHealthTakePlanned(&marker));
   TEST_ASSERT_EQUAL_UINT32(0, marker);
@@ -360,6 +380,29 @@ void test_a_reinstalled_build_is_a_target_again(void) {
   install(v, 0xA0, false);
   install(v, 0xD0, false);
   TEST_ASSERT_FALSE(otherIsTarget(v));
+}
+
+// Model row "fix D after ping-pong": B sits on a left slot with no target,
+// crash-loops past the limit, and its check installs fix D into that slot.
+void test_a_fix_installed_from_a_crash_loop_is_not_rolled_back(void) {
+  Unit u = unitOf(0xA0, 0xB0);
+  guardSwitch(u);
+  TEST_ASSERT_FALSE(otherIsTarget(u));
+  uint32_t streak = 1;  // the switch reset, counted on B
+  for (int i = 0; i < 4; i++) {
+    streak = otaHealthNextCrashStreak(
+        streak, otaHealthBootClass(OTA_RST_PANIC, OTA_PLANNED_NONE, true, false, false));
+  }
+  TEST_ASSERT_TRUE(otaHealthShouldRollback(streak));
+  install(u, 0xD0, true);
+  // D's boot dropped the left record, so B's slot is a target: only the streak decides.
+  TEST_ASSERT_TRUE(otherIsTarget(u));
+  uint32_t fix = otaHealthNextCrashStreak(
+      streak, otaHealthBootClass(OTA_RST_SW, OTA_PLANNED_OPERATOR, false, false, true));
+  TEST_ASSERT_FALSE(otaHealthShouldRollback(fix));
+  TEST_ASSERT_TRUE(otaHealthShouldMark(true, true, 0, fix));
+  // Negative control: B's streak handed over rolls D back at its first boot.
+  TEST_ASSERT_TRUE(otaHealthShouldRollback(otaHealthNextCrashStreak(streak, OTA_RESET_CRASH)));
 }
 
 void test_a_boot_of_the_recorded_slot_drops_the_record(void) {
@@ -482,12 +525,14 @@ int main(int, char**) {
   RUN_TEST(test_unproven_confirmed_image_escapes_on_broker_reboots);
   RUN_TEST(test_new_ota_image_starts_unproven);
   RUN_TEST(test_usb_flashed_image_holds_operator_restarts);
-  RUN_TEST(test_pending_image_counts_every_restart);
+  RUN_TEST(test_unconfirmed_image_counts_every_restart);
+  RUN_TEST(test_install_restart_starts_a_new_streak);
   RUN_TEST(test_panic_and_watchdogs_count_even_when_planned);
   RUN_TEST(test_stale_marker_after_power_on_is_ignored);
   RUN_TEST(test_builds_with_identical_descriptors_are_told_apart);
   RUN_TEST(test_ping_pong_stops_after_one_switch);
   RUN_TEST(test_a_reinstalled_build_is_a_target_again);
+  RUN_TEST(test_a_fix_installed_from_a_crash_loop_is_not_rolled_back);
   RUN_TEST(test_a_boot_of_the_recorded_slot_drops_the_record);
   RUN_TEST(test_only_a_switch_arrival_writes_the_record);
   RUN_TEST(test_a_planned_restart_voids_the_rescue_flag);

@@ -114,7 +114,6 @@
   "battery": {
     "enabled":    true,
     "interval_s": 60,
-    "low_pct":    20,
     "charge_ma":  300,
     "charge_v":   4.2
   },
@@ -159,22 +158,7 @@
   "telegram": {
     "enabled":    false,
     "bot_token":  "",
-    "chat_ids":   [],
-    "cooldown_s": 300,
-    "alerts": [
-      {
-        "enabled":          false,
-        "name":             "overheat",
-        "temp_high_c":      40.0,
-        "message_template": "{{sensor.name}}: {{sensor.value}}C -- OVERHEAT (>= {{threshold}}C)"
-      },
-      {
-        "enabled":          false,
-        "name":             "freeze",
-        "temp_low_c":       2.0,
-        "message_template": "{{sensor.name}}: {{sensor.value}}C -- FREEZE RISK (<= {{threshold}}C)"
-      }
-    ]
+    "chat_ids":   []
   },
 
   "webhook": {

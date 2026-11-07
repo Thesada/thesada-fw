@@ -125,33 +125,91 @@ void test_full_table_still_limits_a_new_ip(void) {
   TEST_ASSERT_FALSE(t.allow("203.0.113.1", 0));
 }
 
-// Full table: the fewest-fails entry goes, and that ip counts from zero.
-void test_evicts_fewest_fails(void) {
+// Full table: a new ip counts on the overflow entry, every listed ip keeps its count.
+void test_full_table_keeps_every_count(void) {
   LoginRateTable<2> t;
   failN(t, "A", 4, 0);
   failN(t, "B", 1, 0);
-  t.fail("C", 0);                       // evicts B
+  t.fail("C", 0);                       // overflow, B keeps its one
   t.fail("A", 0);
-  TEST_ASSERT_FALSE(t.allow("A", 0));   // A kept its four
-  failN(t, "B", 4, 0);                  // evicts C, B restarts at one
-  TEST_ASSERT_TRUE(t.allow("B", 0));
-  t.fail("B", 0);
+  TEST_ASSERT_FALSE(t.allow("A", 0));
+  failN(t, "B", 4, 0);
   TEST_ASSERT_FALSE(t.allow("B", 0));
 }
 
-// All slots locked: the lockout closest to release is the one given up.
-void test_all_locked_evicts_soonest_release(void) {
-  LoginRateTable<2> t;
-  failN(t, "A", 5, 100);
-  failN(t, "B", 5, 0);
-  t.fail("C", 200);                     // evicts B (until 30000 < 30100)
-  TEST_ASSERT_TRUE(t.allow("B", 200));
-  TEST_ASSERT_FALSE(t.allow("A", 200));
-  failN(t, "C", 4, 200);
-  TEST_ASSERT_FALSE(t.allow("C", 200));
+// 16 locked ips and a 17th: the 17th must not unlock one of them (#68).
+void test_full_table_never_evicts_a_locked_ip(void) {
+  LoginRateTable<> t;
+  char ip[16];
+  for (int i = 0; i < 16; i++) {
+    (void)snprintf(ip, sizeof(ip), "198.51.100.%d", i);
+    failN(t, ip, 5, 0);
+  }
+  failN(t, "203.0.113.1", 5, 0);
+  for (int i = 0; i < 16; i++) {
+    (void)snprintf(ip, sizeof(ip), "198.51.100.%d", i);
+    TEST_ASSERT_FALSE(t.allow(ip, 0));
+  }
+  TEST_ASSERT_FALSE(t.allow("203.0.113.1", 0));
 }
 
-// A quiet entry is a free slot, used before evicting a live one.
+// Two spare ips alternating over a full table both hit the limit: before the
+// overflow entry they evicted each other and never locked.
+void test_spare_ips_cannot_thrash_a_slot(void) {
+  LoginRateTable<2> t;
+  failN(t, "A", 2, 0);
+  for (int i = 0; i < 5; i++) {
+    t.fail("B", 0);
+    t.fail("C", 0);
+  }
+  TEST_ASSERT_FALSE(t.allow("B", 0));
+  TEST_ASSERT_FALSE(t.allow("C", 0));
+}
+
+// A locked overflow refuses every ip without a slot, a listed ip keeps its own
+// count, and the overflow ages like any entry.
+void test_locked_overflow_refuses_unlisted_ips(void) {
+  LoginRateTable<2> t;
+  const uint64_t end = LOGIN_RATE_LOCKOUT_MS;
+  failN(t, "A", 1, 0);
+  failN(t, "B", 1, 0);
+  failN(t, "C", 5, 0);
+  TEST_ASSERT_FALSE(t.allow("D", 0));
+  TEST_ASSERT_TRUE(t.allow("A", 0));
+  TEST_ASSERT_FALSE(t.allow("D", end - 1));
+  TEST_ASSERT_TRUE(t.allow("D", end));
+  t.fail("D", end);                     // one guess re-locks the shared entry
+  TEST_ASSERT_FALSE(t.allow("C", end));
+}
+
+// A success never clears the overflow, but frees its own slot for a new ip.
+void test_success_frees_a_slot_not_the_overflow(void) {
+  LoginRateTable<2> t;
+  failN(t, "A", 1, 0);
+  failN(t, "B", 1, 0);
+  failN(t, "C", 5, 0);
+  t.reset("C");                         // unlisted: no-op
+  TEST_ASSERT_FALSE(t.allow("D", 0));
+  t.reset("A");
+  TEST_ASSERT_TRUE(t.allow("D", 0));
+  failN(t, "D", 4, 0);                  // own slot: counts from zero
+  TEST_ASSERT_TRUE(t.allow("D", 0));
+}
+
+// The overflow is forgotten after the quiet period like any ip.
+void test_overflow_quiet_period_clears(void) {
+  LoginRateTable<1> t;
+  const uint64_t q = LOGIN_RATE_QUIET_MS;
+  t.fail("A", 0);
+  failN(t, "B", 5, 0);                  // overflow, locked
+  t.fail("A", q - 1);                   // A stays live, the table stays full
+  failN(t, "B", 4, q);                  // overflow forgotten: 4, not 5
+  TEST_ASSERT_TRUE(t.allow("B", q));
+  t.fail("B", q);
+  TEST_ASSERT_FALSE(t.allow("B", q));
+}
+
+// A quiet entry is a free slot, taken before the overflow entry.
 void test_quiet_slot_reused_before_eviction(void) {
   LoginRateTable<2> t;
   const uint64_t q = LOGIN_RATE_QUIET_MS;
@@ -162,14 +220,16 @@ void test_quiet_slot_reused_before_eviction(void) {
   TEST_ASSERT_FALSE(t.allow("B", q));
 }
 
-// A released lockout is still live: it is evicted by rank, not taken as free.
+// A released lockout is still live: a new ip does not take its slot.
 void test_released_lockout_is_not_a_free_slot(void) {
   LoginRateTable<2> t;
   failN(t, "A", 5, 0);
   failN(t, "B", 3, 0);
-  t.fail("C", LOGIN_RATE_LOCKOUT_MS);   // evicts B (3 fails < A's 4)
+  t.fail("C", LOGIN_RATE_LOCKOUT_MS);   // overflow
   t.fail("A", LOGIN_RATE_LOCKOUT_MS);
   TEST_ASSERT_FALSE(t.allow("A", LOGIN_RATE_LOCKOUT_MS));
+  failN(t, "B", 2, LOGIN_RATE_LOCKOUT_MS);
+  TEST_ASSERT_FALSE(t.allow("B", LOGIN_RATE_LOCKOUT_MS));
 }
 
 void test_empty_or_null_ip_is_ignored(void) {
@@ -207,8 +267,12 @@ int main(int, char**) {
   RUN_TEST(test_no_lockout_appears_past_the_millis_wrap);
   RUN_TEST(test_lockout_across_the_millis_wrap);
   RUN_TEST(test_full_table_still_limits_a_new_ip);
-  RUN_TEST(test_evicts_fewest_fails);
-  RUN_TEST(test_all_locked_evicts_soonest_release);
+  RUN_TEST(test_full_table_keeps_every_count);
+  RUN_TEST(test_full_table_never_evicts_a_locked_ip);
+  RUN_TEST(test_spare_ips_cannot_thrash_a_slot);
+  RUN_TEST(test_locked_overflow_refuses_unlisted_ips);
+  RUN_TEST(test_success_frees_a_slot_not_the_overflow);
+  RUN_TEST(test_overflow_quiet_period_clears);
   RUN_TEST(test_quiet_slot_reused_before_eviction);
   RUN_TEST(test_released_lockout_is_not_a_free_slot);
   RUN_TEST(test_empty_or_null_ip_is_ignored);

@@ -94,35 +94,33 @@ void GNSSModule::readAndPublish() {
   // land as
   // valid telemetry rows and skew charts.
   char perTopic[MQTT_TOPIC_CAP], val[24];
-  snprintf(perTopic, sizeof(perTopic), "%s/sensor/gnss/fix", prefix);
-  MQTTClient::publish(perTopic, _hasFix ? "1" : "0");
+  auto pub = [&](const char* metric, const char* value) {
+    if (MQTTClient::formatTopic(perTopic, sizeof(perTopic), "%s/sensor/gnss/%s", prefix, metric))
+      MQTTClient::publish(perTopic, value);
+  };
+  pub("fix", _hasFix ? "1" : "0");
   if (_hasFix) {
-    snprintf(perTopic, sizeof(perTopic), "%s/sensor/gnss/lat", prefix);
     snprintf(val, sizeof(val), "%.6f", _lat);
-    MQTTClient::publish(perTopic, val);
-    snprintf(perTopic, sizeof(perTopic), "%s/sensor/gnss/lon", prefix);
+    pub("lat", val);
     snprintf(val, sizeof(val), "%.6f", _lon);
-    MQTTClient::publish(perTopic, val);
-    snprintf(perTopic, sizeof(perTopic), "%s/sensor/gnss/alt_m", prefix);
+    pub("lon", val);
     snprintf(val, sizeof(val), "%.1f", _alt);
-    MQTTClient::publish(perTopic, val);
-    snprintf(perTopic, sizeof(perTopic), "%s/sensor/gnss/speed_kmh", prefix);
+    pub("alt_m", val);
     snprintf(val, sizeof(val), "%.1f", _speedKmh);
-    MQTTClient::publish(perTopic, val);
+    pub("speed_kmh", val);
   }
-  snprintf(perTopic, sizeof(perTopic), "%s/sensor/gnss/sats_view", prefix);
   snprintf(val, sizeof(val), "%d", _satsInView);
-  MQTTClient::publish(perTopic, val);
-  snprintf(perTopic, sizeof(perTopic), "%s/sensor/gnss/sats_used", prefix);
+  pub("sats_view", val);
   snprintf(val, sizeof(val), "%d", _satsUsed);
-  MQTTClient::publish(perTopic, val);
+  pub("sats_used", val);
 
   // Combined JSON for Lua / EventBus consumers (rules.lua, scripts).
   char topic[MQTT_TOPIC_CAP];
-  snprintf(topic, sizeof(topic), "%s/sensor/gnss", prefix);
-  char payload[192];
-  serializeJson(doc, payload, sizeof(payload));
-  MQTTClient::publish(topic, payload);
+  if (MQTTClient::formatTopic(topic, sizeof(topic), "%s/sensor/gnss", prefix)) {
+    char payload[192];
+    serializeJson(doc, payload, sizeof(payload));
+    MQTTClient::publish(topic, payload);
+  }
 
   EventBus::publish("gnss", doc.as<JsonObject>());
 

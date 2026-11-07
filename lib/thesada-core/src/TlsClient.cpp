@@ -232,7 +232,12 @@ size_t TlsClient::write(const uint8_t* buf, size_t size) {
       markClosed();
       break;
     }
-    if (millis() - t0 > WRITE_TIMEOUT_MS) break;
+    if (millis() - t0 > WRITE_TIMEOUT_MS) {
+      // mbedTLS still holds the unsent record: the session cannot go on.
+      _lastError = MBEDTLS_ERR_SSL_TIMEOUT;
+      markClosed();
+      break;
+    }
     esp_task_wdt_reset();
     delay(2);
   }

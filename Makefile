@@ -82,16 +82,21 @@ compiledb: ## compile_commands.json for ENV, for clang-tidy and editors
 ##@ Test
 
 .PHONY: test
-test: test-native test-lua ## Host-side suites: native unit tests + Lua rules harness
+test: test-native test-lua test-gates ## Host-side suites: native unit tests, Lua rules harness, gate self-tests
 
 .PHONY: test-native
-test-native: ## Unity tests over the pure policy headers, no board (TEST=test_rollback for one suite)
-	$(PIO) test -e native $(if $(TEST),-f $(TEST),)
+test-native: ## Unity tests over the pure policy headers and the host-built Lua fork, no board (TEST=test_rollback for one suite)
+	$(PIO) test -e $(if $(filter test_lua_stdlibs test_lua_budget_hooks,$(TEST)),native-lua,native) $(if $(TEST),-f $(TEST),)
+	$(if $(TEST),,$(PIO) test -e native-lua)
 
 .PHONY: test-lua
 test-lua: ## Lua rules harness against the mocked bindings
 	@test -n "$(LUA)" || { echo "test-lua: no lua5.3 or lua on PATH - run make setup-sys"; exit 1; }
 	$(LUA) tests/lua/run_all.lua
+
+.PHONY: test-gates
+test-gates: ## Self-test the invariant-ledger gate (CI runs it in the invariant-ledger job)
+	./tests/test_invariant_ledger.sh
 
 .PHONY: coverage
 coverage: ## Per-file line-coverage floors from scripts/coverage-floors.txt
@@ -101,11 +106,12 @@ coverage: ## Per-file line-coverage floors from scripts/coverage-floors.txt
 ci: test lint coverage dist ## Local CI: host tests, lint, coverage floors, every board build
 
 .PHONY: lint
-lint: ## cppcheck + clang-tidy on the pure units, then the path-safety and lib-deps gates
+lint: ## cppcheck + clang-tidy on the pure units, the ADS1115 readADC_ ban, then the path-safety, lib-deps and Lua-entry gates
 	./scripts/static-check.sh
 	./scripts/tidy-check.sh
 	./scripts/check-path-safety.sh
 	./scripts/check-lib-deps.sh
+	./scripts/check-lua-entry.sh
 
 .PHONY: tidy
 tidy: ## clang-tidy alone (.clang-tidy), via the native test units

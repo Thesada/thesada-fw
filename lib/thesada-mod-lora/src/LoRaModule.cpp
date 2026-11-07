@@ -254,12 +254,12 @@ void LoRaModule::publishRx(const LoRaRx& rx) {
   JsonObject cfg = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
   char topic[MQTT_TOPIC_CAP];
-  snprintf(topic, sizeof(topic), "%s/lora/rx", prefix);
-
-  String payload;
-  payload.reserve(measureJson(doc) + 1);
-  serializeJson(doc, payload);
-  MQTTClient::publish(topic, payload.c_str());
+  if (MQTTClient::formatTopic(topic, sizeof(topic), "%s/lora/rx", prefix)) {
+    String payload;
+    payload.reserve(measureJson(doc) + 1);
+    serializeJson(doc, payload);
+    MQTTClient::publish(topic, payload.c_str());
+  }
   EventBus::publish("lora", doc.as<JsonObject>());
 
   Log::kvf(TAG, "lora.rx len=%d rssi=%.1f snr=%.1f",
