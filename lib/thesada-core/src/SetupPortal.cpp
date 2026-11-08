@@ -15,21 +15,29 @@
 #include <mbedtls/platform_util.h>
 #include <stdio.h>
 #include <string.h>
+#include <atomic>
+#include <freertos/FreeRTOS.h>
 
 static const char* TAG = "Setup";
 
 static constexpr size_t SSID_CAP = 33;
 static constexpr size_t PASS_CAP = 64;
-static constexpr size_t LINK_CAP = 320;
+static constexpr size_t LINK_CAP = SetupPortal::LINK_CAP;
 
-static volatile bool _open = false;
-static volatile bool _pending = false;
-static volatile bool _resultReady = false;
+// submit() runs on async_tcp, applyForm() on the loop. The page reads only the
+// published copy under _resMux. The build buffers are loop-only.
+static std::atomic<bool> _open{false};
+static std::atomic<bool> _pending{false};
+static std::atomic<bool> _resultReady{false};
+static std::atomic<bool> _haveLink{false};
 static char _ssid[SSID_CAP];
 static char _pass[PASS_CAP];
 static char _url[ENROLL_URL_CAP];
+static char _buildLink[LINK_CAP];
+static const char* _buildError = "";
 static char _link[LINK_CAP];
 static const char* _error = "";
+static portMUX_TYPE _resMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Saved station networks. in: none. out: count, 0 when the array is absent.
 static size_t stationNetworks() {
@@ -48,8 +56,8 @@ static void copyField(char* dst, size_t cap, const char* src) {
 // Store the posted network and enroll URL, then build the claim link.
 // in: pending fields. out: true when the page must stay up.
 static bool applyForm() {
-  _link[0] = '\0';
-  _error = "";
+  _buildLink[0] = '\0';
+  _buildError = "";
   // New passphrase before the network. An existing one is replaced only after save.
   char field[sizeof("wifi.password:") + SSID_CAP];
   int wrote = snprintf(field, sizeof(field), "wifi.password:%s", _ssid);
@@ -57,7 +65,7 @@ static bool applyForm() {
   bool had = fieldOk && Secret::has(field);
   if (!fieldOk || (!had && !Secret::set(field, _pass))) {
     mbedtls_platform_zeroize(field, sizeof(field));
-    _error = "could not store the passphrase";
+    _buildError = "could not store the passphrase";
     return true;
   }
   char base[ENROLL_URL_CAP];
@@ -79,12 +87,12 @@ static bool applyForm() {
     Config::load();
     if (!had) Secret::clear(field);
     mbedtls_platform_zeroize(field, sizeof(field));
-    _error = "could not save the network";
+    _buildError = "could not save the network";
     return true;
   }
   if (had && !Secret::set(field, _pass)) {
     mbedtls_platform_zeroize(field, sizeof(field));
-    _error = "could not store the passphrase";
+    _buildError = "could not store the passphrase";
     return true;
   }
   mbedtls_platform_zeroize(field, sizeof(field));
@@ -92,11 +100,11 @@ static bool applyForm() {
   bool have = enrollLoadClaimCode(code, sizeof(code));
   const char* id = Identity::deviceId();
   if (!have) {
-    _error = "network saved; no claim code is seeded";
+    _buildError = "network saved; no claim code is seeded";
   } else if (!id || !identityDeviceIdValid(id)) {
-    _error = "network saved; claim link could not be built";
-  } else if (!enrollClaimLink(_link, sizeof(_link), base, id, code)) {
-    _error = "claim link did not fit";
+    _buildError = "network saved; claim link could not be built";
+  } else if (!enrollClaimLink(_buildLink, sizeof(_buildLink), base, id, code)) {
+    _buildError = "claim link did not fit";
   }
   mbedtls_platform_zeroize(code, sizeof(code));
   return true;
@@ -106,9 +114,14 @@ void SetupPortal::loop() {
   if (_pending) {
     bool hold = applyForm();
     mbedtls_platform_zeroize(_pass, sizeof(_pass));
-    _pending = false;
+    taskENTER_CRITICAL(&_resMux);
+    memcpy(_link, _buildLink, sizeof(_link));
+    _error = _buildError;
+    taskEXIT_CRITICAL(&_resMux);
+    _haveLink = _buildLink[0] != '\0';
     _resultReady = hold;
-    Log::kvf(TAG, "setup.applied ok=%d", _link[0] != '\0');
+    _pending = false;
+    Log::kvf(TAG, "setup.applied ok=%d", _haveLink.load());
   }
   _open = setupPortalOpen(WiFiManager::isAPActive(), stationNetworks(), _resultReady);
 }
@@ -119,19 +132,30 @@ bool SetupPortal::busy() { return _pending; }
 
 bool SetupPortal::submit(const char* ssid, const char* pass, const char* url) {
   if (!_open || _pending) return false;
-  if (_resultReady && _link[0]) return false;
+  if (_resultReady && _haveLink) return false;
   if (!setupFormUsable(ssid, pass, url)) return false;
   copyField(_ssid, sizeof(_ssid), ssid);
   copyField(_pass, sizeof(_pass), pass);
   copyField(_url, sizeof(_url), url);
+  taskENTER_CRITICAL(&_resMux);
   _link[0] = '\0';
   _error = "";
+  taskEXIT_CRITICAL(&_resMux);
+  _haveLink = false;
   _pending = true;
   return true;
 }
 
 bool SetupPortal::hasResult() { return _resultReady; }
-const char* SetupPortal::claimLink() { return _link; }
-const char* SetupPortal::resultError() { return _error; }
+void SetupPortal::result(char* link, size_t cap, const char** error) {
+  if (link && cap) link[0] = '\0';
+  taskENTER_CRITICAL(&_resMux);
+  if (link && cap) {
+    strncpy(link, _link, cap - 1);
+    link[cap - 1] = '\0';
+  }
+  if (error) *error = _error;
+  taskEXIT_CRITICAL(&_resMux);
+}
 
 #endif

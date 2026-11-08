@@ -6,9 +6,10 @@
 //
 //   TelegramModule::send(message)          - send to all configured chat_ids
 //   TelegramModule::sendTo(chatId, message) - send to a specific chat_id
-// send() also publishes to EventBus("alert") for MQTT and cellular relay.
+// send() also publishes to EventBus("alert") for the MQTT relay.
 // SPDX-License-Identifier: GPL-3.0-only
 #include "TelegramModule.h"
+#include <alert_payload_policy.h>
 #include <Config.h>
 #include <Secret.h>
 #include <EventBus.h>
@@ -137,8 +138,9 @@ void TelegramModule::begin() {
       }},
       {"broadcast", [](lua_State* L) -> int {
         const char* msg = luaL_checkstring(L, 1);
+        const char* code = luaL_optstring(L, 2, "telegram");
         const uint32_t t0 = millis();
-        bool ok = TelegramModule::send(msg);
+        bool ok = TelegramModule::send(msg, code);
         ScriptEngine::creditNative(millis() - t0);
         lua_pushboolean(L, ok);
         return 1;
@@ -245,21 +247,21 @@ bool TelegramModule::sendTo(const char* chatId, const char* message) {
 
 // ---------------------------------------------------------------------------
 
-// Broadcast a message to all configured chat IDs, EventBus, and optional webhook.
-// Appends `[heap=N]` to the outbound message so every alert carries a heap
-// breadcrumb. MQTT+TLS+Telegram+TLS concurrency is the most likely failure
-// mode for this device class, and the heap value at the moment of alert is
-// the single most useful datapoint for diagnosing it.
-bool TelegramModule::send(const char* message) {
+// Broadcast to every chat, the webhook and EventBus("alert"). Only the alert
+// event carries the [heap=N] breadcrumb, chats get the plain message.
+bool TelegramModule::send(const char* message, const char* code) {
   if (!_ready) { Log::warn(TAG, "telegram.send_skipped reason=not_ready"); return false; }
+  if (!code || !*code) code = "telegram";
 
   char tagged[256];
   snprintf(tagged, sizeof(tagged), "%s [heap=%lu]",
            message, (unsigned long)MQTTClient::currentFreeHeap());
 
-  // Publish alert event - MQTTClient and CellularModule subscribe to this.
+  // The app's alert contract, cut to fit the 256 B MQTT alert slot (alert_payload_policy.h).
   JsonDocument doc;
-  doc["value"] = tagged;
+  doc["severity"] = "warn";
+  doc["code"]     = code;
+  doc["message"]  = String(tagged).substring(0, alertMessageFit("warn", code, tagged, 256));
   EventBus::publish("alert", doc.as<JsonObject>());
 
   // Send to all configured chat_ids (supports both array and object format).

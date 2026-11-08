@@ -38,6 +38,7 @@
 #include <web_snapshot_policy.h>
 #include <shell_mode_policy.h>
 #include <string.h>
+#include <atomic>
 
 static const char* TAG = "WebServer";
 
@@ -46,9 +47,14 @@ static AsyncWebSocket _ws("/ws/serial");
 
 // Cached JSON state document - updated by EventBus subscribers.
 static JsonDocument _stateDoc;
+// /api/state reads this copy, never _stateDoc: the loop rebuilds the doc while async_tcp serves.
+static constexpr size_t STATE_JSON_CAP = 3072;
+static char         _stateJson[STATE_JSON_CAP] = "{}";
+static size_t       _stateJsonLen = 2;
+static portMUX_TYPE _stateMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Deferred restart flag - set by /api/restart, acted on in loop().
-static bool _restartPending = false;
+static std::atomic<bool> _restartPending{false};
 
 // Set once server.begin() has actually bound. See netifUp() below.
 static bool _serverStarted = false;
@@ -296,6 +302,33 @@ static bool _checkAuth(AsyncWebServerRequest* req, bool hasSideEffect = false,
   return allowed;
 }
 
+enum RouteAuth { ROUTE_AUTH_OK, ROUTE_AUTH_DENIED, ROUTE_AUTH_LOCKED };
+
+// Every route handler authenticates here: lockout first, one count per offered wrong credential.
+static RouteAuth _authCounted(AsyncWebServerRequest* req, bool hasSideEffect = false) {
+  const String ip = req->client()->remoteIP().toString();
+  if (!_rlAllow(ip)) return ROUTE_AUTH_LOCKED;
+  bool guessed = false;
+  if (!_checkAuth(req, hasSideEffect, &guessed)) {
+    if (guessed) _rlFail(ip);
+    return ROUTE_AUTH_DENIED;
+  }
+  _rlReset(ip);
+  return ROUTE_AUTH_OK;
+}
+
+// True when authorized, otherwise replies 429 (locked out) or 401.
+static bool _authOrReply(AsyncWebServerRequest* req, bool hasSideEffect = false) {
+  const RouteAuth a = _authCounted(req, hasSideEffect);
+  if (a == ROUTE_AUTH_OK) return true;
+  if (a == ROUTE_AUTH_LOCKED) {
+    req->send(429, "application/json", "{\"ok\":false,\"error\":\"Too many attempts - wait 30s\"}");
+  } else {
+    req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}");
+  }
+  return false;
+}
+
 // POST bodies live in req->_tempObject, one per request. Chunk 0 decides: an
 // unauthenticated or oversized body is never buffered.
 static void _bodyChunk(AsyncWebServerRequest* req, uint8_t* data, size_t len,
@@ -308,7 +341,12 @@ static void _bodyChunk(AsyncWebServerRequest* req, uint8_t* data, size_t len,
 // 413 past the cap, or 400 when it did not arrive whole.
 static const char* _bodyOrReply(AsyncWebServerRequest* req, size_t maxBytes) {
   const HttpBody* b = (const HttpBody*)req->_tempObject;
-  switch (httpBodyVerdict(_checkAuth(req), req->hasHeader("Transfer-Encoding"),
+  const RouteAuth a = _authCounted(req);
+  if (a == ROUTE_AUTH_LOCKED) {
+    req->send(429, "application/json", "{\"ok\":false,\"error\":\"Too many attempts - wait 30s\"}");
+    return nullptr;
+  }
+  switch (httpBodyVerdict(a == ROUTE_AUTH_OK, req->hasHeader("Transfer-Encoding"),
                           req->contentLength(), maxBytes, b)) {
     case HTTP_BODY_OK:
       return b->data;
@@ -392,7 +430,7 @@ static size_t _configWriteOrReply(AsyncWebServerRequest* req, const char* body, 
     req->send(400, "application/json", "{\"ok\":false,\"error\":\"config must be a JSON object\"}");
     return 0;
   }
-  auto done  = std::make_shared<bool>(false);
+  auto done  = std::make_shared<std::atomic<bool>>(false);
   auto bytes = std::make_shared<size_t>(0);
   bool queued = Shell::enqueueDeferred([doc, done, bytes, restart]() {
     bool ok = Config::writeFile(doc->as<JsonVariantConst>(), true, bytes.get());
@@ -525,6 +563,21 @@ void HttpServer::updateState(const char* key, JsonObject data) {
   for (JsonPair kv : data) {
     dest[kv.key()] = kv.value();
   }
+  const size_t need = measureJson(_stateDoc);
+  if (need >= STATE_JSON_CAP) {
+    static uint32_t lastWarnMs = 0;
+    if (_warnDue(lastWarnMs)) Log::kvfw(TAG, "web.state_too_big bytes=%u cap=%u", (unsigned)need, (unsigned)STATE_JSON_CAP);
+    return;
+  }
+  char* tmp = (char*)malloc(need + 1);
+  if (!tmp) return;
+  const size_t n = serializeJson(_stateDoc, tmp, need + 1);
+  taskENTER_CRITICAL(&_stateMux);
+  memcpy(_stateJson, tmp, n);
+  _stateJson[n] = '\0';
+  _stateJsonLen = n;
+  taskEXIT_CRITICAL(&_stateMux);
+  free(tmp);
 }
 
 // ---------------------------------------------------------------------------
@@ -609,8 +662,10 @@ static void sendSetupPage(AsyncWebServerRequest* req) {
     req->send(200, "text/html", kSetupWait);
     return;
   }
-  const char* link = SetupPortal::claimLink();
-  if (SetupPortal::hasResult() && link && link[0]) {
+  char link[SetupPortal::LINK_CAP];
+  const char* err = "";
+  SetupPortal::result(link, sizeof(link), &err);
+  if (SetupPortal::hasResult() && link[0]) {
     String page = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
                   "<title>thesada setup</title></head><body>"
                   "<p>Claim this device:</p><pre>";
@@ -619,7 +674,6 @@ static void sendSetupPage(AsyncWebServerRequest* req) {
     req->send(200, "text/html", page);
     return;
   }
-  const char* err = SetupPortal::resultError();
   if (err && err[0]) {
     String safe = htmlText(err);
     req->send(200, "text/html", setupDocument(safe.c_str()));
@@ -688,13 +742,7 @@ void HttpServer::setupRoutes() {
     if (_sendCredLocked(req, _webCredLock())) return;
     // Side-effect GET: answers "are these cached credentials valid here" and
     // moves the rate-limit counter, so a cross-site caller gets no oracle.
-    bool guessed = false;
-    if (!_checkAuth(req, /*hasSideEffect=*/true, &guessed)) {
-      if (guessed) _rlFail(ip);
-      req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}");
-      return;
-    }
-    _rlReset(ip);
+    if (!_authOrReply(req, /*hasSideEffect=*/true)) return;
     req->send(200, "application/json", "{\"ok\":true}");
   });
 
@@ -706,13 +754,7 @@ void HttpServer::setupRoutes() {
       return;
     }
     if (_sendCredLocked(req, _webCredLock())) return;
-    bool guessed = false;
-    if (!_checkAuth(req, /*hasSideEffect=*/false, &guessed)) {
-      if (guessed) _rlFail(ip);
-      req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}");
-      return;
-    }
-    _rlReset(ip);
+    if (!_authOrReply(req, /*hasSideEffect=*/false)) return;
     const char* token = _createToken();
     char body[128];
     snprintf(body, sizeof(body),
@@ -727,10 +769,7 @@ void HttpServer::setupRoutes() {
   // Side-effect GET: it mints a 30 s IP-bound WS grant, and /ws/serial reaches
   // the shell, so a cross-site call must not ride cached Basic credentials.
   server.on("/api/ws/token", HTTP_GET, [](AsyncWebServerRequest* req) {
-    if (!_checkAuth(req, /*hasSideEffect=*/true)) {
-      req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}");
-      return;
-    }
+    if (!_authOrReply(req, /*hasSideEffect=*/true)) return;
     _grantWsAuth(req->client()->remoteIP().toString());
     req->send(200, "application/json", "{\"ok\":true}");
   });
@@ -756,17 +795,23 @@ void HttpServer::setupRoutes() {
   server.on("/api/state", HTTP_GET, [](AsyncWebServerRequest* req) {
     // Copy sensor state and inject _mqtt metadata so the dashboard can show
     // connection status and last publish time without a separate request.
+    char* snap = (char*)malloc(STATE_JSON_CAP);
+    if (!snap) { req->send(503, "application/json", "{\"error\":\"out of memory\"}"); return; }
+    taskENTER_CRITICAL(&_stateMux);
+    memcpy(snap, _stateJson, _stateJsonLen + 1);
+    taskEXIT_CRITICAL(&_stateMux);
     JsonDocument resp;
-    for (JsonPair kv : _stateDoc.as<JsonObject>()) {
-      resp[kv.key()] = kv.value();
-    }
+    const DeserializationError err = deserializeJson(resp, snap);
+    free(snap);
+    if (err || !resp.is<JsonObject>()) resp.to<JsonObject>();
     JsonObject mqttMeta = resp["_mqtt"].to<JsonObject>();
     mqttMeta["connected"] = MQTTClient::connectedCached();
     time_t lp = MQTTClient::lastPublishTime();
     if (lp > 1700000000UL) {
       char ts[22];
-      struct tm* t = gmtime(&lp);
-      strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", t);
+      struct tm tmv;
+      gmtime_r(&lp, &tmv);
+      strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tmv);
       mqttMeta["last_publish"] = ts;
     } else {
       mqttMeta["last_publish"] = nullptr;
@@ -778,7 +823,7 @@ void HttpServer::setupRoutes() {
 
   // ── GET /api/config - read config.json ────────────────────────────────────
   server.on("/api/config", HTTP_GET, [](AsyncWebServerRequest* req) {
-    if (!_checkAuth(req)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
+    if (!_authOrReply(req)) return;
     if (!LittleFS.exists("/config.json")) {
       req->send(404, "application/json", "{\"error\":\"config.json not found\"}");
       return;
@@ -806,7 +851,7 @@ void HttpServer::setupRoutes() {
 
   // ── POST /api/backup - copy config.json to SD (auth required) ────────────
   server.on("/api/backup", HTTP_POST, [](AsyncWebServerRequest* req) {
-    if (!_checkAuth(req)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
+    if (!_authOrReply(req)) return;
     if (!LittleFS.exists("/config.json")) {
       req->send(200, "application/json", "{\"ok\":false,\"error\":\"config.json not found\"}");
       return;
@@ -830,7 +875,7 @@ void HttpServer::setupRoutes() {
 
   // ── POST /api/restart (auth required) ─────────────────────────────────────
   server.on("/api/restart", HTTP_POST, [](AsyncWebServerRequest* req) {
-    if (!_checkAuth(req)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
+    if (!_authOrReply(req)) return;
     req->send(200, "application/json", "{\"ok\":true}");
     _restartPending = true;
   });
@@ -875,8 +920,8 @@ void HttpServer::setupRoutes() {
     // doing the drain) until either done flips or the timeout expires.
     auto output = std::make_shared<String>("[");
     auto first  = std::make_shared<bool>(true);
-    auto done   = std::make_shared<bool>(false);
-    auto cmdOk  = std::make_shared<bool>(false);
+    auto done   = std::make_shared<std::atomic<bool>>(false);
+    auto cmdOk  = std::make_shared<std::atomic<bool>>(false);
 
     bool ok = Shell::enqueueDeferred([cmdStr, output, first, done, cmdOk]() {
       ShellResult r = Shell::execute(cmdStr.c_str(), [output, first](const char* line) {
@@ -926,7 +971,7 @@ void HttpServer::setupRoutes() {
   // Accepts multipart/form-data with field "firmware". Uses ESP-IDF Update.h.
   server.on("/ota", HTTP_POST,
     [](AsyncWebServerRequest* req) {
-      if (!_checkAuth(req)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
+      if (!_authOrReply(req)) return;
       // No authorized-upload marker = no chunk was ever accepted (empty body
       // or marker alloc failure) - nothing was flashed, don't restart.
       if (req->_tempObject == nullptr) { req->send(400, "application/json", "{\"ok\":false,\"error\":\"no firmware received\"}"); return; }
@@ -978,7 +1023,7 @@ void HttpServer::setupRoutes() {
   // ── GET /api/files - list files (auth required) ──────────────────────────
   // Query param: source=sd (default) or source=littlefs or source=scripts
   server.on("/api/files", HTTP_GET, [](AsyncWebServerRequest* req) {
-    if (!_checkAuth(req)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
+    if (!_authOrReply(req)) return;
     String src = req->hasParam("source") ? req->getParam("source")->value() : "sd";
     bool useLFS     = (src == "littlefs");
     bool useScripts = (src == "scripts");
@@ -1010,7 +1055,7 @@ void HttpServer::setupRoutes() {
 
   // ── GET /api/file?path=...&source=sd|littlefs|scripts - stream a file, any size (auth)
   server.on("/api/file", HTTP_GET, [](AsyncWebServerRequest* req) {
-    if (!_checkAuth(req)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
+    if (!_authOrReply(req)) return;
     if (!req->hasParam("path")) { req->send(400, "text/plain", "missing path"); return; }
     String path = req->getParam("path")->value();
     if (!_pathSafe(path)) { req->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid path\"}"); return; }
@@ -1026,7 +1071,7 @@ void HttpServer::setupRoutes() {
 
   // ── DELETE /api/file?path=...&source=sd|littlefs|scripts - delete file (auth)
   server.on("/api/file", HTTP_DELETE, [](AsyncWebServerRequest* req) {
-    if (!_checkAuth(req)) { req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
+    if (!_authOrReply(req)) return;
     if (!shellModeHttpSurfaceAllowed(Shell::mode(), HTTP_SURFACE_FILE_WRITE)) {
       req->send(403, "application/json", "{\"ok\":false,\"error\":\"shell.mode closes file writes over HTTP\"}");
       return;
@@ -1118,21 +1163,12 @@ void HttpServer::setupRoutes() {
         client->close();
         return;
       }
-      // Replay last N log lines as a single concatenated WS message.
-      uint8_t count = Log::ringCount();
-      if (count > 0) {
-        String replay;
-        replay.reserve(count * 120);
-        for (uint8_t i = 0; i < count; i++) {
-          const char* line = Log::ringLine(i);
-          if (line) {
-            if (replay.length() > 0) replay += '\n';
-            replay += line;
-          }
-        }
-        if (replay.length() > 0) {
-          client->text(replay);
-        }
+      // Replay the log ring as one WS message, copied under the ring lock.
+      char* replay = (char*)malloc(Log::RING_SNAPSHOT_CAP);
+      if (replay) {
+        const size_t n = Log::ringSnapshot(replay, Log::RING_SNAPSHOT_CAP);
+        if (n > 0) client->text(replay, n);
+        free(replay);
       }
     } else if (type == WS_EVT_DATA) {
       // Only accept final, unfragmented text frames. On WS_EVT_DATA the

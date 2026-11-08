@@ -3,24 +3,36 @@
 #include "Log.h"
 #include "Console.h"
 #include "log_kv_policy.h"
+#include <freertos/FreeRTOS.h>
+#include <string.h>
 
 void (*Log::_remoteHandler)(const char* line) = nullptr;
 char    Log::_ring[RING_SIZE][LOG_LINE_LEN] = {};
 uint8_t Log::_ringHead = 0;
 uint8_t Log::_ringUsed = 0;
+// Guards _ring/_ringHead/_ringUsed: Log::write runs on any task, the WS replay on async_tcp.
+static portMUX_TYPE _ringMux = portMUX_INITIALIZER_UNLOCKED;
 
 void Log::setRemoteHandler(void (*handler)(const char* line)) {
   _remoteHandler = handler;
 }
 
-const char* Log::ringLine(uint8_t index) {
-  if (index >= _ringUsed) return nullptr;
-  uint8_t pos = (_ringHead + RING_SIZE - _ringUsed + index) % RING_SIZE;
-  return _ring[pos];
-}
-
-uint8_t Log::ringCount() {
-  return _ringUsed;
+size_t Log::ringSnapshot(char* out, size_t cap) {
+  if (!out || cap == 0) return 0;
+  size_t n = 0;
+  taskENTER_CRITICAL(&_ringMux);
+  for (uint8_t i = 0; i < _ringUsed; i++) {
+    const char* line = _ring[(_ringHead + RING_SIZE - _ringUsed + i) % RING_SIZE];
+    size_t len = strnlen(line, LOG_LINE_LEN);
+    if (n > 0 && n + 1 < cap) out[n++] = '\n';
+    if (n + len >= cap) len = cap - 1 - n;
+    memcpy(out + n, line, len);
+    n += len;
+    if (n + 1 >= cap) break;
+  }
+  taskEXIT_CRITICAL(&_ringMux);
+  out[n] = '\0';
+  return n;
 }
 
 void Log::write(LogLevel level, const char* tag, const char* msg) {
@@ -30,17 +42,21 @@ void Log::write(LogLevel level, const char* tag, const char* msg) {
   // line read as 1970, so omit it until time() clears the sentinel.
   if (now > 1700000000UL) {
     char ts[22];
-    struct tm* t = gmtime(&now);
-    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", t);
+    struct tm tmv;
+    gmtime_r(&now, &tmv);
+    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tmv);
     snprintf(line, sizeof(line), "[%s][%s][%s] %s", levelStr(level), ts, tag, msg);
   } else {
     snprintf(line, sizeof(line), "[%s][%s] %s", levelStr(level), tag, msg);
   }
 
-  strncpy(_ring[_ringHead], line, sizeof(_ring[0]) - 1);
-  _ring[_ringHead][sizeof(_ring[0]) - 1] = '\0';
+  const size_t len = strnlen(line, sizeof(_ring[0]) - 1);
+  taskENTER_CRITICAL(&_ringMux);
+  memcpy(_ring[_ringHead], line, len);
+  _ring[_ringHead][len] = '\0';
   _ringHead = (_ringHead + 1) % RING_SIZE;
   if (_ringUsed < RING_SIZE) _ringUsed++;
+  taskEXIT_CRITICAL(&_ringMux);
 
   Console::log(line);
   if (_remoteHandler) _remoteHandler(line);

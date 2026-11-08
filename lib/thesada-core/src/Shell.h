@@ -20,6 +20,9 @@ using DeferredFn = std::function<void()>;
 
 using ShellCommand = std::function<void(int argc, char** argv, ShellOutput out)>;
 
+// Result of Shell::writeChecked.
+enum FsWrite { FS_WRITE_OK, FS_WRITE_OPEN_FAILED, FS_WRITE_SHORT };
+
 // Disk-usage probe a module supplies for its mount; fs::FS has no byte counts
 // (subclass-specific). Returns bytes, 0 = empty / not mounted.
 using FSDfFn = uint64_t(*)();
@@ -113,6 +116,11 @@ public:
   // literal, so the caller must NOT modify the returned pointer.
   // in: absolute path. out: path relative to the resolved FS root.
   static const char* stripPrefix(const char* path);
+
+  // Write or append len bytes, then read the size back: littlefs commits in close().
+  // out: FS_WRITE_SHORT unless the file grew by exactly len, *onDisk = bytes it grew.
+  static FsWrite writeChecked(fs::FS* fs, const char* path, bool append,
+                              const uint8_t* data, size_t len, size_t* onDisk);
 
   // Validate an externally-supplied FS path before any LittleFS call. Every
   // transport that accepts a path (HTTP, Shell over serial / WS / MQTT CLI,

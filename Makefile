@@ -106,12 +106,13 @@ coverage: ## Per-file line-coverage floors from scripts/coverage-floors.txt
 ci: test lint coverage dist ## Local CI: host tests, lint, coverage floors, every board build
 
 .PHONY: lint
-lint: ## cppcheck + clang-tidy on the pure units, the ADS1115 readADC_ ban, then the path-safety, lib-deps and Lua-entry gates
+lint: ## cppcheck + clang-tidy on the pure units, the ADS1115 readADC_ ban, then the path-safety, lib-deps, Lua-entry and route-auth gates
 	./scripts/static-check.sh
 	./scripts/tidy-check.sh
 	./scripts/check-path-safety.sh
 	./scripts/check-lib-deps.sh
 	./scripts/check-lua-entry.sh
+	./scripts/check-route-auth.sh
 
 .PHONY: tidy
 tidy: ## clang-tidy alone (.clang-tidy), via the native test units

@@ -1524,20 +1524,28 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
 
         fs::FS* fs = Shell::resolveFS(path);
         const char* fsPath = Shell::stripPrefix(path);
-        File f = fs->open(fsPath, mode);
-        if (f) {
-          size_t written = f.write((const uint8_t*)content, contentLen);
-          f.close();
-          resp["ok"] = true;
-          char msg[64];
-          snprintf(msg, sizeof(msg), "%s %d bytes to %s",
-                   mode[0] == 'a' ? "Appended" : "Wrote", (int)written, path);
-          resp["output"][0] = msg;
-          Log::kvf("MQTT", "mqtt.fs_write mode=%s bytes=%d path=%s",
-                   mode[0] == 'a' ? "append" : "write", (int)written, path);
-        } else {
+        size_t onDisk = 0;
+        const bool append = mode[0] == 'a';
+        const FsWrite w = Shell::writeChecked(fs, fsPath, append, (const uint8_t*)content,
+                                              contentLen, &onDisk);
+        if (w == FS_WRITE_OPEN_FAILED) {
           resp["ok"] = false;
           resp["output"][0] = "Failed to open file";
+        } else {
+          char msg[96];
+          resp["ok"] = w == FS_WRITE_OK;
+          if (w == FS_WRITE_OK) {
+            snprintf(msg, sizeof(msg), "%s %u bytes to %s",
+                     append ? "Appended" : "Wrote", (unsigned)onDisk, path);
+          } else {
+            snprintf(msg, sizeof(msg), "Write failed: %u of %u bytes landed in %s (filesystem full?)",
+                     (unsigned)onDisk, (unsigned)contentLen, path);
+          }
+          resp["output"][0] = msg;
+          resp["bytes"] = onDisk;
+          Log::kvf("MQTT", "mqtt.fs_write mode=%s ok=%d bytes=%u want=%u path=%s",
+                   append ? "append" : "write", w == FS_WRITE_OK, (unsigned)onDisk,
+                   (unsigned)contentLen, path);
         }
       }
       publishCliResponse(prefix, resp, replyCap);
