@@ -121,6 +121,20 @@ H.test("Node.setTimeout queue caps at 8 (matches firmware)", function()
   H.assert_false(Node.setTimeout(100, function() end), "9th should be rejected")
 end)
 
+H.test("Node.setTimeout clamps like the firmware (negative to 0, cap at 30 days)", function()
+  M.reset(); M.install()
+  load_inline([[
+    Node.setTimeout(-5, function() MQTT.publish("t/neg", "1") end)
+    Node.setTimeout(math.huge, function() MQTT.publish("t/huge", "1") end)
+  ]])
+  M.advance(0)
+  H.assert_eq(M.count("MQTT.publish"), 1, "a negative delay fires at once")
+  M.advance(30 * 24 * 3600 * 1000 - 1)
+  H.assert_eq(M.count("MQTT.publish"), 1, "the capped timer must not fire before 30 days")
+  M.advance(1)
+  H.assert_eq(M.count("MQTT.publish"), 2, "math.huge fires at the 30 day cap")
+end)
+
 -- ── MQTT delivery ───────────────────────────────────────────────────────────
 
 H.test("MQTT.subscribe receives delivered messages", function()

@@ -16,7 +16,7 @@ public:
   const char* configKey() override { return "telegram"; }
   void status(ShellOutput out) override;
 
-  static bool send(const char* message);
+  static bool send(const char* message, const char* code = "telegram");
   static bool sendTo(const char* chatId, const char* message);
 
 private:

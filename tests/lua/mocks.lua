@@ -35,6 +35,7 @@ M._mqtt_subs  = {}    -- topic       -> list of callbacks
 M._timers     = {}    -- list of { fire_at = ms, cb = fn }
 
 local MAX_TIMERS = 8  -- matches MAX_TIMERS in ScriptEngine.cpp
+local MAX_DELAY_MS = 30 * 24 * 3600 * 1000  -- LUA_TIMER_MAX_DELAY_MS in lua_timer_policy.h
 
 -- ── Internal helpers ────────────────────────────────────────────────────────
 
@@ -272,6 +273,8 @@ function M.install()
       if #M._timers >= MAX_TIMERS then
         return false  -- queue full, matches firmware
       end
+      if ms < 0 then ms = 0 end  -- clamped like luaTimerFireAt
+      if ms > MAX_DELAY_MS then ms = MAX_DELAY_MS end
       table.insert(M._timers, { fire_at = M.now_ms + ms, cb = callback })
       return true
     end,
