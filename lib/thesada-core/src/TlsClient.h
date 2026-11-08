@@ -40,7 +40,7 @@ public:
   void setCertificate(const char* pem);
   void setPrivateKey(const char* pem);
 
-  // Upper bound for TCP dial plus handshake. Default 20 s.
+  // Upper bound for the handshake, timed from the end of the dial. Default 20 s.
   void setHandshakeTimeout(uint32_t ms) { _handshakeTimeoutMs = ms; }
 
   // Dial host:port on the transport and run the handshake. The host name

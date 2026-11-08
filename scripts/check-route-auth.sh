@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-# Every HTTP route authenticates through _authOrReply / _bodyOrReply, so the login lockout
-# covers it: raw _checkAuth and authenticate() calls only at the listed spots.
+# Every HTTP route authenticates through _authCounted (lockout first, one count per guess):
+# the _checkAuth and authenticate identifiers may appear in code only on the lines below, once each.
 
 set -euo pipefail
 cd "$(cd "$(dirname "$0")/.." && pwd)"
@@ -11,37 +11,41 @@ ALLOWED=(
   "static bool _checkAuth(AsyncWebServerRequest* req, bool hasSideEffect = false,"
   "req->authenticate(webUser, webPass);"
   "if (!_checkAuth(req, hasSideEffect, &guessed)) {"
-  "if (index == 0 && _checkAuth(req)) req->_tempObject = httpBodyBegin(total, maxBytes);"
-  "if (index == 0 && _rlAllow(req->client()->remoteIP().toString()) && _checkAuth(req)) req->_tempObject = malloc(1);"
 )
 
 [ -f "$HS" ] || { echo "check-route-auth: $HS not found" >&2; exit 1; }
 
-hits="$(find lib src -type f \( -name '*.cpp' -o -name '*.h' \) \
-  -exec grep -HnE '(_checkAuth|[^A-Za-z_]authenticate)[[:space:]]*\(' {} + 2>/dev/null | sort || true)"
+# Token match on code with // comments cut, so a call split across lines or taken by address still counts.
+hits="$(find lib src -type f \( -name '*.cpp' -o -name '*.h' \) -print0 2>/dev/null |
+  xargs -0 awk '{ line = $0; sub(/\/\/.*$/, "", line); print FILENAME ":" FNR ":" line }' |
+  grep -wE '_checkAuth|authenticate' | sort || true)"
 
 status=0
 seen=0
+count=()
+for i in "${!ALLOWED[@]}"; do count[$i]=0; done
 while IFS= read -r hit; do
   [ -z "$hit" ] && continue
   seen=$((seen + 1))
   file="${hit%%:*}"
-  text="$(printf '%s' "${hit#*:*:}" | sed -E 's/^[[:space:]]+//')"
+  text="$(printf '%s' "${hit#*:*:}" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')"
   ok=0
   if [ "$file" = "$HS" ]; then
-    for a in "${ALLOWED[@]}"; do
-      [ "$text" = "$a" ] && { ok=1; break; }
+    for i in "${!ALLOWED[@]}"; do
+      [ "$text" = "${ALLOWED[$i]}" ] && { ok=1; count[$i]=$((count[$i] + 1)); break; }
     done
   fi
   if [ "$ok" -eq 0 ]; then
-    echo "check-route-auth: raw auth call outside the lockout path: $hit" >&2
+    echo "check-route-auth: raw auth use outside the lockout path: $hit" >&2
     status=1
   fi
 done <<< "$hits"
 
-if [ "$seen" -lt "${#ALLOWED[@]}" ]; then
-  echo "check-route-auth: found $seen auth calls, expected at least ${#ALLOWED[@]} - pattern stale?" >&2
-  status=1
-fi
-[ "$status" -eq 0 ] && echo "check-route-auth: ok ($seen calls, all on the lockout path)"
+for i in "${!ALLOWED[@]}"; do
+  if [ "${count[$i]}" -ne 1 ]; then
+    echo "check-route-auth: expected the allowed line once, found ${count[$i]}: ${ALLOWED[$i]}" >&2
+    status=1
+  fi
+done
+[ "$status" -eq 0 ] && echo "check-route-auth: ok ($seen uses, all on the lockout path)"
 exit "$status"

@@ -269,6 +269,10 @@ function M.install()
     ip         = function() record("Node.ip");      return "0.0.0.0" end,
     setTimeout = function(ms, callback)
       record("Node.setTimeout", ms)
+      -- luaL_checknumber: numeric strings convert, anything else raises
+      local n = tonumber(ms)
+      if n == nil then error("bad argument #1 to 'setTimeout' (number expected)", 2) end
+      ms = n
       if ms ~= ms then return false end  -- NaN refused, matches firmware
       if #M._timers >= MAX_TIMERS then
         return false  -- queue full, matches firmware
@@ -315,8 +319,8 @@ function M.install()
       record("Telegram.send", chat_id, msg)
       return true
     end,
-    broadcast = function(msg)
-      record("Telegram.broadcast", msg)
+    broadcast = function(msg, code)
+      record("Telegram.broadcast", msg, code)
       return true
     end,
   }

@@ -45,6 +45,14 @@ inline TempVerdict tempGuardJudge(TempGuard& g, float c, float maxDelta) {
   return v;
 }
 
+// Floor for temperature.interval_s: 0 would sample every loop pass.
+constexpr uint32_t TEMP_INTERVAL_MIN_S = 5;
+
+// in: configured temperature.interval_s. out: seconds, at least the floor.
+inline uint32_t tempIntervalS(uint32_t raw) {
+  return raw < TEMP_INTERVAL_MIN_S ? TEMP_INTERVAL_MIN_S : raw;
+}
+
 // Missed intervals before HA marks a per-sensor entity unavailable. A stale
 // probe skips its per-sensor topic, so without expiry HA shows the old value.
 constexpr uint32_t TEMP_EXPIRE_INTERVALS = 3;

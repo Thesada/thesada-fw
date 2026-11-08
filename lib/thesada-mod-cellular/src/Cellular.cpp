@@ -25,6 +25,7 @@
 #include <http_fetch_policy.h>
 #include <boot_wait_policy.h>
 #include <cell_recover_policy.h>
+#include <http_url_policy.h>
 #include <atomic>
 
 // ── TinyGSM ─────────────────────────────────────────────────────────────────
@@ -1158,14 +1159,14 @@ bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
   }
   char req[500];
   int reqLen = snprintf(req, sizeof(req),
-    "GET %s HTTP/1.1\r\n"
+    "GET %s%s HTTP/1.1\r\n"
     "Host: %s\r\n"
     "Connection: close\r\n"
     "User-Agent: thesada-fw\r\n"
     "Accept: */*\r\n"
     "%s"
     "\r\n",
-    path, host, rangeHdr);
+    httpTargetLead(path), path, host, rangeHdr);
   if (reqLen <= 0 || reqLen >= (int)sizeof(req)) {
     Log::error(TAG, "cellular.https_get_failed reason=request_overflow");
     client.stop();

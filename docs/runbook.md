@@ -44,7 +44,7 @@ What the user sees: the device drops mTLS and the app has pushed it into **passw
 2. Rule out signal vs SIM: `Registration DENIED` / `timeout` points to coverage/registration; a `SIM not ready` points to the SIM itself (note: blocked vs absent are not distinguished).
 3. Check the SIM with the carrier (quota, block, activation). OneSimCard SIMs need handset-first activation before they work in the modem.
 4. On the device, a wedged modem self-recovers: an activation timeout triggers a DC3 hard power-cycle (`Cellular::hardReset`), and `cell.reset` forces one from the shell. Rebooting the device works too.
-5. Failover: if WiFi is available the device uses it after 60s; cellular is the fallback path.
+5. Failover: the MQTT session moves back to WiFi as soon as WiFi is up. The 60 s is the cellular teardown after that. Cellular is the fallback path.
 
 ## Heap-reboot loop
 

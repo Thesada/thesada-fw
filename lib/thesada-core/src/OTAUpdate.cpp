@@ -888,7 +888,8 @@ static bool downloadBinaryChunkedCellular(
       Cellular::httpsGet(host, path, port, otaCellularCa(), counting, &status, offset, end);
       offset += got;
       if (offset > end) { done = true; break; }
-      if (status != 0 && status != 206 && !(status == 200 && whole)) {
+      // A 5xx is the host, not the image: spend a try on it.
+      if (status != 0 && status < 500 && status != 206 && !(status == 200 && whole)) {
         Log::kvfe(TAG, "ota.chunk_failed offset=%u status=%d", (unsigned)offset, status);
         return false;
       }
