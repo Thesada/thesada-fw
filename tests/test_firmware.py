@@ -22,6 +22,8 @@ import argparse
 import glob
 import json
 import base64
+import os
+import ssl
 import urllib.request
 import urllib.error
 
@@ -765,7 +767,7 @@ def test_filesystem(r):
     # df
     lines = sh.cmd("fs.df")
     lfs_line = next((l for l in lines if "LittleFS:" in l), None)
-    sd_line  = next((l for l in lines if "SD card:" in l), None)
+    sd_line  = next((l for l in lines if l.lstrip().startswith("/sd:") or "SD card:" in l), None)
 
     if lfs_line:
         r.ok("fs.df (LittleFS)", lfs_line.strip())
@@ -1046,7 +1048,7 @@ def test_shell(r):
 
     # module.list
     lines = sh.cmd("module.list")
-    if lines and "Compiled modules:" in lines[0]:
+    if lines and "Registered modules" in lines[0]:
         enabled = [l.split("[x]")[1].strip() for l in lines if "[x]" in l]
         r.ok("module.list", f"enabled: {', '.join(enabled)}" if enabled else "none enabled")
     else:
@@ -1347,7 +1349,11 @@ def test_manual_ota(r):
         try:
             req = urllib.request.Request(manifest_url,
                                          headers={"User-Agent": "thesada-fw-test/1.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            # Python builds without a CA bundle (macOS PlatformIO) also get the system file.
+            ctx = ssl.create_default_context()
+            if os.path.exists("/etc/ssl/cert.pem"):
+                ctx.load_verify_locations(cafile="/etc/ssl/cert.pem")
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
                 body = resp.read()
                 if resp.status == 200:
                     try:
@@ -1435,7 +1441,7 @@ def test_manual_sd_log(r):
 
     sh = r.sh
 
-    lines     = sh.cmd("fs.ls /sd/", wait=2.0)
+    lines     = sh.cmd("fs.ls /sd/", wait=10.0)  # a card with hundreds of logs lists slowly
     log_files = [l for l in lines if ".csv" in l.lower()]
 
     if not log_files:
@@ -1444,9 +1450,19 @@ def test_manual_sd_log(r):
 
     r.ok("sd log files present", f"{len(log_files)} log file(s)")
 
-    # Inspect the last log file
-    last_name = log_files[-1].strip().split()[-1]
-    lines     = sh.cmd(f"fs.cat /sd/{last_name}", wait=3.0)
+    # Inspect the last log file. Serial fs.cat sends the whole file, so a big one
+    # is judged by its listed size instead of being read.
+    last_parts = log_files[-1].strip().split()
+    last_name  = last_parts[-1]
+    if not last_parts[0].isdigit():
+        r.skip(f"sd log content ({last_name}: no size in the listing)")
+        return
+    last_size = int(last_parts[0])
+    if last_size > 64 * 1024:
+        r.skip(f"sd log content ({last_name} holds {last_size} bytes, too big to read over serial)")
+        return
+    last_path = last_name if last_name.startswith("/") else f"/sd/{last_name}"
+    lines     = sh.cmd(f"fs.cat {last_path}", wait=3.0)
 
     if lines and len(lines) >= 2:
         print(f"\n  {DIM}Last 3 lines of {last_name}:{RESET}")
@@ -1684,6 +1700,8 @@ Examples:
         device_ip = None  # resolved later via ifconfig
 
     r = Runner(sh, skips)
+    mqtt_failed = 0
+    interrupted = False
 
     try:
         if args.board:
@@ -1723,16 +1741,17 @@ Examples:
             mqtt_r = Runner(mqtt_sh, skips)
             test_mqtt_cli(mqtt_r)
             mqtt_sh.close()
-            mqtt_r.summary()
+            mqtt_failed = mqtt_r.summary()
 
     except KeyboardInterrupt:
         print(f"\n{YELLOW}Interrupted.{RESET}")
+        interrupted = True
 
     finally:
         sh.close()
 
     failed = r.summary()
-    sys.exit(0 if failed == 0 else 1)
+    sys.exit(0 if failed == 0 and mqtt_failed == 0 and not interrupted else 1)
 
 
 if __name__ == "__main__":

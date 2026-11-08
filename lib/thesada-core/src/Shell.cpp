@@ -14,6 +14,7 @@
 #include "SensorRegistry.h"
 #include "Net.h"
 #include "path_safety_policy.h"
+#include "config_write_policy.h"
 #include "cell_ntp_policy.h"
 #include "ap_policy.h"
 #include "glob_policy.h"
@@ -117,11 +118,8 @@ ShellResult Shell::execute(const char* line, ShellOutput out) {
   return shellDispatchResult(split, argc, cmd != nullptr, handlerFailed);
 }
 
-// Stage a command for main-loop execution via the deferred dispatcher.
-// Capture by-value of the sink intentional - the caller's lambda may
-// reference task-local state that goes out of scope before loop()
-// fires; std::function's small-buffer optimization keeps trivial
-// captures inline.
+// Stage a command for main-loop execution. sink arrives by value (the copy happens on
+// the caller's stack) and is moved into the slot, so nothing allocates under the lock.
 bool Shell::enqueue(const char* line, ShellOutput sink) {
   if (!line || strlen(line) == 0) return false;
   if (!shellFits(line, DEFERRED_LINE_LEN)) return false;
@@ -133,7 +131,7 @@ bool Shell::enqueue(const char* line, ShellOutput sink) {
     slot.mode = SlotMode::Shell;
     strncpy(slot.line, line, sizeof(slot.line) - 1);
     slot.line[sizeof(slot.line) - 1] = '\0';
-    slot.sink = sink;
+    slot.sink = std::move(sink);
     slot.fn = nullptr;
     slot.active = true;
     _ringTail = next;
@@ -385,6 +383,25 @@ fs::FS* Shell::resolveFS(const char* path) {
   return &LittleFS;
 }
 
+FsWrite Shell::writeChecked(fs::FS* fs, const char* path, bool append,
+                            const uint8_t* data, size_t len, size_t* onDisk) {
+  *onDisk = 0;
+  size_t before = 0;
+  if (append) {
+    File p = fs->open(path, FILE_READ);
+    if (p) { before = p.size(); p.close(); }
+  }
+  File f = fs->open(path, append ? FILE_APPEND : FILE_WRITE);
+  if (!f) return FS_WRITE_OPEN_FAILED;
+  size_t written = len ? f.write(data, len) : 0;
+  f.close();
+  size_t after = 0;
+  File chk = fs->open(path, FILE_READ);
+  if (chk) { after = chk.size(); chk.close(); }
+  *onDisk = after >= before ? after - before : 0;
+  return fileWriteLanded(written, *onDisk, len) ? FS_WRITE_OK : FS_WRITE_SHORT;
+}
+
 const char* Shell::stripPrefix(const char* path) {
   if (!path) return path;
   for (int i = 0; i < _fsMountCount; i++) {
@@ -606,14 +623,20 @@ static void cmd_write(int argc, char** argv, ShellOutput out) {
 
   String content(argv[2]);  // restFrom 2: the rest of the line as typed
 
-  File f = fs->open(fsPath, append ? "a" : "w");
-  if (!f) { out("Failed to open for writing"); return; }
-  f.print(content);
-  f.close();
+  size_t onDisk = 0;
+  const FsWrite w = Shell::writeChecked(fs, fsPath, append, (const uint8_t*)content.c_str(),
+                                        content.length(), &onDisk);
+  if (w == FS_WRITE_OPEN_FAILED) { Shell::fail(out, "Failed to open for writing"); return; }
 
-  char msg[64];
-  snprintf(msg, sizeof(msg), "%s %d bytes to %s",
-           append ? "Appended" : "Wrote", content.length(), fsPath);
+  char msg[160];
+  if (w == FS_WRITE_SHORT) {
+    snprintf(msg, sizeof(msg), "Write failed: %u of %u bytes landed in %s (filesystem full?)",
+             (unsigned)onDisk, (unsigned)content.length(), fsPath);
+    Shell::fail(out, msg);
+    return;
+  }
+  snprintf(msg, sizeof(msg), "%s %u bytes to %s",
+           append ? "Appended" : "Wrote", (unsigned)onDisk, fsPath);
   out(msg);
 }
 
@@ -1286,7 +1309,9 @@ static void cmd_ntp(int argc, char** argv, ShellOutput out) {
     if (epoch > 1700000000UL) {
       struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
       settimeofday(&tv, nullptr);
-      struct tm* t = gmtime(&epoch);
+      struct tm tmv;
+      gmtime_r(&epoch, &tmv);
+      struct tm* t = &tmv;
       char ts[32];
       strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", t);
       snprintf(line, sizeof(line), "Time set to %s (epoch %ld)", ts, (long)epoch);
@@ -1319,7 +1344,9 @@ static void cmd_ntp(int argc, char** argv, ShellOutput out) {
       for (uint8_t i = 0; i < n; i++) {
         if (!cell->ntpSync(host[i], timeoutMs)) continue;
         time_t now = time(nullptr);
-        struct tm* t = gmtime(&now);
+        struct tm tmv;
+        gmtime_r(&now, &tmv);
+        struct tm* t = &tmv;
         char ts[32];
         strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", t);
         snprintf(line, sizeof(line), "Synced via cellular - UTC: %s", ts);
@@ -1335,7 +1362,9 @@ static void cmd_ntp(int argc, char** argv, ShellOutput out) {
   }
 
   time_t now = time(nullptr);
-  struct tm* t = gmtime(&now);
+  struct tm tmv;
+  gmtime_r(&now, &tmv);
+  struct tm* t = &tmv;
 
   if (now < 1700000000) {
     out("NTP: not synced (time is before 2023)");

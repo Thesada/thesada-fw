@@ -92,8 +92,9 @@ static bool _heartbeatEnabled = true;
 void setup() {
   Serial.begin(115200);
 #if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
-  // Drop console output when no host reads; a blocked write starves the task watchdog.
-  Serial.setTxTimeoutMs(0);
+  // Bounded wait when no host reads: 0 cut every line past the 256 B buffer,
+  // an unbounded write starves the task watchdog.
+  Serial.setTxTimeoutMs(50);
 #endif
   logBootCause();
   OTAUpdate::rollbackIfCrashLoop();

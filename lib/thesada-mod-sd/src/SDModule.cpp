@@ -219,11 +219,18 @@ void SDModule::logEvent(const char* sensor, const char* json) {
     if (_logPath.isEmpty()) return;
   }
 
+  static uint32_t lastWarnMs = 0;
+  static bool warned = false;
   File f = fs()->open(_logPath, FILE_APPEND);
-  if (!f) return;
-  f.printf("%s,%s,%s\n", ts, sensor, json);
-  f.close();
-  _logBytes += rowSize;
+  size_t written = f ? f.printf("%s,%s,%s\n", ts, sensor, json) : 0;
+  if (f) f.close();
+  _logBytes += written;
+  if (written != rowSize && (!warned || millis() - lastWarnMs >= 60000UL)) {
+    warned = true;
+    lastWarnMs = millis();
+    Log::kvfw("SD", "sd.log_write_failed path=%s wrote=%u want=%u",
+              _logPath.c_str(), (unsigned)written, (unsigned)rowSize);
+  }
 }
 
 // Subscribe to temperature, current, and battery EventBus events for SD logging
