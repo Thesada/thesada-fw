@@ -5,11 +5,29 @@
 #include <stddef.h>
 #include <string.h>
 
-// Bytes one character takes inside a JSON string, as ArduinoJson writes it.
+// Bytes one character takes inside a JSON string, as ArduinoJson 7 writes it.
+// It writes other control bytes raw, so alertScrubControls() runs first.
 inline size_t alertJsonCharLen(unsigned char c) {
   if (c == '"' || c == '\\' || c == '\b' || c == '\f' || c == '\n' || c == '\r' || c == '\t') return 2;
-  if (c < 0x20) return 6;
   return 1;
+}
+
+// Replaces the control bytes ArduinoJson would write raw (invalid JSON) with a space.
+inline void alertScrubControls(char* s) {
+  for (; s && *s; s++) {
+    const unsigned char c = (unsigned char)*s;
+    if (c < 0x20 && alertJsonCharLen(c) == 1) *s = ' ';
+  }
+}
+
+// Length of s cut to at most max bytes without splitting a UTF-8 character.
+inline size_t alertUtf8Cut(const char* s, size_t max) {
+  if (!s) return 0;
+  size_t n = strlen(s);
+  if (n <= max) return n;
+  n = max;
+  while (n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80) n--;
+  return n;
 }
 
 // Escaped length of s[0..n).

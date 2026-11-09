@@ -71,8 +71,35 @@ H.test("rules example: two probes with one name keep their own streaks", functio
   H.assert_eq(broadcasts_containing("Outdoor: 1C - Freeze risk!"), 1, "stale twin must not clear the freeze streak")
 end)
 
-H.test("rules example: the MQTT alert is the JSON the app stores", function()
+H.test("rules example: an odd probe name reaches broadcast unchanged", function()
   load_example()
+  local odd = { name = 'Out"door\\\n\1', address = "28AA00000000000A", temp_c = 1, temp = 1 }
+  for _ = 1, 5 do
+    M.fire_event("temperature", { sensors = { odd } })
+  end
+  local b = M.calls_to("Telegram.broadcast")
+  H.assert_eq(#b, 1, "one alert")
+  H.assert_eq(b[1].args[1], odd.name .. ": 1C - Freeze risk!", "firmware escapes, the script passes it raw")
+  H.assert_eq(b[1].args[2], "freeze")
+end)
+
+local FREEZE_1 = { name = "Outdoor", address = "28AA00000000000B", temp_c = 1, temp = 1 }
+
+H.test("rules example: one alert per firing, carrying the rule code", function()
+  load_example()
+  for _ = 1, 10 do
+    M.fire_event("temperature", { sensors = { FREEZE_1 } })
+  end
+  local b = M.calls_to("Telegram.broadcast")
+  H.assert_eq(#b, 1, "one alert in two sustain windows")
+  H.assert_contains(b[1].args[1], "Freeze risk!")
+  H.assert_eq(b[1].args[2], "freeze", "code is the key's kind")
+  H.assert_eq(M.count("MQTT.publish"), 0, "broadcast publishes the alert, the script must not")
+end)
+
+H.test("rules example: without the Telegram module the script publishes the alert JSON", function()
+  load_example()
+  Telegram = nil
   local odd = { name = 'Out"door\\\n\1', address = "28AA00000000000A", temp_c = 1, temp = 1 }
   for _ = 1, 5 do
     M.fire_event("temperature", { sensors = { odd } })
@@ -85,32 +112,7 @@ H.test("rules example: the MQTT alert is the JSON the app stores", function()
   H.assert_true(type(alert) == "table", "payload must be JSON: " .. tostring(raw))
   H.assert_eq(alert.severity, "warn")
   H.assert_eq(alert.code, "freeze")
-  H.assert_eq(alert.message, 'Out"door\\\n?: 1C - Freeze risk!')
   H.assert_contains(raw, "\\u0001", "control byte escaped")
-end)
-
-local FREEZE_1 = { name = "Outdoor", address = "28AA00000000000B", temp_c = 1, temp = 1 }
-
-H.test("rules example: an alert cut off in the Telegram send has reached MQTT and holds its cooldown", function()
-  load_example()
-  Telegram.broadcast = function() error("script.budget_exceeded budget_ms=10000") end
-  for _ = 1, 10 do
-    pcall(M.fire_event, "temperature", { sensors = { FREEZE_1 } })
-  end
-  local pubs = M.calls_to("MQTT.publish")
-  H.assert_eq(#pubs, 1, "one alert in two sustain windows")
-  H.assert_contains(pubs[1].args[2], "Freeze risk!")
-end)
-
-H.test("rules example: a failed Telegram send re-alerts after sustain", function()
-  load_example()
-  local sent = 0
-  Telegram.broadcast = function() sent = sent + 1 return false end
-  for _ = 1, 10 do
-    M.fire_event("temperature", { sensors = { FREEZE_1 } })
-  end
-  H.assert_eq(sent, 2, "a failed send must not start the cooldown")
-  H.assert_eq(M.count("MQTT.publish"), 2)
 end)
 
 H.test("rules example: going stale ends a temperature streak", function()

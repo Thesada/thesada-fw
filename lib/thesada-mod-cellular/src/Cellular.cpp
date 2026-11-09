@@ -25,6 +25,7 @@
 #include <http_fetch_policy.h>
 #include <boot_wait_policy.h>
 #include <cell_recover_policy.h>
+#include <http_url_policy.h>
 #include <atomic>
 
 // ── TinyGSM ─────────────────────────────────────────────────────────────────
@@ -1158,14 +1159,14 @@ bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
   }
   char req[500];
   int reqLen = snprintf(req, sizeof(req),
-    "GET %s HTTP/1.1\r\n"
+    "GET %s%s HTTP/1.1\r\n"
     "Host: %s\r\n"
     "Connection: close\r\n"
     "User-Agent: thesada-fw\r\n"
     "Accept: */*\r\n"
     "%s"
     "\r\n",
-    path, host, rangeHdr);
+    httpTargetLead(path), path, host, rangeHdr);
   if (reqLen <= 0 || reqLen >= (int)sizeof(req)) {
     Log::error(TAG, "cellular.https_get_failed reason=request_overflow");
     client.stop();
@@ -1253,7 +1254,9 @@ bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
     // Body phase. Trust Content-Length over TinyGSM's connected flag:
     // exit when we have the full payload, or after kBodyIdleTimeoutMs of
     // no data when the server hasn't told us how big the body is.
-    if (contentLen > 0 && bodyBytes >= (size_t)contentLen) break;
+    // An empty body (Content-Length: 0, 204, 304) is complete at once, not after the idle wait.
+    if (contentLen >= 0 && bodyBytes >= (size_t)contentLen) break;
+    if (status == 204 || status == 304) break;
 
     // 1024 B per read keeps each CARECV cycle aligned with a full TCP
     // segment from the modem's socket buffer, reducing the number of

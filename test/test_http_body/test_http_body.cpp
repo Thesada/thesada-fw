@@ -109,6 +109,25 @@ void test_plain_bodies_keep_their_verdicts(void) {
   free(b);
 }
 
+void test_denied_marker_refuses_every_chunk(void) {
+  HttpBody* b = httpBodyDenied();
+  TEST_ASSERT_NOT_NULL(b);
+  TEST_ASSERT_TRUE(b->denied);
+  const uint8_t chunk[4] = {'a', 'b', 'c', 'd'};
+  TEST_ASSERT_FALSE(httpBodyAppend(b, chunk, 4, 0));
+  TEST_ASSERT_FALSE(httpBodyComplete(b));
+  TEST_ASSERT_FALSE(b->locked);
+  free(b);
+  HttpBody* lk = httpBodyDenied(true);
+  TEST_ASSERT_TRUE(lk->denied);
+  TEST_ASSERT_TRUE(lk->locked);
+  free(lk);
+  HttpBody* ok = httpBodyBegin(4, 16);
+  TEST_ASSERT_FALSE(ok->denied);
+  TEST_ASSERT_FALSE(ok->locked);
+  free(ok);
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_whole_body_in_chunks);
@@ -120,5 +139,6 @@ int main(int, char**) {
   RUN_TEST(test_chunked_is_length_required_not_empty);
   RUN_TEST(test_unauthorized_wins_over_everything);
   RUN_TEST(test_plain_bodies_keep_their_verdicts);
+  RUN_TEST(test_denied_marker_refuses_every_chunk);
   return UNITY_END();
 }

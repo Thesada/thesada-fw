@@ -124,6 +124,21 @@ void test_expire_after_is_three_intervals(void) {
   TEST_ASSERT_EQUAL_UINT32(0u, tempExpireAfterS(0));
 }
 
+void test_interval_is_floored(void) {
+  TEST_ASSERT_EQUAL_UINT32(TEMP_INTERVAL_MIN_S, tempIntervalS(0));
+  TEST_ASSERT_EQUAL_UINT32(TEMP_INTERVAL_MIN_S, tempIntervalS(TEMP_INTERVAL_MIN_S - 1));
+  TEST_ASSERT_EQUAL_UINT32(60u, tempIntervalS(60));
+  TEST_ASSERT_EQUAL_UINT32(3 * TEMP_INTERVAL_MIN_S, tempExpireAfterS(tempIntervalS(0)));
+}
+
+void test_interval_is_bounded_before_unsigned(void) {
+  TEST_ASSERT_EQUAL_UINT32(5u, TEMP_INTERVAL_MIN_S);
+  TEST_ASSERT_EQUAL_UINT32(TEMP_INTERVAL_MIN_S, tempIntervalS(-1));
+  TEST_ASSERT_EQUAL_UINT32(TEMP_INTERVAL_MAX_S, tempIntervalS(4294968LL));
+  TEST_ASSERT_EQUAL_UINT32(TEMP_INTERVAL_MAX_S, tempIntervalS(TEMP_INTERVAL_MAX_S));
+  TEST_ASSERT_TRUE((unsigned long long)tempIntervalS(4294968LL) * 1000ULL <= UINT32_MAX);
+}
+
 void test_expire_after_saturates_instead_of_wrapping(void) {
   TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, tempExpireAfterS(UINT32_MAX / 3));  // exact
   TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, tempExpireAfterS(UINT32_MAX / 3 + 1));  // wraps to 2
@@ -141,6 +156,8 @@ int main(int, char**) {
   RUN_TEST(test_zero_or_negative_max_delta_disables_guard);
   RUN_TEST(test_gradual_climb_is_always_accepted);
   RUN_TEST(test_expire_after_is_three_intervals);
+  RUN_TEST(test_interval_is_floored);
+  RUN_TEST(test_interval_is_bounded_before_unsigned);
   RUN_TEST(test_expire_after_saturates_instead_of_wrapping);
   return UNITY_END();
 }

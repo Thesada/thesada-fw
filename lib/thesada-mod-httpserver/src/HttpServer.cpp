@@ -330,18 +330,33 @@ static bool _authOrReply(AsyncWebServerRequest* req, bool hasSideEffect = false)
   return false;
 }
 
-// POST bodies live in req->_tempObject, one per request. Chunk 0 decides: an
-// unauthenticated or oversized body is never buffered.
+// POST bodies live in req->_tempObject, one per request. Chunk 0 authenticates and counts
+// once, so a client that drops mid-body still spends its guess. Refused bodies are never buffered.
 static void _bodyChunk(AsyncWebServerRequest* req, uint8_t* data, size_t len,
                        size_t index, size_t total, size_t maxBytes) {
-  if (index == 0 && _checkAuth(req)) req->_tempObject = httpBodyBegin(total, maxBytes);
+  if (index == 0) {
+    const RouteAuth a = _authCounted(req);
+    req->_tempObject = a == ROUTE_AUTH_OK ? httpBodyBegin(total, maxBytes)
+                                          : httpBodyDenied(a == ROUTE_AUTH_LOCKED);
+  }
   httpBodyAppend((HttpBody*)req->_tempObject, data, len, index);
+}
+
+// The chunk-0 verdict, without counting again: the guess that starts a
+// lockout still answers 401, like on the other routes.
+static void _replyDenied(AsyncWebServerRequest* req, bool locked) {
+  if (locked) {
+    req->send(429, "application/json", "{\"ok\":false,\"error\":\"Too many attempts - wait 30s\"}");
+  } else {
+    req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}");
+  }
 }
 
 // The whole body ("" for Content-Length 0), or nullptr after replying 401,
 // 413 past the cap, or 400 when it did not arrive whole.
 static const char* _bodyOrReply(AsyncWebServerRequest* req, size_t maxBytes) {
   const HttpBody* b = (const HttpBody*)req->_tempObject;
+  if (b && b->denied) { _replyDenied(req, b->locked); return nullptr; }
   const RouteAuth a = _authCounted(req);
   if (a == ROUTE_AUTH_LOCKED) {
     req->send(429, "application/json", "{\"ok\":false,\"error\":\"Too many attempts - wait 30s\"}");
@@ -988,7 +1003,11 @@ void HttpServer::setupRoutes() {
   // Accepts multipart/form-data with field "firmware". Uses ESP-IDF Update.h.
   server.on("/ota", HTTP_POST,
     [](AsyncWebServerRequest* req) {
-      if (!_authOrReply(req)) return;
+      const uint8_t* mark = (const uint8_t*)req->_tempObject;
+      if (mark && *mark != ROUTE_AUTH_OK) { _replyDenied(req, *mark == ROUTE_AUTH_LOCKED); return; }
+      // An accepted chunk 0 settles auth: a lockout started meanwhile by other
+      // requests must not skip the restart into the image just flashed.
+      if (!mark && !_authOrReply(req)) return;
       // No authorized-upload marker = no chunk was ever accepted (empty body
       // or marker alloc failure) - nothing was flashed, don't restart.
       if (req->_tempObject == nullptr) { req->send(400, "application/json", "{\"ok\":false,\"error\":\"no firmware received\"}"); return; }
@@ -1006,10 +1025,14 @@ void HttpServer::setupRoutes() {
        size_t index, uint8_t* data, size_t len, bool final) {
       // Upload chunks arrive BEFORE the onRequest auth check fires, so auth
       // must be enforced here. _tempObject doubles as the per-request
-      // authorized marker: heap pointer set on success, freed by the request
-      // destructor. NULL = unauthorized, drop every chunk untouched.
-      if (index == 0 && _rlAllow(req->client()->remoteIP().toString()) && _checkAuth(req)) req->_tempObject = malloc(1);
-      if (req->_tempObject == nullptr) {
+      // marker: the chunk-0 RouteAuth on the heap, freed by the request destructor.
+      // Only ROUTE_AUTH_OK lets a chunk through, NULL drops every chunk.
+      if (index == 0) {
+        uint8_t* mark = (uint8_t*)malloc(1);
+        if (mark) *mark = (uint8_t)_authCounted(req);
+        req->_tempObject = mark;
+      }
+      if (req->_tempObject == nullptr || *(const uint8_t*)req->_tempObject != ROUTE_AUTH_OK) {
         if (index == 0) Log::warn(TAG, "web.ota_upload_refused reason=unauthorized");
         return;
       }
@@ -1186,6 +1209,10 @@ void HttpServer::setupRoutes() {
         const size_t n = Log::ringSnapshot(replay, Log::RING_SNAPSHOT_CAP);
         if (n > 0) client->text(replay, n);
         free(replay);
+      } else {
+        // A shorter copy would keep the oldest lines, so say why there is no history.
+        Log::kvfw(TAG, "web.ws_replay_skipped reason=no_memory bytes=%u", (unsigned)Log::RING_SNAPSHOT_CAP);
+        client->text("[log history skipped: low memory, new lines still stream]");
       }
     } else if (type == WS_EVT_DATA) {
       // Only accept final, unfragmented text frames. On WS_EVT_DATA the

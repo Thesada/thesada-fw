@@ -11,6 +11,8 @@
 struct HttpBody {
   size_t len;      // bytes received, SIZE_MAX once a chunk was refused
   size_t cap;      // declared total
+  bool   denied;   // chunk 0 failed auth and already counted the guess
+  bool   locked;   // ...and the client was locked out at that point
   char   data[1];  // cap bytes + NUL
 };
 
@@ -31,6 +33,21 @@ inline HttpBody* httpBodyBegin(size_t total, size_t maxBytes) {
   if (!b) return nullptr;
   b->len = 0;
   b->cap = total;
+  b->denied = false;
+  b->locked = false;
+  b->data[0] = '\0';
+  return b;
+}
+
+// out: a refused marker for a request whose chunk 0 failed auth (locked: it was
+// already locked out), or nullptr when the alloc fails.
+inline HttpBody* httpBodyDenied(bool locked = false) {
+  HttpBody* b = (HttpBody*)malloc(sizeof(HttpBody));
+  if (!b) return nullptr;
+  b->len = SIZE_MAX;
+  b->cap = 0;
+  b->denied = true;
+  b->locked = locked;
   b->data[0] = '\0';
   return b;
 }

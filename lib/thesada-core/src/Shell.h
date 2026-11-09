@@ -117,8 +117,8 @@ public:
   // in: absolute path. out: path relative to the resolved FS root.
   static const char* stripPrefix(const char* path);
 
-  // Write or append len bytes, then read the size back: littlefs commits in close().
-  // out: FS_WRITE_SHORT unless the file grew by exactly len, *onDisk = bytes it grew.
+  // in: onDisk non-null. Writes or appends len bytes, then reads the size back (littlefs commits in close()).
+  // out: OPEN_FAILED if open fails, OK only when write() and growth both equal len, *onDisk = growth.
   static FsWrite writeChecked(fs::FS* fs, const char* path, bool append,
                               const uint8_t* data, size_t len, size_t* onDisk);
 
