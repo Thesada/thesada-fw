@@ -1,6 +1,6 @@
 // thesada-fw - TelegramModule.h
-// Telegram Bot API and webhook.url sender for Lua alert rules. send()
-// also publishes the message to EventBus ("alert").
+// Telegram Bot API and webhook.url sender for Lua alert rules. send() publishes
+// EventBus ("alert") at once, chat and webhook sends queue for loop().
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
@@ -20,6 +20,17 @@ public:
   static bool sendTo(const char* chatId, const char* message);
 
 private:
+  static bool _deliverTo(const char* chatId, const char* message);
+  static void _deliverAll(const char* message);
+  static bool _enqueue(const char* chatId, const char* message);
+
+  // Loop task only: Lua, the shell and rules all run there.
+  static constexpr uint8_t QUEUE_LEN = 4;
+  struct Pending { char chat[24]; char msg[512]; };
+  static Pending _queue[QUEUE_LEN];
+  static uint8_t _head;
+  static uint8_t _queued;
+
   static bool _ready;
   // Telegram Bot API client - CA-verified against the Telegram API root
   // (see telegram_ca_progmem.h). Single instance, never deleted, avoids

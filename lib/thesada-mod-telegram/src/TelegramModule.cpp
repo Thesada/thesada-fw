@@ -37,6 +37,9 @@ extern "C" {
 static const char* TAG = "Telegram";
 
 bool TelegramModule::_ready = false;
+TelegramModule::Pending TelegramModule::_queue[TelegramModule::QUEUE_LEN];
+uint8_t TelegramModule::_head   = 0;
+uint8_t TelegramModule::_queued = 0;
 WiFiClientSecure TelegramModule::_secClient;
 String TelegramModule::_caCert;
 String TelegramModule::_webhookCaCert;
@@ -155,8 +158,15 @@ void TelegramModule::begin() {
 
 // ---------------------------------------------------------------------------
 
-// No periodic work - sends are triggered externally
-void TelegramModule::loop() {}
+// One queued send per pass, at the loop's own shallow stack.
+void TelegramModule::loop() {
+  if (_queued == 0) return;
+  Pending& p = _queue[_head];
+  if (p.chat[0]) _deliverTo(p.chat, p.msg);
+  else _deliverAll(p.msg);
+  _head = (_head + 1) % QUEUE_LEN;
+  _queued--;
+}
 
 // ---------------------------------------------------------------------------
 
@@ -200,7 +210,7 @@ static int boundedPost(Client& c, const char* host, uint16_t port, bool tls, con
 // Skips the send if free heap is below TELEGRAM_HEAP_FLOOR_BYTES so the
 // TLS handshake here cannot starve the MQTT client of buffer space.
 // MQTT has hard priority because it carries OTA.
-bool TelegramModule::sendTo(const char* chatId, const char* message) {
+bool TelegramModule::_deliverTo(const char* chatId, const char* message) {
   if (!chatId || strlen(chatId) == 0 || !message || strlen(message) == 0) return false;
   if (!WiFiManager::connected()) { Log::warn(TAG, "telegram.send_skipped reason=wifi_down"); return false; }
 
@@ -247,40 +257,62 @@ bool TelegramModule::sendTo(const char* chatId, const char* message) {
 
 // ---------------------------------------------------------------------------
 
-// Broadcast to every chat, the webhook and EventBus("alert"). Only the alert
-// event carries the [heap=N] breadcrumb, chats get the plain message.
+// Publishes the app alert (EventBus "alert", with the [heap=N] breadcrumb) and
+// queues the plain message for every chat and the webhook. true = the app alert
+// went out. Chat delivery is best effort, every skip is logged.
 bool TelegramModule::send(const char* message, const char* code) {
-  if (!_ready) { Log::warn(TAG, "telegram.send_skipped reason=not_ready"); return false; }
+  if (!message || !*message) return false;
   if (!code || !*code) code = "telegram";
   // A caller's code past 32 bytes would leave no room for the message.
   char codeBuf[33];
-  strncpy(codeBuf, code, sizeof(codeBuf) - 1);
-  codeBuf[sizeof(codeBuf) - 1] = '\0';
+  const size_t codeLen = alertUtf8Cut(code, sizeof(codeBuf) - 1);
+  memcpy(codeBuf, code, codeLen);
+  codeBuf[codeLen] = '\0';
+  alertScrubControls(codeBuf);
   code = codeBuf;
 
-  char tagged[256];
-  snprintf(tagged, sizeof(tagged), "%s [heap=%lu]",
-           message, (unsigned long)MQTTClient::currentFreeHeap());
+  char body[256];
+  strncpy(body, message ? message : "", sizeof(body) - 1);
+  body[sizeof(body) - 1] = '\0';
+  alertScrubControls(body);
+  char crumb[24];
+  snprintf(crumb, sizeof(crumb), " [heap=%lu]", (unsigned long)MQTTClient::currentFreeHeap());
 
-  // The app's alert contract, cut to fit the 256 B MQTT alert slot (alert_payload_policy.h).
+  // The app's alert contract in the 256 B MQTT alert slot, breadcrumb kept (alert_payload_policy.h).
   JsonDocument doc;
   doc["severity"] = "warn";
   doc["code"]     = code;
-  doc["message"]  = String(tagged).substring(0, alertMessageFit("warn", code, tagged, 256));
+  doc["message"]  = String(body).substring(0, alertMessageFit("warn", code, body, 256 - strlen(crumb))) + crumb;
   EventBus::publish("alert", doc.as<JsonObject>());
+  if (!_ready) Log::warn(TAG, "telegram.send_skipped reason=not_ready");
+  else _enqueue("", message);
+  return true;
+}
 
+// Every configured chat, then the optional webhook. Runs from loop() only.
+void TelegramModule::_deliverAll(const char* message) {
   // Send to all configured chat_ids (supports both array and object format).
   JsonObject cfg    = Config::get();
   JsonVariant ids   = cfg["telegram"]["chat_ids"];
+  // A chat id is a string or an integer (group ids are negative numbers).
+  auto sendToId = [message](JsonVariant v) {
+    char num[24];
+    const char* chatId = v.as<const char*>();
+    // A 13-digit id is held as a double here: print it as a decimal integer.
+    if (!chatId && v.is<double>()) {
+      const double d = v.as<double>();
+      if (d == (double)(long long)d && d > -1e15 && d < 1e15) {
+        snprintf(num, sizeof(num), "%lld", (long long)d);
+        chatId = num;
+      }
+    }
+    if (chatId && *chatId) _deliverTo(chatId, message);
+    else Log::warn(TAG, "telegram.send_skipped reason=bad_chat_id");
+  };
   if (ids.is<JsonArray>()) {
-    for (const char* chatId : ids.as<JsonArray>()) {
-      sendTo(chatId, message);
-    }
+    for (JsonVariant v : ids.as<JsonArray>()) sendToId(v);
   } else if (ids.is<JsonObject>()) {
-    for (JsonPair kv : ids.as<JsonObject>()) {
-      const char* chatId = kv.value().as<const char*>();
-      if (chatId && strlen(chatId) > 0) sendTo(chatId, message);
-    }
+    for (JsonPair kv : ids.as<JsonObject>()) sendToId(kv.value());
   }
 
   // Optional HTTP webhook.
@@ -319,7 +351,33 @@ bool TelegramModule::send(const char* message, const char* code) {
       }
     }
   }
+}
 
+// Lua and rules callers sit deep in shell, MQTT or timer chains, too deep for a
+// TLS handshake on the loop task, so sends queue here and loop() delivers them.
+bool TelegramModule::sendTo(const char* chatId, const char* message) {
+  if (!chatId || !*chatId) return false;
+  return _enqueue(chatId, message);
+}
+
+bool TelegramModule::_enqueue(const char* chatId, const char* message) {
+  if (!message || !*message) return false;
+  if (strlen(chatId) >= sizeof(_queue[0].chat)) {
+    Log::warn(TAG, "telegram.send_skipped reason=bad_chat_id");
+    return false;
+  }
+  if (_queued >= QUEUE_LEN) {
+    Log::warn(TAG, "telegram.send_skipped reason=queue_full");
+    return false;
+  }
+  Pending& p = _queue[(_head + _queued) % QUEUE_LEN];
+  strcpy(p.chat, chatId);
+  const size_t n = alertUtf8Cut(message, sizeof(p.msg) - 1);
+  if (message[n]) Log::kvfw(TAG, "telegram.message_cut bytes=%u kept=%u",
+                            (unsigned)strlen(message), (unsigned)n);
+  memcpy(p.msg, message, n);
+  p.msg[n] = '\0';
+  _queued++;
   return true;
 }
 

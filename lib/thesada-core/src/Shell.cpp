@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "Shell.h"
+#include "config_scalar_policy.h"
 #include "Identity.h"
 #include "Config.h"
 #include "Secret.h"
@@ -1025,21 +1026,12 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
       }
     }
 
-    if (value == "true") target.set(true);
-    else if (value == "false") target.set(false);
-    else {
-      char* end;
-      long lv = strtol(value.c_str(), &end, 10);
-      if (*end == '\0' && value.length() > 0) {
-        target.set(lv);
-      } else {
-        float fv = strtof(value.c_str(), &end);
-        if (*end == '\0' && value.length() > 0) {
-          target.set(fv);
-        } else {
-          target.set(value);
-        }
-      }
+    bool bv; long long iv; float fv;
+    switch (configScalarKind(value.c_str(), &bv, &iv, &fv)) {
+      case CFG_SCALAR_BOOL:  target.set(bv); break;
+      case CFG_SCALAR_INT:   target.set(iv); break;
+      case CFG_SCALAR_FLOAT: target.set(fv); break;
+      default:               target.set(value); break;
     }
   } else {
     // Top-level key.

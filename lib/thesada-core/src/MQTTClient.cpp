@@ -1987,7 +1987,7 @@ void MQTTClient::publishDiscovery() {
   if (sensors) {
     const char* tunit = cfg["temperature"]["unit"] | "C";
     const char* haUnit = (tunit[0] == 'F' || tunit[0] == 'f') ? "\xC2\xB0""F" : "\xC2\xB0""C";
-    uint32_t expS = tempExpireAfterS(cfg["temperature"]["interval_s"] | 60);
+    uint32_t expS = tempExpireAfterS(tempIntervalS(cfg["temperature"]["interval_s"] | 60LL));
     for (JsonObject s : sensors) {
       const char* sname = s["name"] | "unknown";
       makeSlug(sname, slug, sizeof(slug));

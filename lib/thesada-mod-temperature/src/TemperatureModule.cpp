@@ -20,7 +20,7 @@ static_assert(TEMP_NO_READING == DEVICE_DISCONNECTED_C, "guard sentinel must mat
 void TemperatureModule::begin() {
   JsonObject cfg = Config::get();
 
-  _intervalMs     = (uint32_t)(cfg["temperature"]["interval_s"] | 60) * 1000;
+  _intervalMs     = tempIntervalS(cfg["temperature"]["interval_s"] | 60LL) * 1000UL;
   _autoDiscover   = cfg["temperature"]["auto_discover"]       | true;
   _conversionMs   = cfg["temperature"]["conversion_wait_ms"]  | 750;
   if (_conversionMs > 1000) _conversionMs = 1000;

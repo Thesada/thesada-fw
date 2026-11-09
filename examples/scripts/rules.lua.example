@@ -5,7 +5,6 @@
 
 Log.info("rules.lua loaded")
 
-local prefix = Config.get("mqtt.topic_prefix")
 local unit   = Config.get("temperature.unit") or "C"
 
 -- ── Alert infrastructure ────────────────────────────────────────────────────
@@ -42,34 +41,17 @@ local function json_str(v)
   return '"' .. s .. '"'
 end
 
--- The <prefix>/alert payload the app stores. code is the key's kind, e.g. "freeze".
-local function alert_json(msg, key)
-  return '{"severity":"warn","code":' .. json_str(key:match("^[^:]+")) ..
-         ',"message":' .. json_str(msg) .. '}'
-end
-
--- Send alert to all channels: log, MQTT, Telegram.
--- MQTT and the cooldown come before the slow Telegram send, so a callback
--- cut off during it has still alerted the app and does not re-alert on every
--- reading. A failed send drops the cooldown, so the alert re-fires after
--- sustain. If it fails 3 times in a row (heap too low, network), reboot to
--- clear fragmentation. The boot alert confirms the node is back.
-local send_failures = 0
-
+-- One alert per firing, code = the key's kind. Telegram.broadcast publishes it
+-- and queues the chats, without the Telegram module the script publishes it.
 local function notify(msg, key)
   Log.warn(msg)
-  MQTT.publish(prefix .. "/alert", alert_json(msg, key))
   set_cooldown(key)
-  if Telegram.broadcast(msg) then
-    send_failures = 0
+  local code = key:match("^[^:]+")
+  if Telegram then
+    Telegram.broadcast(msg, code)
   else
-    cooldown[key] = nil
-    send_failures = send_failures + 1
-    Log.error("Telegram failed (" .. send_failures .. "/3)")
-    if send_failures >= 3 then
-      Log.error("3 consecutive Telegram failures - rebooting")
-      Node.restart()
-    end
+    MQTT.publish(Config.get("mqtt.topic_prefix") .. "/alert",
+      '{"severity":"warn","code":' .. json_str(code) .. ',"message":' .. json_str(msg) .. '}')
   end
 end
 
