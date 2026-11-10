@@ -357,7 +357,8 @@ static const char* _bodyOrReply(AsyncWebServerRequest* req, size_t maxBytes) {
     return nullptr;
   }
   switch (httpBodyVerdict(a == ROUTE_AUTH_OK, req->hasHeader("Transfer-Encoding"),
-                          req->contentLength(), maxBytes, b)) {
+                          req->hasHeader("Content-Length"), req->contentLength(),
+                          maxBytes, b)) {
     case HTTP_BODY_OK:
       return b->data;
     case HTTP_BODY_EMPTY:
@@ -366,7 +367,7 @@ static const char* _bodyOrReply(AsyncWebServerRequest* req, size_t maxBytes) {
       req->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}");
       return nullptr;
     case HTTP_BODY_LENGTH_REQUIRED:
-      req->send(411, "application/json", "{\"ok\":false,\"error\":\"Content-Length required, chunked bodies are refused\"}");
+      req->send(411, "application/json", "{\"ok\":false,\"error\":\"Content-Length required, chunked or unsized bodies are refused\"}");
       return nullptr;
     case HTTP_BODY_TOO_LARGE:
       req->send(413, "application/json", "{\"ok\":false,\"error\":\"body too large\"}");

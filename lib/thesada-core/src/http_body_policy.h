@@ -75,17 +75,18 @@ enum HttpBodyVerdict {
   HTTP_BODY_OK = 0,             // whole body buffered
   HTTP_BODY_EMPTY,              // Content-Length 0, a legitimate empty body
   HTTP_BODY_UNAUTHORIZED,       // 401
-  HTTP_BODY_LENGTH_REQUIRED,    // 411, chunked: nothing was buffered
+  HTTP_BODY_LENGTH_REQUIRED,    // 411, chunked or no Content-Length: nothing was buffered
   HTTP_BODY_TOO_LARGE,          // 413
   HTTP_BODY_INCOMPLETE,         // 400, body did not arrive whole
 };
 
-// A chunked body has Content-Length 0 and onBody total 0, so it is never
+// A chunked body, or one with no Content-Length, has length 0 and is never
 // buffered. Checked before the empty case, or it would read as an empty body.
-inline HttpBodyVerdict httpBodyVerdict(bool authed, bool chunked, size_t contentLength,
-                                       size_t maxBytes, const HttpBody* b) {
+inline HttpBodyVerdict httpBodyVerdict(bool authed, bool chunked, bool lengthDeclared,
+                                       size_t contentLength, size_t maxBytes,
+                                       const HttpBody* b) {
   if (!authed) return HTTP_BODY_UNAUTHORIZED;
-  if (chunked) return HTTP_BODY_LENGTH_REQUIRED;
+  if (chunked || !lengthDeclared) return HTTP_BODY_LENGTH_REQUIRED;
   if (contentLength == 0) return HTTP_BODY_EMPTY;
   if (contentLength > maxBytes) return HTTP_BODY_TOO_LARGE;
   if (!httpBodyComplete(b)) return HTTP_BODY_INCOMPLETE;
