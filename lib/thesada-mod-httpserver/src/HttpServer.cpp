@@ -15,6 +15,7 @@
 #include <web_auth_policy.h>
 #include <login_rate_policy.h>
 #include <ttl_policy.h>
+#include <ws_grant_policy.h>
 #include <http_body_policy.h>
 #include <EventBus.h>
 #include <Log.h>
@@ -33,6 +34,7 @@
 #include <WiFi.h>
 #include <mbedtls/platform_util.h>
 #include <esp_timer.h>
+#include <esp_random.h>
 #include <enroll_policy.h>
 #include <config_write_policy.h>
 #include <web_snapshot_policy.h>
@@ -126,14 +128,6 @@ static const char* _createToken() {
   return _tokens[slot].token;
 }
 
-// Constant-time byte compare - no early return on first mismatch, so
-// the time taken does not leak how many leading bytes were correct.
-static bool _constTimeEq(const char* a, const char* b, size_t len) {
-  uint8_t diff = 0;
-  for (size_t i = 0; i < len; i++) diff |= (uint8_t)(a[i] ^ b[i]);
-  return diff == 0;
-}
-
 // Validate a Bearer token. Compares in constant time and walks every
 // slot regardless of an early match, so neither the per-byte compare
 // nor the slot loop leaks token correctness via response timing.
@@ -145,7 +139,7 @@ static bool _validateToken(const char* token) {
   bool found = false;
   for (uint8_t i = 0; i < MAX_TOKENS; i++) {
     bool active = ttlActive(now, _tokens[i].expiry);
-    bool match  = _constTimeEq(_tokens[i].token, token, tlen);
+    bool match  = constTimeEq(_tokens[i].token, token, tlen);
     if (active && match) found = true;
   }
   return found;
@@ -472,33 +466,28 @@ static size_t _configWriteOrReply(AsyncWebServerRequest* req, const char* body, 
   return *bytes;
 }
 
-// IP-based WS pre-auth: GET /api/ws/token (auth-gated) marks the caller's IP as
-// authorized for 30 s. WS_EVT_CONNECT checks the IP - no query-param parsing needed.
-struct _WsAuth { char ip[20]; uint64_t expiry; };
-static _WsAuth _wsAuth[4] = {};
+// Single-use WS grants (ws_grant_policy.h): /api/ws/token mints a random token
+// bound to the caller's IP, the /ws/serial handshake spends it.
+static WsGrant      _wsGrants[WS_GRANT_SLOTS] = {};
+static portMUX_TYPE _wsGrantMux = portMUX_INITIALIZER_UNLOCKED;
 
-// Grant a 30-second WebSocket authorization window for the given IP
-static void _grantWsAuth(const String& ip) {
-  const uint64_t now = _uptimeMs();
-  uint8_t  slot = 0;
-  for (uint8_t i = 0; i < 4; i++) {
-    if (!ttlActive(now, _wsAuth[i].expiry)) { slot = i; break; }
-  }
-  strncpy(_wsAuth[slot].ip, ip.c_str(), sizeof(_wsAuth[0].ip) - 1);
-  _wsAuth[slot].ip[sizeof(_wsAuth[0].ip) - 1] = '\0';
-  _wsAuth[slot].expiry = now + 30000UL;
+// in: issuing IP, out buffer of WS_TOKEN_HEX + 1. out: false when the table is full.
+static bool _issueWsGrant(const String& ip, char* token) {
+  uint8_t raw[WS_TOKEN_HEX / 2];
+  esp_fill_random(raw, sizeof(raw));
+  wsTokenHex(raw, sizeof(raw), token);
+  mbedtls_platform_zeroize(raw, sizeof(raw));
+  portENTER_CRITICAL(&_wsGrantMux);
+  const int slot = wsGrantIssue(_wsGrants, _uptimeMs(), token, ip.c_str());
+  portEXIT_CRITICAL(&_wsGrantMux);
+  return slot >= 0;
 }
 
-// Consume a one-time WebSocket auth token for the given IP
-static bool _consumeWsAuth(const String& ip) {
-  const uint64_t now = _uptimeMs();
-  for (uint8_t i = 0; i < 4; i++) {
-    if (ttlActive(now, _wsAuth[i].expiry) && strcmp(_wsAuth[i].ip, ip.c_str()) == 0) {
-      _wsAuth[i].expiry = 0;  // one-time use
-      return true;
-    }
-  }
-  return false;
+static bool _consumeWsGrant(const char* token, const String& ip) {
+  portENTER_CRITICAL(&_wsGrantMux);
+  const bool ok = wsGrantConsume(_wsGrants, _uptimeMs(), token, ip.c_str());
+  portEXIT_CRITICAL(&_wsGrantMux);
+  return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -780,14 +769,22 @@ void HttpServer::setupRoutes() {
     Log::info(TAG, "web.token_issued");
   });
 
-  // ── GET /api/ws/token - issue a short-lived WS token (auth required) ────────
-  // Clients call this before opening /ws/serial, then pass ?token=<hex>.
-  // Side-effect GET: it mints a 30 s IP-bound WS grant, and /ws/serial reaches
-  // the shell, so a cross-site call must not ride cached Basic credentials.
+  // ── GET /api/ws/token - issue a single-use WS token (auth required) ───────
+  // Clients pass it as /ws/serial?token=<hex>. Side-effect GET: it mints a
+  // grant and /ws/serial reaches the shell, so no cached cross-site Basic.
   server.on("/api/ws/token", HTTP_GET, [](AsyncWebServerRequest* req) {
     if (!_authOrReply(req, /*hasSideEffect=*/true)) return;
-    _grantWsAuth(req->client()->remoteIP().toString());
-    req->send(200, "application/json", "{\"ok\":true}");
+    char token[WS_TOKEN_HEX + 1];
+    if (!_issueWsGrant(req->client()->remoteIP().toString(), token)) {
+      Log::warn(TAG, "web.ws_token_refused reason=table_full");
+      req->send(503, "application/json", "{\"ok\":false,\"error\":\"too many pending terminal logins, retry in 30 s\"}");
+      return;
+    }
+    char body[64];
+    snprintf(body, sizeof(body), "{\"ok\":true,\"token\":\"%s\"}", token);
+    mbedtls_platform_zeroize(token, sizeof(token));
+    req->send(200, "application/json", body);
+    mbedtls_platform_zeroize(body, sizeof(body));
   });
 
   // ── GET /api/info - firmware version + build info (no auth) ──────────────
@@ -1181,29 +1178,31 @@ void HttpServer::setupRoutes() {
 
   // ── WebSocket /ws/serial - bidirectional serial terminal ──────────────────
   // All commands are handled by the Shell core class.
+  // The upgrade is refused before a client exists, so a refused socket never
+  // joins textAll and gets no log line. 401 on refusal (library default).
+  _ws.handleHandshake([](AsyncWebServerRequest* req) -> bool {
+    // Before the grant is spent: a narrowed shell.mode allows no session.
+    if (!shellModeHttpSurfaceAllowed(Shell::mode(), HTTP_SURFACE_TERMINAL)) {
+      Log::kvfw(TAG, "web.ws_rejected reason=shell_mode");
+      return false;
+    }
+    const AsyncWebParameter* p = req->getParam("token");
+    if (!p) {
+      Log::warn(TAG, "web.ws_rejected reason=no_token");
+      return false;
+    }
+    if (!_consumeWsGrant(p->value().c_str(), req->client()->remoteIP().toString())) {
+      Log::warn(TAG, "web.ws_rejected reason=bad_token");
+      return false;
+    }
+    return true;
+  });
+
   _ws.onEvent([](AsyncWebSocket* srv, AsyncWebSocketClient* client,
                  AwsEventType type, void* arg, uint8_t* data, size_t len) {
     if (type == WS_EVT_CONNECT) {
-      // Use the AsyncWebSocketClient lambda param for remoteIP(), not
-      // req->client(). On WS_EVT_CONNECT the underlying lwIP pcb has
-      // already been transferred from the HTTP request's AsyncClient to
-      // the new AsyncWebSocketClient via _switchClient, so
-      // req->client()->_pcb is NULL and the old API null-derefs in
-      // AsyncClient::getRemoteAddress().
-      // Before the grant is spent and before any log replay: a narrowed
-      // shell.mode must not leave an interactive session or its output up.
-      if (!shellModeHttpSurfaceAllowed(Shell::mode(), HTTP_SURFACE_TERMINAL)) {
-        Log::kvfw(TAG, "web.ws_rejected reason=shell_mode");
-        client->close();
-        return;
-      }
-      String ip = client->remoteIP().toString();
-      if (!_consumeWsAuth(ip)) {
-        Log::warn(TAG, "web.ws_rejected reason=not_preauthorized");
-        client->close();
-        return;
-      }
-      // Replay the log ring as one WS message, copied under the ring lock.
+      // The handshake already spent the grant. Replay the log ring as one
+      // WS message, copied under the ring lock.
       char* replay = (char*)malloc(Log::RING_SNAPSHOT_CAP);
       if (replay) {
         const size_t n = Log::ringSnapshot(replay, Log::RING_SNAPSHOT_CAP);

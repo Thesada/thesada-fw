@@ -33,6 +33,7 @@ lib/thesada-core/src/secret_keymap.h            95
 lib/thesada-core/src/secret_heap.h              95
 lib/thesada-core/src/sd_log_policy.h            95
 lib/thesada-core/src/ttl_policy.h               95
+lib/thesada-core/src/ws_grant_policy.h          95
 lib/thesada-core/src/web_auth_policy.h          95
 lib/thesada-core/src/setup_portal_policy.h      95
 lib/thesada-core/src/shell_mode_policy.h        95
@@ -49,4 +50,5 @@ lib/thesada-core/src/ads_sample_policy.h        95
 lib/thesada-core/src/config_write_policy.h       95
 lib/thesada-core/src/web_snapshot_policy.h       95
 lib/thesada-core/src/alert_payload_policy.h      95
+lib/thesada-core/src/config_schema_policy.h      95
 lib/thesada-core/src/config_scalar_policy.h      95

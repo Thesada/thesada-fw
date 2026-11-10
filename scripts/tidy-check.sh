@@ -18,6 +18,8 @@ if [ ! -f "$UNITY/unity.h" ]; then
   pio test -e native --without-testing --without-uploading >/dev/null
 fi
 [ -f "$UNITY/unity.h" ] || { echo "tidy-check: Unity missing under $UNITY after pio test"; exit 2; }
+AJSON=.pio/libdeps/native/ArduinoJson/src
+[ -f "$AJSON/ArduinoJson.h" ] || { echo "tidy-check: ArduinoJson missing under $AJSON after pio test"; exit 2; }
 
 shopt -s nullglob
 units=()
@@ -34,5 +36,5 @@ echo "tidy-check: $TIDY over ${#units[@]} test units, headers lib/thesada-core/s
 # The static analyzer skips header-defined functions nobody in the TU calls;
 # analyze-headers makes it walk every policy function, reached or not.
 "$TIDY" --quiet --extra-arg=-Xclang --extra-arg=-analyzer-opt-analyze-headers \
-  "${units[@]}" -- -std=gnu++14 -I lib/thesada-core/src -I "$UNITY"
+  "${units[@]}" -- -std=gnu++14 -I lib/thesada-core/src -I "$UNITY" -isystem "$AJSON"
 echo "tidy-check: OK"

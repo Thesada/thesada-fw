@@ -3,6 +3,7 @@
 #include "Config.h"
 #include "Log.h"
 #include "config_write_policy.h"
+#include "config_schema_policy.h"
 #include <LittleFS.h>
 
 static const char* TAG = "Config";
@@ -17,6 +18,9 @@ static bool _topicPrefixHeld = false;
 
 // Bumped, and the hooks run, after every call that rebuilt or edited _doc.
 static uint32_t _revision = 0;
+
+// Set by the boot migration when it could not run, empty otherwise.
+static char _schemaAlert[128];
 static void (*_changeHooks[4])() = {};
 uint32_t Config::revision() { return _revision; }
 
@@ -41,7 +45,96 @@ static void clearHeldTopicPrefix() {
   _diskTopicPrefix[0] = '\0';
 }
 
+// Copy /config.json to /config.json.bak through a tmp, read back by size.
+static bool backupConfigFile() {
+  File in = LittleFS.open("/config.json", "r");
+  if (!in) return false;
+  const size_t want = in.size();
+  File out = LittleFS.open("/config.json.bak.tmp", "w");
+  if (!out) { in.close(); return false; }
+  uint8_t buf[256];
+  size_t copied = 0;
+  while (in.available()) {
+    const size_t n = in.read(buf, sizeof(buf));
+    if (n == 0 || out.write(buf, n) != n) break;
+    copied += n;
+  }
+  in.close();
+  out.close();
+  size_t onDisk = 0;
+  File chk = LittleFS.open("/config.json.bak.tmp", "r");
+  if (chk) { onDisk = chk.size(); chk.close(); }
+  if (copied != want || onDisk != want || !LittleFS.rename("/config.json.bak.tmp", "/config.json.bak")) {
+    LittleFS.remove("/config.json.bak.tmp");
+    return false;
+  }
+  return true;
+}
+
+static void logSchemaStep(int from, const char* name, size_t changed) {
+  Log::kvf(TAG, "config.schema_step from=%d name=%s changed=%u", from, name, (unsigned)changed);
+}
+
+// Parse /config.json into doc. out: false if it cannot be read or parsed.
+static bool parseConfigFile(JsonDocument& doc) {
+  File f = LittleFS.open("/config.json", "r");
+  if (!f) return false;
+  const DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  return !err;
+}
+
+// Bring a parsed older config up to CONFIG_SCHEMA_CURRENT on disk, old file kept
+// as .bak. The work doc is a fresh parse: a deep copy of _doc overflows the boot stack.
+static void migrateSchema(JsonDocument& live) {
+  _schemaAlert[0] = '\0';
+  const int from = configSchemaVersion(live.as<JsonVariantConst>());
+  if (from == CONFIG_SCHEMA_CURRENT) return;
+  JsonDocument work;
+  if (!parseConfigFile(work)) {
+    Log::kvfe(TAG, "config.schema_migrate_failed from=%d reason=reread action=run_unmigrated", from);
+    snprintf(_schemaAlert, sizeof(_schemaAlert), "config schema %d could not be re-read, running unmigrated", from);
+    return;
+  }
+  switch (configMigrate(work, logSchemaStep)) {
+    case CFG_SCHEMA_CURRENT:
+      return;
+    case CFG_SCHEMA_NEWER:
+      Log::kvfw(TAG, "config.schema_newer have=%d know=%d action=run_as_is", from, CONFIG_SCHEMA_CURRENT);
+      snprintf(_schemaAlert, sizeof(_schemaAlert), "config schema %d is newer than this firmware (%d), running as is",
+               from, CONFIG_SCHEMA_CURRENT);
+      return;
+    case CFG_SCHEMA_INVALID:
+      Log::kvfe(TAG, "config.schema_invalid action=run_unmigrated");
+      snprintf(_schemaAlert, sizeof(_schemaAlert), "config schema field is not a whole number, running unmigrated");
+      return;
+    case CFG_SCHEMA_MIGRATED:
+      break;
+  }
+  const char* why = nullptr;
+  if (!backupConfigFile()) why = "backup";
+  else if (!Config::writeFile(work.as<JsonVariantConst>(), false)) why = "write";
+  if (why) {
+    Log::kvfe(TAG, "config.schema_migrate_failed from=%d to=%d reason=%s action=run_unmigrated",
+              from, CONFIG_SCHEMA_CURRENT, why);
+    snprintf(_schemaAlert, sizeof(_schemaAlert), "config schema %d to %d failed (%s), running unmigrated",
+             from, CONFIG_SCHEMA_CURRENT, why);
+    return;
+  }
+  work.clear();
+  if (!parseConfigFile(live)) {
+    live.clear();
+    Log::kvfe(TAG, "config.schema_reload_failed action=use_defaults");
+    return;
+  }
+  Log::kvf(TAG, "config.schema_migrated from=%d to=%d backup=/config.json.bak", from, CONFIG_SCHEMA_CURRENT);
+}
+
+const char* Config::schemaAlert() { return _schemaAlert[0] ? _schemaAlert : nullptr; }
+
 void Config::load() {
+  bool parsed = false;
+  _schemaAlert[0] = '\0';
   auto read = [&]() {
     clearHeldTopicPrefix();
     if (!LittleFS.begin()) return;
@@ -54,9 +147,12 @@ void Config::load() {
     if (err) {
       _doc.clear();
       Log::kvfe(TAG, "config.parse_failed err=%s action=use_defaults", err.c_str());
+      return;
     }
+    parsed = true;
   };
   read();
+  if (parsed) migrateSchema(_doc);
   configChanged();
 }
 
