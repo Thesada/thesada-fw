@@ -84,28 +84,41 @@ void test_file_body_cap_matches_the_read_cap(void) {
 // empty body it truncated the target, so it must be refused first.
 void test_chunked_is_length_required_not_empty(void) {
   TEST_ASSERT_EQUAL(HTTP_BODY_LENGTH_REQUIRED,
-                    httpBodyVerdict(true, true, 0, HTTP_BODY_FILE_MAX, nullptr));
+                    httpBodyVerdict(true, true, true, 0, HTTP_BODY_FILE_MAX, nullptr));
   TEST_ASSERT_EQUAL(HTTP_BODY_LENGTH_REQUIRED,
-                    httpBodyVerdict(true, true, 10, HTTP_BODY_FILE_MAX, nullptr));
+                    httpBodyVerdict(true, true, true, 10, HTTP_BODY_FILE_MAX, nullptr));
+}
+
+// No Content-Length and no Transfer-Encoding: the library reads no body, so
+// it looked like Content-Length 0 and truncated the /api/file target.
+void test_missing_length_is_length_required_not_empty(void) {
+  TEST_ASSERT_EQUAL(HTTP_BODY_LENGTH_REQUIRED,
+                    httpBodyVerdict(true, false, false, 0, HTTP_BODY_FILE_MAX, nullptr));
+  TEST_ASSERT_EQUAL(HTTP_BODY_LENGTH_REQUIRED,
+                    httpBodyVerdict(true, false, false, 0, HTTP_BODY_CFG_MAX, nullptr));
+  TEST_ASSERT_EQUAL(HTTP_BODY_UNAUTHORIZED,
+                    httpBodyVerdict(false, false, false, 0, HTTP_BODY_FILE_MAX, nullptr));
+  TEST_ASSERT_EQUAL(HTTP_BODY_EMPTY,
+                    httpBodyVerdict(true, false, true, 0, HTTP_BODY_FILE_MAX, nullptr));
 }
 
 void test_unauthorized_wins_over_everything(void) {
   TEST_ASSERT_EQUAL(HTTP_BODY_UNAUTHORIZED,
-                    httpBodyVerdict(false, true, 0, HTTP_BODY_FILE_MAX, nullptr));
+                    httpBodyVerdict(false, true, true, 0, HTTP_BODY_FILE_MAX, nullptr));
   TEST_ASSERT_EQUAL(HTTP_BODY_UNAUTHORIZED,
-                    httpBodyVerdict(false, false, 99999, HTTP_BODY_FILE_MAX, nullptr));
+                    httpBodyVerdict(false, false, true, 99999, HTTP_BODY_FILE_MAX, nullptr));
 }
 
 void test_plain_bodies_keep_their_verdicts(void) {
-  TEST_ASSERT_EQUAL(HTTP_BODY_EMPTY, httpBodyVerdict(true, false, 0, HTTP_BODY_FILE_MAX, nullptr));
+  TEST_ASSERT_EQUAL(HTTP_BODY_EMPTY, httpBodyVerdict(true, false, true, 0, HTTP_BODY_FILE_MAX, nullptr));
   TEST_ASSERT_EQUAL(HTTP_BODY_TOO_LARGE,
-                    httpBodyVerdict(true, false, HTTP_BODY_CFG_MAX + 1, HTTP_BODY_CFG_MAX, nullptr));
-  TEST_ASSERT_EQUAL(HTTP_BODY_INCOMPLETE, httpBodyVerdict(true, false, 4, HTTP_BODY_CMD_MAX, nullptr));
+                    httpBodyVerdict(true, false, true, HTTP_BODY_CFG_MAX + 1, HTTP_BODY_CFG_MAX, nullptr));
+  TEST_ASSERT_EQUAL(HTTP_BODY_INCOMPLETE, httpBodyVerdict(true, false, true, 4, HTTP_BODY_CMD_MAX, nullptr));
   HttpBody* b = httpBodyBegin(4, HTTP_BODY_CMD_MAX);
   TEST_ASSERT_TRUE(httpBodyAppend(b, U("ab"), 2, 0));
-  TEST_ASSERT_EQUAL(HTTP_BODY_INCOMPLETE, httpBodyVerdict(true, false, 4, HTTP_BODY_CMD_MAX, b));
+  TEST_ASSERT_EQUAL(HTTP_BODY_INCOMPLETE, httpBodyVerdict(true, false, true, 4, HTTP_BODY_CMD_MAX, b));
   TEST_ASSERT_TRUE(httpBodyAppend(b, U("cd"), 2, 2));
-  TEST_ASSERT_EQUAL(HTTP_BODY_OK, httpBodyVerdict(true, false, 4, HTTP_BODY_CMD_MAX, b));
+  TEST_ASSERT_EQUAL(HTTP_BODY_OK, httpBodyVerdict(true, false, true, 4, HTTP_BODY_CMD_MAX, b));
   free(b);
 }
 
@@ -137,6 +150,7 @@ int main(int, char**) {
   RUN_TEST(test_two_requests_do_not_share);
   RUN_TEST(test_file_body_cap_matches_the_read_cap);
   RUN_TEST(test_chunked_is_length_required_not_empty);
+  RUN_TEST(test_missing_length_is_length_required_not_empty);
   RUN_TEST(test_unauthorized_wins_over_everything);
   RUN_TEST(test_plain_bodies_keep_their_verdicts);
   RUN_TEST(test_denied_marker_refuses_every_chunk);
