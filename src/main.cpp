@@ -12,6 +12,7 @@
 #include <soc/soc_caps.h>
 #include "thesada_config.h"
 #include <Config.h>
+#include <EventBus.h>
 #include <Identity.h>
 #include <Enroll.h>
 #include <ModuleRegistry.h>
@@ -180,6 +181,16 @@ void setup() {
 
   // All modules self-registered via MODULE_REGISTER. beginAll() sorts by priority.
   ModuleRegistry::beginAll();
+
+  // A config schema migration that could not run reaches the app as an alert.
+  // MQTT queues it until the first session.
+  if (const char* why = Config::schemaAlert()) {
+    JsonDocument alert;
+    alert["severity"] = "warn";
+    alert["code"]     = "config_schema";
+    alert["message"]  = why;
+    EventBus::publish("alert", alert.as<JsonObject>());
+  }
 
   SleepManager::begin();
 

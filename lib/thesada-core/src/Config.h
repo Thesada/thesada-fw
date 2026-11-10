@@ -40,6 +40,8 @@ public:
   // in: hook. out: false when all 4 slots are taken.
   static bool onChange(void (*fn)());
   static JsonObject get();
+  // in: none. out: why the boot schema migration did not run, or nullptr.
+  static const char* schemaAlert();
 private:
   static JsonDocument _doc;
 };
