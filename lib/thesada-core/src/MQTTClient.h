@@ -75,7 +75,10 @@ public:
   // in:  topic    MQTT topic string (wildcards supported)
   // in:  callback fired on match
   // out: none; can be called before connect()
-  static void subscribe(const char* topic, MQTTCallback callback);
+  static void subscribe(const char* topic, MQTTCallback callback,
+                        uint8_t owner = MQTT_SUB_OWNER_CORE);
+  // Free every slot owner holds and unsubscribe the topics no slot still wants.
+  static void unsubscribeOwner(uint8_t owner);
 
   // Per-device mTLS client certificate stored in NVS. If both cert and key
   // are present, MQTT connects with mTLS auth (broker extracts CN as

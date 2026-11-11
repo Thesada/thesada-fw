@@ -144,6 +144,41 @@ void test_expire_after_saturates_instead_of_wrapping(void) {
   TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, tempExpireAfterS(UINT32_MAX / 3 + 1));  // wraps to 2
 }
 
+// --- the DS18B20 power-on value ------------------------------------------
+
+// fw #2: a probe that reset reads 85.00 C before its first conversion, and
+// that value was published as a real temperature after boot.
+void test_power_on_value_first_is_held_back(void) {
+  TempGuard g;
+  TEST_ASSERT_TRUE(tempGuardJudge(g, 85.0f, DELTA) == TempVerdict::PowerOn);
+  TEST_ASSERT_EQUAL_FLOAT(TEMP_NO_READING, g.accepted);
+  TEST_ASSERT_TRUE(tempGuardJudge(g, 21.5f, DELTA) == TempVerdict::Accepted);
+  TEST_ASSERT_EQUAL_FLOAT(21.5f, g.accepted);
+}
+
+// A probe reset mid-run reads 85.00 too, guard off or not.
+void test_power_on_value_after_a_cold_reading_is_held_back(void) {
+  const float deltas[] = {DELTA, 0.0f};
+  for (float d : deltas) {
+    TempGuard g;
+    tempGuardJudge(g, 21.0f, d);
+    TEST_ASSERT_TRUE(tempGuardJudge(g, 85.0f, d) == TempVerdict::PowerOn);
+    TEST_ASSERT_EQUAL_FLOAT(21.0f, g.accepted);
+  }
+}
+
+// A boiler really at 85 C: near the last reading it passes, and at boot the
+// second 85.00 in a row confirms it.
+void test_real_85_is_accepted(void) {
+  TempGuard g;
+  tempGuardJudge(g, 84.6f, DELTA);
+  TEST_ASSERT_TRUE(tempGuardJudge(g, 85.0f, DELTA) == TempVerdict::Accepted);
+  TempGuard b;
+  TEST_ASSERT_TRUE(tempGuardJudge(b, 85.0f, DELTA) == TempVerdict::PowerOn);
+  TEST_ASSERT_TRUE(tempGuardJudge(b, 85.0f, DELTA) == TempVerdict::Rebaselined);
+  TEST_ASSERT_EQUAL_FLOAT(85.0f, b.accepted);
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_first_reading_is_accepted_whatever_its_value);
@@ -159,5 +194,8 @@ int main(int, char**) {
   RUN_TEST(test_interval_is_floored);
   RUN_TEST(test_interval_is_bounded_before_unsigned);
   RUN_TEST(test_expire_after_saturates_instead_of_wrapping);
+  RUN_TEST(test_power_on_value_first_is_held_back);
+  RUN_TEST(test_power_on_value_after_a_cold_reading_is_held_back);
+  RUN_TEST(test_real_85_is_accepted);
   return UNITY_END();
 }

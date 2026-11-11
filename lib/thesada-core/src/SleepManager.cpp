@@ -7,6 +7,7 @@
 #include "Shell.h"
 #include "MQTTClient.h"
 #include "WiFiManager.h"
+#include "elapsed_policy.h"
 #include <WiFi.h>
 #include <esp_sleep.h>
 
@@ -16,7 +17,7 @@ static const char* TAG = "Sleep";
 RTC_DATA_ATTR static RtcData _rtc;
 
 bool     SleepManager::_enabled      = false;
-uint32_t SleepManager::_sleepUs      = 0;
+uint64_t SleepManager::_sleepUs      = 0;
 uint32_t SleepManager::_wakeDeadline = 0;
 
 // Initialize RTC data, read sleep config, and set wake deadline
@@ -72,7 +73,7 @@ void SleepManager::begin() {
 // Enter deep sleep when the wake deadline has passed
 void SleepManager::loop() {
   if (!_enabled) return;
-  if (millis() < _wakeDeadline) return;
+  if (!msReached(millis(), _wakeDeadline)) return;
 
   gracefulShutdown();
 }

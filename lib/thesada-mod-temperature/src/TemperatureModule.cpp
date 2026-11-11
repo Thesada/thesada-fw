@@ -306,6 +306,10 @@ float TemperatureModule::readSensorC(TempSensor& s) {
       Log::kvfw(TAG, "temp.read_rejected addr=%s last=%.2f got=%.2f reason=implausible",
                 s.addressStr, last, temp);
       break;
+    case TempVerdict::PowerOn:
+      Log::kvfw(TAG, "temp.read_rejected addr=%s last=%.2f got=%.2f reason=power_on",
+                s.addressStr, last, temp);
+      break;
     case TempVerdict::NoReading:
       break;
   }

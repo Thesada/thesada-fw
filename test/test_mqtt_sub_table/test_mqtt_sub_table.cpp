@@ -163,6 +163,97 @@ void test_empty_topic_is_refused(void) {
   TEST_ASSERT_EQUAL_UINT8(0, t.count());
 }
 
+// --- owners: a Lua reload frees its slots --------------------------------
+
+static int g_unsubs;
+static char g_unsubTopic[64];
+static void onUnsub(const char* topic) {
+  g_unsubs++;
+  (void)snprintf(g_unsubTopic, sizeof(g_unsubTopic), "%s", topic);
+}
+
+// fw #2: every Lua reload added its subscriptions again, so a few reloads
+// filled the table and the script's MQTT subscribe was refused.
+void test_reloads_do_not_leak_lua_slots(void) {
+  Table t;
+  TEST_ASSERT_TRUE(t.add("core/cli/#", hitA));
+  for (int reload = 0; reload < 10; reload++) {
+    t.removeOwner(MQTT_SUB_OWNER_LUA);
+    TEST_ASSERT_TRUE(t.add("lua/a", hitB, MQTT_SUB_OWNER_LUA));
+    TEST_ASSERT_TRUE(t.add("lua/b", hitB, MQTT_SUB_OWNER_LUA));
+  }
+  TEST_ASSERT_EQUAL_UINT8(3, t.count());
+}
+
+void test_remove_owner_keeps_other_owners(void) {
+  Table t;
+  t.add("core/cli/#", hitA);
+  t.add("lua/a", hitB, MQTT_SUB_OWNER_LUA);
+  t.add("core/ota", hitA);
+  TEST_ASSERT_EQUAL_UINT8(1, t.removeOwner(MQTT_SUB_OWNER_LUA));
+  t.dispatch("lua/a", "x");
+  TEST_ASSERT_EQUAL_INT(0, g_hitsB);
+  t.dispatch("core/ota", "x");
+  TEST_ASSERT_EQUAL_INT(1, g_hitsA);
+  TEST_ASSERT_TRUE(t.isRegistered("core/cli/#"));
+  TEST_ASSERT_FALSE(t.isRegistered("lua/a"));
+}
+
+// fw #3: reinitSubscriptions emptied the whole table, so Lua subscriptions
+// were dead until a reboot. A reinit frees core slots only.
+void test_core_reinit_keeps_lua_slots(void) {
+  Table t;
+  t.add("old/cli/#", hitA);
+  t.add("lua/a", hitB, MQTT_SUB_OWNER_LUA);
+  t.removeOwner(MQTT_SUB_OWNER_CORE);
+  t.add("new/cli/#", hitA);
+  t.dispatch("lua/a", "x");
+  TEST_ASSERT_EQUAL_INT(1, g_hitsB);
+  TEST_ASSERT_FALSE(t.isRegistered("old/cli/#"));
+  TEST_ASSERT_TRUE(t.isRegistered("new/cli/#"));
+}
+
+// A freed slot in the middle is reused, so a full table takes a new
+// subscription after a reload.
+void test_freed_slot_is_reused(void) {
+  Table t;
+  t.add("a", hitA);
+  t.add("lua/1", hitB, MQTT_SUB_OWNER_LUA);
+  t.add("b", hitA);
+  t.add("c", hitA);
+  TEST_ASSERT_FALSE(t.add("d", hitA));
+  t.removeOwner(MQTT_SUB_OWNER_LUA);
+  TEST_ASSERT_TRUE(t.add("d", hitA));
+  TEST_ASSERT_EQUAL_UINT8(4, t.count());
+  TEST_ASSERT_TRUE(t.isRegistered("d"));
+}
+
+// The broker unsubscribe runs once per topic and only when no other slot
+// still wants it.
+void test_unsubscribe_only_topics_nobody_holds(void) {
+  Table t;
+  g_unsubs = 0;
+  t.add("shared", hitA);
+  t.add("shared", hitB, MQTT_SUB_OWNER_LUA);
+  t.add("only/lua", hitB, MQTT_SUB_OWNER_LUA);
+  t.add("only/lua", hitB, MQTT_SUB_OWNER_LUA);
+  TEST_ASSERT_EQUAL_UINT8(3, t.removeOwner(MQTT_SUB_OWNER_LUA, onUnsub));
+  TEST_ASSERT_EQUAL_INT(1, g_unsubs);
+  TEST_ASSERT_EQUAL_STRING("only/lua", g_unsubTopic);
+}
+
+// Trailing freed slots give the count back; reset still empties everything.
+void test_trailing_free_slots_shrink_the_count(void) {
+  Table t;
+  t.add("a", hitA);
+  t.add("lua/1", hitB, MQTT_SUB_OWNER_LUA);
+  t.add("lua/2", hitB, MQTT_SUB_OWNER_LUA);
+  t.removeOwner(MQTT_SUB_OWNER_LUA);
+  TEST_ASSERT_EQUAL_UINT8(1, t.count());
+  t.reset();
+  TEST_ASSERT_EQUAL_UINT8(0, t.count());
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_reset_clears_count_not_just_active);
@@ -177,5 +268,11 @@ int main(int, char**) {
   RUN_TEST(test_for_each_active_walks_registration_order);
   RUN_TEST(test_long_topic_is_refused_not_clipped);
   RUN_TEST(test_empty_topic_is_refused);
+  RUN_TEST(test_reloads_do_not_leak_lua_slots);
+  RUN_TEST(test_remove_owner_keeps_other_owners);
+  RUN_TEST(test_core_reinit_keeps_lua_slots);
+  RUN_TEST(test_freed_slot_is_reused);
+  RUN_TEST(test_unsubscribe_only_topics_nobody_holds);
+  RUN_TEST(test_trailing_free_slots_shrink_the_count);
   return UNITY_END();
 }

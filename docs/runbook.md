@@ -28,7 +28,7 @@ What the user sees: the device drops mTLS and the app has pushed it into **passw
 1. Symptom: device fails to apply config, or connects with wrong/empty settings.
 2. Critical `mqtt.*` keys self-heal: boot-time `rollbackIfUncommitted()` compares live config against the last-good NVS snapshot and restores it (`Log::warn "mqtt.config_rollback"`, `MQTTClient.cpp:523`). Let it reboot once and check for that log.
 3. Inspect on-device: `fs.cat /config.json` (or the mounted path); `fs.ls /` to see what is present.
-   An older file is migrated at boot (`config.schema_migrated` in the log). The file before that migration is `/config.json.bak`. `config.schema_migrate_failed`, `config.schema_newer` or `config.schema_invalid` means the device runs the file as it was and the app got a `config_schema` alert.
+   An older file is migrated at boot (`config.schema_migrated` in the log). The file before that migration is `/config.json.bak`. `config.schema_migrate_failed`, `config.schema_newer` or `config.schema_invalid` means the device runs the file as it was and the app got a `config_schema` alert. `config.schema_reload_failed` means the migrated file was written but did not parse back: the device runs on defaults, the app got the same alert, and `/config.json.bak` holds the file before the migration.
 4. If only non-critical keys are bad: fix with `config.set <key> <value>` and commit. *(Confirm the exact config command names on the running build.)*
 5. If the file is unrecoverable: reformat LittleFS (`fs.format --yes` - LittleFS) and re-provision from the app pairing flow. Secrets in NVS (via `secret.set`) survive an FS reformat; a full NVS erase does not.
 

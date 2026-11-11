@@ -35,6 +35,7 @@
 #include "ota_verify_policy.h"
 #include "http_url_policy.h"
 #include "ota_health_policy.h"
+#include "elapsed_policy.h"
 #include <esp_ota_ops.h>
 #include <esp_image_format.h>
 #include <esp_timer.h>
@@ -737,8 +738,8 @@ static bool otaHttpGetWiFiHop(const char* url,
   int contentLength  = http.getSize();
   size_t total = 0;
   uint8_t buf[1024];
-  uint32_t deadline = millis() + 5UL * 60UL * 1000UL;  // 5 min cap
-  while (millis() < deadline) {
+  const uint32_t t0 = millis();
+  while (msWithin(millis(), t0, 5UL * 60UL * 1000UL)) {  // 5 min cap
     yield(); Watchdog::feed();
     Shell::pumpConsole();
     if (!stream->connected() && !stream->available()) break;
@@ -896,14 +897,14 @@ static bool downloadBinaryChunkedCellular(
       Log::kvfw(TAG, "ota.chunk_retry offset=%u attempt=%d got=%u", (unsigned)offset, attempt,
                 (unsigned)got);
       // Probe the link, and re-run activation once the probe has dropped it.
-      uint32_t waitUntil = millis() + LINK_WAIT_MS;
+      const uint32_t waitT0 = millis();
       do {
         if (Cellular::activated()) Cellular::loop();
         else Cellular::tickActivation();
         Shell::pumpConsole();
         esp_task_wdt_reset();
         delay(200);
-      } while (!Cellular::connected() && millis() < waitUntil);
+      } while (!Cellular::connected() && msWithin(millis(), waitT0, LINK_WAIT_MS));
     }
     if (!done) {
       Log::kvfe(TAG, "ota.chunk_failed offset=%u tries=%d", (unsigned)offset, CHUNK_TRIES);
@@ -914,8 +915,8 @@ static bool downloadBinaryChunkedCellular(
 
     if (offset >= expectedSize) break;
 
-    uint32_t paceUntil = millis() + CHUNK_GAP_MS;
-    while (millis() < paceUntil) {
+    const uint32_t paceT0 = millis();
+    while (msWithin(millis(), paceT0, CHUNK_GAP_MS)) {
       Shell::pumpConsole();
       esp_task_wdt_reset();
       delay(200);

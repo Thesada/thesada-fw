@@ -4,21 +4,22 @@
 #pragma once
 #include <ArduinoJson.h>
 #include <functional>
-#include <map>
-#include <vector>
 #include <string>
+#include "event_bus_table.h"
 
 using EventCallback = std::function<void(JsonObject)>;
 
 // Single-task invariant: both subscribe() and publish() touch the shared
-// _subscribers map with no locking. Every caller must run on the main
+// _subscribers table with no locking. Every caller must run on the main
 // loop task. Do NOT call either from an ISR or a secondary FreeRTOS task -
 // concurrent map access corrupts it. If a second task ever needs the bus,
 // add a mutex here first.
 class EventBus {
 public:
-  static void subscribe(const std::string& event, EventCallback cb);
-  static void publish(const std::string& event, JsonObject data);
+  static void   subscribe(const std::string& event, EventCallback cb,
+                          uint8_t owner = EVENT_OWNER_CORE);
+  static void   publish(const std::string& event, JsonObject data);
+  static size_t unsubscribeOwner(uint8_t owner);
 private:
-  static std::map<std::string, std::vector<EventCallback>> _subscribers;
+  static EventBusTable<EventCallback> _subscribers;
 };

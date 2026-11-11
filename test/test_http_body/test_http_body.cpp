@@ -141,6 +141,36 @@ void test_denied_marker_refuses_every_chunk(void) {
   free(ok);
 }
 
+// --- the shared budget ---------------------------------------------------
+
+// fw #73: each authed POST malloc'd its declared body with no total, so a
+// few concurrent 64 KB uploads could take the heap.
+void test_budget_refuses_past_the_total(void) {
+  size_t held = 0;
+  TEST_ASSERT_TRUE(httpBodyReserve(held, HTTP_BODY_FILE_MAX, HTTP_BODY_BUDGET));
+  TEST_ASSERT_TRUE(httpBodyReserve(held, HTTP_BODY_CFG_MAX, HTTP_BODY_BUDGET));
+  TEST_ASSERT_EQUAL_UINT32(HTTP_BODY_BUDGET, held);
+  TEST_ASSERT_FALSE(httpBodyReserve(held, 1, HTTP_BODY_BUDGET));
+  TEST_ASSERT_EQUAL_UINT32(HTTP_BODY_BUDGET, held);
+}
+
+void test_budget_comes_back_on_release(void) {
+  size_t held = 0;
+  httpBodyReserve(held, HTTP_BODY_FILE_MAX, HTTP_BODY_BUDGET);
+  TEST_ASSERT_FALSE(httpBodyReserve(held, HTTP_BODY_FILE_MAX, HTTP_BODY_BUDGET));
+  httpBodyRelease(held, HTTP_BODY_FILE_MAX);
+  TEST_ASSERT_EQUAL_UINT32(0, held);
+  TEST_ASSERT_TRUE(httpBodyReserve(held, HTTP_BODY_FILE_MAX, HTTP_BODY_BUDGET));
+}
+
+// A release larger than what is held floors at zero instead of wrapping.
+void test_budget_release_never_wraps(void) {
+  size_t held = 10;
+  httpBodyRelease(held, 50);
+  TEST_ASSERT_EQUAL_UINT32(0, held);
+  TEST_ASSERT_FALSE(httpBodyReserve(held, (size_t)-1, HTTP_BODY_BUDGET));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_whole_body_in_chunks);
@@ -154,5 +184,8 @@ int main(int, char**) {
   RUN_TEST(test_unauthorized_wins_over_everything);
   RUN_TEST(test_plain_bodies_keep_their_verdicts);
   RUN_TEST(test_denied_marker_refuses_every_chunk);
+  RUN_TEST(test_budget_refuses_past_the_total);
+  RUN_TEST(test_budget_comes_back_on_release);
+  RUN_TEST(test_budget_release_never_wraps);
   return UNITY_END();
 }

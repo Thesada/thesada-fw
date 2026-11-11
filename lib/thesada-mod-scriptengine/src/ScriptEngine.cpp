@@ -20,9 +20,9 @@
 //   Node.uptime()                      - ms since boot, 64-bit, never wraps
 //
 // Hot reload:
-//   ScriptEngine::reload() bumps generation counter, destroys Lua state,
-//   creates fresh state, re-executes both scripts. Stale EventBus callbacks
-//   check generation and silently skip.
+//   ScriptEngine::reload() bumps generation counter, frees the Lua-owned MQTT
+//   slots and EventBus callbacks, destroys Lua state, creates fresh state,
+//   re-executes both scripts.
 //
 // SPDX-License-Identifier: GPL-3.0-only
 
@@ -132,7 +132,7 @@ static int lua_mqtt_subscribe(lua_State* L) {
                 err ? err : "unknown");
       lua_pop(gL, 1);
     }
-  });
+  }, MQTT_SUB_OWNER_LUA);
 
   Log::kvf("Lua", "script.mqtt_subscribed topic=%s", topic);
   return 0;
@@ -282,49 +282,45 @@ static const luaL_Reg configLib[] = {
 // Lua binding: EventBus
 // ---------------------------------------------------------------------------
 
+static void pushJsonVariant(lua_State* L, JsonVariant v);
+
 // Recursively convert an ArduinoJson object to a Lua table on the stack
 static void jsonObjectToLuaTable(lua_State* L, JsonObject obj) {
   lua_newtable(L);
   for (JsonPair kv : obj) {
     lua_pushstring(L, kv.key().c_str());
-    JsonVariant v = kv.value();
-    if (v.is<bool>()) {
-      lua_pushboolean(L, v.as<bool>());
-    } else if (v.is<long>()) {
-      lua_pushinteger(L, v.as<long>());
-    } else if (v.is<double>()) {
-      lua_pushnumber(L, v.as<double>());
-    } else if (v.is<const char*>()) {
-      lua_pushstring(L, v.as<const char*>());
-    } else if (v.is<JsonArray>()) {
-      JsonArray arr = v.as<JsonArray>();
-      lua_newtable(L);
-      int idx = 1;
-      for (JsonVariant elem : arr) {
-        lua_pushinteger(L, idx++);
-        if (elem.is<JsonObject>()) {
-          jsonObjectToLuaTable(L, elem.as<JsonObject>());
-        } else if (elem.is<long>()) {
-          lua_pushinteger(L, elem.as<long>());
-        } else if (elem.is<double>()) {
-          lua_pushnumber(L, elem.as<double>());
-        } else if (elem.is<const char*>()) {
-          lua_pushstring(L, elem.as<const char*>());
-        } else {
-          String json;
-          serializeJson(elem, json);
-          lua_pushstring(L, json.c_str());
-        }
-        lua_settable(L, -3);
-      }
-    } else if (v.is<JsonObject>()) {
-      jsonObjectToLuaTable(L, v.as<JsonObject>());
-    } else {
-      String json;
-      serializeJson(v, json);
-      lua_pushstring(L, json.c_str());
-    }
+    pushJsonVariant(L, kv.value());
     lua_settable(L, -3);
+  }
+}
+
+// One JSON value as its Lua value: arrays and objects as tables at any depth,
+// null as nil. Shared by JSON.decode and the EventBus payloads.
+static void pushJsonVariant(lua_State* L, JsonVariant v) {
+  if (v.isNull()) {
+    lua_pushnil(L);
+  } else if (v.is<bool>()) {
+    lua_pushboolean(L, v.as<bool>());
+  } else if (v.is<long>()) {
+    lua_pushinteger(L, v.as<long>());
+  } else if (v.is<double>()) {
+    lua_pushnumber(L, v.as<double>());
+  } else if (v.is<const char*>()) {
+    lua_pushstring(L, v.as<const char*>());
+  } else if (v.is<JsonObject>()) {
+    jsonObjectToLuaTable(L, v.as<JsonObject>());
+  } else if (v.is<JsonArray>()) {
+    lua_newtable(L);
+    lua_Integer idx = 1;
+    for (JsonVariant elem : v.as<JsonArray>()) {
+      lua_pushinteger(L, idx++);
+      pushJsonVariant(L, elem);
+      lua_settable(L, -3);
+    }
+  } else {
+    String json;
+    serializeJson(v, json);
+    lua_pushstring(L, json.c_str());
   }
 }
 
@@ -355,7 +351,7 @@ static int lua_eventbus_subscribe(lua_State* L) {
                 err ? err : "unknown");
       lua_pop(gL, 1);
     }
-  });
+  }, EVENT_OWNER_LUA);
 
   Log::kvf(TAG, "script.event_subscribed event=%s", event);
   return 0;
@@ -378,25 +374,8 @@ static int lua_json_decode(lua_State* L) {
     lua_pushnil(L);
     return 1;
   }
-  if (doc.is<JsonObject>()) {
-    jsonObjectToLuaTable(L, doc.as<JsonObject>());
-  } else if (doc.is<JsonArray>()) {
-    JsonArray arr = doc.as<JsonArray>();
-    lua_newtable(L);
-    int idx = 1;
-    for (JsonVariant elem : arr) {
-      lua_pushinteger(L, idx++);
-      if (elem.is<JsonObject>()) {
-        jsonObjectToLuaTable(L, elem.as<JsonObject>());
-      } else if (elem.is<double>()) {
-        lua_pushnumber(L, elem.as<double>());
-      } else if (elem.is<const char*>()) {
-        lua_pushstring(L, elem.as<const char*>());
-      } else {
-        lua_pushnil(L);
-      }
-      lua_settable(L, -3);
-    }
+  if (doc.is<JsonObject>() || doc.is<JsonArray>()) {
+    pushJsonVariant(L, doc.as<JsonVariant>());
   } else {
     lua_pushnil(L);
   }
@@ -642,6 +621,9 @@ void ScriptEngine::begin() {
 void ScriptEngine::reload() {
   Log::info(TAG, "script.reload_start");
   _generation++;
+  // The old state's subscriptions go with it: the new scripts register their own.
+  MQTTClient::unsubscribeOwner(MQTT_SUB_OWNER_LUA);
+  EventBus::unsubscribeOwner(EVENT_OWNER_LUA);
 
   destroyState();
   createState();

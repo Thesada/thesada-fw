@@ -25,6 +25,22 @@ static const size_t HTTP_BODY_CFG_MAX  = 16384;
 static const size_t HTTP_BODY_CMD_MAX  = 2048;
 static const size_t HTTP_BODY_FILE_MAX = HTTP_FILE_MAX;
 
+// Bytes all POST bodies may hold at once: one full file write beside one
+// config push. Without it, concurrent authed POSTs each malloc their cap.
+static const size_t HTTP_BODY_BUDGET = HTTP_BODY_FILE_MAX + HTTP_BODY_CFG_MAX;
+
+// in: bytes held now, bytes wanted, budget. out: true, and held grows, when it fits.
+inline bool httpBodyReserve(size_t& held, size_t want, size_t budget) {
+  if (want > budget || held > budget - want) return false;
+  held += want;
+  return true;
+}
+
+// in: bytes held now, bytes one finished request reserved. out: held shrinks.
+inline void httpBodyRelease(size_t& held, size_t n) {
+  held = n > held ? 0 : held - n;
+}
+
 // in: declared total, cap. out: a buffer for exactly total bytes, or nullptr
 // when total is 0, past the cap, or the alloc fails.
 inline HttpBody* httpBodyBegin(size_t total, size_t maxBytes) {

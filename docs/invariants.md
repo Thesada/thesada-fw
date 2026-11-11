@@ -1308,8 +1308,15 @@ staging over it would destroy it. The declared length is written, so a NUL
 inside the body no longer cuts the file short. Same
 chunk-before-completion ordering as the `/ota` rule above.
 
+All live bodies share one budget, `HTTP_BODY_BUDGET` (one 64 KB file write
+beside one 16 KB config push). Chunk 0 reserves its declared length after
+auth, the request's disconnect gives it back, and a body that does not fit
+is not buffered: the handler answers 503 and `web.body_refused
+reason=budget` is logged. Before, each authed POST malloc'd its own cap with
+no total.
+
 How enforced: host tests in `test/test_http_body` over
-`http_body_policy.h` and in `test/test_config_write` over
+`http_body_policy.h` (including the budget) and in `test/test_config_write` over
 `config_write_policy.h`, coverage floor 95%. No body-taking handler keeps a
 file-scope buffer.
 
@@ -1596,8 +1603,8 @@ Source: `lib/thesada-core/src/Console.cpp::endReply`,
 
 ### Config and EventBus are walked on the main loop only, other tasks read copies
 
-`Config::_doc` (JsonDocument) and `EventBus::_subscribers` (std::map)
-have no locking. Every call into either runs on the main-loop task:
+`Config::_doc` (JsonDocument) and `EventBus::_subscribers` (an
+`EventBusTable`, std::map inside) have no locking. Every call into either runs on the main-loop task:
 Shell handlers, MQTT callbacks, ModuleRegistry init, module `loop()`s.
 Cellular AT-bus work is on its own task but does not touch Config or
 EventBus, and neither does the `net.http` fetch task.
@@ -1666,15 +1673,39 @@ a hold longer than the 30 s task watchdog. Every wait is fed:
 |---|---|
 | The constructor and `pause()` take the mutex in slices of 1 s at most (`waitSliceMs`) and feed the watchdog between them when the calling task is watched (`esp_task_wdt_status`). A zero timeout is still one try | the probe's 30 s default wait sat in one unfed take while `net.http` held the bus through a 40 s bearer recycle, and the TWDT panics at 30 s |
 | Socket-failure recovery runs on the task that drives activation and the probe (`cellRecoverHere`). A streak on another task counts and queues its step (`cellular.socket_recover_queued`), and the next `Cellular::loop` probe runs it under its guard. A hard reset or a fresh bearer clears the queue | the bearer recycle (up to 40 s) and the hard reset (a 120 s guard, up to 60 s for AT) held the bus from `net.http` and changed `_started` under the loop's state machine |
+| The open and send failure streaks are kept per socket slot (`CellFailStreaks`). A success clears only its own slot, and the power cycle one slot earns clears every slot | one shared open streak let an HTTPS success on slot 1 wipe the count of an MQTT slot 0 that kept failing, so it never reached the recycle |
 
 How enforced: `test/test_boot_wait_policy` (slices walk any budget, fed)
 and `test/test_cell_recover` (step per streak, reset over recycle, driver
-task) under the 95% floors on `boot_wait_policy.h` and
+task, one slot's success keeps the other slot's streak) under the 95% floors on `boot_wait_policy.h` and
 `cell_recover_policy.h`. The fed take itself runs only on hardware.
 
 Source: `lib/thesada-mod-cellular/src/Cellular.cpp` (`atTake`, `ATGuard`,
 `socketRecover`, `Cellular::loop`), `lib/thesada-core/src/boot_wait_policy.h`,
 `lib/thesada-core/src/cell_recover_policy.h`.
+
+### A `millis()` deadline or span holds across the 49.7-day wrap
+
+A wait is timed as a span from its start, `msWithin(millis(), t0, span)`,
+which is `millis() - t0 < span`. A deadline kept in a variable is checked
+with `msReached(now, at)`, the signed difference. No wait compares
+`millis() < end`: an end set in the last minutes before the wrap lands past
+zero, and the loop then ended at once, which aborted a cellular OTA, a
+modem reset wait or a download near day 49.7. Spans run in the modem waits
+(`waitChunked`, `modemSoftReset`, the AT exchange, the GPS fix and bearer
+settle, the `httpsGet` 5 min cap), the OTA download cap, the chunk link
+wait and pacing, and the heartbeat pulse. The awake window before deep
+sleep is a deadline. A GNSS interval runs from the end of the previous read,
+so a cold fix that timed out does not start the next at once.
+
+How enforced: `test/test_elapsed` covers a deadline and a 5 min span that
+start just before the wrap, under the 95% floor on `elapsed_policy.h`.
+
+Source: `lib/thesada-core/src/elapsed_policy.h`,
+`lib/thesada-core/src/OTAUpdate.cpp` (`otaHttpGetWiFiHop`,
+`downloadBinaryChunkedCellular`), `lib/thesada-core/src/SleepManager.cpp`,
+`lib/thesada-core/src/HeartbeatLED.cpp`,
+`lib/thesada-mod-gnss/src/GNSSModule.cpp`.
 
 ### `net.http` runs TLS on its own task and keeps MQTT serviced
 
@@ -1857,6 +1888,9 @@ Source: `lib/thesada-core/src/lua_timer_policy.h`,
 ### The subscription table's `active` flags and its slot count clear together
 
 `MqttSubTable::reset()` is the only way to empty the table, and it clears both.
+`removeOwner()` frees one owner's slots in place and gives back the count of
+trailing free slots, and `add()` takes the first free slot before it grows the
+count, so a freed slot in the middle is never stranded.
 Clearing `active` alone leaves the count high: the freed slots stay skipped by
 dispatch, and the next `subscribe()` writes past them. That is what happened:
 `MQTTClient::begin()` cleared the flags only, so the `ota.cmd_topic` subscription
@@ -1872,15 +1906,33 @@ block, which can return early on a truncated prefix. That function re-reads
 `ota.enabled` rather than the `_enabled` flag, so the second call site cannot
 hand a remote OTA trigger to a device whose config has OTA switched off.
 
+Every slot carries an owner. `MQTTClient::begin()` and `reinitSubscriptions()`
+free the core slots and register them again under the current prefix, and
+keep the Lua slots, which hold whole topics the script chose. A Lua reload
+(`ScriptEngine::reload`) frees the Lua slots, unsubscribes each topic no other
+slot still holds and lets the new scripts subscribe again, so reloads never
+fill the table. Slots are marked free, never moved, so a reload that runs
+inside `dispatch()` (the MQTT reload topic) leaves the walk on a stable
+table. EventBus entries carry an owner too (`event_bus_table.h`): a reload
+drops the Lua callbacks, and a drop inside `publish()` skips the dropped
+entries and sweeps them once the outermost publish returns. Before, a reinit
+killed every Lua subscription until reboot, and each reload left its MQTT
+slots and EventBus callbacks behind.
+
 How enforced: the table is a type with no public way to clear one field
 (`mqtt_sub_table.h`, host-tested in `test/test_mqtt_sub_table` under a 95%
-floor). Anything that empties the table calls `reset()`. `mqtt.diag` prints
+floor, including ten reloads, a core reinit beside Lua slots and slot reuse).
+`test/test_event_bus_table` covers ten reloads, a drop and a subscribe from
+inside a publish, under a 95% floor on `event_bus_table.h`. Anything that
+empties the table calls `reset()`. `mqtt.diag` prints
 `subs: n/max` and the active topics, which is where a stranded subscription
 shows.
 
 Source: `lib/thesada-core/src/mqtt_sub_table.h`,
-`lib/thesada-core/src/MQTTClient.cpp` `begin()` / `reinitSubscriptions()`,
-`lib/thesada-core/src/OTAUpdate.cpp::registerCommandTopic`.
+`lib/thesada-core/src/event_bus_table.h`,
+`lib/thesada-core/src/MQTTClient.cpp` `begin()` / `reinitSubscriptions()` /
+`unsubscribeOwner()`, `lib/thesada-core/src/OTAUpdate.cpp::registerCommandTopic`,
+`lib/thesada-mod-scriptengine/src/ScriptEngine.cpp::reload`.
 
 ### One MQTT session, one subscription table, on every transport
 
@@ -2567,8 +2619,12 @@ it needs both, so it is a convenience and not the path to rely on.
 An absent key parses to `full`, so a config written before the key existed
 behaves exactly as it did. A present value that is not a known name parses to
 `off` and says so - `shell.mode_unrecognised` for a misspelt string,
-`shell.mode_not_a_string` for a bool, number or object, which the config layer
-would otherwise hand over as an absent key. A hardening request the firmware
+`shell.mode_not_a_string` for a bool, number, object or an explicit `null`,
+which the config layer would otherwise hand over as an absent key. An empty
+string is present too and closes the same way (`shell.mode_unrecognised
+value=""`), so a blank UI field cannot open the HTTP command, file and
+terminal routes. Only a missing `mode` key is `full`. `shell.ready` logs the
+mode applied, not the raw value. A hardening request the firmware
 cannot read exactly must not silently serve the full surface. The mode is resolved once on first use, not
 per command - it changes on reboot, which is also when a config push lands.
 
@@ -2669,7 +2725,11 @@ The plausibility guard (`temperature.max_delta_c`, 0 = off) holds a
 reading more than `max_delta_c` from the last accepted one. The next
 reading within `max_delta_c` of the held one is accepted
 (`temp.read_rebaselined`); a failed read in between keeps the held one.
-The first reading after boot is accepted unchecked.
+The first reading after boot is accepted unchecked, except the DS18B20
+power-on value: exactly 85.0 C is held back (`temp.read_rejected
+reason=power_on`) unless the last accepted reading is within 2 C of it or
+the next read repeats it, so a probe reset never publishes 85.00 while a
+boiler really at 85 C still reads.
 
 Why: the old fallback republished the last good value with no flag, so a
 House Supply lead that broke at 80 C would keep reading 80 C while the
@@ -2681,7 +2741,7 @@ mid fire-up) locked that probe out until reboot.
 How enforced: `test/test_temp_guard_policy` (the 5 C to 70 C return,
 a held reading across a failed read, lone and disagreeing outliers,
 library fault codes and NaN, guard off, the expiry of three intervals
-and its saturation); the coverage floor on
+and its saturation, the 85.0 C power-on value first, mid-run and repeated); the coverage floor on
 `temp_guard_policy.h`; `tests/lua/test_rules_example.lua` (the example
 rules skip a stale probe, alert on it once sustained, and still judge
 the probes after it). The same file checks that a same-name stale twin
