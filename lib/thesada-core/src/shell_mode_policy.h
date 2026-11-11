@@ -12,11 +12,11 @@ enum ShellMode {
   SHELL_MODE_OFF,
 };
 
-// Absent or empty means a config written before the key existed: behave as
-// before. A value that was typed but not understood closes instead, so a
-// misspelt hardening request never silently serves the full surface.
+// Name to mode. nullptr is the absent key: behave as before the key existed.
+// A value that was typed but not understood closes instead, so a misspelt
+// hardening request never silently serves the full surface.
 inline ShellMode shellModeParse(const char* s) {
-  if (!s || !*s) return SHELL_MODE_FULL;
+  if (!s) return SHELL_MODE_FULL;
   if (strcmp(s, "full") == 0)        return SHELL_MODE_FULL;
   if (strcmp(s, "serial-only") == 0) return SHELL_MODE_SERIAL_ONLY;
   if (strcmp(s, "mqtt-only") == 0)   return SHELL_MODE_MQTT_ONLY;
@@ -53,8 +53,8 @@ inline bool shellModeHttpSurfaceAllowed(ShellMode m, HttpSurface s) {
 }
 
 // Resolve from the two facts the config layer can see. A key that is present
-// but not a string (a bool, a number, an object) is a hardening request we
-// cannot read, so it closes - only a genuinely absent key means full.
+// but not a usable string (null, "", a bool, a number, an object) is a
+// hardening request we cannot read, so it closes - only an absent key means full.
 inline ShellMode shellModeResolve(bool keyPresent, const char* stringValue) {
   if (!keyPresent) return SHELL_MODE_FULL;
   if (!stringValue) return SHELL_MODE_OFF;
@@ -64,5 +64,15 @@ inline ShellMode shellModeResolve(bool keyPresent, const char* stringValue) {
 // True when the parsed value did not come from a name we know, so the caller
 // can say so once at boot rather than leaving the operator guessing.
 inline bool shellModeUnrecognised(const char* s) {
-  return s && *s && shellModeParse(s) == SHELL_MODE_OFF && strcmp(s, "off") != 0;
+  return s && shellModeParse(s) == SHELL_MODE_OFF && strcmp(s, "off") != 0;
+}
+
+// in: mode. out: its config name, for the log.
+inline const char* shellModeName(ShellMode m) {
+  switch (m) {
+    case SHELL_MODE_FULL:        return "full";
+    case SHELL_MODE_SERIAL_ONLY: return "serial-only";
+    case SHELL_MODE_MQTT_ONLY:   return "mqtt-only";
+    default:                     return "off";
+  }
 }

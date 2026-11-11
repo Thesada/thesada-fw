@@ -19,7 +19,6 @@ void test_each_mode_name_parses(void) {
 // the mode existed - a fleet mid-upgrade must not go quiet.
 void test_absent_key_is_full(void) {
   TEST_ASSERT_EQUAL(SHELL_MODE_FULL, shellModeParse(nullptr));
-  TEST_ASSERT_EQUAL(SHELL_MODE_FULL, shellModeParse(""));
 }
 
 // A value that was typed but not understood is a hardening request we cannot
@@ -55,15 +54,15 @@ void test_off_drops_both(void) {
 
 // --- shellModeUnrecognised ----------------------------------------------------
 
-// Only a typo is worth warning about: a real "off" and an absent key are both
-// deliberate, and neither should nag on every boot.
+// A typo or a blank value is worth warning about, since both close: a real
+// "off" and an absent key are deliberate, and neither should nag every boot.
 void test_only_a_typo_is_unrecognised(void) {
   TEST_ASSERT_TRUE(shellModeUnrecognised("of"));
   TEST_ASSERT_TRUE(shellModeUnrecognised("Full"));
   TEST_ASSERT_FALSE(shellModeUnrecognised("off"));
   TEST_ASSERT_FALSE(shellModeUnrecognised("full"));
   TEST_ASSERT_FALSE(shellModeUnrecognised(nullptr));
-  TEST_ASSERT_FALSE(shellModeUnrecognised(""));
+  TEST_ASSERT_TRUE(shellModeUnrecognised(""));
 }
 
 // --- shellModeHttpAllowed -----------------------------------------------------
@@ -96,6 +95,22 @@ void test_missing_key_resolves_full(void) {
 // that as absent would serve the whole surface to someone asking to close it.
 void test_present_non_string_resolves_off(void) {
   TEST_ASSERT_EQUAL(SHELL_MODE_OFF, shellModeResolve(true, nullptr));
+}
+
+// An empty string or a JSON null is a present key we cannot read, so it
+// closes like any other unreadable value. A blank UI field must not open
+// the HTTP cmd, file and terminal routes.
+void test_present_empty_or_null_resolves_off(void) {
+  TEST_ASSERT_EQUAL(SHELL_MODE_OFF, shellModeResolve(true, ""));
+  TEST_ASSERT_EQUAL(SHELL_MODE_OFF, shellModeResolve(true, nullptr));
+  TEST_ASSERT_TRUE(shellModeUnrecognised(""));
+}
+
+// shell.ready logs the mode applied, not the raw value ("" logged as mode=).
+void test_mode_names_round_trip(void) {
+  const char* names[] = {"full", "serial-only", "mqtt-only", "off"};
+  for (const char* n : names) TEST_ASSERT_EQUAL_STRING(n, shellModeName(shellModeParse(n)));
+  TEST_ASSERT_EQUAL_STRING("off", shellModeName(shellModeResolve(true, "")));
 }
 
 void test_present_string_parses_normally(void) {
@@ -150,5 +165,7 @@ int main(int, char**) {
   RUN_TEST(test_narrowed_modes_close_http_file_writes);
   RUN_TEST(test_config_push_and_ota_stay_open_in_every_mode);
   RUN_TEST(test_full_opens_every_http_surface);
+  RUN_TEST(test_present_empty_or_null_resolves_off);
+  RUN_TEST(test_mode_names_round_trip);
   return UNITY_END();
 }

@@ -25,6 +25,22 @@ static const size_t HTTP_BODY_CFG_MAX  = 16384;
 static const size_t HTTP_BODY_CMD_MAX  = 2048;
 static const size_t HTTP_BODY_FILE_MAX = HTTP_FILE_MAX;
 
+// Bytes all POST bodies may hold at once: one full file write beside one
+// config push. Without it, concurrent authed POSTs each malloc their cap.
+static const size_t HTTP_BODY_BUDGET = HTTP_BODY_FILE_MAX + HTTP_BODY_CFG_MAX;
+
+// in: bytes held now, bytes wanted, budget. out: true, and held grows, when it fits.
+inline bool httpBodyReserve(size_t& held, size_t want, size_t budget) {
+  if (want > budget || held > budget - want) return false;
+  held += want;
+  return true;
+}
+
+// in: bytes held now, bytes one finished request reserved. out: held shrinks.
+inline void httpBodyRelease(size_t& held, size_t n) {
+  held = n > held ? 0 : held - n;
+}
+
 // in: declared total, cap. out: a buffer for exactly total bytes, or nullptr
 // when total is 0, past the cap, or the alloc fails.
 inline HttpBody* httpBodyBegin(size_t total, size_t maxBytes) {
@@ -91,4 +107,36 @@ inline HttpBodyVerdict httpBodyVerdict(bool authed, bool chunked, bool lengthDec
   if (contentLength > maxBytes) return HTTP_BODY_TOO_LARGE;
   if (!httpBodyComplete(b)) return HTTP_BODY_INCOMPLETE;
   return HTTP_BODY_OK;
+}
+
+// Bodies ESPAsyncWebServer parses itself, never through onBody or the budget:
+// a form, a text/plain `name=` body, a multipart upload. Judged at the end of
+// the headers, before any body byte. 1 KB holds the setup form fully escaped.
+static const size_t HTTP_FORM_MAX = 1024;
+
+enum HttpParsedBodyVerdict {
+  HTTP_PARSED_PASS = 0,         // the library parses nothing, or a form within HTTP_FORM_MAX
+  HTTP_PARSED_TOO_LARGE,        // 413, a form past HTTP_FORM_MAX
+  HTTP_PARSED_UNSUPPORTED,      // 415, multipart on a route that takes no upload
+};
+
+// in: media type without parameters, Content-Length, the library's multipart
+// flag, whether this route takes an upload. out: the verdict.
+inline HttpParsedBodyVerdict httpParsedBodyVerdict(const char* mediaType, size_t contentLength,
+                                                   bool multipart, bool uploadRoute) {
+  if (multipart) return uploadRoute ? HTTP_PARSED_PASS : HTTP_PARSED_UNSUPPORTED;
+  if (!mediaType) return HTTP_PARSED_PASS;
+  // Case-folded, so every spelling the library parses is covered.
+  auto is = [mediaType](const char* want, bool prefix) {
+    size_t i = 0;
+    for (; want[i]; i++) {
+      char c = mediaType[i];
+      if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+      if (c != want[i]) return false;
+    }
+    return prefix || mediaType[i] == '\0';
+  };
+  const bool form = is("application/x-www-form-urlencoded", true) || is("text/plain", false);
+  if (form && contentLength > HTTP_FORM_MAX) return HTTP_PARSED_TOO_LARGE;
+  return HTTP_PARSED_PASS;
 }

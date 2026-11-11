@@ -125,6 +125,8 @@ static void migrateSchema(JsonDocument& live) {
   if (!parseConfigFile(live)) {
     live.clear();
     Log::kvfe(TAG, "config.schema_reload_failed action=use_defaults");
+    snprintf(_schemaAlert, sizeof(_schemaAlert),
+             "config schema %d to %d reload failed, running on defaults", from, CONFIG_SCHEMA_CURRENT);
     return;
   }
   Log::kvf(TAG, "config.schema_migrated from=%d to=%d backup=/config.json.bak", from, CONFIG_SCHEMA_CURRENT);

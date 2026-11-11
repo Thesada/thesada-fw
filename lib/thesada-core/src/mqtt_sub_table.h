@@ -27,6 +27,10 @@ inline bool mqttSubMatches(const char* sub, const char* topic) {
   return strcmp(sub, topic) == 0;
 }
 
+// Who registered a slot. Core slots are rebuilt by reinitSubscriptions(),
+// Lua slots are freed by a script reload and kept across a reinit.
+enum : uint8_t { MQTT_SUB_OWNER_CORE = 0, MQTT_SUB_OWNER_LUA = 1 };
+
 // CB is the callback type - std::function on the device, a plain function
 // pointer in the host tests - so this header pulls in no Arduino headers.
 template <typename CB, uint8_t N, size_t TOPIC_CAP = 160>
@@ -34,8 +38,9 @@ class MqttSubTable {
  public:
   struct Slot {
     char topic[TOPIC_CAP];
-    CB   callback;
-    bool active;
+    CB      callback;
+    bool    active;
+    uint8_t owner;
   };
 
   // Drop every registration. Clearing `active` without the count leaves the
@@ -47,16 +52,47 @@ class MqttSubTable {
 
   // false when the table is full, or the topic is empty or does not fit a slot.
   // A clipped filter resubscribes a different topic. The caller logs.
-  bool add(const char* topic, CB cb) {
-    if (_count >= N) return false;
+  // A slot freed by removeOwner() is taken before the count grows.
+  bool add(const char* topic, CB cb, uint8_t owner = MQTT_SUB_OWNER_CORE) {
     if (!topic || !*topic || strnlen(topic, TOPIC_CAP) >= TOPIC_CAP) return false;
-    Slot& s = _slots[_count];
+    uint8_t i = 0;
+    while (i < _count && _slots[i].active) i++;
+    if (i >= N) return false;
+    Slot& s = _slots[i];
     memcpy(s.topic, topic, strlen(topic) + 1);
     s.callback             = cb;
     s.active               = true;
-    _count++;
+    s.owner                = owner;
+    if (i == _count) _count++;
     return true;
   }
+
+  // Free every slot owner registered. fn(topic) runs once per freed topic no
+  // other active slot still holds, for the broker unsubscribe.
+  // in: owner, fn (may be null). out: slots freed.
+  // Slots are only marked free, never moved, so a dispatch that runs a
+  // reload keeps walking a stable table.
+  template <typename Fn>
+  uint8_t removeOwner(uint8_t owner, Fn fn) {
+    uint8_t freed = 0;
+    for (uint8_t i = 0; i < _count; i++) {
+      if (!_slots[i].active || _slots[i].owner != owner) continue;
+      _slots[i].active = false;
+      freed++;
+    }
+    for (uint8_t i = 0; fn && freed && i < _count; i++) {
+      const Slot& s = _slots[i];
+      if (s.active || s.owner != owner || isRegistered(s.topic)) continue;
+      bool seen = false;
+      for (uint8_t j = 0; j < i && !seen; j++) {
+        seen = !_slots[j].active && _slots[j].owner == owner && strcmp(_slots[j].topic, s.topic) == 0;
+      }
+      if (!seen) fn(s.topic);
+    }
+    while (_count > 0 && !_slots[_count - 1].active) _count--;
+    return freed;
+  }
+  uint8_t removeOwner(uint8_t owner) { return removeOwner(owner, (void (*)(const char*)) nullptr); }
 
   uint8_t                  count() const { return _count; }
   static constexpr uint8_t capacity() { return N; }

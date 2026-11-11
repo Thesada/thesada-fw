@@ -40,6 +40,7 @@ lib/thesada-core/src/shell_mode_policy.h        95
 lib/thesada-core/src/shell_line_policy.h        95
 lib/thesada-core/src/glob_policy.h              95
 lib/thesada-core/src/mqtt_sub_table.h           95
+lib/thesada-core/src/event_bus_table.h          95
 lib/thesada-core/src/mqtt_topic_policy.h        95
 lib/thesada-core/src/boot_wait_policy.h          95
 lib/thesada-core/src/http_url_policy.h          95
@@ -52,3 +53,5 @@ lib/thesada-core/src/web_snapshot_policy.h       95
 lib/thesada-core/src/alert_payload_policy.h      95
 lib/thesada-core/src/config_schema_policy.h      95
 lib/thesada-core/src/config_scalar_policy.h      95
+lib/thesada-core/src/elapsed_policy.h            95
+lib/thesada-core/src/sleep_policy.h              95

@@ -15,6 +15,7 @@ private:
   static bool     _activeLow;
   static int32_t  _intervalMs;
   static uint32_t _lastBeat;
-  static uint32_t _offAt;
+  static uint32_t _pulseAt;
+  static bool     _pulseOn;
   static bool     _usePmu;
 };
