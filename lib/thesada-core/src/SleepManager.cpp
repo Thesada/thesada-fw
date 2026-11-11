@@ -7,6 +7,7 @@
 #include "Shell.h"
 #include "MQTTClient.h"
 #include "WiFiManager.h"
+#include "sleep_policy.h"
 #include <WiFi.h>
 #include <esp_sleep.h>
 
@@ -16,8 +17,9 @@ static const char* TAG = "Sleep";
 RTC_DATA_ATTR static RtcData _rtc;
 
 bool     SleepManager::_enabled      = false;
-uint32_t SleepManager::_sleepUs      = 0;
-uint32_t SleepManager::_wakeDeadline = 0;
+uint64_t SleepManager::_sleepUs      = 0;
+uint32_t SleepManager::_wakeStart    = 0;
+uint32_t SleepManager::_wakeSpanMs   = 0;
 
 // Initialize RTC data, read sleep config, and set wake deadline
 void SleepManager::begin() {
@@ -43,7 +45,7 @@ void SleepManager::begin() {
         if (SleepManager::enabled()) {
           JsonObject cfg = Config::get();
           uint32_t sleepS = cfg["sleep"]["sleep_s"] | 300;
-          uint32_t wakeS  = cfg["sleep"]["wake_s"]  | 30;
+          uint32_t wakeS  = sleepWakeSpanMs(cfg["sleep"]["wake_s"] | 30u) / 1000;
           snprintf(line, sizeof(line), "  wake %lus  sleep %lus", (unsigned long)wakeS, (unsigned long)sleepS);
           out(line);
           time_t lastOta = SleepManager::lastOtaCheck();
@@ -57,22 +59,26 @@ void SleepManager::begin() {
   if (!_enabled) return;
 
   uint32_t sleepS = cfg["sleep"]["sleep_s"] | 300;
-  uint32_t wakeS  = cfg["sleep"]["wake_s"]  | 30;
+  uint32_t wakeS  = cfg["sleep"]["wake_s"]  | 30u;
 
   if (sleepS < 10)  sleepS = 10;   // minimum 10s sleep
-  if (wakeS  < 10)  wakeS  = 10;   // minimum 10s awake
 
-  _sleepUs      = (uint64_t)sleepS * 1000000ULL;
-  _wakeDeadline = millis() + (wakeS * 1000);
+  _sleepUs    = (uint64_t)sleepS * 1000000ULL;
+  _wakeSpanMs = sleepWakeSpanMs(wakeS);
+  _wakeStart  = millis();
+  if (wakeS > SLEEP_WAKE_S_MAX) {
+    Log::kvf(TAG, "sleep.wake_clamped wake_s=%lu max=%lu",
+             (unsigned long)wakeS, (unsigned long)SLEEP_WAKE_S_MAX);
+  }
 
   Log::kvf(TAG, "sleep.enabled awake_s=%lu sleep_s=%lu boot=%lu",
-           (unsigned long)wakeS, (unsigned long)sleepS, (unsigned long)_rtc.bootCount);
+           (unsigned long)(_wakeSpanMs / 1000), (unsigned long)sleepS, (unsigned long)_rtc.bootCount);
 }
 
 // Enter deep sleep when the wake deadline has passed
 void SleepManager::loop() {
   if (!_enabled) return;
-  if (millis() < _wakeDeadline) return;
+  if (!sleepWakeDone(millis(), _wakeStart, _wakeSpanMs)) return;
 
   gracefulShutdown();
 }

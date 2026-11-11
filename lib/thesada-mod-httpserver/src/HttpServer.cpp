@@ -326,12 +326,25 @@ static bool _authOrReply(AsyncWebServerRequest* req, bool hasSideEffect = false)
 
 // POST bodies live in req->_tempObject, one per request. Chunk 0 authenticates and counts
 // once, so a client that drops mid-body still spends its guess. Refused bodies are never buffered.
+// Bytes the live bodies reserved. async_tcp only: the body chunks and the
+// disconnect that ends every request both run there.
+static size_t _bodyHeld = 0;
+
 static void _bodyChunk(AsyncWebServerRequest* req, uint8_t* data, size_t len,
                        size_t index, size_t total, size_t maxBytes) {
   if (index == 0) {
     const RouteAuth a = _authCounted(req);
-    req->_tempObject = a == ROUTE_AUTH_OK ? httpBodyBegin(total, maxBytes)
-                                          : httpBodyDenied(a == ROUTE_AUTH_LOCKED);
+    if (a != ROUTE_AUTH_OK) {
+      req->_tempObject = httpBodyDenied(a == ROUTE_AUTH_LOCKED);
+    } else if (total > maxBytes || !httpBodyReserve(_bodyHeld, total, HTTP_BODY_BUDGET)) {
+      if (total <= maxBytes) Log::kvfw(TAG, "web.body_refused reason=budget len=%u held=%u",
+                                       (unsigned)total, (unsigned)_bodyHeld);
+      req->_tempObject = nullptr;
+    } else {
+      req->_tempObject = httpBodyBegin(total, maxBytes);
+      if (!req->_tempObject) httpBodyRelease(_bodyHeld, total);
+      else req->onDisconnect([total]() { httpBodyRelease(_bodyHeld, total); });
+    }
   }
   httpBodyAppend((HttpBody*)req->_tempObject, data, len, index);
 }
@@ -373,6 +386,10 @@ static const char* _bodyOrReply(AsyncWebServerRequest* req, size_t maxBytes) {
       req->send(413, "application/json", "{\"ok\":false,\"error\":\"body too large\"}");
       return nullptr;
     case HTTP_BODY_INCOMPLETE:
+      if (!b) {
+        req->send(503, "application/json", "{\"ok\":false,\"error\":\"busy, retry\"}");
+        return nullptr;
+      }
       break;
   }
   req->send(400, "application/json", "{\"ok\":false,\"error\":\"body not received\"}");
@@ -688,8 +705,39 @@ static void sendSetupPage(AsyncWebServerRequest* req) {
   req->send(200, "text/html", setupDocument(nullptr));
 }
 
+// First in the handler list, so it judges every request once its headers are
+// in. It claims a refused one and, being trivial, makes the library skip its
+// body bytes instead of parsing them (ESPAsyncWebServer 3.12.1 _onData).
+class ParsedBodyGuard : public AsyncWebHandler {
+ public:
+  bool canHandle(AsyncWebServerRequest* req) const override {
+    return verdict(req) != HTTP_PARSED_PASS;
+  }
+  bool isRequestHandlerTrivial() const override { return true; }
+  void handleRequest(AsyncWebServerRequest* req) override {
+    const HttpParsedBodyVerdict v = verdict(req);
+    Log::kvfw(TAG, "web.body_refused reason=%s len=%u",
+              v == HTTP_PARSED_TOO_LARGE ? "form_too_large" : "multipart",
+              (unsigned)req->contentLength());
+    if (v == HTTP_PARSED_TOO_LARGE) {
+      req->send(413, "application/json", "{\"ok\":false,\"error\":\"form body too large\"}");
+    } else {
+      req->send(415, "application/json", "{\"ok\":false,\"error\":\"multipart only on /ota\"}");
+    }
+  }
+
+ private:
+  static HttpParsedBodyVerdict verdict(AsyncWebServerRequest* req) {
+    const bool upload = req->method() == HTTP_POST && req->url() == "/ota";
+    return httpParsedBodyVerdict(req->contentType().c_str(), req->contentLength(),
+                                 req->multipart(), upload);
+  }
+};
+
 // Register all HTTP routes, WebSocket handler, OTA endpoint, and captive portal
 void HttpServer::setupRoutes() {
+  server.addHandler(new ParsedBodyGuard());
+
   // Credentials are resolved per request in _checkAuth; check once here only
   // for the boot-time default-password warning.
   const WebCredState bootCred = _webCredLock();
@@ -897,8 +945,17 @@ void HttpServer::setupRoutes() {
       req->send(200, "application/json", "{\"ok\":false,\"error\":\"SD write failed - is card mounted?\"}");
       return;
     }
-    while (src.available()) dst.write(src.read());
+    uint8_t buf[512];
+    bool    copied = true;
+    for (int n; copied && (n = src.read(buf, sizeof(buf))) > 0;) {
+      copied = dst.write(buf, (size_t)n) == (size_t)n;
+    }
     src.close(); dst.close();
+    if (!copied) {
+      Log::kvfe(TAG, "web.config_backup_failed reason=short_write");
+      req->send(200, "application/json", "{\"ok\":false,\"error\":\"SD write failed\"}");
+      return;
+    }
     Log::info(TAG, "web.config_backup dest=sd:/config_backup.json");
     req->send(200, "application/json", "{\"ok\":true}");
   });

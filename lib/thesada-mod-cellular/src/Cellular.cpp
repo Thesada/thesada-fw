@@ -25,6 +25,7 @@
 #include <http_fetch_policy.h>
 #include <boot_wait_policy.h>
 #include <cell_recover_policy.h>
+#include <elapsed_policy.h>
 #include <http_url_policy.h>
 #include <atomic>
 
@@ -133,10 +134,10 @@ class ThesadaModem : public TinyGsm {
 static ThesadaModem modem(Serial1);
 
 // Open-failure bookkeeping, defined after waitChunked below.
-static void socketOpenFailed();
-static void socketOpenOk();
-static void socketSendFailed();
-static void socketSendOk();
+static void socketOpenFailed(uint8_t slot);
+static void socketOpenOk(uint8_t slot);
+static void socketSendFailed(uint8_t slot);
+static void socketSendOk(uint8_t slot);
 
 // One plain modem TCP socket. Lives for the whole program, so TinyGSM's
 // sockets[] table never points at a freed client, and with slot 0 always
@@ -205,8 +206,8 @@ class ModemClient : public Client {
     esp_task_wdt_reset();
     bool ok = _s.open(ip, port, 15);
     esp_task_wdt_reset();
-    if (ok) socketOpenOk();
-    else    socketOpenFailed();
+    if (ok) socketOpenOk(_mux);
+    else    socketOpenFailed(_mux);
     return ok ? 1 : 0;
   }
   int connect(IPAddress ip, uint16_t port) override {
@@ -226,8 +227,8 @@ class ModemClient : public Client {
       done += n;
       esp_task_wdt_reset();
     }
-    if (done == size) socketSendOk();
-    else              socketSendFailed();
+    if (done == size) socketSendOk(_mux);
+    else              socketSendFailed(_mux);
     return done;
   }
   // While bytes are flowing, poll the modem every 30 ms: TinyGSM's own
@@ -305,10 +306,10 @@ static bool               s_linkUp         = false;
 // 1 on OK match, >1 on alternate matches, 0 on timeout.
 template <typename... Args>
 static int waitChunked(uint32_t totalMs, Args... args) {
-  uint32_t end = millis() + totalMs;
+  const uint32_t t0 = millis();
   int res = 0;
-  while (millis() < end) {
-    uint32_t left  = end - millis();
+  while (msWithin(millis(), t0, totalMs)) {
+    uint32_t left  = totalMs - (millis() - t0);
     uint32_t chunk = left > 1500 ? 1500 : left;
     res = modem.waitResponse(chunk, args...);
     if (res != 0) return res;
@@ -317,10 +318,10 @@ static int waitChunked(uint32_t totalMs, Args... args) {
   return 0;
 }
 
-// Consecutive failed socket opens, and consecutive failed sends. Either
-// streak at 3 recycles the bearer, at 6 power-cycles the modem.
-static uint8_t s_openFails = 0;
-static uint8_t s_sendFails = 0;
+// Consecutive failed socket opens, and consecutive failed sends, per slot.
+// Either streak at 3 recycles the bearer, at 6 power-cycles the modem.
+static CellFailStreaks<Cellular::TCP_SLOTS> s_openFails;
+static CellFailStreaks<Cellular::TCP_SLOTS> s_sendFails;
 
 // The task that runs activation and the probe, and a step queued off it.
 static TaskHandle_t         s_driverTask = nullptr;
@@ -341,14 +342,14 @@ static void socketRecoverRun(uint8_t step) {
   }
 }
 
-static void socketRecover(uint8_t& streak, const char* kind) {
-  ++streak;
-  Log::kvfw(TAG, "cellular.socket_%s_failed streak=%u", kind, (unsigned)streak);
+static void socketRecover(CellFailStreaks<Cellular::TCP_SLOTS>& streaks, uint8_t slot,
+                          const char* kind) {
+  const uint8_t step = streaks.fail(slot);
+  Log::kvfw(TAG, "cellular.socket_%s_failed slot=%u streak=%u", kind, (unsigned)slot,
+            (unsigned)(step == CELL_RECOVER_RESET ? CELL_RESET_STREAK : streaks.streak(slot)));
   // A refused open or send often takes the data context down with it on
   // this modem: probe on the next loop instead of up to a minute later.
   s_lastHealthMs = 0;
-  const uint8_t step = cellRecoverStep(streak);
-  if (step == CELL_RECOVER_RESET) streak = 0;
   if (step == CELL_RECOVER_NONE) return;
   if (cellRecoverHere(xTaskGetCurrentTaskHandle(), s_driverTask)) {
     socketRecoverRun(step);
@@ -360,10 +361,10 @@ static void socketRecover(uint8_t& streak, const char* kind) {
             step == CELL_RECOVER_RESET ? "hard_reset" : "bearer_recycle");
 }
 
-static void socketOpenOk()     { s_openFails = 0; }
-static void socketOpenFailed() { socketRecover(s_openFails, "open"); }
-static void socketSendOk()     { s_sendFails = 0; }
-static void socketSendFailed() { socketRecover(s_sendFails, "send"); }
+static void socketOpenOk(uint8_t slot)     { s_openFails.ok(slot); }
+static void socketOpenFailed(uint8_t slot) { socketRecover(s_openFails, slot, "open"); }
+static void socketSendOk(uint8_t slot)     { s_sendFails.ok(slot); }
+static void socketSendFailed(uint8_t slot) { socketRecover(s_sendFails, slot, "send"); }
 
 // Hardware-reset the modem by dropping DC3 for 200 ms via the PMU,
 // then re-pulsing PWRKEY and waiting for AT. Replaces the previous
@@ -389,8 +390,8 @@ static bool modemSoftReset() {
   digitalWrite(PIN_MODEM_PWR, HIGH); delay(1000);
   digitalWrite(PIN_MODEM_PWR, LOW);
 
-  uint32_t deadline = millis() + REBOOT_BUDGET_MS;
-  while (millis() < deadline) {
+  const uint32_t t0 = millis();
+  while (msWithin(millis(), t0, REBOOT_BUDGET_MS)) {
     delay(1000);
     esp_task_wdt_reset();
     Shell::pumpConsole();
@@ -607,12 +608,12 @@ int Cellular::cellAT(const char* cmd, const char* expect, uint32_t timeoutMs,
   Serial1.print(cmd);
   Serial1.print("\r\n");
 
-  uint32_t end = millis() + timeoutMs;
+  const uint32_t t0 = millis();
   uint32_t lastWdt = millis();
   char     line[512];
   size_t   lineLen = 0;
 
-  while (millis() < end) {
+  while (msWithin(millis(), t0, timeoutMs)) {
     // Watchdog feed every 500 ms so callers can pass long timeouts
     // without tripping the 5 s task watchdog.
     if (millis() - lastWdt > 500) {
@@ -989,10 +990,10 @@ bool Cellular::gpsAcquireFix(uint32_t timeoutMs,
 
   bool fix = false;
   if (modem.enableGPS()) {
-    uint32_t end = millis() + timeoutMs;
+    const uint32_t t0 = millis();
     float fLat = 0, fLon = 0, fAlt = 0, fSpeed = 0, fAcc = 0;
     int   vSat = 0, uSat = 0;
-    while (millis() < end) {
+    while (msWithin(millis(), t0, timeoutMs)) {
       if (modem.getGPS(&fLat, &fLon, &fSpeed, &fAlt, &vSat, &uSat, &fAcc)) {
         fix = true;
         if (lat)        *lat        = fLat;
@@ -1020,8 +1021,8 @@ bool Cellular::gpsAcquireFix(uint32_t timeoutMs,
   modem.sendAT("+CFUN=1");
   modem.waitResponse(5000UL);
 
-  uint32_t settleEnd = millis() + 5000UL;
-  while (millis() < settleEnd && !isGprsConnectedRaw()) {
+  const uint32_t settleT0 = millis();
+  while (msWithin(millis(), settleT0, 5000UL) && !isGprsConnectedRaw()) {
     delay(250);
     esp_task_wdt_reset();
     Shell::pumpConsole();
@@ -1190,11 +1191,11 @@ bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
   // waiting for CARECV to drain. Empirically a multi-second idle is the
   // signal we've actually run out of data, not the connected flag.
   static constexpr uint32_t kBodyIdleTimeoutMs = 15000UL;
-  uint32_t deadline = millis() + 5UL * 60UL * 1000UL;  // 5 min global cap
+  const uint32_t capT0 = millis();  // 5 min global cap
   uint32_t lastWdt  = millis();
   uint32_t lastByte = millis();
 
-  while (millis() < deadline) {
+  while (msWithin(millis(), capT0, 5UL * 60UL * 1000UL)) {
     if (httpReadBudgetSpent(millis() - tStart, budgetMs)) {
       Log::kvfw(TAG, "cellular.https_get_cut reason=budget budget_ms=%u status=%d body_bytes=%u",
                 (unsigned)budgetMs, status, (unsigned)bodyBytes);

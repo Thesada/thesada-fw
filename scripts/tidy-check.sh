@@ -13,12 +13,12 @@ fi
 [ -n "$TIDY" ] || { echo "tidy-check: clang-tidy not found - make setup-sys, or CLANG_TIDY=/path/to/clang-tidy"; exit 2; }
 
 UNITY=.pio/libdeps/native/Unity/src
-if [ ! -f "$UNITY/unity.h" ]; then
-  echo "tidy-check: fetching Unity for the native env"
+AJSON=.pio/libdeps/native/ArduinoJson/src
+if [ ! -f "$UNITY/unity.h" ] || [ ! -f "$AJSON/ArduinoJson.h" ]; then
+  echo "tidy-check: fetching Unity and ArduinoJson for the native env"
   pio test -e native --without-testing --without-uploading >/dev/null
 fi
 [ -f "$UNITY/unity.h" ] || { echo "tidy-check: Unity missing under $UNITY after pio test"; exit 2; }
-AJSON=.pio/libdeps/native/ArduinoJson/src
 [ -f "$AJSON/ArduinoJson.h" ] || { echo "tidy-check: ArduinoJson missing under $AJSON after pio test"; exit 2; }
 
 shopt -s nullglob

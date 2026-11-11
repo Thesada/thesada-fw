@@ -613,9 +613,9 @@ void MQTTClient::begin() {
   }
 #endif
 
-  // Empty table, then put OTA back: main.cpp registers it before MQTT for
-  // heap reasons, so without this ota.cmd_topic is dead for the whole boot.
-  _subs.reset();
+  // Drop the core slots, then put OTA back: main.cpp registers it before MQTT
+  // for heap reasons, so without this ota.cmd_topic is dead for the whole boot.
+  _subs.removeOwner(MQTT_SUB_OWNER_CORE);
   OTAUpdate::registerCommandTopic();
 
   EventBus::subscribe("alert", [](JsonObject data) {
@@ -1158,8 +1158,8 @@ void MQTTClient::loop() {
       return;
     }
 
-    _client.loop();
-    _lastSuccessMs = millis();
+    // loop() is false once the keepalive gave up on the session.
+    if (_client.loop()) _lastSuccessMs = millis();
 
     if (_queueCount > 0) {
       if (_minIntervalMs == 0 || now - _lastPublishMs >= _minIntervalMs) {
@@ -1338,13 +1338,13 @@ void MQTTClient::publishRetainedSet(bool force) {
 
 // ---------------------------------------------------------------------------
 
-void MQTTClient::subscribe(const char* topic, MQTTCallback callback) {
+void MQTTClient::subscribe(const char* topic, MQTTCallback callback, uint8_t owner) {
   if (!mqttTopicFits(topic, MQTT_TOPIC_CAP)) {
     Log::kvfw(TAG, "mqtt.sub_rejected reason=topic_length len=%u cap=%u",
               topic ? (unsigned)strlen(topic) : 0u, (unsigned)MQTT_TOPIC_CAP);
     return;
   }
-  if (!_subs.add(topic, callback)) {
+  if (!_subs.add(topic, callback, owner)) {
     Log::kvfe(TAG, "mqtt.sub_rejected reason=max_subs max=%d", MQTT_MAX_SUBS);
     return;
   }
@@ -1358,6 +1358,14 @@ void MQTTClient::subscribe(const char* topic, MQTTCallback callback) {
     _client.subscribe(topic);
     _client.loop();
   }
+}
+
+void MQTTClient::unsubscribeOwner(uint8_t owner) {
+  const uint8_t freed = _subs.removeOwner(owner, [](const char* topic) {
+    if (_client.connected()) _client.unsubscribe(topic);
+  });
+  Log::kvf(TAG, "mqtt.sub_freed owner=%u slots=%u count=%d max=%d", (unsigned)owner,
+           (unsigned)freed, _subs.count(), MQTT_MAX_SUBS);
 }
 
 // ---------------------------------------------------------------------------
@@ -1862,9 +1870,21 @@ void MQTTClient::reconnectWithCurrentConfig() {
   _reinitPending = true;
 }
 
-// Re-register core subscriptions (cli/#, OTA, cmd/config) under the current prefix.
-// Called after config.reload when mqtt.topic_prefix changed. Does not
-// re-register EventBus handlers or reload TLS certs.
+// Re-register core subscriptions (cli/#, OTA, cmd/config, onReinit hooks) under the current prefix.
+// Called after config.reload when mqtt.topic_prefix changed. Lua slots carry
+// whole topics and stay. Does not re-register EventBus handlers or reload TLS certs.
+static constexpr uint8_t MQTT_REINIT_HOOKS = 4;
+static void (*s_reinitHooks[MQTT_REINIT_HOOKS])() = {};
+
+bool MQTTClient::onReinit(void (*fn)()) {
+  for (auto& h : s_reinitHooks) {
+    if (h == fn) return true;
+    if (!h) { h = fn; return true; }
+  }
+  Log::kvfw(TAG, "mqtt.reinit_hook_refused reason=full");
+  return false;
+}
+
 void MQTTClient::reinitSubscriptions() {
   // Drop the session before subscribe(). subscribe() pumps the client
   // while it is still connected. The reconnect resubscribes from the table.
@@ -1874,7 +1894,7 @@ void MQTTClient::reinitSubscriptions() {
     Log::kvf(TAG, "mqtt.state_change from=connected to=disconnected reason=sub_reinit");
   }
 
-  _subs.reset();
+  _subs.removeOwner(MQTT_SUB_OWNER_CORE);
 
   JsonObject  cfg    = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
@@ -1887,6 +1907,9 @@ void MQTTClient::reinitSubscriptions() {
 
   OTAUpdate::begin();
   mqttSubscribeCmdConfig();
+  for (auto h : s_reinitHooks) {
+    if (h) h();
+  }
   _reinitPending = true;
 }
 

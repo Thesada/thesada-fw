@@ -34,7 +34,8 @@ void GNSSModule::begin() {
 // stays free for MQTT.
 void GNSSModule::loop() {
   uint32_t now = millis();
-  if (_lastReadMs != 0 && now - _lastReadMs < _intervalMs) return;
+  if (_readOnce && now - _lastReadMs < _intervalMs) return;
+  _readOnce   = true;
   _lastReadMs = now;
 
   // GNSS does not depend on cellular registration / MQTT; it just needs
@@ -48,6 +49,8 @@ void GNSSModule::loop() {
     }
   }
   readAndPublish();
+  // From the end of the read: a cold fix that timed out does not start the next at once.
+  _lastReadMs = millis();
 }
 
 // Acquire one GNSS sample (atomic enable/wait/disable/CFUN=1) and

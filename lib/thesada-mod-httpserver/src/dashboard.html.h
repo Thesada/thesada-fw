@@ -327,13 +327,17 @@ function refreshState() {
             row(esc(c.name), metrics);
           });
         } else if (val.voltage_v !== undefined && val.percent !== undefined) {
-          const col = val.percent <= 20 ? '#c44' : val.charging ? '#4c4' : '';
           group(key);
-          row('Battery', [
-            { label: 'charge', value: esc(val.percent + '%') },
-            { label: 'voltage', value: esc(val.voltage_v + ' V') },
-            { label: 'state', value: val.charging ? 'charging' : 'discharging' },
-          ], col);
+          if (val.present === false) {
+            row('Battery', [{ label: 'state', value: 'not present' }]);
+          } else {
+            const col = val.percent <= 20 ? '#c44' : val.charging ? '#4c4' : '';
+            row('Battery', [
+              { label: 'charge', value: esc(val.percent + '%') },
+              { label: 'voltage', value: esc(val.voltage_v + ' V') },
+              { label: 'state', value: val.charging ? 'charging' : 'discharging' },
+            ], col);
+          }
         } else {
           group(key);
           row(esc(key), [{ label: '', value: esc(JSON.stringify(val)) }]);

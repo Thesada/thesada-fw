@@ -141,6 +141,70 @@ void test_denied_marker_refuses_every_chunk(void) {
   free(ok);
 }
 
+// --- the shared budget ---------------------------------------------------
+
+// fw #73: each authed POST malloc'd its declared body with no total, so a
+// few concurrent 64 KB uploads could take the heap.
+void test_budget_refuses_past_the_total(void) {
+  size_t held = 0;
+  TEST_ASSERT_TRUE(httpBodyReserve(held, HTTP_BODY_FILE_MAX, HTTP_BODY_BUDGET));
+  TEST_ASSERT_TRUE(httpBodyReserve(held, HTTP_BODY_CFG_MAX, HTTP_BODY_BUDGET));
+  TEST_ASSERT_EQUAL_UINT32(HTTP_BODY_BUDGET, held);
+  TEST_ASSERT_FALSE(httpBodyReserve(held, 1, HTTP_BODY_BUDGET));
+  TEST_ASSERT_EQUAL_UINT32(HTTP_BODY_BUDGET, held);
+}
+
+void test_budget_comes_back_on_release(void) {
+  size_t held = 0;
+  httpBodyReserve(held, HTTP_BODY_FILE_MAX, HTTP_BODY_BUDGET);
+  TEST_ASSERT_FALSE(httpBodyReserve(held, HTTP_BODY_FILE_MAX, HTTP_BODY_BUDGET));
+  httpBodyRelease(held, HTTP_BODY_FILE_MAX);
+  TEST_ASSERT_EQUAL_UINT32(0, held);
+  TEST_ASSERT_TRUE(httpBodyReserve(held, HTTP_BODY_FILE_MAX, HTTP_BODY_BUDGET));
+}
+
+// A release larger than what is held floors at zero instead of wrapping.
+void test_budget_release_never_wraps(void) {
+  size_t held = 10;
+  httpBodyRelease(held, 50);
+  TEST_ASSERT_EQUAL_UINT32(0, held);
+  TEST_ASSERT_FALSE(httpBodyReserve(held, (size_t)-1, HTTP_BODY_BUDGET));
+}
+
+// CR #126: the library parsed a form into heap before any handler ran, so an
+// unauthenticated form POST to /api/config sat outside the body budget.
+void test_form_past_cap_refused_before_parse(void) {
+  const char* form = "application/x-www-form-urlencoded";
+  TEST_ASSERT_EQUAL_INT(HTTP_PARSED_PASS, httpParsedBodyVerdict(form, 0, false, false));
+  TEST_ASSERT_EQUAL_INT(HTTP_PARSED_PASS, httpParsedBodyVerdict(form, HTTP_FORM_MAX, false, false));
+  TEST_ASSERT_EQUAL_INT(HTTP_PARSED_TOO_LARGE, httpParsedBodyVerdict(form, HTTP_FORM_MAX + 1, false, false));
+  TEST_ASSERT_EQUAL_INT(HTTP_PARSED_TOO_LARGE, httpParsedBodyVerdict(form, 80000, false, true));
+  TEST_ASSERT_EQUAL_INT(HTTP_PARSED_TOO_LARGE,
+                        httpParsedBodyVerdict("Application/X-WWW-Form-Urlencoded", 80000, false, false));
+}
+
+// text/plain is parsed as a form when its body opens with `name=`, which the
+// headers cannot tell, so a large one is refused like a form.
+void test_text_plain_past_cap_refused(void) {
+  TEST_ASSERT_EQUAL_INT(HTTP_PARSED_PASS, httpParsedBodyVerdict("text/plain", 200, false, false));
+  TEST_ASSERT_EQUAL_INT(HTTP_PARSED_TOO_LARGE, httpParsedBodyVerdict("text/plain", 80000, false, false));
+  TEST_ASSERT_EQUAL_INT(HTTP_PARSED_TOO_LARGE, httpParsedBodyVerdict("TEXT/PLAIN", 80000, false, false));
+}
+
+void test_multipart_only_on_upload_route(void) {
+  TEST_ASSERT_EQUAL_INT(HTTP_PARSED_UNSUPPORTED, httpParsedBodyVerdict("multipart/form-data", 10, true, false));
+  TEST_ASSERT_EQUAL_INT(HTTP_PARSED_PASS, httpParsedBodyVerdict("multipart/form-data", 1500000, true, true));
+}
+
+// Bodies that reach onBody keep their own caps and the budget.
+void test_onbody_types_pass(void) {
+  TEST_ASSERT_EQUAL_INT(HTTP_PARSED_PASS, httpParsedBodyVerdict("application/json", 16384, false, false));
+  TEST_ASSERT_EQUAL_INT(HTTP_PARSED_PASS, httpParsedBodyVerdict("application/octet-stream", 65536, false, false));
+  TEST_ASSERT_EQUAL_INT(HTTP_PARSED_PASS, httpParsedBodyVerdict("text/plainx", 80000, false, false));
+  TEST_ASSERT_EQUAL_INT(HTTP_PARSED_PASS, httpParsedBodyVerdict("", 80000, false, false));
+  TEST_ASSERT_EQUAL_INT(HTTP_PARSED_PASS, httpParsedBodyVerdict(nullptr, 80000, false, false));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_whole_body_in_chunks);
@@ -154,5 +218,12 @@ int main(int, char**) {
   RUN_TEST(test_unauthorized_wins_over_everything);
   RUN_TEST(test_plain_bodies_keep_their_verdicts);
   RUN_TEST(test_denied_marker_refuses_every_chunk);
+  RUN_TEST(test_budget_refuses_past_the_total);
+  RUN_TEST(test_budget_comes_back_on_release);
+  RUN_TEST(test_budget_release_never_wraps);
+  RUN_TEST(test_form_past_cap_refused_before_parse);
+  RUN_TEST(test_text_plain_past_cap_refused);
+  RUN_TEST(test_multipart_only_on_upload_route);
+  RUN_TEST(test_onbody_types_pass);
   return UNITY_END();
 }

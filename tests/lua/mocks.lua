@@ -296,6 +296,7 @@ function M.install()
       record("EventBus.subscribe", event)
       M._event_subs[event] = M._event_subs[event] or {}
       table.insert(M._event_subs[event], callback)
+      return true
     end,
   }
 

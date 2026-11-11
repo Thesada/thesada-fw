@@ -18,11 +18,19 @@ struct TempGuard {
   float held     = TEMP_NO_READING;
 };
 
+// A DS18B20 reads exactly 85.0 C after power-on or a reset, before its first
+// conversion. Clones that fail every conversion read it with a scratchpad the
+// library does not flag, and nothing the module reads tells the two apart, so
+// 85.0 is taken only near the last accepted reading, never on repeats alone.
+constexpr float TEMP_POWER_ON_C      = 85.0f;
+constexpr float TEMP_POWER_ON_NEAR_C = 2.0f;
+
 enum class TempVerdict : unsigned char {
   Accepted,     // near the last accepted reading, first reading, or guard off
   Rebaselined,  // far from the last accepted, near the held one: accepted
   NoReading,    // read failed or NaN; state untouched, a held reading survives
   Implausible,  // far from both; it becomes the held reading
+  PowerOn,      // 85.0 C, the probe's power-on value, not near the last accepted
 };
 
 // Judge one reading and update the guard.
@@ -30,6 +38,11 @@ enum class TempVerdict : unsigned char {
 // out: verdict. Only Accepted and Rebaselined carry a value to publish.
 inline TempVerdict tempGuardJudge(TempGuard& g, float c, float maxDelta) {
   if (std::isnan(c) || c <= TEMP_NO_READING) return TempVerdict::NoReading;
+
+  if (std::fabs(c - TEMP_POWER_ON_C) < 1e-3f &&
+      !(g.accepted > TEMP_NO_READING && std::fabs(c - g.accepted) <= TEMP_POWER_ON_NEAR_C)) {
+    return TempVerdict::PowerOn;  // never a held reading another one confirms
+  }
 
   bool guardOn = maxDelta > 0.0f && g.accepted > TEMP_NO_READING;
   TempVerdict v = TempVerdict::Accepted;

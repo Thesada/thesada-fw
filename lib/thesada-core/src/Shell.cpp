@@ -2400,10 +2400,21 @@ void Shell::registerBuiltins() {
   registerCommand("module.status", "Module status overview",        cmd_module_status);
 }
 
+// An explicit "mode": null is present: isNull() alone reads it as absent.
+static bool shellModeKeyPresent() {
+  JsonObjectConst shell = Config::get()["shell"].as<JsonObjectConst>();
+  if (shell.isNull()) return false;
+  for (JsonPairConst kv : shell) {
+    if (strcmp(kv.key().c_str(), "mode") == 0) return true;
+  }
+  return false;
+}
+
 ShellMode Shell::mode() {
   static const ShellMode m = []() {
     JsonVariantConst v = Config::get()["shell"]["mode"];
-    return shellModeResolve(!v.isNull(), v.is<const char*>() ? v.as<const char*>() : nullptr);
+    return shellModeResolve(shellModeKeyPresent(),
+                            v.is<const char*>() ? v.as<const char*>() : nullptr);
   }();
   return m;
 }
@@ -2414,15 +2425,15 @@ void Shell::begin() {
 
   JsonVariantConst modeVal = Config::get()["shell"]["mode"];
   const char* raw = modeVal.is<const char*>() ? modeVal.as<const char*>() : nullptr;
-  if (!modeVal.isNull() && !raw) {
+  if (shellModeKeyPresent() && !raw) {
     Log::kvfw("Shell", "shell.mode_not_a_string applied=off "
                        "hint=\"full|serial-only|mqtt-only|off\"");
   } else if (shellModeUnrecognised(raw)) {
-    Log::kvfw("Shell", "shell.mode_unrecognised value=%s applied=off "
+    Log::kvfw("Shell", "shell.mode_unrecognised value=\"%s\" applied=off "
                        "hint=\"full|serial-only|mqtt-only|off\"", raw);
   }
   Log::kvf("Shell", "shell.ready commands=%d mode=%s serial=%d mqtt=%d",
-           _commandCount, raw ? raw : "full",
+           _commandCount, shellModeName(mode()),
            shellModeSerialAllowed(mode()) ? 1 : 0,
            shellModeMqttAllowed(mode()) ? 1 : 0);
 }
