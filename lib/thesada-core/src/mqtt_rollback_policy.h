@@ -27,6 +27,13 @@ inline bool mqttSnapshotProven(const char* cfgHost, unsigned cfgPort,
   return cfgPort == livePort && strcmp(cfgHost, liveHost) == 0;
 }
 
+// Dial only a broker that is set. With no host the failures, and the budget
+// reboots they spend, buy something only when a last-good snapshot exists
+// for the rollback to restore. in: live host, snapshot set. out: true to dial.
+inline bool mqttShouldDial(const char* host, bool haveLg) {
+  return (host && *host) || haveLg;
+}
+
 // Low-heap defrag reboot: three straight failures that resolved the broker
 // and died before it answered (rc -2) on a heap under 40 KB, budget not
 // halted. A DNS outage never reached TLS, so it never qualifies.

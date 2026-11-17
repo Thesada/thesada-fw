@@ -62,3 +62,22 @@ inline bool luaBudgetLeave(LuaBudget& b) {
   b.depth--;
   return b.hit;
 }
+
+// A reload closes the state, so it never runs with a call into Lua on the
+// stack. in: budget, latch. out: true to reload now, else the latch is set.
+inline bool luaReloadNow(const LuaBudget& b, bool* pending) {
+  if (luaBudgetActive(b)) {
+    *pending = true;
+    return false;
+  }
+  *pending = false;
+  return true;
+}
+
+// Loop side of the latch. in: budget, latch. out: true to run the latched
+// reload now, latch cleared.
+inline bool luaReloadDue(const LuaBudget& b, bool* pending) {
+  if (!*pending || luaBudgetActive(b)) return false;
+  *pending = false;
+  return true;
+}

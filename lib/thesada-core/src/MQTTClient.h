@@ -154,9 +154,9 @@ public:
   // out: none
   static void publishRetainedSet(bool force = false);
 
-  // in:  cn / serial / notBefore / notAfter  caller-allocated, each >= maxLen bytes
-  // out: true if cert parsed; never touches private key
-  static bool getCertInfo(char* cn, char* serial, char* notBefore, char* notAfter, size_t maxLen);
+  // in:  info, filled within its own field sizes
+  // out: true if the cert parsed and its serial fit. Never touches the private key
+  static bool getCertInfo(CertInfo& info);
 
 private:
   static void connect();

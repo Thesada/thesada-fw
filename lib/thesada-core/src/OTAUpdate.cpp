@@ -605,6 +605,11 @@ void OTAUpdate::confirmIfHealthy() {
   dropOwnFledRecord();
 }
 
+bool OTAUpdate::awaitingConfirm() {
+  if (_otaImageSettled) return false;
+  return _otaStateKnown ? _otaPending : _otaBootPending;
+}
+
 uint32_t OTAUpdate::_lastCheck       = 0;
 uint32_t OTAUpdate::_checkIntervalMs = 21600000;  // 6 hours
 bool     OTAUpdate::_enabled         = true;
@@ -1061,9 +1066,9 @@ void OTAUpdate::loop() {
     _checkRequested = false;
     bool force = _forceRequested;
     _forceRequested = false;
-    const char* override = _pendingManifestUrl.length() > 0
-                             ? _pendingManifestUrl.c_str() : nullptr;
-    check(override, force);
+    // A copy: a nested ota.check typed during the fetch reassigns the member.
+    const String pending = _pendingManifestUrl;
+    check(pending.length() > 0 ? pending.c_str() : nullptr, force);
     _pendingManifestUrl = "";
     return;
   }
@@ -1102,9 +1107,10 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
   }
 
   JsonObject cfg = Config::get();
-  const char* url = manifestOverride
-                      ? manifestOverride
-                      : (cfg["ota"]["manifest_url"] | "");
+  // A copy: the fetch pumps the console, and a config.set there rebuilds the doc.
+  const String urlCopy = manifestOverride ? manifestOverride
+                                          : (const char*)(cfg["ota"]["manifest_url"] | "");
+  const char* url = urlCopy.c_str();
 
   if (strlen(url) == 0) {
     Log::error(TAG, "ota.check_refused reason=no_manifest_url");
@@ -1170,6 +1176,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
     publishOtaRefusal("manifest-fetch-failed");
     return;
   }
+  cfg = Config::get();  // the doc may have been rebuilt during the fetch
 
   Log::kvf(TAG, "ota.version_check remote=%s local=%s",
            remoteVersion.c_str(), FIRMWARE_VERSION);

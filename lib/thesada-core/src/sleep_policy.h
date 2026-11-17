@@ -20,3 +20,14 @@ inline uint32_t sleepWakeSpanMs(uint32_t wakeS) {
 inline bool sleepWakeDone(uint32_t now, uint32_t start, uint32_t spanMs) {
   return !msWithin(now, start, spanMs);
 }
+
+// Awake time past the OTA health gate, so its confirm gets a loop turn first.
+constexpr uint32_t SLEEP_OTA_GRACE_MS = 30000;
+
+// A wake runs the bootloader, which rolls back an image still pending. So
+// sleep waits while the running image awaits its confirm, up to the health
+// gate's uptime plus the grace. Past that the image is not confirming.
+// in: image awaiting confirm, uptime ms, health gate ms. out: true to stay awake.
+inline bool sleepHeldForOta(bool awaitingConfirm, uint32_t uptimeMs, uint32_t healthMs) {
+  return awaitingConfirm && uptimeMs < healthMs + SLEEP_OTA_GRACE_MS;
+}

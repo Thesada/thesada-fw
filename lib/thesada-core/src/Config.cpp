@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "Config.h"
 #include "Log.h"
+#include "config_load_policy.h"
 #include "config_write_policy.h"
 #include "config_schema_policy.h"
 #include <LittleFS.h>
@@ -134,28 +135,35 @@ static void migrateSchema(JsonDocument& live) {
 
 const char* Config::schemaAlert() { return _schemaAlert[0] ? _schemaAlert : nullptr; }
 
-void Config::load() {
-  bool parsed = false;
-  _schemaAlert[0] = '\0';
-  auto read = [&]() {
-    clearHeldTopicPrefix();
-    if (!LittleFS.begin()) return;
+// configLoadInto's view of LittleFS.
+struct LittleFsConfigSource {
+  bool mount() { return LittleFS.begin(); }
+  bool parse(JsonDocument& doc, DeserializationError& err) {
     File f = LittleFS.open("/config.json", "r");
-    if (!f) return;
-    DeserializationError err = deserializeJson(_doc, f);
+    if (!f) return false;
+    err = deserializeJson(doc, f);
     f.close();
-    // A malformed file would otherwise leave _doc half-parsed; clear to a
-    // clean empty doc so get() returns defaults, not garbage.
-    if (err) {
-      _doc.clear();
-      Log::kvfe(TAG, "config.parse_failed err=%s action=use_defaults", err.c_str());
-      return;
-    }
-    parsed = true;
-  };
-  read();
-  if (parsed) migrateSchema(_doc);
+    return true;
+  }
+};
+
+bool Config::load() {
+  _schemaAlert[0] = '\0';
+  const bool hadDoc = !_doc.isNull();
+  LittleFsConfigSource src;
+  DeserializationError err;
+  const ConfigLoad r = configLoadInto(src, _doc, err);
+  if (r != CONFIG_LOAD_OK) {
+    // The doc and its held prefix stay as they were, on boot and reload alike.
+    Log::kvfe(TAG, "%s err=%s action=%s", configLoadEvent(r),
+              err ? err.c_str() : (r == CONFIG_LOAD_PARSE_FAILED ? "not_object" : "none"),
+              hadDoc ? "keep_previous" : "use_defaults");
+    return false;
+  }
+  clearHeldTopicPrefix();
+  migrateSchema(_doc);
   configChanged();
+  return true;
 }
 
 // Persist the in-memory doc to /config.json. out: true on success;
@@ -196,7 +204,9 @@ bool Config::save() {
   return ok;
 }
 
-// The one tmp + rename writer for /config.json. lfs rename replaces the
+static bool commitTmp(size_t written, size_t expected, size_t* bytes);
+
+// The one tmp + rename path for /config.json. lfs rename replaces the
 // destination atomically, so a failure leaves the last good file in place.
 bool Config::writeFile(JsonVariantConst src, bool pretty, size_t* bytes) {
   File f = LittleFS.open("/config.json.tmp", "w");
@@ -207,6 +217,27 @@ bool Config::writeFile(JsonVariantConst src, bool pretty, size_t* bytes) {
   size_t written  = pretty ? serializeJsonPretty(src, f) : serializeJson(src, f);
   size_t expected = pretty ? measureJsonPretty(src) : measureJson(src);
   f.close();
+  return commitTmp(written, expected, bytes);
+}
+
+bool Config::writeRaw(const char* data, size_t len, size_t* bytes) {
+  if (!configBytesAreObject(data, len)) {
+    Log::error(TAG, "config.save_failed reason=not_object");
+    return false;
+  }
+  File f = LittleFS.open("/config.json.tmp", "w");
+  if (!f) {
+    Log::error(TAG, "config.save_failed reason=tmp_open");
+    return false;
+  }
+  size_t written = f.write((const uint8_t*)data, len);
+  f.close();
+  return commitTmp(written, len, bytes);
+}
+
+// Rename a closed /config.json.tmp over /config.json once its size read back
+// matches. in: bytes handed to the File, intended size. out: false if the old file stayed.
+static bool commitTmp(size_t written, size_t expected, size_t* bytes) {
   // The real lfs write is inside fclose and its result is dropped. Read back.
   size_t onDisk = 0;
   File chk = LittleFS.open("/config.json.tmp", "r");
@@ -240,16 +271,16 @@ bool Config::replace(const char* json) {
     }
     keepBoot = true;
   }
-  // save() must write this document, not a prefix held from an earlier push.
-  clearHeldTopicPrefix();
-  _doc.clear();
-  DeserializationError err = deserializeJson(_doc, json);
+  // Parsed aside first: a malformed push leaves the live doc and its hold alone.
+  JsonDocument fresh;
+  DeserializationError err = deserializeJson(fresh, json);
   if (err) {
-    Log::kvfe(TAG, "config.replace_failed err=%s action=rollback", err.c_str());
-    load();
-    if (keepBoot) Config::holdTopicPrefix(bootPrefix);
+    Log::kvfe(TAG, "config.replace_failed err=%s action=keep_live", err.c_str());
     return false;
   }
+  // save() must write this document, not a prefix held from an earlier push.
+  clearHeldTopicPrefix();
+  _doc = std::move(fresh);
   if (!save()) {
     Log::error(TAG, "config.replace_failed reason=persist");
     load();

@@ -11,6 +11,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <utility>
 
 // MQTT topic match: exact, trailing `/#` (multi-level), trailing `/+` (one
 // level). Lifted verbatim from MQTTClient::matchAndDispatch.
@@ -60,7 +61,7 @@ class MqttSubTable {
     if (i >= N) return false;
     Slot& s = _slots[i];
     memcpy(s.topic, topic, strlen(topic) + 1);
-    s.callback             = cb;
+    s.callback             = std::move(cb);
     s.active               = true;
     s.owner                = owner;
     if (i == _count) _count++;
@@ -104,11 +105,13 @@ class MqttSubTable {
     return false;
   }
 
-  // Deliver to every active slot whose filter matches.
+  // Deliver to every active slot whose filter matches. Each callback runs
+  // from a copy: an add() inside it may reuse its slot and destroy the original.
   void dispatch(const char* topic, const char* payload) const {
     for (uint8_t i = 0; i < _count; i++) {
-      if (!_slots[i].active) continue;
-      if (mqttSubMatches(_slots[i].topic, topic)) _slots[i].callback(topic, payload);
+      if (!_slots[i].active || !mqttSubMatches(_slots[i].topic, topic)) continue;
+      const CB cb = _slots[i].callback;
+      cb(topic, payload);
     }
   }
 

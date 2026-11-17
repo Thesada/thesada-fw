@@ -43,8 +43,32 @@ void test_done_across_wrap(void) {
   TEST_ASSERT_TRUE(sleepWakeDone(start + span, start, span));
 }
 
+// A pending image keeps the unit awake until the health gate can confirm it,
+// so a 30 s awake window no longer ends in a bootloader rollback.
+void test_pending_image_holds_sleep_until_the_health_gate(void) {
+  const uint32_t gate = 300000;
+  TEST_ASSERT_TRUE(sleepHeldForOta(true, 30000, gate));
+  TEST_ASSERT_TRUE(sleepHeldForOta(true, gate, gate));
+  TEST_ASSERT_TRUE(sleepHeldForOta(true, gate + SLEEP_OTA_GRACE_MS - 1, gate));
+}
+
+// The hold is bounded: an image that will not confirm (crash streak at the
+// limit, unread streak) does not keep a battery unit awake.
+void test_hold_ends_after_the_gate_and_grace(void) {
+  const uint32_t gate = 300000;
+  TEST_ASSERT_FALSE(sleepHeldForOta(true, gate + SLEEP_OTA_GRACE_MS, gate));
+}
+
+void test_confirmed_image_never_holds_sleep(void) {
+  TEST_ASSERT_FALSE(sleepHeldForOta(false, 0, 300000));
+  TEST_ASSERT_FALSE(sleepHeldForOta(false, 30000, 300000));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
+  RUN_TEST(test_pending_image_holds_sleep_until_the_health_gate);
+  RUN_TEST(test_hold_ends_after_the_gate_and_grace);
+  RUN_TEST(test_confirmed_image_never_holds_sleep);
   RUN_TEST(test_span_floor_and_plain);
   RUN_TEST(test_span_capped_no_overflow);
   RUN_TEST(test_done_plain);
