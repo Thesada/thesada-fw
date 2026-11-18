@@ -49,6 +49,7 @@ lib/thesada-core/src/lua_budget_policy.h        95
 lib/thesada-core/src/temp_guard_policy.h        95
 lib/thesada-core/src/ads_sample_policy.h        95
 lib/thesada-core/src/config_write_policy.h       95
+lib/thesada-core/src/config_load_policy.h        95
 lib/thesada-core/src/web_snapshot_policy.h       95
 lib/thesada-core/src/alert_payload_policy.h      95
 lib/thesada-core/src/config_schema_policy.h      95

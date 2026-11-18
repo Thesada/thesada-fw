@@ -3,6 +3,7 @@
 // so it is host-unit-testable. See the rollback invariant for the contract.
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
+#include <ArduinoJson.h>
 #include <string.h>
 
 // Roll back to last-good iff a snapshot exists (lg / haveLg), the still-current
@@ -25,6 +26,23 @@ inline bool mqttSnapshotProven(const char* cfgHost, unsigned cfgPort,
                                const char* liveHost, unsigned livePort) {
   if (!cfgHost || !liveHost || !*liveHost) return false;
   return cfgPort == livePort && strcmp(cfgHost, liveHost) == 0;
+}
+
+// Dial only a broker that is set. With no host the failures, and the budget
+// reboots they spend, buy something only when a last-good snapshot exists
+// for the rollback to restore. in: live host, snapshot set. out: true to dial.
+inline bool mqttShouldDial(const char* host, bool haveLg) {
+  return (host && *host) || haveLg;
+}
+
+// The marker and the snapshot are two NVS writes, so the marker alone proves
+// nothing. in: snapshot text, marker. out: true when a rollback could restore it.
+inline bool mqttLastGoodUsable(const char* lg, bool lgSet) {
+  if (!lgSet || !lg || !*lg) return false;
+  JsonDocument d;
+  if (deserializeJson(d, lg) || !d.is<JsonObject>()) return false;
+  const char* broker = d["broker"] | "";
+  return *broker != '\0';
 }
 
 // Low-heap defrag reboot: three straight failures that resolved the broker

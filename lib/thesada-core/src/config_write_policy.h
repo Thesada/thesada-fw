@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 // in: path after pathSafePolicy. out: true when littlefs 2.10+ resolves it to
@@ -17,6 +18,19 @@ inline bool configPathIsLive(const char* path) {
     break;
   }
   return strcmp(p, "config.json") == 0;
+}
+
+enum FsWriteRoute {
+  FS_ROUTE_PLAIN = 0,      // writeChecked on the file itself
+  FS_ROUTE_CONFIG,         // whole JSON object, tmp + rename (Config::writeRaw)
+  FS_ROUTE_CONFIG_APPEND,  // refused: an append to the config file is in place
+};
+
+// How fs.write / fs.append reach a path. Only LittleFS holds the config file.
+// in: target is LittleFS, path after stripPrefix, append. out: route.
+inline FsWriteRoute fsWriteRoute(bool littleFs, const char* path, bool append) {
+  if (!littleFs || !configPathIsLive(path)) return FS_ROUTE_PLAIN;
+  return append ? FS_ROUTE_CONFIG_APPEND : FS_ROUTE_CONFIG;
 }
 
 // in: bytes handed to the File, tmp size read back after close, intended size.
@@ -95,4 +109,20 @@ inline FatCommit fatCommit(Fs& fs, const char* tmp, const char* bak, const char*
   }
   if (parked && !fs.remove(bak)) return FAT_COMMIT_OK_BAK_LEFT;
   return FAT_COMMIT_OK;
+}
+
+// The reply a shell config writer gives once the file landed.
+// in: buf, key, value (null for a delete), reloaded = Config::load() result.
+// out: buf filled, true when the reply is a success.
+inline bool configSavedReply(char* buf, size_t cap, const char* key, const char* value, bool reloaded) {
+  if (!reloaded) {
+    (void)snprintf(buf, cap, "Saved %s to /config.json, live config not reloaded (see log)", key);
+    return false;
+  }
+  if (value) {
+    (void)snprintf(buf, cap, "Set %s = %s (saved - run config.reload to apply network changes)", key, value);
+  } else {
+    (void)snprintf(buf, cap, "Deleted %s (saved)", key);
+  }
+  return true;
 }

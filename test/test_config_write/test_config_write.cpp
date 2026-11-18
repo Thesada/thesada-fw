@@ -72,6 +72,29 @@ void test_disagreeing_or_empty_sizes_fail(void) {
   TEST_ASSERT_FALSE(configWriteLanded(0, 0, 0));
 }
 
+// --- fs.write / fs.append routing ---------------------------------------------
+
+// fs.write onto the live config file goes whole through tmp + rename.
+void test_fs_write_of_the_config_file_is_staged(void) {
+  TEST_ASSERT_EQUAL_INT(FS_ROUTE_CONFIG, fsWriteRoute(true, "/config.json", false));
+  TEST_ASSERT_EQUAL_INT(FS_ROUTE_CONFIG, fsWriteRoute(true, "/./config.json", false));
+}
+
+// An append cannot be made atomic, so it never reaches the config file.
+void test_fs_append_to_the_config_file_is_refused(void) {
+  TEST_ASSERT_EQUAL_INT(FS_ROUTE_CONFIG_APPEND, fsWriteRoute(true, "/config.json", true));
+  TEST_ASSERT_EQUAL_INT(FS_ROUTE_CONFIG_APPEND, fsWriteRoute(true, "//config.json", true));
+}
+
+// Other files, the app's staging copy and anything on SD keep the plain path.
+void test_other_writes_stay_plain(void) {
+  TEST_ASSERT_EQUAL_INT(FS_ROUTE_PLAIN, fsWriteRoute(true, "/config.json.new", false));
+  TEST_ASSERT_EQUAL_INT(FS_ROUTE_PLAIN, fsWriteRoute(true, "/config.json.new", true));
+  TEST_ASSERT_EQUAL_INT(FS_ROUTE_PLAIN, fsWriteRoute(true, "/scripts/rules.lua", false));
+  TEST_ASSERT_EQUAL_INT(FS_ROUTE_PLAIN, fsWriteRoute(false, "/config.json", false));
+  TEST_ASSERT_EQUAL_INT(FS_ROUTE_PLAIN, fsWriteRoute(true, nullptr, false));
+}
+
 // --- fileWriteLanded / uploadTmpPath (#67) ------------------------------------
 
 // An empty upload is a legitimate empty file, unlike an empty config.
@@ -230,8 +253,32 @@ void test_fat_commit_reports_a_bak_it_could_not_remove(void) {
   TEST_ASSERT_EQUAL_STRING("new", fs.files[P].c_str());
 }
 
+void test_saved_reply_is_ok_once_reloaded(void) {
+  char buf[200];
+  TEST_ASSERT_TRUE(configSavedReply(buf, sizeof(buf), "mqtt.port", "8883", true));
+  TEST_ASSERT_NOT_NULL(strstr(buf, "Set mqtt.port = 8883 (saved"));
+  TEST_ASSERT_TRUE(configSavedReply(buf, sizeof(buf), "lora", nullptr, true));
+  TEST_ASSERT_EQUAL_STRING("Deleted lora (saved)", buf);
+}
+
+// A failed reload keeps the old live doc, so the write is no plain success.
+void test_saved_reply_fails_when_the_reload_failed(void) {
+  char buf[200];
+  char longValue[300];
+  memset(longValue, 'v', sizeof(longValue) - 1);
+  longValue[sizeof(longValue) - 1] = '\0';
+  TEST_ASSERT_FALSE(configSavedReply(buf, sizeof(buf), "mqtt.port", longValue, false));
+  TEST_ASSERT_NOT_NULL(strstr(buf, "mqtt.port"));
+  TEST_ASSERT_NOT_NULL(strstr(buf, "live config not reloaded"));
+  TEST_ASSERT_FALSE(configSavedReply(buf, sizeof(buf), "lora", nullptr, false));
+  TEST_ASSERT_NOT_NULL(strstr(buf, "live config not reloaded"));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
+  RUN_TEST(test_fs_write_of_the_config_file_is_staged);
+  RUN_TEST(test_fs_append_to_the_config_file_is_refused);
+  RUN_TEST(test_other_writes_stay_plain);
   RUN_TEST(test_plain_config_path_is_live);
   RUN_TEST(test_dot_segment_spellings_are_live);
   RUN_TEST(test_path_after_the_file_is_not_live);
@@ -253,5 +300,7 @@ int main(int, char**) {
   RUN_TEST(test_fat_commit_strands_both_copies_rather_than_delete_one);
   RUN_TEST(test_fat_commit_survives_a_writer_recreating_the_target);
   RUN_TEST(test_fat_commit_reports_a_bak_it_could_not_remove);
+  RUN_TEST(test_saved_reply_is_ok_once_reloaded);
+  RUN_TEST(test_saved_reply_fails_when_the_reload_failed);
   return UNITY_END();
 }

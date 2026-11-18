@@ -11,6 +11,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <memory>
+#include <utility>
 
 // MQTT topic match: exact, trailing `/#` (multi-level), trailing `/+` (one
 // level). Lifted verbatim from MQTTClient::matchAndDispatch.
@@ -38,7 +40,7 @@ class MqttSubTable {
  public:
   struct Slot {
     char topic[TOPIC_CAP];
-    CB      callback;
+    std::shared_ptr<CB> callback;
     bool    active;
     uint8_t owner;
   };
@@ -60,7 +62,7 @@ class MqttSubTable {
     if (i >= N) return false;
     Slot& s = _slots[i];
     memcpy(s.topic, topic, strlen(topic) + 1);
-    s.callback             = cb;
+    s.callback             = std::make_shared<CB>(std::move(cb));
     s.active               = true;
     s.owner                = owner;
     if (i == _count) _count++;
@@ -104,11 +106,13 @@ class MqttSubTable {
     return false;
   }
 
-  // Deliver to every active slot whose filter matches.
+  // Deliver to every active slot whose filter matches. Each call holds a
+  // handle to its target: an add() inside it may reuse the slot.
   void dispatch(const char* topic, const char* payload) const {
     for (uint8_t i = 0; i < _count; i++) {
-      if (!_slots[i].active) continue;
-      if (mqttSubMatches(_slots[i].topic, topic)) _slots[i].callback(topic, payload);
+      if (!_slots[i].active || !mqttSubMatches(_slots[i].topic, topic)) continue;
+      const std::shared_ptr<CB> cb = _slots[i].callback;
+      (*cb)(topic, payload);
     }
   }
 

@@ -498,10 +498,9 @@ void MQTTClient::begin() {
   uint32_t    ivs  = cfg["mqtt"]["send_interval_s"] | 0;
   _minIntervalMs   = ivs * 1000UL;
 
-  if (strlen(host) == 0) {
-    Log::error(TAG, "mqtt.config_missing key=broker");
-    return;
-  }
+  // Not a return: the callback, CA and subscriptions below must be in place
+  // for a broker a later config.reload sets. connect() decides on dialing.
+  if (strlen(host) == 0) Log::error(TAG, "mqtt.config_missing key=broker");
 
   _bufferIn  = cfg["mqtt"]["buffer_in"]  | 4096;
   _bufferOut = cfg["mqtt"]["buffer_out"] | 4096;
@@ -526,8 +525,8 @@ void MQTTClient::begin() {
 #ifdef MQTT_TLS
   _tlsVerified = false;
   // Boot clock floor: lift an epoch clock to a sane lower bound of real time
-  // before the first TLS handshake, so certificate validity checks pass from
-  // the very first connect and no insecure window exists. Floor = newer of
+  // before the first TLS handshake. Cert dates are never checked on this build
+  // (see the ledger), the floor keeps time() plausible for the rest. Floor = newer of
   // the persisted floor and the firmware build stamp; the clock is never
   // moved backwards, so an already-synced clock is untouched.
   {
@@ -809,6 +808,25 @@ void MQTTClient::connect() {
 #endif
   const MqttTransport transport = transportWanted();
   if (transport == MqttTransport::NONE) return;
+
+  static bool idleLogged = false;
+  bool haveLg = false;
+  if (!*_brokerHost) {
+    Preferences prefs;
+    if (prefs.begin(BOOT_NS, true)) {
+      const bool lgSet = prefs.getUChar(RB_KEY_LGSET, 0) != 0;
+      char lg[LG_MAX_LEN] = {0};
+      if (lgSet) prefs.getString(RB_KEY_LG, lg, sizeof(lg));
+      prefs.end();
+      haveLg = mqttLastGoodUsable(lg, lgSet);
+    }
+  }
+  if (!mqttShouldDial(_brokerHost, haveLg)) {
+    if (!idleLogged) Log::warn(TAG, "mqtt.state_change from=disconnected to=idle reason=no_broker");
+    idleLogged = true;
+    return;
+  }
+  idleLogged = false;
 
   JsonObject  cfg      = Config::get();
   const char* clientId = Identity::nodeName();
@@ -1352,12 +1370,9 @@ void MQTTClient::subscribe(const char* topic, MQTTCallback callback, uint8_t own
   Log::kvf(TAG, "mqtt.sub_registered topic=%s count=%d max=%d",
            topic, _subs.count(), MQTT_MAX_SUBS);
 
-  // Feed keepalive during bulk Lua subscription (>10 s): without this the
-  // broker or HAProxy drops the idle TCP connection.
-  if (_client.connected()) {
-    _client.subscribe(topic);
-    _client.loop();
-  }
+  // No _client.loop() here: it dispatches inbound messages, and a Lua caller
+  // would run callbacks, or a reload, inside the chunk still on the stack.
+  if (_client.connected()) _client.subscribe(topic);
 }
 
 void MQTTClient::unsubscribeOwner(uint8_t owner) {
@@ -1534,11 +1549,14 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
         const char* fsPath = Shell::stripPrefix(path);
         size_t onDisk = 0;
         const bool append = mode[0] == 'a';
-        const FsWrite w = Shell::writeChecked(fs, fsPath, append, (const uint8_t*)content,
-                                              contentLen, &onDisk);
+        const FsWrite w = Shell::writeRouted(fs, fsPath, append, (const uint8_t*)content,
+                                             contentLen, &onDisk);
         if (w == FS_WRITE_OPEN_FAILED) {
           resp["ok"] = false;
           resp["output"][0] = "Failed to open file";
+        } else if (const char* why = Shell::fsWriteRefusal(w)) {
+          resp["ok"] = false;
+          resp["output"][0] = why;
         } else {
           char msg[160];
           resp["ok"] = w == FS_WRITE_OK;
@@ -1886,8 +1904,8 @@ bool MQTTClient::onReinit(void (*fn)()) {
 }
 
 void MQTTClient::reinitSubscriptions() {
-  // Drop the session before subscribe(). subscribe() pumps the client
-  // while it is still connected. The reconnect resubscribes from the table.
+  // Drop the session first. The reconnect resubscribes from the table
+  // under the new prefix.
   if (_client.connected()) {
     _client.disconnect();
     _connectedSinceMs = 0;
@@ -2501,11 +2519,9 @@ bool MQTTClient::hasClientCert() {
 }
 
 // Parse stored cert PEM and extract metadata. Never touches the private key.
-// in: cn, serial, notBefore, notAfter (>= maxLen each), maxLen >= 64.
-// out: true if parsed, false if missing or malformed.
-bool MQTTClient::getCertInfo(char* cn, char* serial, char* notBefore, char* notAfter, size_t maxLen) {
-  if (!cn || !serial || !notBefore || !notAfter || maxLen < 64) return false;
-
+// in: info. out: true if parsed, false if missing, malformed, or the serial
+// does not fit info.serial.
+bool MQTTClient::getCertInfo(CertInfo& info) {
   char* cert = (char*)malloc(CERT_MAX_LEN);
   if (!cert) return false;
 
@@ -2529,21 +2545,21 @@ bool MQTTClient::getCertInfo(char* cn, char* serial, char* notBefore, char* notA
 
   char subj[256];
   mbedtls_x509_dn_gets(subj, sizeof(subj), &crt.subject);
-  if (!certExtractCn(subj, cn, maxLen)) {
-    snprintf(cn, maxLen, "(no CN)");
+  if (!certExtractCn(subj, info.cn, sizeof(info.cn))) {
+    snprintf(info.cn, sizeof(info.cn), "(no CN)");
   }
 
-  char* sp = serial;
-  char* se = serial + maxLen - 1;
-  for (size_t i = 0; i < crt.serial.len && sp + 2 < se; i++) {
-    sp += snprintf(sp, 3, "%02x", crt.serial.p[i]);
+  if (!certSerialHex(crt.serial.p, crt.serial.len, info.serial, sizeof(info.serial))) {
+    Log::kvfw(TAG, "mqtt.cert_info_refused reason=serial_length len=%u cap=%u",
+              (unsigned)crt.serial.len, (unsigned)((sizeof(info.serial) - 1) / 2));
+    mbedtls_x509_crt_free(&crt);
+    return false;
   }
-  *sp = '\0';
 
-  snprintf(notBefore, maxLen, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+  snprintf(info.notBefore, sizeof(info.notBefore), "%04d-%02d-%02dT%02d:%02d:%02dZ",
            crt.valid_from.year, crt.valid_from.mon, crt.valid_from.day,
            crt.valid_from.hour, crt.valid_from.min, crt.valid_from.sec);
-  snprintf(notAfter, maxLen, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+  snprintf(info.notAfter, sizeof(info.notAfter), "%04d-%02d-%02dT%02d:%02d:%02dZ",
            crt.valid_to.year, crt.valid_to.mon, crt.valid_to.day,
            crt.valid_to.hour, crt.valid_to.min, crt.valid_to.sec);
 

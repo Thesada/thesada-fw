@@ -2,7 +2,7 @@
 //
 // Manifest format (JSON at a known URL):
 //   {
-//     "version": "1.x",
+//     "version": "1.2.3",   (strict N.N.N, see otaParseVersion)
 //     "url": "https://example.com/firmware.bin",
 //     "sha256": "e3b0c44298fc1c149afbf4c8996fb924..."
 //   }
@@ -605,6 +605,11 @@ void OTAUpdate::confirmIfHealthy() {
   dropOwnFledRecord();
 }
 
+bool OTAUpdate::awaitingConfirm() {
+  if (_otaImageSettled) return false;
+  return _otaStateKnown ? _otaPending : _otaBootPending;
+}
+
 uint32_t OTAUpdate::_lastCheck       = 0;
 uint32_t OTAUpdate::_checkIntervalMs = 21600000;  // 6 hours
 bool     OTAUpdate::_enabled         = true;
@@ -660,11 +665,11 @@ static void publishOtaRefusal(const char* reason) {
 
 // Short socket + handshake timeouts so a flaky upstream cannot block
 // readBytes() long enough to trip the task watchdog. WiFiClientSecure
-// defaults to ~60s read timeout, far past the ~5s TWDT window.
+// defaults to ~60s read timeout, past the 30 s TWDT window (TASK_WDT_TIMEOUT_MS).
 //
-// When /ca.crt is missing OTAUpdate::begin() refuses to enable OTA unless
-// ota.allow_insecure is set in config.json, so by the time we get here we
-// already know either the CA cert is loaded or the operator has opted in.
+// Without /ca.crt the baked PROGMEM bundle loads. Only with no CA at all does
+// begin() refuse OTA unless ota.allow_insecure is set, so here either a CA is
+// loaded or the operator has opted in.
 static void configureSecureClient(WiFiClientSecure& client) {
   loadCaCert();
   if (_otaCaCert.isEmpty()) {
@@ -1057,14 +1062,8 @@ void OTAUpdate::triggerCheck(const char* manifestOverride, bool force) {
 void OTAUpdate::loop() {
   confirmIfHealthy();
   // Deferred MQTT-triggered check: runs outside MQTT callback context.
-  if (_checkRequested) {
-    _checkRequested = false;
-    bool force = _forceRequested;
-    _forceRequested = false;
-    const char* override = _pendingManifestUrl.length() > 0
-                             ? _pendingManifestUrl.c_str() : nullptr;
-    check(override, force);
-    _pendingManifestUrl = "";
+  if (otaRunRequested(_checkRequested, _forceRequested, _pendingManifestUrl,
+                      [](const char* url, bool force) { check(url, force); })) {
     return;
   }
 
@@ -1102,9 +1101,10 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
   }
 
   JsonObject cfg = Config::get();
-  const char* url = manifestOverride
-                      ? manifestOverride
-                      : (cfg["ota"]["manifest_url"] | "");
+  // A copy: the fetch pumps the console, and a config.set there rebuilds the doc.
+  const String urlCopy = manifestOverride ? manifestOverride
+                                          : (const char*)(cfg["ota"]["manifest_url"] | "");
+  const char* url = urlCopy.c_str();
 
   if (strlen(url) == 0) {
     Log::error(TAG, "ota.check_refused reason=no_manifest_url");
@@ -1170,6 +1170,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
     publishOtaRefusal("manifest-fetch-failed");
     return;
   }
+  cfg = Config::get();  // the doc may have been rebuilt during the fetch
 
   Log::kvf(TAG, "ota.version_check remote=%s local=%s",
            remoteVersion.c_str(), FIRMWARE_VERSION);

@@ -83,8 +83,43 @@ void test_no_snapshot_without_a_live_broker(void) {
   TEST_ASSERT_FALSE(mqttSnapshotProven("mqtt.thesada.app", 8884, nullptr, 8884));
 }
 
+// A fresh unit or a standalone config with no broker never dials "", so it
+// never spends the reboot budget on a config already logged as missing.
+void test_no_broker_and_no_snapshot_does_not_dial(void) {
+  TEST_ASSERT_FALSE(mqttShouldDial("", false));
+  TEST_ASSERT_FALSE(mqttShouldDial(nullptr, false));
+}
+
+// An emptied broker on a unit with a last-good snapshot still dials: those
+// failures record the candidate and the boot rollback restores the snapshot.
+void test_no_broker_with_snapshot_still_dials_for_the_rollback(void) {
+  TEST_ASSERT_TRUE(mqttShouldDial("", true));
+  static const char* EMPTIED = "{\"broker\":\"\",\"port\":8884}";
+  TEST_ASSERT_TRUE(mqttRollbackShould(GOOD, true, EMPTIED, EMPTIED));
+}
+
+// CR #129: the marker landed but the snapshot write did not. Nothing to restore.
+void test_last_good_needs_the_snapshot_not_only_the_marker(void) {
+  TEST_ASSERT_TRUE(mqttLastGoodUsable(GOOD, true));
+  TEST_ASSERT_FALSE(mqttLastGoodUsable(GOOD, false));
+  TEST_ASSERT_FALSE(mqttLastGoodUsable("", true));
+  TEST_ASSERT_FALSE(mqttLastGoodUsable(nullptr, true));
+  TEST_ASSERT_FALSE(mqttLastGoodUsable("{\"broker\":\"mqtt.thes", true));
+  TEST_ASSERT_FALSE(mqttLastGoodUsable("{\"broker\":\"\",\"port\":8884}", true));
+  TEST_ASSERT_FALSE(mqttLastGoodUsable("[]", true));
+}
+
+void test_a_set_broker_dials(void) {
+  TEST_ASSERT_TRUE(mqttShouldDial("broker.example", false));
+  TEST_ASSERT_TRUE(mqttShouldDial("broker.example", true));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
+  RUN_TEST(test_no_broker_and_no_snapshot_does_not_dial);
+  RUN_TEST(test_no_broker_with_snapshot_still_dials_for_the_rollback);
+  RUN_TEST(test_last_good_needs_the_snapshot_not_only_the_marker);
+  RUN_TEST(test_a_set_broker_dials);
   RUN_TEST(test_snapshot_when_session_dialed_the_config_broker);
   RUN_TEST(test_no_snapshot_when_host_was_refused);
   RUN_TEST(test_no_snapshot_when_port_not_applied);
