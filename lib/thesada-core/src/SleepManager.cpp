@@ -19,6 +19,7 @@ static const char* TAG = "Sleep";
 RTC_DATA_ATTR static RtcData _rtc;
 
 bool     SleepManager::_enabled      = false;
+bool     SleepManager::_shuttingDown = false;
 uint64_t SleepManager::_sleepUs      = 0;
 uint32_t SleepManager::_wakeStart    = 0;
 uint32_t SleepManager::_wakeSpanMs   = 0;
@@ -118,8 +119,13 @@ void SleepManager::setLastOtaCheck(time_t t) {
   _rtc.lastOtaCheck = t;
 }
 
+bool SleepManager::shuttingDown() {
+  return _shuttingDown;
+}
+
 // Flush MQTT, disconnect WiFi, and enter deep sleep
 void SleepManager::gracefulShutdown() {
+  _shuttingDown = true;
   Log::info(TAG, "sleep.shutdown_start");
 
   // Publish sleep status and flush the MQTT queue.

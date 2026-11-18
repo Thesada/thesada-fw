@@ -74,6 +74,15 @@ inline bool luaReloadNow(const LuaBudget& b, bool* pending) {
   return true;
 }
 
+// MQTT side of the latch. No loop runs after the sleep shutdown starts and
+// deep sleep clears the latch, so a request then is refused.
+// in: sleep shutdown running, latch. out: true when latched.
+inline bool luaReloadRequest(bool shuttingDown, bool* pending) {
+  if (shuttingDown) return false;
+  *pending = true;
+  return true;
+}
+
 // Loop side of the latch. in: budget, latch. out: true to run the latched
 // reload now, latch cleared.
 inline bool luaReloadDue(const LuaBudget& b, bool* pending) {

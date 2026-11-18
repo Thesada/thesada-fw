@@ -294,6 +294,97 @@ void test_callback_keeps_its_state_between_deliveries(void) {
   TEST_ASSERT_EQUAL_INT(2, seen);
 }
 
+// A heap that runs out on demand and counts what is still held.
+struct TestHeap {
+  static bool fail;
+  static int  live;
+  static void* alloc(size_t n) {
+    if (fail) return nullptr;
+    live++;
+    return ::operator new(n, std::nothrow);
+  }
+  static void release(void* p) {
+    live--;
+    ::operator delete(p);
+  }
+};
+bool TestHeap::fail = false;
+int  TestHeap::live = 0;
+using HeapTable = MqttSubTable<std::function<void(const char*, const char*)>, 4, 160, TestHeap>;
+
+// CR #131: add() allocated with make_shared, so an out-of-heap registration
+// aborted. It is refused and the table stays as it was.
+void test_add_refuses_when_the_heap_is_out(void) {
+  TestHeap::fail = false;
+  TestHeap::live = 0;
+  {
+    HeapTable t;
+    int hits = 0;
+    TEST_ASSERT_TRUE(t.add("a", [&hits](const char*, const char*) { hits++; }));
+    TEST_ASSERT_TRUE(t.add("b", [](const char*, const char*) {}, MQTT_SUB_OWNER_LUA));
+    t.removeOwner(MQTT_SUB_OWNER_LUA);
+    TestHeap::fail = true;
+    TEST_ASSERT_FALSE(t.add("c", [](const char*, const char*) {}));
+    TEST_ASSERT_TRUE(t.hasFreeSlot());
+    TestHeap::fail = false;
+    TEST_ASSERT_EQUAL_UINT8(1, t.count());
+    TEST_ASSERT_FALSE(t.isRegistered("c"));
+    t.dispatch("a", "");
+    TEST_ASSERT_EQUAL_INT(1, hits);
+    TEST_ASSERT_TRUE(t.add("c", [](const char*, const char*) {}));
+    TEST_ASSERT_TRUE(t.isRegistered("c"));
+    TEST_ASSERT_TRUE(t.add("d", [](const char*, const char*) {}, MQTT_SUB_OWNER_LUA));
+    TEST_ASSERT_TRUE(t.add("e", [](const char*, const char*) {}));
+    TEST_ASSERT_FALSE(t.hasFreeSlot());
+    g_unsubs = 0;
+    TEST_ASSERT_EQUAL_UINT8(1, t.removeOwner(MQTT_SUB_OWNER_LUA, onUnsub));
+    TEST_ASSERT_EQUAL_INT(1, g_unsubs);
+    TEST_ASSERT_EQUAL_UINT8(4, t.count());
+    TEST_ASSERT_TRUE(t.hasFreeSlot());
+  }
+  TEST_ASSERT_EQUAL_INT(0, TestHeap::live);
+}
+
+// A callback that replaces itself frees its old box once it returns, not before.
+static HeapTable* g_heapTable;
+void test_replaced_box_is_freed_after_its_call(void) {
+  TestHeap::fail = false;
+  TestHeap::live = 0;
+  {
+    HeapTable t;
+    g_heapTable = &t;
+    int liveInCall = -1;
+    t.add("lua/reload", [&liveInCall](const char*, const char*) {
+      g_heapTable->removeOwner(MQTT_SUB_OWNER_LUA);
+      g_heapTable->add("lua/reload", [](const char*, const char*) {}, MQTT_SUB_OWNER_LUA);
+      liveInCall = TestHeap::live;
+    }, MQTT_SUB_OWNER_LUA);
+    t.dispatch("lua/reload", "");
+    TEST_ASSERT_EQUAL_INT(2, liveInCall);
+    TEST_ASSERT_EQUAL_INT(1, TestHeap::live);
+    t.dispatch("lua/reload", "");
+    TEST_ASSERT_EQUAL_INT(1, TestHeap::live);
+  }
+  TEST_ASSERT_EQUAL_INT(0, TestHeap::live);
+}
+
+// The function-pointer table takes the same path.
+static Table* g_fpTable;
+static void reAddSelf(const char*, const char*) {
+  g_fpTable->removeOwner(MQTT_SUB_OWNER_LUA);
+  g_fpTable->add("self", hitA, MQTT_SUB_OWNER_LUA);
+}
+void test_fn_pointer_callback_replaces_itself(void) {
+  Table t;
+  g_fpTable = &t;
+  t.add("self", reAddSelf, MQTT_SUB_OWNER_LUA);
+  t.dispatch("self", "");
+  TEST_ASSERT_EQUAL_INT(0, g_hitsA);
+  t.dispatch("self", "");
+  TEST_ASSERT_EQUAL_INT(1, g_hitsA);
+  TEST_ASSERT_EQUAL_UINT8(1, t.count());
+}
+
 // The std::function table the client uses unsubscribes the same way.
 void test_fn_table_unsubscribes_only_unheld_topics(void) {
   FnTable t;
@@ -332,5 +423,8 @@ int main(int, char**) {
   RUN_TEST(test_callback_that_resubscribes_keeps_its_captures);
   RUN_TEST(test_callback_keeps_its_state_between_deliveries);
   RUN_TEST(test_fn_table_unsubscribes_only_unheld_topics);
+  RUN_TEST(test_add_refuses_when_the_heap_is_out);
+  RUN_TEST(test_replaced_box_is_freed_after_its_call);
+  RUN_TEST(test_fn_pointer_callback_replaces_itself);
   return UNITY_END();
 }

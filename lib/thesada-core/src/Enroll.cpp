@@ -238,13 +238,14 @@ static bool onCert(const String& reply) {
   }
   if (!ackPendingSet(true)) return false;
 
-  JsonObject cfg = Config::get();
-  JsonObject m   = cfg["mqtt"].is<JsonObject>() ? cfg["mqtt"].as<JsonObject>()
+  bool saved = Config::edit([&](JsonObject cfg) {
+    JsonObject m = cfg["mqtt"].is<JsonObject>() ? cfg["mqtt"].as<JsonObject>()
                                                 : cfg["mqtt"].to<JsonObject>();
-  m["broker"]       = String(host);
-  m["port"]         = port;
-  m["topic_prefix"] = String(prefix);
-  if (!Config::save() || !MQTTClient::storeClientCert(cert, key)) {
+    m["broker"]       = String(host);
+    m["port"]         = port;
+    m["topic_prefix"] = String(prefix);
+  });
+  if (!saved || !MQTTClient::storeClientCert(cert, key)) {
     ackPendingSet(false);
     Log::error(TAG, "enroll.store_failed");
     return false;

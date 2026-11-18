@@ -73,18 +73,18 @@ static bool applyForm() {
   if (n >= sizeof(base)) n = sizeof(base) - 1;
   memcpy(base, _url, n);
   base[n] = '\0';
-  JsonObject cfg = Config::get();
-  JsonArray nets = cfg["wifi"]["networks"].is<JsonArray>()
-                       ? cfg["wifi"]["networks"].as<JsonArray>()
-                       : cfg["wifi"]["networks"].to<JsonArray>();
-  nets.clear();
-  JsonObject net = nets.add<JsonObject>();
-  net["ssid"] = String(_ssid);
-  JsonObject enroll = cfg["enroll"].is<JsonObject>() ? cfg["enroll"].as<JsonObject>()
-                                                      : cfg["enroll"].to<JsonObject>();
-  enroll["url"] = String(base);
-  if (!Config::save()) {
-    Config::load();
+  bool saved = Config::edit([&](JsonObject cfg) {
+    JsonArray nets = cfg["wifi"]["networks"].is<JsonArray>()
+                         ? cfg["wifi"]["networks"].as<JsonArray>()
+                         : cfg["wifi"]["networks"].to<JsonArray>();
+    nets.clear();
+    JsonObject net = nets.add<JsonObject>();
+    net["ssid"] = String(_ssid);
+    JsonObject enroll = cfg["enroll"].is<JsonObject>() ? cfg["enroll"].as<JsonObject>()
+                                                        : cfg["enroll"].to<JsonObject>();
+    enroll["url"] = String(base);
+  });
+  if (!saved) {
     if (!had) Secret::clear(field);
     mbedtls_platform_zeroize(field, sizeof(field));
     _buildError = "could not save the network";

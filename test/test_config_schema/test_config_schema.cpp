@@ -11,6 +11,10 @@ void tearDown() {}
 
 static std::string out(JsonDocument& d) { std::string s; serializeJson(d, s); return s; }
 
+// Compares without as<int>(): clang-analyzer 21 walks its string-to-number
+// branch and flags ArduinoJson's parseNumber.
+static bool holdsInt(JsonVariantConst v, int want) { return v.is<int>() && v == want; }
+
 void test_absent_schema_is_zero() {
   JsonDocument d; deserializeJson(d, "{\"wifi\":{}}");
   TEST_ASSERT_EQUAL(0, configSchemaVersion(d.as<JsonVariantConst>()));
@@ -49,7 +53,7 @@ void test_colon_duplicate_dropped_plain_kept() {
   TEST_ASSERT_EQUAL_STRING("u", d["mqtt"]["user"] | "");
   TEST_ASSERT_TRUE(d["mqtt"]["password:"].isNull());
   TEST_ASSERT_TRUE(d["mqtt"]["user:"].isNull());
-  TEST_ASSERT_EQUAL(1, d["schema"].as<int>());
+  TEST_ASSERT_TRUE(holdsInt(d["schema"], 1));
   TEST_ASSERT_EQUAL(1, steps);
   TEST_ASSERT_EQUAL(2, lastChanged);
 }
@@ -67,14 +71,14 @@ void test_nested_objects_and_arrays() {
   configMigrate(d, onStep);
   TEST_ASSERT_EQUAL_STRING("p", d["wifi"]["networks"][0]["password"] | "");
   TEST_ASSERT_TRUE(d["wifi"]["networks"][0]["password:"].isNull());
-  TEST_ASSERT_EQUAL(1, d["top"]["k"].as<int>());
+  TEST_ASSERT_TRUE(holdsInt(d["top"]["k"], 1));
   TEST_ASSERT_TRUE(d["top:"].isNull());
 }
 
 void test_lone_colon_key_and_values_untouched() {
   JsonDocument d; deserializeJson(d, "{\":\":1,\"url\":\"http://h:1/\",\"a\":\"b:\"}");
   configMigrate(d, onStep);
-  TEST_ASSERT_EQUAL(1, d[":"].as<int>());
+  TEST_ASSERT_TRUE(holdsInt(d[":"], 1));
   TEST_ASSERT_EQUAL_STRING("http://h:1/", d["url"] | "");
   TEST_ASSERT_EQUAL_STRING("b:", d["a"] | "");
   TEST_ASSERT_EQUAL(0, lastChanged);
@@ -121,7 +125,7 @@ void test_migrate_live_switches_after_write() {
   JsonDocument live; liveFrom(live, OLD_CFG);
   TEST_ASSERT_EQUAL(CFG_MIGRATE_DONE, configMigrateLive(fs, live, onStep));
   TEST_ASSERT_EQUAL_STRING("u", live["mqtt"]["user"] | "");
-  TEST_ASSERT_EQUAL(1, live["schema"].as<int>());
+  TEST_ASSERT_TRUE(holdsInt(live["schema"], 1));
   TEST_ASSERT_EQUAL_STRING(out(live).c_str(), fs.written.c_str());
 }
 

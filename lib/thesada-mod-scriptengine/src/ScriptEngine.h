@@ -22,7 +22,8 @@ public:
   // out: true when it ran now.
   static bool reload();
   // Latch a reload for the next loop(). For callers that may sit inside a
-  // dispatch or a binding, like the MQTT reload trigger.
+  // dispatch or a binding, like the MQTT reload trigger. Refused and logged
+  // once the sleep shutdown runs, since no loop() follows it.
   static void requestReload();
   static uint32_t generation();
 

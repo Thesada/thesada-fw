@@ -272,6 +272,21 @@ bool Config::replace(const char* json) {
   return true;
 }
 
+bool Config::edit(const std::function<void(JsonObject)>& fn) {
+  switch (configEditLive(_doc, [&](JsonDocument& d) { fn(d.as<JsonObject>()); }, [] { return save(); })) {
+    case CONFIG_EDIT_OK:
+      configChanged();
+      return true;
+    case CONFIG_EDIT_NO_COPY:
+      Log::error(TAG, "config.edit_failed reason=no_heap action=keep_live");
+      return false;
+    case CONFIG_EDIT_PERSIST_FAILED:
+      Log::error(TAG, "config.edit_failed reason=persist action=restore_live");
+      return false;
+  }
+  return false;
+}
+
 // Keep `prefix` as the live topic prefix. The value already in the doc
 // stays the one save() writes.
 // in: boot prefix. out: false if prefix is null, the disk value is not a

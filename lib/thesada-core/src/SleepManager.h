@@ -38,10 +38,14 @@ public:
   // in: UTC epoch. out: none.
   static void setLastOtaCheck(time_t t);
 
+  // in: none. out: true from the start of the deep-sleep shutdown on.
+  static bool shuttingDown();
+
 private:
   static void gracefulShutdown();
 
   static bool     _enabled;
+  static bool     _shuttingDown;
   static uint64_t _sleepUs;  // sleep_s past 4294 overflows 32 bits
   static uint32_t _wakeStart;   // millis() at begin
   static uint32_t _wakeSpanMs;  // awake window, wake_s capped (sleep_policy.h)

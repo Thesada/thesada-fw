@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #include <ArduinoJson.h>
+#include <functional>
 
 // Single-task invariant: every method reads or writes the one _doc with no
 // locking, and ArduinoJson is not thread-safe. Every caller must run on the
@@ -26,6 +27,9 @@ public:
   // false on a parse failure, a non-object, or a persist failure. Each
   // leaves the live doc and the held boot prefix as they were.
   static bool replace(const char* json);
+  // Run fn on the live doc root, then save. A failed save puts back the doc
+  // from before fn. in: edit. out: false when nothing was kept.
+  static bool edit(const std::function<void(JsonObject)>& fn);
   // Largest topic prefix the hold can keep without truncating it.
   static constexpr size_t TOPIC_PREFIX_CAP = 128;
   // Put the boot prefix back in the live doc after a replace. Later saves

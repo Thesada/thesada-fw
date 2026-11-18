@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include <unity.h>
 #include "config_load_policy.h"
+#include <stdlib.h>
 #include <string>
 
 void setUp(void) {}
@@ -243,6 +244,55 @@ void test_replace_failed_persist_restores_doc_and_hold(void) {
   TEST_ASSERT_EQUAL_STRING("boot", hold.disk);
 }
 
+static void editNetwork(JsonDocument& d) {
+  d["mqtt"]["broker"] = "new.example";
+  d["wifi"]["networks"][0]["ssid"] = "rejected";
+}
+
+void test_edit_saved_keeps_the_edit(void) {
+  JsonDocument live;
+  liveWithBroker(live);
+  TEST_ASSERT_EQUAL_INT(CONFIG_EDIT_OK, configEditLive(live, editNetwork, saveOk));
+  TEST_ASSERT_EQUAL_STRING("new.example", live["mqtt"]["broker"] | "");
+  TEST_ASSERT_EQUAL_STRING("rejected", live["wifi"]["networks"][0]["ssid"] | "");
+}
+
+// CR #131: the setup page rolled a failed save back through load(), and a
+// failed load kept the rejected network live.
+void test_edit_failed_persist_restores_the_doc(void) {
+  JsonDocument live;
+  liveWithBroker(live);
+  TEST_ASSERT_EQUAL_INT(CONFIG_EDIT_PERSIST_FAILED, configEditLive(live, editNetwork, saveFail));
+  TEST_ASSERT_EQUAL_STRING("old.example", live["mqtt"]["broker"] | "");
+  TEST_ASSERT_TRUE(live["wifi"].isNull());
+}
+
+// An allocator that runs out on demand.
+struct FlakyAllocator : ArduinoJson::Allocator {
+  bool fail = false;
+  void* allocate(size_t n) override { return fail ? nullptr : malloc(n); }
+  void deallocate(void* p) override { free(p); }
+  void* reallocate(void* p, size_t n) override { return fail ? nullptr : realloc(p, n); }
+};
+
+static bool g_edited;
+static void markEdited(JsonDocument&) { g_edited = true; }
+
+// No room to keep the doc as it was: nothing is edited or saved.
+void test_edit_without_room_for_the_copy_changes_nothing(void) {
+  FlakyAllocator heap;
+  JsonDocument live(&heap);
+  liveWithBroker(live);
+  heap.fail = true;
+  g_edited = false;
+  saves = 0;
+  TEST_ASSERT_EQUAL_INT(CONFIG_EDIT_NO_COPY, configEditLive(live, markEdited, saveCount));
+  TEST_ASSERT_FALSE(g_edited);
+  TEST_ASSERT_EQUAL_INT(0, saves);
+  heap.fail = false;
+  TEST_ASSERT_EQUAL_STRING("old.example", live["mqtt"]["broker"] | "");
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_good_file_replaces_the_live_doc);
@@ -259,5 +309,8 @@ int main(int, char**) {
   RUN_TEST(test_replace_malformed_keeps_doc_and_hold);
   RUN_TEST(test_replace_saved_installs_doc_and_clears_hold);
   RUN_TEST(test_replace_failed_persist_restores_doc_and_hold);
+  RUN_TEST(test_edit_saved_keeps_the_edit);
+  RUN_TEST(test_edit_failed_persist_restores_the_doc);
+  RUN_TEST(test_edit_without_room_for_the_copy_changes_nothing);
   return UNITY_END();
 }

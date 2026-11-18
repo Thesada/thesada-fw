@@ -126,3 +126,22 @@ inline ConfigReplace configReplaceLive(JsonDocument& live, Hold& hold, const cha
   hold = prevHold;
   return CONFIG_REPLACE_PERSIST_FAILED;
 }
+
+enum ConfigEdit {
+  CONFIG_EDIT_OK = 0,
+  CONFIG_EDIT_NO_COPY,
+  CONFIG_EDIT_PERSIST_FAILED,
+};
+
+// Edit the live doc in place, then persist it. A failed save puts back the doc
+// from before the edit, with no filesystem read. No room for that copy: no edit.
+// in: live doc, edit(JsonDocument&), save() -> bool. out: result.
+template <typename Edit, typename Save>
+inline ConfigEdit configEditLive(JsonDocument& live, Edit edit, Save save) {
+  JsonDocument prev(live.allocator());
+  if (!prev.set(live) || prev.overflowed()) return CONFIG_EDIT_NO_COPY;
+  edit(live);
+  if (save()) return CONFIG_EDIT_OK;
+  live = std::move(prev);
+  return CONFIG_EDIT_PERSIST_FAILED;
+}

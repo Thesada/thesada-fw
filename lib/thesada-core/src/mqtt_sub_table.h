@@ -11,7 +11,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
-#include <memory>
+#include <new>
 #include <utility>
 
 // MQTT topic match: exact, trailing `/#` (multi-level), trailing `/+` (one
@@ -33,17 +33,47 @@ inline bool mqttSubMatches(const char* sub, const char* topic) {
 // Lua slots are freed by a script reload and kept across a reinit.
 enum : uint8_t { MQTT_SUB_OWNER_CORE = 0, MQTT_SUB_OWNER_LUA = 1 };
 
+// Where a registration's callback box lives. alloc() returns nullptr when the
+// heap is out, never throws. Tests swap in one that fails on demand.
+struct MqttSubHeap {
+  static void* alloc(size_t n) { return ::operator new(n, std::nothrow); }
+  static void  release(void* p) { ::operator delete(p); }
+};
+
 // CB is the callback type - std::function on the device, a plain function
 // pointer in the host tests - so this header pulls in no Arduino headers.
-template <typename CB, uint8_t N, size_t TOPIC_CAP = 160>
+template <typename CB, uint8_t N, size_t TOPIC_CAP = 160, typename Heap = MqttSubHeap>
 class MqttSubTable {
+  // A registration's one target, held by its slot and by each dispatch
+  // running it. Freed when the last of them lets go.
+  struct Box {
+    CB       fn;
+    uint16_t refs;
+  };
+  static Box* hold(Box* b) {
+    b->refs++;
+    return b;
+  }
+  static void drop(Box* b) {
+    if (!b || --b->refs) return;
+    b->~Box();
+    Heap::release(b);
+  }
+
  public:
   struct Slot {
     char topic[TOPIC_CAP];
-    std::shared_ptr<CB> callback;
+    Box*    callback;
     bool    active;
     uint8_t owner;
   };
+
+  MqttSubTable() : _slots(), _count(0) {}
+  MqttSubTable(const MqttSubTable&) = delete;
+  MqttSubTable& operator=(const MqttSubTable&) = delete;
+  ~MqttSubTable() {
+    for (Slot& s : _slots) drop(s.callback);
+  }
 
   // Drop every registration. Clearing `active` without the count leaves the
   // freed slots skipped by dispatch and makes add() start past them.
@@ -52,7 +82,8 @@ class MqttSubTable {
     _count = 0;
   }
 
-  // false when the table is full, or the topic is empty or does not fit a slot.
+  // false when the table is full, the topic is empty or does not fit a slot,
+  // or the heap has no room for the callback. Each leaves the table as it was.
   // A clipped filter resubscribes a different topic. The caller logs.
   // A slot freed by removeOwner() is taken before the count grows.
   bool add(const char* topic, CB cb, uint8_t owner = MQTT_SUB_OWNER_CORE) {
@@ -60,9 +91,12 @@ class MqttSubTable {
     uint8_t i = 0;
     while (i < _count && _slots[i].active) i++;
     if (i >= N) return false;
+    void* mem = Heap::alloc(sizeof(Box));
+    if (!mem) return false;
     Slot& s = _slots[i];
+    drop(s.callback);
+    s.callback = new (mem) Box{std::move(cb), 1};
     memcpy(s.topic, topic, strlen(topic) + 1);
-    s.callback             = std::make_shared<CB>(std::move(cb));
     s.active               = true;
     s.owner                = owner;
     if (i == _count) _count++;
@@ -97,6 +131,13 @@ class MqttSubTable {
   uint8_t removeOwner(uint8_t owner) { return removeOwner(owner, (void (*)(const char*)) nullptr); }
 
   uint8_t                  count() const { return _count; }
+  // in: none. out: true when add() has a slot to take, so a refusal was the heap.
+  bool hasFreeSlot() const {
+    for (uint8_t i = 0; i < _count; i++) {
+      if (!_slots[i].active) return true;
+    }
+    return _count < N;
+  }
   static constexpr uint8_t capacity() { return N; }
 
   bool isRegistered(const char* topic) const {
@@ -111,8 +152,14 @@ class MqttSubTable {
   void dispatch(const char* topic, const char* payload) const {
     for (uint8_t i = 0; i < _count; i++) {
       if (!_slots[i].active || !mqttSubMatches(_slots[i].topic, topic)) continue;
-      const std::shared_ptr<CB> cb = _slots[i].callback;
-      (*cb)(topic, payload);
+      Box* b = hold(_slots[i].callback);
+      b->fn(topic, payload);
+      // A box still in its slot keeps the slot's reference, so only a replaced one can go.
+      if (_slots[i].callback == b) {
+        b->refs--;
+      } else {
+        drop(b);
+      }
     }
   }
 
@@ -126,6 +173,6 @@ class MqttSubTable {
   }
 
  private:
-  Slot    _slots[N] = {};
-  uint8_t _count    = 0;
+  Slot    _slots[N];
+  uint8_t _count;
 };

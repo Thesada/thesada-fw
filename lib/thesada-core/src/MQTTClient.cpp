@@ -1363,7 +1363,8 @@ void MQTTClient::subscribe(const char* topic, MQTTCallback callback, uint8_t own
     return;
   }
   if (!_subs.add(topic, callback, owner)) {
-    Log::kvfe(TAG, "mqtt.sub_rejected reason=max_subs max=%d", MQTT_MAX_SUBS);
+    Log::kvfe(TAG, "mqtt.sub_rejected reason=%s max=%d",
+              _subs.hasFreeSlot() ? "no_heap" : "max_subs", MQTT_MAX_SUBS);
     return;
   }
 

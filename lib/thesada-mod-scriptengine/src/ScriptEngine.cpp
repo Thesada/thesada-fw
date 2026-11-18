@@ -34,6 +34,7 @@
 #include <OTAUpdate.h>
 #include <Log.h>
 #include <Shell.h>
+#include <SleepManager.h>
 #include <ModuleRegistry.h>
 #include <Watchdog.h>
 #include <boot_wait_policy.h>
@@ -648,7 +649,9 @@ bool ScriptEngine::reload() {
 }
 
 void ScriptEngine::requestReload() {
-  s_reloadPending = true;
+  if (!luaReloadRequest(SleepManager::shuttingDown(), &s_reloadPending)) {
+    Log::kvfw(TAG, "script.reload_refused reason=sleep_shutdown");
+  }
 }
 
 // Hot-reload scripts by bumping generation and re-creating the Lua state.
