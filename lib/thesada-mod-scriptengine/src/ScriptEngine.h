@@ -18,7 +18,12 @@ class ScriptEngine {
 public:
   static void begin();
   static void loop();
-  static void reload();
+  // Reload now, or latch it for loop() while a call into Lua is on the stack.
+  // out: true when it ran now.
+  static bool reload();
+  // Latch a reload for the next loop(). For callers that may sit inside a
+  // dispatch or a binding, like the MQTT reload trigger.
+  static void requestReload();
   static uint32_t generation();
 
   // Modules call this in their begin() to register Lua bindings.
@@ -35,6 +40,7 @@ private:
   static void registerCoreBindings();
   static void callAllRegistrars();
   static bool executeFile(const char* path);
+  static void runReload();
 
   static uint32_t _generation;
   static constexpr uint8_t MAX_REGISTRARS = 16;

@@ -12,13 +12,19 @@
 // web snapshot does for the async_tcp handlers.
 class Config {
 public:
-  static void load();
+  // Read /config.json into the live doc. A mount failure, a missing file or a
+  // file that is not one JSON object logs and keeps the doc it had.
+  // out: false when the doc was kept.
+  static bool load();
   static bool save();   // false if the on-disk write failed (open or short write)
   // tmp + rename into /config.json, live doc untouched. Main loop only: every
   // writer shares /config.json.tmp. out: false if the old file stayed, bytes on disk.
   static bool writeFile(JsonVariantConst src, bool pretty, size_t* bytes = nullptr);
-  // false on parse or persist failure. Either failure reloads the on-disk file
-  // and puts a held boot prefix back.
+  // As writeFile for a file handed over as bytes, kept byte for byte. Refuses
+  // anything but one JSON object. out: false if the old file stayed, bytes on disk.
+  static bool writeRaw(const char* data, size_t len, size_t* bytes);
+  // false on a parse failure, a non-object, or a persist failure. Each
+  // leaves the live doc and the held boot prefix as they were.
   static bool replace(const char* json);
   // Largest topic prefix the hold can keep without truncating it.
   static constexpr size_t TOPIC_PREFIX_CAP = 128;

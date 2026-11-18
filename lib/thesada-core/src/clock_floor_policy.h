@@ -1,8 +1,8 @@
 // thesada-fw - clock_floor_policy.h
 // Pure decision logic for the boot clock floor. No NVS/Arduino deps, so it is
 // host-unit-testable. The floor guarantees time(nullptr) is always a sane
-// lower bound of real time, which lets MQTT TLS validate certificates from
-// the very first connect - the pre-NTP setInsecure window is gone (F1).
+// lower bound of real time. TLS never checks cert dates on this build, so the
+// floor does not make them valid. MQTT has no pre-NTP setInsecure window (F1).
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #include <stdint.h>

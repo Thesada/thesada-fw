@@ -89,6 +89,87 @@ void test_migration_is_idempotent() {
   TEST_ASSERT_EQUAL(CFG_SCHEMA_CURRENT, configMigrate(d, onStep));
 }
 
+// A LittleFS stand-in for the boot migration. parse() fails from call failFrom on.
+struct MigrateFs {
+  std::string text;
+  std::string written;
+  int parses = 0;
+  int failFrom = 99;
+  bool backupOk = true;
+  bool writeOk = true;
+  bool backedUp = false;
+  bool parse(JsonDocument& d) {
+    if (++parses >= failFrom) return false;
+    return !deserializeJson(d, text);
+  }
+  bool backup() { backedUp = true; return backupOk; }
+  bool write(JsonVariantConst v) {
+    if (!writeOk) return false;
+    written.clear();
+    serializeJson(v, written);
+    text = written;
+    return true;
+  }
+};
+
+static const char* OLD_CFG = "{\"mqtt\":{\"broker\":\"b\",\"user:\":\"u\"}}";
+
+static void liveFrom(JsonDocument& live, const char* j) { live.clear(); deserializeJson(live, j); }
+
+void test_migrate_live_switches_after_write() {
+  MigrateFs fs; fs.text = OLD_CFG;
+  JsonDocument live; liveFrom(live, OLD_CFG);
+  TEST_ASSERT_EQUAL(CFG_MIGRATE_DONE, configMigrateLive(fs, live, onStep));
+  TEST_ASSERT_EQUAL_STRING("u", live["mqtt"]["user"] | "");
+  TEST_ASSERT_EQUAL(1, live["schema"].as<int>());
+  TEST_ASSERT_EQUAL_STRING(out(live).c_str(), fs.written.c_str());
+}
+
+// CR #128: the write landed, the read back failed, and the unit ran on
+// defaults while load() reported a good reload.
+void test_migrate_live_never_reads_back_after_write() {
+  MigrateFs fs; fs.text = OLD_CFG; fs.failFrom = 2;
+  JsonDocument live; liveFrom(live, OLD_CFG);
+  TEST_ASSERT_EQUAL(CFG_MIGRATE_DONE, configMigrateLive(fs, live, onStep));
+  TEST_ASSERT_EQUAL_STRING("b", live["mqtt"]["broker"] | "");
+  TEST_ASSERT_EQUAL_STRING("u", live["mqtt"]["user"] | "");
+}
+
+void test_migrate_live_failures_keep_live() {
+  struct Case { int failFrom; bool backupOk; bool writeOk; ConfigMigrateResult want; };
+  const Case cases[] = {
+    {1, true, true, CFG_MIGRATE_REREAD_FAILED},
+    {99, false, true, CFG_MIGRATE_BACKUP_FAILED},
+    {99, true, false, CFG_MIGRATE_WRITE_FAILED},
+  };
+  for (const Case& c : cases) {
+    MigrateFs fs; fs.text = OLD_CFG; fs.failFrom = c.failFrom;
+    fs.backupOk = c.backupOk; fs.writeOk = c.writeOk;
+    JsonDocument live; liveFrom(live, OLD_CFG);
+    TEST_ASSERT_EQUAL(c.want, configMigrateLive(fs, live, onStep));
+    TEST_ASSERT_EQUAL_STRING("u", live["mqtt"]["user:"] | "");
+    TEST_ASSERT_TRUE(live["schema"].isNull());
+  }
+}
+
+void test_migrate_live_untouched_verdicts() {
+  struct Case { const char* live; const char* file; ConfigMigrateResult want; };
+  const Case cases[] = {
+    {"{\"schema\":1}", "{}", CFG_MIGRATE_NONE},
+    {"{}", "{\"schema\":1}", CFG_MIGRATE_NONE},
+    {"{\"schema\":99}", "{\"schema\":99}", CFG_MIGRATE_NEWER},
+    {"{\"schema\":\"x\"}", "{\"schema\":\"x\"}", CFG_MIGRATE_INVALID},
+  };
+  for (const Case& c : cases) {
+    MigrateFs fs; fs.text = c.file;
+    JsonDocument live; liveFrom(live, c.live);
+    const std::string before = out(live);
+    TEST_ASSERT_EQUAL(c.want, configMigrateLive(fs, live, onStep));
+    TEST_ASSERT_EQUAL_STRING(before.c_str(), out(live).c_str());
+    TEST_ASSERT_FALSE(fs.backedUp);
+  }
+}
+
 int main() {
   UNITY_BEGIN();
   RUN_TEST(test_absent_schema_is_zero);
@@ -100,5 +181,9 @@ int main() {
   RUN_TEST(test_nested_objects_and_arrays);
   RUN_TEST(test_lone_colon_key_and_values_untouched);
   RUN_TEST(test_migration_is_idempotent);
+  RUN_TEST(test_migrate_live_switches_after_write);
+  RUN_TEST(test_migrate_live_never_reads_back_after_write);
+  RUN_TEST(test_migrate_live_failures_keep_live);
+  RUN_TEST(test_migrate_live_untouched_verdicts);
   return UNITY_END();
 }

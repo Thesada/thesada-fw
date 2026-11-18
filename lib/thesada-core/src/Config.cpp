@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "Config.h"
 #include "Log.h"
+#include "config_load_policy.h"
 #include "config_write_policy.h"
 #include "config_schema_policy.h"
 #include <LittleFS.h>
@@ -12,9 +13,12 @@ JsonDocument Config::_doc;
 
 // Prefix already written by replace(). save() writes this, not the boot
 // value holdTopicPrefix puts back into the live doc.
-static char _diskTopicPrefix[Config::TOPIC_PREFIX_CAP];
-static bool _diskTopicPrefixPresent = false;
-static bool _topicPrefixHeld = false;
+struct TopicPrefixHold {
+  char disk[Config::TOPIC_PREFIX_CAP];
+  bool diskPresent;
+  bool held;
+};
+static TopicPrefixHold _hold = {};
 
 // Bumped, and the hooks run, after every call that rebuilt or edited _doc.
 static uint32_t _revision = 0;
@@ -40,9 +44,7 @@ static void configChanged() {
 // Drop the boot-prefix overlay.
 // in: none. out: none.
 static void clearHeldTopicPrefix() {
-  _topicPrefixHeld = false;
-  _diskTopicPrefixPresent = false;
-  _diskTopicPrefix[0] = '\0';
+  _hold = TopicPrefixHold();
 }
 
 // Copy /config.json to /config.json.bak through a tmp, read back by size.
@@ -75,87 +77,85 @@ static void logSchemaStep(int from, const char* name, size_t changed) {
   Log::kvf(TAG, "config.schema_step from=%d name=%s changed=%u", from, name, (unsigned)changed);
 }
 
-// Parse /config.json into doc. out: false if it cannot be read or parsed.
-static bool parseConfigFile(JsonDocument& doc) {
-  File f = LittleFS.open("/config.json", "r");
-  if (!f) return false;
-  const DeserializationError err = deserializeJson(doc, f);
-  f.close();
-  return !err;
-}
+// configMigrateLive's view of LittleFS.
+struct LittleFsMigrateFs {
+  bool parse(JsonDocument& doc) {
+    File f = LittleFS.open("/config.json", "r");
+    if (!f) return false;
+    const DeserializationError err = deserializeJson(doc, f);
+    f.close();
+    return !err;
+  }
+  bool backup() { return backupConfigFile(); }
+  bool write(JsonVariantConst src) { return Config::writeFile(src, false); }
+};
 
 // Bring a parsed older config up to CONFIG_SCHEMA_CURRENT on disk, old file kept
-// as .bak. The work doc is a fresh parse: a deep copy of _doc overflows the boot stack.
+// as .bak. Logs the outcome and sets the schema alert when it could not run.
 static void migrateSchema(JsonDocument& live) {
   _schemaAlert[0] = '\0';
   const int from = configSchemaVersion(live.as<JsonVariantConst>());
-  if (from == CONFIG_SCHEMA_CURRENT) return;
-  JsonDocument work;
-  if (!parseConfigFile(work)) {
-    Log::kvfe(TAG, "config.schema_migrate_failed from=%d reason=reread action=run_unmigrated", from);
-    snprintf(_schemaAlert, sizeof(_schemaAlert), "config schema %d could not be re-read, running unmigrated", from);
-    return;
-  }
-  switch (configMigrate(work, logSchemaStep)) {
-    case CFG_SCHEMA_CURRENT:
+  LittleFsMigrateFs fs;
+  const char* why = nullptr;
+  switch (configMigrateLive(fs, live, logSchemaStep)) {
+    case CFG_MIGRATE_NONE:
       return;
-    case CFG_SCHEMA_NEWER:
+    case CFG_MIGRATE_DONE:
+      Log::kvf(TAG, "config.schema_migrated from=%d to=%d backup=/config.json.bak", from, CONFIG_SCHEMA_CURRENT);
+      return;
+    case CFG_MIGRATE_REREAD_FAILED:
+      Log::kvfe(TAG, "config.schema_migrate_failed from=%d reason=reread action=run_unmigrated", from);
+      snprintf(_schemaAlert, sizeof(_schemaAlert), "config schema %d could not be re-read, running unmigrated", from);
+      return;
+    case CFG_MIGRATE_NEWER:
       Log::kvfw(TAG, "config.schema_newer have=%d know=%d action=run_as_is", from, CONFIG_SCHEMA_CURRENT);
       snprintf(_schemaAlert, sizeof(_schemaAlert), "config schema %d is newer than this firmware (%d), running as is",
                from, CONFIG_SCHEMA_CURRENT);
       return;
-    case CFG_SCHEMA_INVALID:
+    case CFG_MIGRATE_INVALID:
       Log::kvfe(TAG, "config.schema_invalid action=run_unmigrated");
       snprintf(_schemaAlert, sizeof(_schemaAlert), "config schema field is not a whole number, running unmigrated");
       return;
-    case CFG_SCHEMA_MIGRATED:
-      break;
+    case CFG_MIGRATE_BACKUP_FAILED: why = "backup"; break;
+    case CFG_MIGRATE_WRITE_FAILED:  why = "write";  break;
   }
-  const char* why = nullptr;
-  if (!backupConfigFile()) why = "backup";
-  else if (!Config::writeFile(work.as<JsonVariantConst>(), false)) why = "write";
-  if (why) {
-    Log::kvfe(TAG, "config.schema_migrate_failed from=%d to=%d reason=%s action=run_unmigrated",
-              from, CONFIG_SCHEMA_CURRENT, why);
-    snprintf(_schemaAlert, sizeof(_schemaAlert), "config schema %d to %d failed (%s), running unmigrated",
-             from, CONFIG_SCHEMA_CURRENT, why);
-    return;
-  }
-  work.clear();
-  if (!parseConfigFile(live)) {
-    live.clear();
-    Log::kvfe(TAG, "config.schema_reload_failed action=use_defaults");
-    snprintf(_schemaAlert, sizeof(_schemaAlert),
-             "config schema %d to %d reload failed, running on defaults", from, CONFIG_SCHEMA_CURRENT);
-    return;
-  }
-  Log::kvf(TAG, "config.schema_migrated from=%d to=%d backup=/config.json.bak", from, CONFIG_SCHEMA_CURRENT);
+  Log::kvfe(TAG, "config.schema_migrate_failed from=%d to=%d reason=%s action=run_unmigrated",
+            from, CONFIG_SCHEMA_CURRENT, why);
+  snprintf(_schemaAlert, sizeof(_schemaAlert), "config schema %d to %d failed (%s), running unmigrated",
+           from, CONFIG_SCHEMA_CURRENT, why);
 }
 
 const char* Config::schemaAlert() { return _schemaAlert[0] ? _schemaAlert : nullptr; }
 
-void Config::load() {
-  bool parsed = false;
-  _schemaAlert[0] = '\0';
-  auto read = [&]() {
-    clearHeldTopicPrefix();
-    if (!LittleFS.begin()) return;
+// configLoadInto's view of LittleFS.
+struct LittleFsConfigSource {
+  bool mount() { return LittleFS.begin(); }
+  bool parse(JsonDocument& doc, DeserializationError& err) {
     File f = LittleFS.open("/config.json", "r");
-    if (!f) return;
-    DeserializationError err = deserializeJson(_doc, f);
+    if (!f) return false;
+    configParseWhole(f, doc, err);
     f.close();
-    // A malformed file would otherwise leave _doc half-parsed; clear to a
-    // clean empty doc so get() returns defaults, not garbage.
-    if (err) {
-      _doc.clear();
-      Log::kvfe(TAG, "config.parse_failed err=%s action=use_defaults", err.c_str());
-      return;
-    }
-    parsed = true;
-  };
-  read();
-  if (parsed) migrateSchema(_doc);
+    return true;
+  }
+};
+
+bool Config::load() {
+  _schemaAlert[0] = '\0';
+  const bool hadDoc = !_doc.isNull();
+  LittleFsConfigSource src;
+  DeserializationError err;
+  const ConfigLoad r = configLoadInto(src, _doc, err);
+  if (r != CONFIG_LOAD_OK) {
+    // The doc and its held prefix stay as they were, on boot and reload alike.
+    Log::kvfe(TAG, "%s err=%s action=%s", configLoadEvent(r),
+              err ? err.c_str() : (r == CONFIG_LOAD_PARSE_FAILED ? "not_object" : "none"),
+              hadDoc ? "keep_previous" : "use_defaults");
+    return false;
+  }
+  clearHeldTopicPrefix();
+  migrateSchema(_doc);
   configChanged();
+  return true;
 }
 
 // Persist the in-memory doc to /config.json. out: true on success;
@@ -163,12 +163,11 @@ void Config::load() {
 // LittleFS full) so callers never report a save that did not happen.
 // Writes go to a temp file first, then rename over config.json - lfs
 // rename atomically replaces the destination, so a short write never
-// destroys the last good config and the load() rollback in replace()
-// genuinely restores it.
+// destroys the last good config.
 bool Config::save() {
   char livePrefix[Config::TOPIC_PREFIX_CAP];
   bool swapped = false;
-  if (_topicPrefixHeld) {
+  if (_hold.held) {
     const char* live = _doc["mqtt"]["topic_prefix"] | "";
     size_t n = strlen(live);
     // The hold only stores a prefix that fits. A longer live value means
@@ -178,8 +177,8 @@ bool Config::save() {
       return false;
     }
     memcpy(livePrefix, live, n + 1);
-    if (_diskTopicPrefixPresent) {
-      _doc["mqtt"]["topic_prefix"] = _diskTopicPrefix;
+    if (_hold.diskPresent) {
+      _doc["mqtt"]["topic_prefix"] = _hold.disk;
     } else {
       // The pushed document left the key out. Writing "" would make the
       // next boot read an empty prefix instead of the default.
@@ -196,7 +195,9 @@ bool Config::save() {
   return ok;
 }
 
-// The one tmp + rename writer for /config.json. lfs rename replaces the
+static bool commitTmp(size_t written, size_t expected, size_t* bytes);
+
+// The one tmp + rename path for /config.json. lfs rename replaces the
 // destination atomically, so a failure leaves the last good file in place.
 bool Config::writeFile(JsonVariantConst src, bool pretty, size_t* bytes) {
   File f = LittleFS.open("/config.json.tmp", "w");
@@ -207,6 +208,27 @@ bool Config::writeFile(JsonVariantConst src, bool pretty, size_t* bytes) {
   size_t written  = pretty ? serializeJsonPretty(src, f) : serializeJson(src, f);
   size_t expected = pretty ? measureJsonPretty(src) : measureJson(src);
   f.close();
+  return commitTmp(written, expected, bytes);
+}
+
+bool Config::writeRaw(const char* data, size_t len, size_t* bytes) {
+  if (!configBytesAreObject(data, len)) {
+    Log::error(TAG, "config.save_failed reason=not_object");
+    return false;
+  }
+  File f = LittleFS.open("/config.json.tmp", "w");
+  if (!f) {
+    Log::error(TAG, "config.save_failed reason=tmp_open");
+    return false;
+  }
+  size_t written = f.write((const uint8_t*)data, len);
+  f.close();
+  return commitTmp(written, len, bytes);
+}
+
+// Rename a closed /config.json.tmp over /config.json once its size read back
+// matches. in: bytes handed to the File, intended size. out: false if the old file stayed.
+static bool commitTmp(size_t written, size_t expected, size_t* bytes) {
   // The real lfs write is inside fclose and its result is dropped. Read back.
   size_t onDisk = 0;
   File chk = LittleFS.open("/config.json.tmp", "r");
@@ -227,34 +249,23 @@ bool Config::writeFile(JsonVariantConst src, bool pretty, size_t* bytes) {
   return true;
 }
 
-// Replace whole config with new JSON. On parse or persist failure the
-// cleared doc is rolled back to the on-disk file so a bad MQTT payload
-// cannot wipe live config. in: JSON string. out: false if nothing was written.
+// Replace whole config with new JSON. A push that is not one object, or does
+// not persist, leaves the live doc and its prefix hold as they were.
+// in: JSON string. out: false if nothing was written.
 bool Config::replace(const char* json) {
-  char bootPrefix[Config::TOPIC_PREFIX_CAP];
-  bool keepBoot = false;
-  if (_topicPrefixHeld) {
-    if (!Config::copyBootTopicPrefix(bootPrefix, sizeof(bootPrefix))) {
-      Log::error(TAG, "config.replace_failed reason=prefix_length");
+  DeserializationError err;
+  switch (configReplaceLive(_doc, _hold, json, err, [] { return save(); })) {
+    case CONFIG_REPLACE_OK:
+      break;
+    case CONFIG_REPLACE_PARSE_FAILED:
+      Log::kvfe(TAG, "config.replace_failed err=%s action=keep_live", err.c_str());
       return false;
-    }
-    keepBoot = true;
-  }
-  // save() must write this document, not a prefix held from an earlier push.
-  clearHeldTopicPrefix();
-  _doc.clear();
-  DeserializationError err = deserializeJson(_doc, json);
-  if (err) {
-    Log::kvfe(TAG, "config.replace_failed err=%s action=rollback", err.c_str());
-    load();
-    if (keepBoot) Config::holdTopicPrefix(bootPrefix);
-    return false;
-  }
-  if (!save()) {
-    Log::error(TAG, "config.replace_failed reason=persist");
-    load();
-    if (keepBoot) Config::holdTopicPrefix(bootPrefix);
-    return false;
+    case CONFIG_REPLACE_NOT_OBJECT:
+      Log::error(TAG, "config.replace_failed reason=not_object action=keep_live");
+      return false;
+    case CONFIG_REPLACE_PERSIST_FAILED:
+      Log::error(TAG, "config.replace_failed reason=persist action=keep_live");
+      return false;
   }
   Log::info(TAG, "config.replaced source=mqtt");
   configChanged();
@@ -290,24 +301,24 @@ bool Config::holdTopicPrefix(const char* prefix) {
   }
   size_t diskLen = strlen(disk);
   size_t liveLen = strlen(prefix);
-  if (diskLen >= sizeof(_diskTopicPrefix) || liveLen >= sizeof(_diskTopicPrefix)) {
+  if (diskLen >= sizeof(_hold.disk) || liveLen >= sizeof(_hold.disk)) {
     Log::warn(TAG, "config.topic_prefix_hold_skipped reason=length");
     return false;
   }
-  if (present) memcpy(_diskTopicPrefix, disk, diskLen + 1);
-  else _diskTopicPrefix[0] = '\0';
-  _diskTopicPrefixPresent = present;
-  _topicPrefixHeld = true;
+  if (present) memcpy(_hold.disk, disk, diskLen + 1);
+  else _hold.disk[0] = '\0';
+  _hold.diskPresent = present;
+  _hold.held = true;
   _doc["mqtt"]["topic_prefix"] = prefix;
   return true;
 }
 
 bool Config::topicPrefixHeld() {
-  return _topicPrefixHeld;
+  return _hold.held;
 }
 
 bool Config::copyBootTopicPrefix(char* out, size_t cap) {
-  if (!out || cap == 0 || !_topicPrefixHeld) return false;
+  if (!out || cap == 0 || !_hold.held) return false;
   const char* live = _doc["mqtt"]["topic_prefix"] | "";
   size_t n = strlen(live);
   if (n >= cap) {
@@ -326,8 +337,8 @@ bool Config::copyDiskDoc(JsonDocument& dst) {
   if (serializeJson(_doc, text) == 0) return false;
   if (deserializeJson(dst, text) != DeserializationError::Ok) return false;
   if (!dst.is<JsonObject>()) return false;
-  if (_topicPrefixHeld) {
-    if (_diskTopicPrefixPresent) dst["mqtt"]["topic_prefix"] = _diskTopicPrefix;
+  if (_hold.held) {
+    if (_hold.diskPresent) dst["mqtt"]["topic_prefix"] = _hold.disk;
     else dst["mqtt"].as<JsonObject>().remove("topic_prefix");
   }
   return true;

@@ -134,8 +134,33 @@ void test_next_call_resets_credit(void) {
   TEST_ASSERT_FALSE(luaBudgetLeave(b));
 }
 
+// A reload asked for inside a call into Lua waits for the loop.
+void test_reload_inside_a_call_is_latched(void) {
+  LuaBudget b = fresh();
+  bool pending = false;
+  luaBudgetEnter(b, 0);
+  TEST_ASSERT_FALSE(luaReloadNow(b, &pending));
+  TEST_ASSERT_TRUE(pending);
+  TEST_ASSERT_FALSE(luaReloadDue(b, &pending));
+  TEST_ASSERT_TRUE(pending);
+  luaBudgetLeave(b);
+  TEST_ASSERT_TRUE(luaReloadDue(b, &pending));
+  TEST_ASSERT_FALSE(pending);
+  TEST_ASSERT_FALSE(luaReloadDue(b, &pending));
+}
+
+void test_reload_outside_a_call_runs_now(void) {
+  LuaBudget b = fresh();
+  bool pending = true;
+  TEST_ASSERT_TRUE(luaReloadNow(b, &pending));
+  TEST_ASSERT_FALSE(pending);
+  TEST_ASSERT_FALSE(luaReloadDue(b, &pending));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
+  RUN_TEST(test_reload_inside_a_call_is_latched);
+  RUN_TEST(test_reload_outside_a_call_runs_now);
   RUN_TEST(test_idle_budget_never_raises);
   RUN_TEST(test_call_raises_once_spent_and_stays_spent);
   RUN_TEST(test_nested_call_shares_the_outer_clock);

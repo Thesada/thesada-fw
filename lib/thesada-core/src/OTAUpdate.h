@@ -46,6 +46,10 @@ public:
   // or leave it pending. Call every main-loop turn, even when loop() is skipped.
   static void confirmIfHealthy();
 
+  // in: none. out: true while the running image is pending and not yet
+  // confirmed, so the next bootloader run would roll it back.
+  static bool awaitingConfirm();
+
   // Fetch manifest, compare version, download, verify SHA256, flash, reboot.
   // A manifest version a guard switch fled, or one installed that never
   // confirmed, is refused as fled-release for 24 h, then installed again.

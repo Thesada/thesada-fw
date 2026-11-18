@@ -15,6 +15,7 @@
 #include "SensorRegistry.h"
 #include "Net.h"
 #include "path_safety_policy.h"
+#include "config_load_policy.h"
 #include "config_write_policy.h"
 #include "cell_ntp_policy.h"
 #include "ap_policy.h"
@@ -403,6 +404,31 @@ FsWrite Shell::writeChecked(fs::FS* fs, const char* path, bool append,
   return fileWriteLanded(written, *onDisk, len) ? FS_WRITE_OK : FS_WRITE_SHORT;
 }
 
+FsWrite Shell::writeRouted(fs::FS* fs, const char* path, bool append,
+                           const uint8_t* data, size_t len, size_t* onDisk) {
+  *onDisk = 0;
+  switch (fsWriteRoute(fs == &LittleFS, path, append)) {
+    case FS_ROUTE_PLAIN:
+      return writeChecked(fs, path, append, data, len, onDisk);
+    case FS_ROUTE_CONFIG_APPEND:
+      return FS_WRITE_CONFIG_APPEND;
+    case FS_ROUTE_CONFIG:
+      break;
+  }
+  if (!configBytesAreObject((const char*)data, len)) return FS_WRITE_CONFIG_NOT_OBJECT;
+  return Config::writeRaw((const char*)data, len, onDisk) ? FS_WRITE_OK : FS_WRITE_SHORT;
+}
+
+const char* Shell::fsWriteRefusal(FsWrite w) {
+  if (w == FS_WRITE_CONFIG_APPEND) {
+    return "Refused: /config.json takes no append, fs.write the whole file or use config.set";
+  }
+  if (w == FS_WRITE_CONFIG_NOT_OBJECT) {
+    return "Refused: /config.json must be one JSON object, nothing written";
+  }
+  return nullptr;
+}
+
 const char* Shell::stripPrefix(const char* path) {
   if (!path) return path;
   for (int i = 0; i < _fsMountCount; i++) {
@@ -625,9 +651,10 @@ static void cmd_write(int argc, char** argv, ShellOutput out) {
   String content(argv[2]);  // restFrom 2: the rest of the line as typed
 
   size_t onDisk = 0;
-  const FsWrite w = Shell::writeChecked(fs, fsPath, append, (const uint8_t*)content.c_str(),
-                                        content.length(), &onDisk);
+  const FsWrite w = Shell::writeRouted(fs, fsPath, append, (const uint8_t*)content.c_str(),
+                                       content.length(), &onDisk);
   if (w == FS_WRITE_OPEN_FAILED) { Shell::fail(out, "Failed to open for writing"); return; }
+  if (const char* why = Shell::fsWriteRefusal(w)) { Shell::fail(out, why); return; }
 
   char msg[160];
   if (w == FS_WRITE_SHORT) {
@@ -861,6 +888,8 @@ static bool captureBootPrefix(BootPrefixKeep* kept, ShellOutput out) {
 // in: captured prefix, the key this command wrote. out: none.
 static void restoreBootPrefix(const BootPrefixKeep* kept, const char* key) {
   if (!kept->keep) return;
+  // Still held: the reload failed and kept the doc, overlay included.
+  if (Config::topicPrefixHeld()) return;
   if (key && (strcmp(key, "mqtt") == 0 || strcmp(key, "mqtt.topic_prefix") == 0)) return;
   if (!Config::holdTopicPrefix(kept->prefix)) {
     Log::error("Shell", "config.boot_prefix_restore_failed");
@@ -1122,7 +1151,10 @@ static void cmd_config_reload(int argc, char** argv, ShellOutput out) {
   oldOtaTopic[sizeof(oldOtaTopic) - 1] = '\0';
   oldPort = oldCfg["mqtt"]["port"] | 8883;
 
-  Config::load();
+  if (!Config::load()) {
+    Shell::fail(out, "Reload failed: /config.json unreadable, missing or not one JSON object. Previous config kept");
+    return;
+  }
   JsonObject cfg = Config::get();
   const char* name = cfg["device"]["name"] | "?";
 
@@ -1741,17 +1773,17 @@ static void cmd_cert_info(int argc, char** argv, ShellOutput out) {
     return;
   }
 
-  char cn[128], serial[96], notBefore[32], notAfter[32];
-  bool parsed = hasCertBlob && MQTTClient::getCertInfo(cn, serial, notBefore, notAfter, sizeof(cn));
+  CertInfo info;
+  bool parsed = hasCertBlob && MQTTClient::getCertInfo(info);
 
   if (parsed) {
     char line[192];
-    snprintf(line, sizeof(line), "CN:         %s", cn);         out(line);
-    snprintf(line, sizeof(line), "Serial:     %s", serial);     out(line);
-    snprintf(line, sizeof(line), "Not before: %s", notBefore);  out(line);
-    snprintf(line, sizeof(line), "Not after:  %s", notAfter);   out(line);
+    snprintf(line, sizeof(line), "CN:         %s", info.cn);         out(line);
+    snprintf(line, sizeof(line), "Serial:     %s", info.serial);     out(line);
+    snprintf(line, sizeof(line), "Not before: %s", info.notBefore);  out(line);
+    snprintf(line, sizeof(line), "Not after:  %s", info.notAfter);   out(line);
   } else if (hasCertBlob) {
-    out("Cert stored but unparseable (corrupt or not valid PEM)");
+    out("Cert stored but unparseable (corrupt, not valid PEM, or serial over 47 bytes)");
   }
 
   if (hasCertBlob && hasKeyBlob) {
