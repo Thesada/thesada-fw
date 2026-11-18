@@ -19,6 +19,19 @@ inline bool configPathIsLive(const char* path) {
   return strcmp(p, "config.json") == 0;
 }
 
+enum FsWriteRoute {
+  FS_ROUTE_PLAIN = 0,      // writeChecked on the file itself
+  FS_ROUTE_CONFIG,         // whole JSON object, tmp + rename (Config::writeRaw)
+  FS_ROUTE_CONFIG_APPEND,  // refused: an append to the config file is in place
+};
+
+// How fs.write / fs.append reach a path. Only LittleFS holds the config file.
+// in: target is LittleFS, path after stripPrefix, append. out: route.
+inline FsWriteRoute fsWriteRoute(bool littleFs, const char* path, bool append) {
+  if (!littleFs || !configPathIsLive(path)) return FS_ROUTE_PLAIN;
+  return append ? FS_ROUTE_CONFIG_APPEND : FS_ROUTE_CONFIG;
+}
+
 // in: bytes handed to the File, tmp size read back after close, intended size.
 // out: true when all agree. fclose does the real write and its result is dropped.
 inline bool fileWriteLanded(size_t written, size_t onDisk, size_t expected) {

@@ -336,9 +336,9 @@ static void checkUnanswered(int status) {
 // in: none. out: none.
 static void startCheck() {
   _check.due = false;
-  char cn[96], raw[96], nb[96], na[96];
-  if (!MQTTClient::getCertInfo(cn, raw, nb, na, sizeof(cn)) ||
-      !enrollSerialCanonical(raw, _check.serial, sizeof(_check.serial))) {
+  CertInfo info;
+  if (!MQTTClient::getCertInfo(info) ||
+      !enrollSerialCanonical(info.serial, _check.serial, sizeof(_check.serial))) {
     // No readable cert: nothing to check until the next boot decides again.
     Log::kvfw(TAG, "enroll.status_skipped reason=no_cert");
     return;

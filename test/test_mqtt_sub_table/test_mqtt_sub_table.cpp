@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <string.h>
 #include "mqtt_sub_table.h"
+#include <functional>
+#include <memory>
 
 using Cb    = void (*)(const char*, const char*);
 using Table = MqttSubTable<Cb, 4>;
@@ -254,6 +256,48 @@ void test_trailing_free_slots_shrink_the_count(void) {
   TEST_ASSERT_EQUAL_UINT8(0, t.count());
 }
 
+// A callback that frees its owner's slots and subscribes again (a Lua reload
+// inside an MQTT callback) gets its own slot back. Dispatch runs a copy, so
+// the reassignment cannot free the captures of the call still running.
+using FnTable = MqttSubTable<std::function<void(const char*, const char*)>, 4>;
+static FnTable*           g_fnTable;
+static std::weak_ptr<int> g_capture;
+static bool               g_captureAliveAfterReAdd;
+
+void test_callback_that_resubscribes_keeps_its_captures(void) {
+  FnTable t;
+  g_fnTable = &t;
+  g_captureAliveAfterReAdd = false;
+  auto owned = std::make_shared<int>(7);
+  g_capture  = owned;
+  t.add("lua/reload", [owned](const char*, const char*) {
+    g_fnTable->removeOwner(MQTT_SUB_OWNER_LUA);
+    g_fnTable->add("lua/reload", [](const char*, const char*) {}, MQTT_SUB_OWNER_LUA);
+    g_captureAliveAfterReAdd = !g_capture.expired();
+  }, MQTT_SUB_OWNER_LUA);
+  owned.reset();
+  TEST_ASSERT_FALSE(g_capture.expired());
+  t.dispatch("lua/reload", "");
+  TEST_ASSERT_TRUE(g_captureAliveAfterReAdd);
+  TEST_ASSERT_TRUE(g_capture.expired());
+  TEST_ASSERT_EQUAL_UINT8(1, t.count());
+}
+
+// The std::function table the client uses unsubscribes the same way.
+void test_fn_table_unsubscribes_only_unheld_topics(void) {
+  FnTable t;
+  g_unsubs  = 0;
+  auto noop = [](const char*, const char*) {};
+  t.add("shared", noop);
+  t.add("shared", noop, MQTT_SUB_OWNER_LUA);
+  t.add("only/lua", noop, MQTT_SUB_OWNER_LUA);
+  TEST_ASSERT_EQUAL_UINT8(2, t.removeOwner(MQTT_SUB_OWNER_LUA, onUnsub));
+  TEST_ASSERT_EQUAL_INT(1, g_unsubs);
+  TEST_ASSERT_EQUAL_STRING("only/lua", g_unsubTopic);
+  TEST_ASSERT_TRUE(t.isRegistered("shared"));
+  TEST_ASSERT_FALSE(t.isRegistered("only/lua"));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_reset_clears_count_not_just_active);
@@ -274,5 +318,7 @@ int main(int, char**) {
   RUN_TEST(test_freed_slot_is_reused);
   RUN_TEST(test_unsubscribe_only_topics_nobody_holds);
   RUN_TEST(test_trailing_free_slots_shrink_the_count);
+  RUN_TEST(test_callback_that_resubscribes_keeps_its_captures);
+  RUN_TEST(test_fn_table_unsubscribes_only_unheld_topics);
   return UNITY_END();
 }
