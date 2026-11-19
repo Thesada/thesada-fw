@@ -408,7 +408,7 @@ static size_t mqttCriticalJson(char* out, size_t maxLen);
 // in: JSON object text. out: none.
 static void mqttApplyCmdConfig(const char* json) {
   JsonDocument doc;
-  if (deserializeJson(doc, json) || !doc.is<JsonObject>()) {
+  if (deserializeJson(doc, json, DeserializationOption::NestingLimit(CONFIG_MAX_DEPTH)) || !doc.is<JsonObject>()) {
     Log::warn(TAG, "mqtt.cmd_config_refused reason=json");
     return;
   }
@@ -777,12 +777,15 @@ void MQTTClient::rollbackIfUncommitted() {
   JsonDocument lg;
   if (deserializeJson(lg, lgJson)) return;  // corrupt snapshot: leave config alone
 
-  JsonObject m = Config::get()["mqtt"];
-  m["broker"]   = String((const char*)(lg["broker"] | ""));
-  m["port"]     = lg["port"] | 0;
-  m["user"]     = String((const char*)(lg["user"]     | ""));
-  m["password"] = String((const char*)(lg["password"] | ""));
-  if (Config::save()) {
+  const bool saved = Config::edit([&](JsonObject cfg) {
+    JsonObject m  = cfg["mqtt"].is<JsonObject>() ? cfg["mqtt"].as<JsonObject>() : cfg["mqtt"].to<JsonObject>();
+    m["broker"]   = String((const char*)(lg["broker"] | ""));
+    m["port"]     = lg["port"] | 0;
+    m["user"]     = String((const char*)(lg["user"] | ""));
+    m["password"] = String((const char*)(lg["password"] | ""));
+    return true;
+  });
+  if (saved) {
     mqttRebootCountClear();                 // fresh reboot budget for the restored config
     mqttClearRbCfg();
     Log::warn(TAG, "mqtt.config_rollback");
@@ -1363,8 +1366,7 @@ void MQTTClient::subscribe(const char* topic, MQTTCallback callback, uint8_t own
     return;
   }
   if (!_subs.add(topic, callback, owner)) {
-    Log::kvfe(TAG, "mqtt.sub_rejected reason=%s max=%d",
-              _subs.hasFreeSlot() ? "no_heap" : "max_subs", MQTT_MAX_SUBS);
+    Log::kvfe(TAG, "mqtt.sub_rejected reason=max_subs max=%d", MQTT_MAX_SUBS);
     return;
   }
 

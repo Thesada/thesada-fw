@@ -231,11 +231,6 @@ static bool onCert(const String& reply) {
     Log::kvfw(TAG, "enroll.reply_refused reason=cert_pair");
     return false;
   }
-  // A held boot prefix makes save() write the old prefix instead of this one.
-  if (Config::topicPrefixHeld()) {
-    Log::kvfw(TAG, "enroll.reply_refused reason=prefix_held");
-    return false;
-  }
   if (!ackPendingSet(true)) return false;
 
   bool saved = Config::edit([&](JsonObject cfg) {
@@ -244,6 +239,7 @@ static bool onCert(const String& reply) {
     m["broker"]       = String(host);
     m["port"]         = port;
     m["topic_prefix"] = String(prefix);
+    return true;
   });
   if (!saved || !MQTTClient::storeClientCert(cert, key)) {
     ackPendingSet(false);

@@ -25,9 +25,9 @@ void test_whole_body_in_chunks(void) {
 // A declared total past the cap is never allocated, so a stalled
 // Content-Length cannot pin heap.
 void test_over_cap_and_zero_refused(void) {
-  TEST_ASSERT_NULL(httpBodyBegin(HTTP_BODY_CFG_MAX + 1, HTTP_BODY_CFG_MAX));
-  TEST_ASSERT_NULL(httpBodyBegin(0, HTTP_BODY_CFG_MAX));
-  HttpBody* b = httpBodyBegin(HTTP_BODY_CFG_MAX, HTTP_BODY_CFG_MAX);
+  TEST_ASSERT_NULL(httpBodyBegin(CONFIG_FILE_MAX + 1, CONFIG_FILE_MAX));
+  TEST_ASSERT_NULL(httpBodyBegin(0, CONFIG_FILE_MAX));
+  HttpBody* b = httpBodyBegin(CONFIG_FILE_MAX, CONFIG_FILE_MAX);
   TEST_ASSERT_NOT_NULL(b);
   free(b);
 }
@@ -95,7 +95,7 @@ void test_missing_length_is_length_required_not_empty(void) {
   TEST_ASSERT_EQUAL(HTTP_BODY_LENGTH_REQUIRED,
                     httpBodyVerdict(true, false, false, 0, HTTP_BODY_FILE_MAX, nullptr));
   TEST_ASSERT_EQUAL(HTTP_BODY_LENGTH_REQUIRED,
-                    httpBodyVerdict(true, false, false, 0, HTTP_BODY_CFG_MAX, nullptr));
+                    httpBodyVerdict(true, false, false, 0, CONFIG_FILE_MAX, nullptr));
   TEST_ASSERT_EQUAL(HTTP_BODY_UNAUTHORIZED,
                     httpBodyVerdict(false, false, false, 0, HTTP_BODY_FILE_MAX, nullptr));
   TEST_ASSERT_EQUAL(HTTP_BODY_EMPTY,
@@ -112,7 +112,7 @@ void test_unauthorized_wins_over_everything(void) {
 void test_plain_bodies_keep_their_verdicts(void) {
   TEST_ASSERT_EQUAL(HTTP_BODY_EMPTY, httpBodyVerdict(true, false, true, 0, HTTP_BODY_FILE_MAX, nullptr));
   TEST_ASSERT_EQUAL(HTTP_BODY_TOO_LARGE,
-                    httpBodyVerdict(true, false, true, HTTP_BODY_CFG_MAX + 1, HTTP_BODY_CFG_MAX, nullptr));
+                    httpBodyVerdict(true, false, true, CONFIG_FILE_MAX + 1, CONFIG_FILE_MAX, nullptr));
   TEST_ASSERT_EQUAL(HTTP_BODY_INCOMPLETE, httpBodyVerdict(true, false, true, 4, HTTP_BODY_CMD_MAX, nullptr));
   HttpBody* b = httpBodyBegin(4, HTTP_BODY_CMD_MAX);
   TEST_ASSERT_TRUE(httpBodyAppend(b, U("ab"), 2, 0));
@@ -148,7 +148,7 @@ void test_denied_marker_refuses_every_chunk(void) {
 void test_budget_refuses_past_the_total(void) {
   size_t held = 0;
   TEST_ASSERT_TRUE(httpBodyReserve(held, HTTP_BODY_FILE_MAX, HTTP_BODY_BUDGET));
-  TEST_ASSERT_TRUE(httpBodyReserve(held, HTTP_BODY_CFG_MAX, HTTP_BODY_BUDGET));
+  TEST_ASSERT_TRUE(httpBodyReserve(held, CONFIG_FILE_MAX, HTTP_BODY_BUDGET));
   TEST_ASSERT_EQUAL_UINT32(HTTP_BODY_BUDGET, held);
   TEST_ASSERT_FALSE(httpBodyReserve(held, 1, HTTP_BODY_BUDGET));
   TEST_ASSERT_EQUAL_UINT32(HTTP_BODY_BUDGET, held);

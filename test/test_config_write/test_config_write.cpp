@@ -255,23 +255,10 @@ void test_fat_commit_reports_a_bak_it_could_not_remove(void) {
 
 void test_saved_reply_is_ok_once_reloaded(void) {
   char buf[200];
-  TEST_ASSERT_TRUE(configSavedReply(buf, sizeof(buf), "mqtt.port", "8883", true));
+  configSavedReply(buf, sizeof(buf), "mqtt.port", "8883");
   TEST_ASSERT_NOT_NULL(strstr(buf, "Set mqtt.port = 8883 (saved"));
-  TEST_ASSERT_TRUE(configSavedReply(buf, sizeof(buf), "lora", nullptr, true));
+  configSavedReply(buf, sizeof(buf), "lora", nullptr);
   TEST_ASSERT_EQUAL_STRING("Deleted lora (saved)", buf);
-}
-
-// A failed reload keeps the old live doc, so the write is no plain success.
-void test_saved_reply_fails_when_the_reload_failed(void) {
-  char buf[200];
-  char longValue[300];
-  memset(longValue, 'v', sizeof(longValue) - 1);
-  longValue[sizeof(longValue) - 1] = '\0';
-  TEST_ASSERT_FALSE(configSavedReply(buf, sizeof(buf), "mqtt.port", longValue, false));
-  TEST_ASSERT_NOT_NULL(strstr(buf, "mqtt.port"));
-  TEST_ASSERT_NOT_NULL(strstr(buf, "live config not reloaded"));
-  TEST_ASSERT_FALSE(configSavedReply(buf, sizeof(buf), "lora", nullptr, false));
-  TEST_ASSERT_NOT_NULL(strstr(buf, "live config not reloaded"));
 }
 
 int main(int, char**) {
@@ -301,6 +288,5 @@ int main(int, char**) {
   RUN_TEST(test_fat_commit_survives_a_writer_recreating_the_target);
   RUN_TEST(test_fat_commit_reports_a_bak_it_could_not_remove);
   RUN_TEST(test_saved_reply_is_ok_once_reloaded);
-  RUN_TEST(test_saved_reply_fails_when_the_reload_failed);
   return UNITY_END();
 }

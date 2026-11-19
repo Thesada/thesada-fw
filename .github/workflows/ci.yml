@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -50,7 +50,7 @@ jobs:
     # Host-side Lua harness - exercises data/scripts/*.lua against the
     # mocked firmware bindings (tests/lua/). Fast, no PlatformIO needed;
     # runs in parallel with the board builds and gates the release.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -65,7 +65,7 @@ jobs:
   native-tests:
     # Host-native unit tests for the pure security logic (parse bounds, key
     # mapping, rollback policy). No board, fast, gates the release.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -87,7 +87,7 @@ jobs:
     # Line coverage over the same pure units the native tests exercise, floored
     # per file in scripts/coverage-floors.txt. Separate job from native-tests so
     # the fast unit run is not slowed by the instrumented build.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -115,7 +115,7 @@ jobs:
   static-analysis:
     # cppcheck and clang-tidy over the pure security units, then the
     # path-safety gate. Gates the release alongside the native unit tests.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -144,7 +144,7 @@ jobs:
     # arrives via a direct push or a contributor who has not installed
     # the hooks. Bypass with `INVARIANT_OK: 1` trailer in any commit in
     # the range.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -199,7 +199,7 @@ jobs:
   # squash commit on dev/main is written by the merge box, not a contributor.
   dco:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -229,7 +229,7 @@ jobs:
   release:
     needs: [build, lua-tests, native-tests, coverage, static-analysis, invariant-ledger]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:

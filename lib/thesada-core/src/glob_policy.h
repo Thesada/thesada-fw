@@ -5,6 +5,7 @@
 #pragma once
 #include <stddef.h>
 #include <string.h>
+#include "config_write_policy.h"
 
 inline bool globHasWildcard(const char* s) {
   return s && (strchr(s, '*') || strchr(s, '?'));
@@ -54,9 +55,10 @@ inline bool globSplit(const char* path, char* dirOut, size_t dirCap,
 }
 
 // The two files the firmware needs to boot and to verify TLS. A wildcard rm
-// skips them whatever the pattern says; an exact fs.rm still removes them.
+// skips them whatever the pattern says, an exact fs.rm still removes them.
+// "/." and "//" are the root too.
 inline bool globRmProtected(const char* dir, const char* name) {
-  if (!dir || !name) return false;
-  if (strcmp(dir, "/") != 0) return false;
+  if (!dir || !name || *dir != '/') return false;
+  if (*fsSkipRootDots(dir) != '\0') return false;
   return strcmp(name, "config.json") == 0 || strcmp(name, "ca.crt") == 0;
 }

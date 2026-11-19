@@ -449,12 +449,13 @@ static bool _fileWriteAtomic(bool lfs, const char* path, const char* data, size_
 // main loop task. Replies on failure. out: bytes on disk, 0 if nothing landed.
 static size_t _configWriteOrReply(AsyncWebServerRequest* req, const char* body, bool restart) {
   // One config cap for every route, /api/file buffers up to the file cap.
-  if (req->contentLength() > HTTP_BODY_CFG_MAX) {
+  if (req->contentLength() > CONFIG_FILE_MAX) {
     req->send(413, "application/json", "{\"ok\":false,\"error\":\"config larger than 16 KB\"}");
     return 0;
   }
   auto doc = std::make_shared<JsonDocument>();
-  if (deserializeJson(*doc, body) || !doc->is<JsonObject>()) {
+  if (deserializeJson(*doc, body, DeserializationOption::NestingLimit(CONFIG_MAX_DEPTH)) ||
+      !doc->is<JsonObject>()) {
     req->send(400, "application/json", "{\"ok\":false,\"error\":\"config must be a JSON object\"}");
     return 0;
   }
@@ -917,10 +918,10 @@ void HttpServer::setupRoutes() {
   cfgHandler->setMethod(HTTP_POST);
   cfgHandler->onBody([](AsyncWebServerRequest* req, uint8_t* data, size_t len,
                         size_t index, size_t total) {
-    _bodyChunk(req, data, len, index, total, HTTP_BODY_CFG_MAX);
+    _bodyChunk(req, data, len, index, total, CONFIG_FILE_MAX);
   });
   cfgHandler->onRequest([](AsyncWebServerRequest* req) {
-    const char* body = _bodyOrReply(req, HTTP_BODY_CFG_MAX);
+    const char* body = _bodyOrReply(req, CONFIG_FILE_MAX);
     if (!body) return;
     if (_configWriteOrReply(req, body, /*restart=*/true) == 0) return;
     req->send(200, "application/json", "{\"ok\":true}");

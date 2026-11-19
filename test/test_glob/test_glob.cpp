@@ -100,6 +100,17 @@ void test_same_names_off_root_are_not_protected(void) {
   TEST_ASSERT_FALSE(globRmProtected("/backup", "ca.crt"));
 }
 
+// littlefs skips "." segments, so /./config.* is the root config too.
+void test_rm_protected_sees_through_dot_segments(void) {
+  TEST_ASSERT_TRUE(globRmProtected("/.", "config.json"));
+  TEST_ASSERT_TRUE(globRmProtected("/./", "ca.crt"));
+  TEST_ASSERT_TRUE(globRmProtected("/././/.", "config.json"));
+  TEST_ASSERT_TRUE(globRmProtected("//", "config.json"));
+  TEST_ASSERT_FALSE(globRmProtected("/.sd", "config.json"));
+  TEST_ASSERT_FALSE(globRmProtected("/./sd", "config.json"));
+  TEST_ASSERT_FALSE(globRmProtected("/..", "config.json"));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_detects_wildcards);
@@ -115,5 +126,6 @@ int main(int, char**) {
   RUN_TEST(test_root_config_and_ca_are_protected);
   RUN_TEST(test_other_root_files_are_not_protected);
   RUN_TEST(test_same_names_off_root_are_not_protected);
+  RUN_TEST(test_rm_protected_sees_through_dot_segments);
   return UNITY_END();
 }

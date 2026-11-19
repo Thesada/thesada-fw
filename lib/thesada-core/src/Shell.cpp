@@ -17,6 +17,7 @@
 #include "path_safety_policy.h"
 #include "config_load_policy.h"
 #include "config_write_policy.h"
+#include "config_path_policy.h"
 #include "cell_ntp_policy.h"
 #include "ap_policy.h"
 #include "glob_policy.h"
@@ -802,20 +803,6 @@ static void cmd_format(int argc, char** argv, ShellOutput out) {
 // Config commands
 // ---------------------------------------------------------------------------
 
-// Parse `tok` as an unsigned integer for use as a JsonArray index.
-// in:  tok    candidate token string
-// out: bool   true if every char is a digit (and at least one digit), idx filled
-static bool parseArrayIndex(const char* tok, size_t& idx) {
-  if (!tok || !*tok) return false;
-  size_t v = 0;
-  for (const char* p = tok; *p; ++p) {
-    if (*p < '0' || *p > '9') return false;
-    v = v * 10 + (size_t)(*p - '0');
-  }
-  idx = v;
-  return true;
-}
-
 // Read a config value by dot-notation key. Supports array indices
 // (e.g. wifi.networks.0.ssid - "0" descends into the JsonArray returned
 // by wifi.networks).
@@ -833,7 +820,7 @@ static void cmd_config_get(int argc, char** argv, ShellOutput out) {
   char* token = strtok(key, ".");
   while (token) {
     size_t idx;
-    if (current.is<JsonArray>() && parseArrayIndex(token, idx)) {
+    if (current.is<JsonArray>() && configArrayIndex(token, idx)) {
       JsonArray arr = current.as<JsonArray>();
       if (idx >= arr.size()) { out("Array index out of range"); return; }
       current = arr[idx];
@@ -855,54 +842,30 @@ static void cmd_config_get(int argc, char** argv, ShellOutput out) {
   }
 }
 
-// Persist a document through Config::writeFile (tmp + rename), so a short
-// write (fs full) never destroys the last good config. Reports failure.
-static bool shellConfigWrite(JsonVariantConst src, ShellOutput out, size_t* bytes = nullptr) {
-  if (!Config::writeFile(src, true, bytes)) {
-    Shell::fail(out, "Failed to write config.json (fs full?)");
-    return false;
+// Set a dotted key (value) or delete it (null) through Config::edit, then reply.
+// A refused path writes nothing.
+static void shellConfigApply(const char* key, const char* value, ShellOutput out) {
+  char msg[200];
+  bool refused = false;
+  const bool saved = Config::edit([&](JsonObject root) {
+    refused = !configPathApply(root, key, value, msg, sizeof(msg));
+    return !refused;
+  });
+  if (refused) {
+    Shell::fail(out, msg);
+    return;
   }
-  return true;
-}
-
-struct BootPrefixKeep {
-  char prefix[Config::TOPIC_PREFIX_CAP];
-  bool keep;
-};
-
-// Remember a boot prefix held over the live doc. A shell write reloads the
-// file, and that reload would otherwise publish the pushed prefix immediately.
-// in: none. out: false when a held prefix does not fit and the command must stop.
-static bool captureBootPrefix(BootPrefixKeep* kept, ShellOutput out) {
-  kept->keep = false;
-  kept->prefix[0] = '\0';
-  if (!Config::topicPrefixHeld()) return true;
-  if (!Config::copyBootTopicPrefix(kept->prefix, sizeof(kept->prefix))) {
-    Shell::fail(out, "Refused: boot topic prefix does not fit");
-    return false;
+  if (!saved) {
+    Shell::fail(out, "Failed to write config.json (fs full or file unreadable?)");
+    return;
   }
-  kept->keep = true;
-  return true;
-}
-
-// in: captured prefix, the key this command wrote. out: none.
-static void restoreBootPrefix(const BootPrefixKeep* kept, const char* key) {
-  if (!kept->keep) return;
-  // Still held: the reload failed and kept the doc, overlay included.
-  if (Config::topicPrefixHeld()) return;
-  if (key && (strcmp(key, "mqtt") == 0 || strcmp(key, "mqtt.topic_prefix") == 0)) return;
-  if (!Config::holdTopicPrefix(kept->prefix)) {
-    Log::error("Shell", "config.boot_prefix_restore_failed");
-  }
+  configSavedReply(msg, sizeof(msg), key, value);
+  out(msg);
 }
 
 static void cmd_config_set(int argc, char** argv, ShellOutput out) {
-  if (argc < 3) { Shell::fail(out, "Usage: config.set <key> <value>  (then config.save to persist)"); return; }
-  char key[128];
-  if (!shellFits(argv[1], sizeof(key))) { Shell::fail(out, "Key too long (max 127 bytes)"); return; }
-  BootPrefixKeep kept;
-  if (!captureBootPrefix(&kept, out)) return;
-
+  if (argc < 3) { Shell::fail(out, "Usage: config.set <key> <value>"); return; }
+  if (!shellFits(argv[1], CONFIG_KEY_MAX)) { Shell::fail(out, "Key too long (max 127 bytes)"); return; }
   // Registered with restFrom 2: argv[2] is the value as typed.
   String value(argv[2]);
   // Strip surrounding double quotes (MQTT CLI payloads often arrive quoted)
@@ -910,229 +873,25 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
     value.remove(value.length() - 1);
     value.remove(0, 1);
   }
-
-  if (!LittleFS.exists("/config.json")) { Shell::fail(out, "config.json not found"); return; }
-  File f = LittleFS.open("/config.json", "r");
-  if (!f) { Shell::fail(out, "Failed to read config.json"); return; }
-  String json = f.readString();
-  f.close();
-
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, json);
-  if (err) { Shell::fail(out, "JSON parse error in config.json"); return; }
-
-  strncpy(key, argv[1], sizeof(key) - 1);
-  key[sizeof(key) - 1] = '\0';
-
-  char* lastDot = strrchr(key, '.');
-  if (lastDot) {
-    *lastDot = '\0';
-    const char* finalKey = lastDot + 1;
-    String parentPath(key);  // parent path with dots intact, for error messages
-
-    JsonVariant parent = doc.as<JsonVariant>();
-    String walked;           // dotted path resolved so far
-    char* saveptr = nullptr;
-    char* token = strtok_r(key, ".", &saveptr);
-    while (token) {
-      // Peek the next segment so an auto-created intermediate knows
-      // whether the user actually wants an array at this level.
-      char* nextToken = strtok_r(nullptr, ".", &saveptr);
-
-      size_t idx;
-      if (parent.is<JsonArray>() && parseArrayIndex(token, idx)) {
-        JsonArray arr = parent.as<JsonArray>();
-        if (idx >= arr.size()) { Shell::fail(out, "Parent array index out of range"); return; }
-        parent = arr[idx];
-      } else if (parent.is<JsonObject>()) {
-        // Auto-create missing intermediate objects so config.set can land
-        // a value into a section that does not exist yet (e.g. enabling a
-        // brand-new optional module like gnss). Never auto-creates arrays:
-        // if the next segment is a numeric index the user wants an array
-        // here, so refuse with a clear instruction rather than silently
-        // creating an object the index cannot address.
-        if (parent[token].isNull()) {
-          size_t dummy;
-          if (nextToken && parseArrayIndex(nextToken, dummy)) {
-            String path = walked.length() ? walked + "." + token : String(token);
-            char msg[160];
-            snprintf(msg, sizeof(msg),
-                     "Parent path '%s' doesn't exist. Run config.set %s [] first.",
-                     path.c_str(), path.c_str());
-            Shell::fail(out, msg);
-            return;
-          }
-          parent[token].to<JsonObject>();
-        }
-        parent = parent[token];
-      } else {
-        Shell::fail(out, "Parent key not found");
-        return;
-      }
-      walked = walked.length() ? walked + "." + token : String(token);
-      token = nextToken;
-    }
-
-    // Resolve a writable target for the final key. JsonObject member
-    // assignment + JsonArray index assignment use different ArduinoJson
-    // APIs; capture the destination as a JsonVariant once so the value
-    // detection below is target-agnostic.
-    //
-    // Append semantics on arrays: if the terminal index equals
-    // arr.size() the slot is appended via arr.add<JsonVariant>() so
-    // numeric-suffix config.set paths naturally extend an array. Strict
-    // idx > size rejection still prevents a sparse array from ever
-    // forming.
-    // A numeric final segment only addresses an array. If the parent
-    // resolved to an object the array does not exist yet - refuse rather
-    // than creating a string-keyed member that merely looks like an index.
-    JsonVariant target;
-    size_t finalIdx;
-    if (parseArrayIndex(finalKey, finalIdx) && !parent.is<JsonArray>()) {
-      char msg[160];
-      snprintf(msg, sizeof(msg),
-               "Parent path '%s' is not an array. Run config.set %s [] first.",
-               parentPath.c_str(), parentPath.c_str());
-      Shell::fail(out, msg);
-      return;
-    }
-    if (parent.is<JsonArray>() && parseArrayIndex(finalKey, finalIdx)) {
-      JsonArray arr = parent.as<JsonArray>();
-      if (finalIdx > arr.size()) {
-        Shell::fail(out, "Array index out of range (would leave hole)");
-        return;
-      }
-      if (finalIdx == arr.size()) {
-        target = arr.add<JsonVariant>();
-      } else {
-        target = arr[finalIdx];
-      }
-    } else if (parent.is<JsonObject>()) {
-      // ArduinoJson's operator[] yields an *unbound* variant for a key
-      // that does not exist yet; capturing that into `target` and
-      // calling target.set() later writes into nothing. That is why
-      // config.set could update an existing key but silently failed to
-      // create a new one. Materialise the member first (mirrors the
-      // intermediate-object auto-create above) so the captured handle
-      // binds to a real document slot. The placeholder object is
-      // overwritten by the value assignment below.
-      if (parent[finalKey].isNull()) {
-        parent[finalKey].to<JsonObject>();
-      }
-      target = parent[finalKey];
-    } else {
-      Shell::fail(out, "Parent is not an object or array");
-      return;
-    }
-
-    if (value == "--delete") {
-      if (parent.is<JsonObject>()) {
-        parent[finalKey].clear();
-        parent.as<JsonObject>().remove(finalKey);
-      } else {
-        // For arrays we set the slot to null; remove() would shift
-        // indices and silently break sibling references.
-        target.clear();
-      }
-      goto save;
-    }
-
-    // Assign as a Variant so config.set wifi.networks [{"ssid":"..."}] stores
-    // a real JsonArray, not a stringified blob (prior fallthrough behaviour).
-    {
-      String trimmed = value;
-      trimmed.trim();
-      if (trimmed.length() > 0 &&
-          (trimmed.charAt(0) == '{' || trimmed.charAt(0) == '[')) {
-        JsonDocument lit;
-        DeserializationError lerr = deserializeJson(lit, trimmed);
-        if (!lerr) {
-          target.set(lit.as<JsonVariant>());
-          goto save;
-        }
-        // Parse failed - fall through to scalar detection. The user
-        // probably typed a string that just happens to start with `{`.
-      }
-    }
-
-    bool bv; long long iv; float fv;
-    switch (configScalarKind(value.c_str(), &bv, &iv, &fv)) {
-      case CFG_SCALAR_BOOL:  target.set(bv); break;
-      case CFG_SCALAR_INT:   target.set(iv); break;
-      case CFG_SCALAR_FLOAT: target.set(fv); break;
-      default:               target.set(value); break;
-    }
-  } else {
-    // Top-level key.
-    Shell::fail(out, "Cannot set top-level keys directly (use section.key format)");
-    return;
-  }
-
-  save:
-  if (!shellConfigWrite(doc.as<JsonVariantConst>(), out)) return;
-
-  // Does NOT trigger MQTT reconnect - that requires config.reload.
-  bool reloaded = Config::load();
-  restoreBootPrefix(&kept, argv[1]);
-
-  char msg[200];
-  bool del = value == "--delete";
-  if (configSavedReply(msg, sizeof(msg), argv[1], del ? nullptr : value.c_str(), reloaded)) {
-    out(msg);
-  } else {
-    Shell::fail(out, msg);
-  }
+  shellConfigApply(argv[1], value == "--delete" ? nullptr : value.c_str(), out);
 }
 
-// For programmatic changes to Config::get() that bypass config.set.
+// Write /config.json back through Config::edit and make it live.
 static void cmd_config_save(int argc, char** argv, ShellOutput out) {
-  JsonDocument dst;
-  if (!Config::copyDiskDoc(dst)) {
-    Shell::fail(out, "Failed to snapshot config");
+  if (!Config::edit([](JsonObject) { return true; })) {
+    Shell::fail(out, "Failed to write config.json (fs full or file unreadable?)");
     return;
   }
-  size_t bytes = 0;
-  if (!shellConfigWrite(dst.as<JsonVariantConst>(), out, &bytes)) return;
-  char msg[64];
-  snprintf(msg, sizeof(msg), "Config saved to /config.json (%d bytes)", (int)bytes);
-  out(msg);
+  out("Config saved to /config.json");
 }
 
-// Delete a config key. Dotted keys go through the config.set --delete
-// path (object member removed; array slot nulled so sibling indices stay
-// stable). A bare top-level key removes the whole section - the cleanup
-// for a key whose type changed between releases (e.g. bool -> object):
-// delete the stale node, then config.set recreates it with the new shape.
+// Delete a config key. A dotted key removes the member, or nulls an array
+// slot so sibling indices stay. A bare top-level key removes the whole
+// section, the cleanup for a key whose type changed between releases.
 static void cmd_config_del(int argc, char** argv, ShellOutput out) {
   if (argc < 2) { Shell::fail(out, "Usage: config.del <key>  (dot notation; bare section name deletes the section)"); return; }
-  BootPrefixKeep kept;
-  if (!captureBootPrefix(&kept, out)) return;
-
-  if (!strchr(argv[1], '.')) {
-    if (!LittleFS.exists("/config.json")) { Shell::fail(out, "config.json not found"); return; }
-    File f = LittleFS.open("/config.json", "r");
-    if (!f) { Shell::fail(out, "Failed to read config.json"); return; }
-    String json = f.readString();
-    f.close();
-    JsonDocument doc;
-    if (deserializeJson(doc, json)) { Shell::fail(out, "JSON parse error in config.json"); return; }
-    JsonObject root = doc.as<JsonObject>();
-    if (root[argv[1]].isNull()) { Shell::fail(out, "Key not found"); return; }
-    root.remove(argv[1]);
-    if (!shellConfigWrite(doc.as<JsonVariantConst>(), out)) return;
-    bool reloaded = Config::load();
-    restoreBootPrefix(&kept, argv[1]);
-    char msg[200];
-    if (configSavedReply(msg, sizeof(msg), argv[1], nullptr, reloaded)) {
-      out(msg);
-    } else {
-      Shell::fail(out, msg);
-    }
-    return;
-  }
-
-  char* delArgv[3] = { argv[0], argv[1], (char*)"--delete" };
-  cmd_config_set(3, delArgv, out);
+  if (!shellFits(argv[1], CONFIG_KEY_MAX)) { Shell::fail(out, "Key too long (max 127 bytes)"); return; }
+  shellConfigApply(argv[1], nullptr, out);
 }
 
 // Reload config from flash. If network-affecting keys changed, reinit MQTT
@@ -2400,7 +2159,7 @@ void Shell::registerBuiltins() {
 
   // Config
   registerCommand("config.get",    "Read config key (dot notation)",   cmd_config_get);
-  registerCommand("config.set",    "Set config key (saves + reloads)", cmd_config_set, 2);
+  registerCommand("config.set",    "Set config key (saves, live at once)", cmd_config_set, 2);
   registerCommand("config.del",    "Delete config key or section",     cmd_config_del);
   registerCommand("config.save",   "Save current config to flash",     cmd_config_save);
   registerCommand("config.reload", "Reload config from flash",         cmd_config_reload);

@@ -257,12 +257,13 @@ void test_trailing_free_slots_shrink_the_count(void) {
 }
 
 // A callback that frees its owner's slots and subscribes again (a Lua reload
-// inside an MQTT callback) gets its own slot back. Dispatch holds a handle, so
-// the reassignment cannot free the captures of the call still running.
+// inside an MQTT callback) runs to the end on its own captures. The new
+// registration takes a different slot, and the old one is swept after the call.
 using FnTable = MqttSubTable<std::function<void(const char*, const char*)>, 4>;
 static FnTable*           g_fnTable;
 static std::weak_ptr<int> g_capture;
 static bool               g_captureAliveAfterReAdd;
+static uint8_t            g_countInCall;
 
 void test_callback_that_resubscribes_keeps_its_captures(void) {
   FnTable t;
@@ -274,13 +275,18 @@ void test_callback_that_resubscribes_keeps_its_captures(void) {
     g_fnTable->removeOwner(MQTT_SUB_OWNER_LUA);
     g_fnTable->add("lua/reload", [](const char*, const char*) {}, MQTT_SUB_OWNER_LUA);
     g_captureAliveAfterReAdd = !g_capture.expired();
+    g_countInCall            = g_fnTable->count();
   }, MQTT_SUB_OWNER_LUA);
   owned.reset();
   TEST_ASSERT_FALSE(g_capture.expired());
   t.dispatch("lua/reload", "");
   TEST_ASSERT_TRUE(g_captureAliveAfterReAdd);
+  TEST_ASSERT_EQUAL_UINT8(2, g_countInCall);
   TEST_ASSERT_TRUE(g_capture.expired());
-  TEST_ASSERT_EQUAL_UINT8(1, t.count());
+  TEST_ASSERT_TRUE(t.isRegistered("lua/reload"));
+  // Slot 0 is free again: the next add takes it and the count stays.
+  TEST_ASSERT_TRUE(t.add("next", [](const char*, const char*) {}));
+  TEST_ASSERT_EQUAL_UINT8(2, t.count());
 }
 
 // A mutable callback keeps its state from one delivery to the next.
@@ -294,78 +300,125 @@ void test_callback_keeps_its_state_between_deliveries(void) {
   TEST_ASSERT_EQUAL_INT(2, seen);
 }
 
-// A heap that runs out on demand and counts what is still held.
-struct TestHeap {
-  static bool fail;
-  static int  live;
-  static void* alloc(size_t n) {
-    if (fail) return nullptr;
-    live++;
-    return ::operator new(n, std::nothrow);
-  }
-  static void release(void* p) {
-    live--;
-    ::operator delete(p);
-  }
+// Counts live copies of itself, so a test sees when the table destroys one.
+struct Counted {
+  static int live;
+  int*       hits;
+  explicit Counted(int* h) : hits(h) { live++; }
+  Counted(const Counted& o) : hits(o.hits) { live++; }
+  ~Counted() { live--; }
+  Counted& operator=(const Counted&) = delete;
+  void     operator()(const char*, const char*) const { (*hits)++; }
 };
-bool TestHeap::fail = false;
-int  TestHeap::live = 0;
-using HeapTable = MqttSubTable<std::function<void(const char*, const char*)>, 4, 160, TestHeap>;
+int Counted::live = 0;
 
-// CR #131: add() allocated with make_shared, so an out-of-heap registration
-// aborted. It is refused and the table stays as it was.
-void test_add_refuses_when_the_heap_is_out(void) {
-  TestHeap::fail = false;
-  TestHeap::live = 0;
-  {
-    HeapTable t;
-    int hits = 0;
-    TEST_ASSERT_TRUE(t.add("a", [&hits](const char*, const char*) { hits++; }));
-    TEST_ASSERT_TRUE(t.add("b", [](const char*, const char*) {}, MQTT_SUB_OWNER_LUA));
-    t.removeOwner(MQTT_SUB_OWNER_LUA);
-    TestHeap::fail = true;
-    TEST_ASSERT_FALSE(t.add("c", [](const char*, const char*) {}));
-    TEST_ASSERT_TRUE(t.hasFreeSlot());
-    TestHeap::fail = false;
-    TEST_ASSERT_EQUAL_UINT8(1, t.count());
-    TEST_ASSERT_FALSE(t.isRegistered("c"));
-    t.dispatch("a", "");
-    TEST_ASSERT_EQUAL_INT(1, hits);
-    TEST_ASSERT_TRUE(t.add("c", [](const char*, const char*) {}));
-    TEST_ASSERT_TRUE(t.isRegistered("c"));
-    TEST_ASSERT_TRUE(t.add("d", [](const char*, const char*) {}, MQTT_SUB_OWNER_LUA));
-    TEST_ASSERT_TRUE(t.add("e", [](const char*, const char*) {}));
-    TEST_ASSERT_FALSE(t.hasFreeSlot());
-    g_unsubs = 0;
-    TEST_ASSERT_EQUAL_UINT8(1, t.removeOwner(MQTT_SUB_OWNER_LUA, onUnsub));
-    TEST_ASSERT_EQUAL_INT(1, g_unsubs);
-    TEST_ASSERT_EQUAL_UINT8(4, t.count());
-    TEST_ASSERT_TRUE(t.hasFreeSlot());
-  }
-  TEST_ASSERT_EQUAL_INT(0, TestHeap::live);
+static FnTable* g_t;
+static int      g_hitsC;
+
+// A remove inside dispatch leaves the slot a zombie until the dispatch returns.
+void test_remove_inside_dispatch_is_swept_after_it(void) {
+  FnTable t;
+  g_t     = &t;
+  g_hitsC = 0;
+  uint8_t countInCall = 0;
+  bool    stillHeld   = true;
+  t.add("lua/a", [](const char*, const char*) { g_hitsC++; }, MQTT_SUB_OWNER_LUA);
+  t.add("core/x", [&](const char*, const char*) {
+    g_t->removeOwner(MQTT_SUB_OWNER_LUA);
+    countInCall = g_t->count();
+    stillHeld   = g_t->isRegistered("lua/a");
+  });
+  t.dispatch("core/x", "");
+  TEST_ASSERT_EQUAL_UINT8(2, countInCall);
+  TEST_ASSERT_FALSE(stillHeld);
+  TEST_ASSERT_EQUAL_UINT8(2, t.count());
+  t.dispatch("lua/a", "");
+  TEST_ASSERT_EQUAL_INT(0, g_hitsC);
+  // The swept zombie is free: a new add lands in slot 0, the count stays.
+  TEST_ASSERT_TRUE(t.add("lua/b", [](const char*, const char*) {}, MQTT_SUB_OWNER_LUA));
+  TEST_ASSERT_EQUAL_UINT8(2, t.count());
 }
 
-// A callback that replaces itself frees its old box once it returns, not before.
-static HeapTable* g_heapTable;
-void test_replaced_box_is_freed_after_its_call(void) {
-  TestHeap::fail = false;
-  TestHeap::live = 0;
+// A dispatch from inside a callback does not sweep: only the outer one does.
+void test_nested_dispatch_sweeps_once_at_depth_zero(void) {
+  FnTable t;
+  g_t = &t;
+  int     liveAfterInner = -1;
+  int     hits           = 0;
+  Counted::live          = 0;
+  t.add("lua/a", Counted(&hits), MQTT_SUB_OWNER_LUA);
+  t.add("inner", [](const char*, const char*) { g_t->removeOwner(MQTT_SUB_OWNER_LUA); });
+  t.add("outer", [&](const char*, const char*) {
+    g_t->dispatch("inner", "");
+    liveAfterInner = Counted::live;
+  });
+  TEST_ASSERT_EQUAL_INT(1, Counted::live);
+  t.dispatch("outer", "");
+  TEST_ASSERT_EQUAL_INT(1, liveAfterInner);
+  TEST_ASSERT_EQUAL_INT(0, Counted::live);
+}
+
+// add() inside a dispatch takes a free slot below the count, never a zombie:
+// a zombie can hold the callback still running.
+void test_add_inside_dispatch_takes_a_free_slot_not_a_zombie(void) {
+  FnTable t;
+  g_t     = &t;
+  g_hitsC = 0;
+  t.add("lua/a", [](const char*, const char*) {}, MQTT_SUB_OWNER_LUA);
+  t.add("free/me", [](const char*, const char*) {}, MQTT_SUB_OWNER_LUA);
+  t.add("core/x", [](const char*, const char*) {
+    g_t->removeOwner(MQTT_SUB_OWNER_LUA);
+    g_t->add("lua/new", [](const char*, const char*) { g_hitsC++; }, MQTT_SUB_OWNER_LUA);
+  });
+  t.add("hold", [](const char*, const char*) {});
+  // Free slot 1, keep lua/a in slot 0: the dispatch turns slot 0 into a zombie.
+  t.removeOwner(MQTT_SUB_OWNER_LUA);
+  t.add("lua/a", [](const char*, const char*) {}, MQTT_SUB_OWNER_LUA);
+  TEST_ASSERT_EQUAL_UINT8(4, t.count());
+  t.dispatch("core/x", "");
+  TEST_ASSERT_TRUE(t.isRegistered("lua/new"));
+  TEST_ASSERT_FALSE(t.isRegistered("lua/a"));
+  t.dispatch("lua/new", "");
+  TEST_ASSERT_EQUAL_INT(1, g_hitsC);
+  // Slot 0 is free after the sweep, and the table is full once it is taken.
+  TEST_ASSERT_TRUE(t.add("last", [](const char*, const char*) {}));
+  TEST_ASSERT_FALSE(t.add("over", [](const char*, const char*) {}));
+}
+
+// The count covers zombies until the outermost dispatch returns.
+void test_count_holds_until_the_outer_dispatch_returns(void) {
+  FnTable t;
+  g_t = &t;
+  uint8_t inner = 0;
+  t.add("core/x", [&](const char*, const char*) {
+    g_t->removeOwner(MQTT_SUB_OWNER_LUA);
+    inner = g_t->count();
+  });
+  t.add("lua/a", [](const char*, const char*) {}, MQTT_SUB_OWNER_LUA);
+  t.add("lua/b", [](const char*, const char*) {}, MQTT_SUB_OWNER_LUA);
+  t.dispatch("core/x", "");
+  TEST_ASSERT_EQUAL_UINT8(3, inner);
+  TEST_ASSERT_EQUAL_UINT8(1, t.count());
+}
+
+// A removed callback is destroyed at the sweep, not later and not before.
+void test_removed_callback_is_destroyed_at_sweep(void) {
+  Counted::live = 0;
+  int hits      = 0;
   {
-    HeapTable t;
-    g_heapTable = &t;
-    int liveInCall = -1;
-    t.add("lua/reload", [&liveInCall](const char*, const char*) {
-      g_heapTable->removeOwner(MQTT_SUB_OWNER_LUA);
-      g_heapTable->add("lua/reload", [](const char*, const char*) {}, MQTT_SUB_OWNER_LUA);
-      liveInCall = TestHeap::live;
-    }, MQTT_SUB_OWNER_LUA);
-    t.dispatch("lua/reload", "");
-    TEST_ASSERT_EQUAL_INT(2, liveInCall);
-    TEST_ASSERT_EQUAL_INT(1, TestHeap::live);
-    t.dispatch("lua/reload", "");
-    TEST_ASSERT_EQUAL_INT(1, TestHeap::live);
+    FnTable t;
+    t.add("lua/a", Counted(&hits), MQTT_SUB_OWNER_LUA);
+    TEST_ASSERT_EQUAL_INT(1, Counted::live);
+    t.dispatch("lua/a", "");
+    TEST_ASSERT_EQUAL_INT(1, hits);
+    t.removeOwner(MQTT_SUB_OWNER_LUA);
+    TEST_ASSERT_EQUAL_INT(0, Counted::live);
+    t.add("lua/b", Counted(&hits), MQTT_SUB_OWNER_LUA);
+    t.reset();
+    TEST_ASSERT_EQUAL_INT(0, Counted::live);
+    t.add("lua/c", Counted(&hits), MQTT_SUB_OWNER_LUA);
   }
-  TEST_ASSERT_EQUAL_INT(0, TestHeap::live);
+  TEST_ASSERT_EQUAL_INT(0, Counted::live);
 }
 
 // The function-pointer table takes the same path.
@@ -382,7 +435,10 @@ void test_fn_pointer_callback_replaces_itself(void) {
   TEST_ASSERT_EQUAL_INT(0, g_hitsA);
   t.dispatch("self", "");
   TEST_ASSERT_EQUAL_INT(1, g_hitsA);
-  TEST_ASSERT_EQUAL_UINT8(1, t.count());
+  // The new registration sits in slot 1, the swept slot 0 is free below it.
+  TEST_ASSERT_EQUAL_UINT8(2, t.count());
+  TEST_ASSERT_TRUE(t.add("next", hitB));
+  TEST_ASSERT_EQUAL_UINT8(2, t.count());
 }
 
 // The std::function table the client uses unsubscribes the same way.
@@ -423,8 +479,11 @@ int main(int, char**) {
   RUN_TEST(test_callback_that_resubscribes_keeps_its_captures);
   RUN_TEST(test_callback_keeps_its_state_between_deliveries);
   RUN_TEST(test_fn_table_unsubscribes_only_unheld_topics);
-  RUN_TEST(test_add_refuses_when_the_heap_is_out);
-  RUN_TEST(test_replaced_box_is_freed_after_its_call);
+  RUN_TEST(test_remove_inside_dispatch_is_swept_after_it);
+  RUN_TEST(test_nested_dispatch_sweeps_once_at_depth_zero);
+  RUN_TEST(test_add_inside_dispatch_takes_a_free_slot_not_a_zombie);
+  RUN_TEST(test_count_holds_until_the_outer_dispatch_returns);
+  RUN_TEST(test_removed_callback_is_destroyed_at_sweep);
   RUN_TEST(test_fn_pointer_callback_replaces_itself);
   return UNITY_END();
 }

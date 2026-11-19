@@ -7,17 +7,21 @@
 #include <stdio.h>
 #include <string.h>
 
-// in: path after pathSafePolicy. out: true when littlefs 2.10+ resolves it to
-// /config.json. lfs_dir_find skips "." segments and refuses any path after a file.
-inline bool configPathIsLive(const char* path) {
-  if (!path) return false;
-  const char* p = path;
+// lfs_dir_find skips "." segments. in: path. out: path past its leading
+// slashes and "." segments, "" for the root.
+inline const char* fsSkipRootDots(const char* p) {
   for (;;) {
     while (*p == '/') p++;
     if (p[0] == '.' && (p[1] == '/' || p[1] == '\0')) { p++; continue; }
-    break;
+    return p;
   }
-  return strcmp(p, "config.json") == 0;
+}
+
+// in: path after pathSafePolicy. out: true when littlefs 2.10+ resolves it to
+// /config.json. lfs_dir_find refuses any path after a file.
+inline bool configPathIsLive(const char* path) {
+  if (!path) return false;
+  return strcmp(fsSkipRootDots(path), "config.json") == 0;
 }
 
 enum FsWriteRoute {
@@ -111,18 +115,12 @@ inline FatCommit fatCommit(Fs& fs, const char* tmp, const char* bak, const char*
   return FAT_COMMIT_OK;
 }
 
-// The reply a shell config writer gives once the file landed.
-// in: buf, key, value (null for a delete), reloaded = Config::load() result.
-// out: buf filled, true when the reply is a success.
-inline bool configSavedReply(char* buf, size_t cap, const char* key, const char* value, bool reloaded) {
-  if (!reloaded) {
-    (void)snprintf(buf, cap, "Saved %s to /config.json, live config not reloaded (see log)", key);
-    return false;
-  }
+// The reply config.set / config.del give once the edit is on disk and live.
+// in: buf, key, value (null for a delete). out: buf filled.
+inline void configSavedReply(char* buf, size_t cap, const char* key, const char* value) {
   if (value) {
     (void)snprintf(buf, cap, "Set %s = %s (saved - run config.reload to apply network changes)", key, value);
   } else {
     (void)snprintf(buf, cap, "Deleted %s (saved)", key);
   }
-  return true;
 }
