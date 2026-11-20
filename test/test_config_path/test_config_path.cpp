@@ -162,6 +162,32 @@ void test_array_index_refuses_overflow(void) {
   TEST_ASSERT_EQUAL_STRING("{\"l\":[1]}", json(doc).c_str());
 }
 
+// A key with an empty segment names nothing: refused, the doc untouched.
+void test_empty_segments_are_refused(void) {
+  static const char* const bad[] = {"mqtt..topic_prefix", ".mqtt.topic_prefix", "mqtt.topic_prefix.",
+                                    "mqtt.", ".mqtt", "..", ".", "", "a..b.c"};
+  for (const char* k : bad) {
+    JsonDocument doc;
+    deserializeJson(doc, "{\"mqtt\":{\"topic_prefix\":\"old\"}}");
+    TEST_ASSERT_FALSE_MESSAGE(configPathApply(doc.as<JsonObject>(), k, "\"new\"", msg, sizeof(msg)), k);
+    TEST_ASSERT_FALSE_MESSAGE(configPathApply(doc.as<JsonObject>(), k, nullptr, msg, sizeof(msg)), k);
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("{\"mqtt\":{\"topic_prefix\":\"old\"}}", json(doc).c_str(), k);
+  }
+  JsonDocument doc;
+  deserializeJson(doc, "{\"mqtt\":{\"topic_prefix\":\"old\"}}");
+  TEST_ASSERT_TRUE(configPathApply(doc.as<JsonObject>(), "mqtt.topic_prefix", "new", msg, sizeof(msg)));
+  TEST_ASSERT_EQUAL_STRING("new", doc["mqtt"]["topic_prefix"] | "");
+}
+
+// Which key names config.set, config.del and config.get take.
+void test_key_valid_table(void) {
+  static const char* const good[] = {"mqtt", "mqtt.topic_prefix", "wifi.networks.0.ssid", "a.b.c.d.e.f.g.h", "x_y.z-1"};
+  static const char* const bad[]  = {"", ".", "..", ".mqtt", "mqtt.", "mqtt..topic_prefix", "a.b..c", "a...b"};
+  for (const char* k : good) TEST_ASSERT_TRUE_MESSAGE(configKeyValid(k), k);
+  for (const char* k : bad) TEST_ASSERT_FALSE_MESSAGE(configKeyValid(k), k);
+  TEST_ASSERT_FALSE(configKeyValid(nullptr));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_set_creates_missing_sections);
@@ -174,5 +200,7 @@ int main(int, char**) {
   RUN_TEST(test_array_index_is_digits_only);
   RUN_TEST(test_literal_out_of_heap_is_refused);
   RUN_TEST(test_array_index_refuses_overflow);
+  RUN_TEST(test_empty_segments_are_refused);
+  RUN_TEST(test_key_valid_table);
   return UNITY_END();
 }

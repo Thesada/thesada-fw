@@ -304,7 +304,9 @@ void test_commit_refuses_an_edit_that_made_root_an_array(void) {
 // A stage source: the FakeFs file, or the live doc when there is none.
 struct StageFs : FakeFs {
   bool liveCopies = true;
+  bool live       = true;
   bool opens      = true;
+  bool hasLive() { return live; }
   bool parse(JsonDocument& doc, DeserializationError& err) { return opens && FakeFs::parse(doc, err); }
   bool copyLive(JsonDocument& doc) {
     if (!liveCopies) return false;
@@ -325,6 +327,7 @@ void test_stage_prefers_the_file_and_falls_back_to_live(void) {
   TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_LIVE, configStage(fs, staged, err));
   TEST_ASSERT_EQUAL_STRING("live.example", staged["mqtt"]["broker"] | "");
   fs.liveCopies = false;
+  fs.live       = false;
   TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_NO_LIVE, configStage(fs, staged, err));
 }
 
@@ -669,6 +672,7 @@ void test_rescue_stage_fresh_doc_on_a_blank_filesystem(void) {
   StageFs fs;
   fs.exists     = false;
   fs.liveCopies = false;
+  fs.live       = false;
   JsonDocument staged;
   DeserializationError err;
   TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_RESCUED, configStageRescue(fs, staged, err, 3));
@@ -678,6 +682,22 @@ void test_rescue_stage_fresh_doc_on_a_blank_filesystem(void) {
   fs.opens  = false;
   fs.text   = "{\"mqtt\":{}}";
   TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_NO_LIVE, configStageRescue(fs, staged, err, 3));
+}
+
+// A live doc that exists but could not be copied (no heap) is not a blank
+// filesystem: the edit is refused and the portal never stages a fresh doc.
+void test_failed_live_copy_is_not_a_blank_filesystem(void) {
+  StageFs fs;
+  fs.exists     = false;
+  fs.liveCopies = false;
+  JsonDocument staged;
+  DeserializationError err;
+  TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_COPY_FAILED, configStage(fs, staged, err));
+  TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_COPY_FAILED, configStageRescue(fs, staged, err, 3));
+  TEST_ASSERT_TRUE(staged.isNull());
+  fs.liveCopies = true;
+  TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_LIVE, configStageRescue(fs, staged, err, 3));
+  TEST_ASSERT_EQUAL_STRING("live.example", staged["mqtt"]["broker"] | "");
 }
 
 // A valid file that ran out of heap while it was parsed is not broken:
@@ -768,5 +788,6 @@ int main(int, char**) {
   RUN_TEST(test_shell_prefix_set_to_the_live_value_takes_no_hold);
   RUN_TEST(test_shell_prefix_delete_holds_the_boot_prefix);
   RUN_TEST(test_shell_prefix_hold_that_cannot_be_kept);
+  RUN_TEST(test_failed_live_copy_is_not_a_blank_filesystem);
   return UNITY_END();
 }

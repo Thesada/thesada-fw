@@ -89,7 +89,7 @@ version="$(version_at "$sha")"
 if [ "$mode" = create ]; then
   notes="$1"
   shift
-  gh release create "$tag" "$@" --title "thesada-fw $tag" --notes-file "$notes" --target "$sha"
+  gh release create "$tag" "$@" --repo "$repo" --title "thesada-fw $tag" --notes-file "$notes" --target "$sha"
   check_tag
   echo "release-target: created $tag on $sha"
   exit 0

@@ -47,6 +47,8 @@ public:
   // Copy the live doc as it is on disk, a held boot prefix left out.
   // in: destination document. out: false if the copy did not land.
   static bool copyDiskDoc(JsonDocument& dst);
+  // out: true when a live doc (an object) is loaded.
+  static bool hasLiveDoc();
   // Changes after every load, replace or set that rebuilt or edited the doc.
   static uint32_t revision();
   // Run fn on the main loop after each such change, before the caller resumes.

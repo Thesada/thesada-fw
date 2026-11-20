@@ -119,8 +119,9 @@ struct ConfigTextReader {
 };
 
 // Where an edit's working copy came from. PARSE_FAILED covers malformed,
-// trailing content and not one object, NO_LIVE a missing file plus a failed copy,
-// NO_HEAP a file that ran out of heap while it was parsed.
+// trailing content and not one object, NO_LIVE a missing file and no live doc,
+// NO_HEAP a file that ran out of heap while it was parsed, COPY_FAILED a missing
+// file and a live doc that could not be copied.
 enum ConfigStage {
   CONFIG_STAGE_FILE = 0,
   CONFIG_STAGE_LIVE,
@@ -129,10 +130,11 @@ enum ConfigStage {
   CONFIG_STAGE_TOO_LARGE,
   CONFIG_STAGE_RESCUED,
   CONFIG_STAGE_NO_HEAP,
+  CONFIG_STAGE_COPY_FAILED,
 };
 
 // Stage an edit from the file, the live doc only when the file is missing.
-// Fs: size() -> bytes or -1, parse(doc, err), copyLive(doc) -> bool. out: source.
+// Fs: size() -> bytes or -1, parse(doc, err), copyLive(doc) -> bool, hasLive(). out: source.
 template <typename Fs>
 inline ConfigStage configStage(Fs& fs, JsonDocument& staged, DeserializationError& err) {
   err = DeserializationError::Ok;
@@ -144,7 +146,9 @@ inline ConfigStage configStage(Fs& fs, JsonDocument& staged, DeserializationErro
     return err || !staged.is<JsonObject>() ? CONFIG_STAGE_PARSE_FAILED : CONFIG_STAGE_FILE;
   }
   staged.clear();
-  return fs.copyLive(staged) && staged.is<JsonObject>() ? CONFIG_STAGE_LIVE : CONFIG_STAGE_NO_LIVE;
+  if (fs.copyLive(staged) && staged.is<JsonObject>()) return CONFIG_STAGE_LIVE;
+  staged.clear();
+  return fs.hasLive() ? CONFIG_STAGE_COPY_FAILED : CONFIG_STAGE_NO_LIVE;
 }
 
 // configStage for the setup portal, the way back from a broken file: a file that

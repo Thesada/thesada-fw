@@ -53,14 +53,31 @@ inline bool mqttDefragRebootDue(unsigned retryCount, bool resolved, int rc,
   return retryCount >= 3 && resolved && rc == -2 && maxAllocHeap < 40000 && !halted;
 }
 
+// DIAL: last-good this session. LIVE: the live config, the fallback is over.
+// RETRY: the snapshot ran out of heap, keep the fallback and dial nothing now.
+enum MqttSessionLg {
+  MQTT_LG_LIVE = 0,
+  MQTT_LG_DIAL,
+  MQTT_LG_RETRY,
+};
+
 // A rollback whose persist failed still dials last-good this session, as long
 // as the live critical config is the failing one it replaced. An edit since wins.
 // in: persist failed, failing candidate, live critical config, snapshot text.
-// out: true with lg parsed and carrying a broker.
+// out: DIAL with lg parsed and carrying a broker, RETRY on a parse out of heap.
+inline MqttSessionLg mqttRollbackSessionDecide(bool persistFailed, const char* failing, const char* cur,
+                                               const char* lgText, JsonDocument& lg) {
+  if (!persistFailed || !failing || !*failing || !cur || strcmp(failing, cur) != 0) return MQTT_LG_LIVE;
+  if (!lgText) return MQTT_LG_LIVE;
+  const DeserializationError err = deserializeJson(lg, lgText);
+  if (err) return err == DeserializationError::NoMemory ? MQTT_LG_RETRY : MQTT_LG_LIVE;
+  if (!lg.is<JsonObject>()) return MQTT_LG_LIVE;
+  const char* broker = lg["broker"] | "";
+  return *broker != '\0' ? MQTT_LG_DIAL : MQTT_LG_LIVE;
+}
+
+// in: as mqttRollbackSessionDecide. out: true only for DIAL.
 inline bool mqttRollbackSessionLastGood(bool persistFailed, const char* failing, const char* cur,
                                         const char* lgText, JsonDocument& lg) {
-  if (!persistFailed || !failing || !*failing || !cur || strcmp(failing, cur) != 0) return false;
-  if (!lgText || deserializeJson(lg, lgText) || !lg.is<JsonObject>()) return false;
-  const char* broker = lg["broker"] | "";
-  return *broker != '\0';
+  return mqttRollbackSessionDecide(persistFailed, failing, cur, lgText, lg) == MQTT_LG_DIAL;
 }

@@ -814,6 +814,7 @@ static void cmd_config_get(int argc, char** argv, ShellOutput out) {
 
   char key[128];
   if (!shellFits(argv[1], sizeof(key))) { out("Key too long (max 127 bytes)"); return; }
+  if (!configKeyValid(argv[1])) { out("Invalid key (empty segment)"); return; }
   strncpy(key, argv[1], sizeof(key) - 1);
   key[sizeof(key) - 1] = '\0';
 
@@ -845,6 +846,7 @@ static void cmd_config_get(int argc, char** argv, ShellOutput out) {
 // Set a dotted key (value) or delete it (null) through Config::edit, then reply.
 // A refused path writes nothing. A new prefix waits for a restart.
 static void shellConfigApply(const char* key, const char* value, ShellOutput out) {
+  if (!configKeyValid(key)) { Shell::fail(out, "Invalid key (empty segment)"); return; }
   char msg[200];
   bool refused = false;
   const bool saved = Config::edit([&](JsonObject root) {

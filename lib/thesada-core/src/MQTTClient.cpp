@@ -484,24 +484,30 @@ static void mqttApplyCmdConfig(const char* json) {
 // Set when the boot rollback could not persist last-good: this session dials it anyway.
 static bool s_rbPersistFailed = false;
 
-// in: doc for the snapshot. out: true with lg filled when this session dials
-// last-good in place of the live config. An edit since ends it for the session.
-static bool rollbackSessionLastGood(JsonDocument& lg) {
-  if (!s_rbPersistFailed) return false;
+// in: doc for the snapshot. out: DIAL with lg filled when this session dials
+// last-good, RETRY when it cannot tell now. Only an edit or a bad snapshot ends it.
+static MqttSessionLg rollbackSessionState(JsonDocument& lg) {
+  if (!s_rbPersistFailed) return MQTT_LG_LIVE;
   char failing[LG_MAX_LEN] = {0};
   char lgText[LG_MAX_LEN]  = {0};
   char cur[LG_MAX_LEN];
   Preferences prefs;
-  if (!prefs.begin(BOOT_NS, true)) return false;
+  if (!prefs.begin(BOOT_NS, true)) return MQTT_LG_RETRY;
   prefs.getString(RB_KEY_RBCFG, failing, sizeof(failing));
   prefs.getString(RB_KEY_LG, lgText, sizeof(lgText));
   prefs.end();
-  if (mqttCriticalJson(cur, sizeof(cur)) == 0) return false;
-  if (mqttRollbackSessionLastGood(true, failing, cur, lgText, lg)) return true;
-  s_rbPersistFailed = false;
-  Log::kvfw(TAG, "mqtt.config_rollback_session_end reason=config_changed");
-  return false;
+  if (mqttCriticalJson(cur, sizeof(cur)) == 0) return MQTT_LG_RETRY;
+  const MqttSessionLg state = mqttRollbackSessionDecide(true, failing, cur, lgText, lg);
+  if (state == MQTT_LG_RETRY) {
+    Log::kvfw(TAG, "mqtt.config_rollback_session_retry reason=no_heap");
+  } else if (state == MQTT_LG_LIVE) {
+    s_rbPersistFailed = false;
+    Log::kvfw(TAG, "mqtt.config_rollback_session_end reason=config_changed");
+  }
+  return state;
 }
+
+static bool rollbackSessionLastGood(JsonDocument& lg) { return rollbackSessionState(lg) == MQTT_LG_DIAL; }
 
 // Initialize MQTT: load config, TLS certs, set up subscriptions, connect.
 // in: none (reads Config, LittleFS /ca.crt, NVS cert namespace).
@@ -862,7 +868,19 @@ void MQTTClient::connect() {
 
   JsonObject  cfg      = Config::get();
   JsonDocument lg;
-  const bool  lastGood = rollbackSessionLastGood(lg);
+  const bool  wasFallback = s_rbPersistFailed;
+  const MqttSessionLg session = rollbackSessionState(lg);
+  if (session == MQTT_LG_RETRY) return;
+  const bool  lastGood = session == MQTT_LG_DIAL;
+  // Host and credentials from one source: begin() may have decided before this.
+  if (lastGood || wasFallback) {
+    JsonVariantConst src = lastGood ? lg.as<JsonVariantConst>() : cfg["mqtt"].as<JsonVariantConst>();
+    const char* host = src["broker"] | "";
+    if (*host && mqttHostCopy(_brokerHost, sizeof(_brokerHost), host)) {
+      _brokerPort = src["port"] | 8883;
+      _client.setServer(_brokerHost, _brokerPort);
+    }
+  }
   JsonVariantConst creds = lastGood ? lg.as<JsonVariantConst>() : cfg["mqtt"].as<JsonVariantConst>();
   const char* clientId = Identity::nodeName();
   const char* user     = creds["user"] | "";

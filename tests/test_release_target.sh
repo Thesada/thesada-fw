@@ -68,7 +68,7 @@ run() {
   rm -rf "$tmp/s" && mkdir "$tmp/s"
   while [ "$1" != -- ]; do printf '%s' "${1#*=}" >"$tmp/s/${1%%=*}"; shift; done
   shift
-  out="$(cd "$repo" && PATH="$tmp/bin:$PATH" FAKE_GH_STATE="$tmp/s" GITHUB_REPOSITORY=o/r \
+  out="$(cd "$repo" && PATH="$tmp/bin:$PATH" FAKE_GH_STATE="$tmp/s" GITHUB_REPOSITORY="${RT_REPO-o/r}" \
     "$gate" "$@" 2>"$tmp/err")" || got=$?
   if [ "$got" != "$want" ]; then
     printf 'FAIL  %s (exit %s, want %s)\n' "$label" "$got" "$want" >&2
@@ -111,13 +111,14 @@ run 1 "is on $other" "tag on an unknown commit fails" ref="commit $other" releas
 git -C "$repo" checkout -q --detach "$c3"
 touch "$tmp/notes.md"
 run 0 - "create passes the built commit and verifies it" ref= -- create $v "$c3" "$tmp/notes.md" a.bin b.json
-if grep -qxF "release create $v a.bin b.json --title thesada-fw $v --notes-file $tmp/notes.md --target $c3" "$tmp/s/calls"; then
-  echo "ok    create call carries --target"
+if grep -qxF "release create $v a.bin b.json --repo o/r --title thesada-fw $v --notes-file $tmp/notes.md --target $c3" "$tmp/s/calls"; then
+  echo "ok    create call carries --repo and --target"
 else
   echo "FAIL  create call without the target:" >&2
   sed 's/^/      /' "$tmp/s/calls" >&2 || true
   fail=1
 fi
+RT_REPO= run 1 "GITHUB_REPOSITORY" "create refuses an empty repository" ref= -- create $v "$c3" "$tmp/notes.md" a.bin
 run 1 "is on $other, the build is $c3" "create fails when GitHub tags another commit" ref= retarget="$other" -- create $v "$c3" "$tmp/notes.md" a.bin
 
 run 0 - "verify: tag on the built commit" ref="commit $c3" -- verify $v "$c3"

@@ -27,6 +27,16 @@ inline bool configArrayIndex(const char* tok, size_t& idx) {
   return true;
 }
 
+// in: dotted key. out: false when empty or a segment is empty (leading,
+// trailing or doubled dot). Checked before any walk: strtok skips empty segments.
+inline bool configKeyValid(const char* key) {
+  if (!key || !*key || *key == '.') return false;
+  for (const char* p = key; *p; ++p) {
+    if (*p == '.' && (p[1] == '.' || p[1] == '\0')) return false;
+  }
+  return true;
+}
+
 enum ConfigStore {
   CONFIG_STORE_OK = 0,
   CONFIG_STORE_TOO_DEEP,
@@ -73,6 +83,10 @@ inline bool configPathApply(JsonObject root, const char* keyIn, const char* valu
     return false;
   }
   memcpy(key, keyIn, klen + 1);
+  if (!configKeyValid(key)) {
+    (void)snprintf(msg, cap, "Invalid key (empty segment)");
+    return false;
+  }
   int segs = 1;
   for (const char* p = key; *p; ++p) segs += *p == '.';
   if (segs > CONFIG_MAX_DEPTH) {

@@ -233,6 +233,7 @@ struct LittleFsStageSource {
     return true;
   }
   bool copyLive(JsonDocument& doc) { return Config::copyDiskDoc(doc); }
+  bool hasLive() { return Config::hasLiveDoc(); }
 };
 
 // Write staged and move it into _doc. in: staged doc, log event. out: false if live stayed.
@@ -288,8 +289,10 @@ bool Config::rescueEdit(const std::function<bool(JsonObject)>& fn) {
   const long size = src.size();
   const ConfigStage from = configStageRescue(src, staged, err, CONFIG_SCHEMA_CURRENT);
   if (from != CONFIG_STAGE_FILE && from != CONFIG_STAGE_LIVE && from != CONFIG_STAGE_RESCUED) {
-    Log::kvfe(TAG, "config.edit_failed reason=%s err=%s action=keep_live",
-              from == CONFIG_STAGE_NO_HEAP ? "no_heap" : "no_source", err ? err.c_str() : "none");
+    const char* why = from == CONFIG_STAGE_NO_HEAP       ? "no_heap"
+                      : from == CONFIG_STAGE_COPY_FAILED ? "copy_failed"
+                                                         : "no_source";
+    Log::kvfe(TAG, "config.edit_failed reason=%s err=%s action=keep_live", why, err ? err.c_str() : "none");
     return false;
   }
   if (!fn(staged.as<JsonObject>())) return false;
@@ -310,6 +313,7 @@ bool Config::edit(const std::function<bool(JsonObject)>& fn, bool deferPrefix) {
     const char* why = from == CONFIG_STAGE_NO_LIVE    ? "no_source"
                       : from == CONFIG_STAGE_TOO_LARGE ? "too_large"
                       : from == CONFIG_STAGE_NO_HEAP   ? "no_heap"
+                      : from == CONFIG_STAGE_COPY_FAILED ? "copy_failed"
                                                        : "file_unreadable";
     Log::kvfe(TAG, "config.edit_failed reason=%s err=%s action=keep_live", why, err ? err.c_str() : "none");
     return false;
@@ -346,6 +350,8 @@ bool Config::topicPrefixHeld() {
 bool Config::topicPrefixPending() {
   return configPrefixPending(_doc, _hold);
 }
+
+bool Config::hasLiveDoc() { return _doc.is<JsonObject>(); }
 
 bool Config::copyDiskDoc(JsonDocument& dst) {
   dst.clear();
