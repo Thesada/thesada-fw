@@ -85,6 +85,30 @@ inline bool certExtractCn(const char* dn, char* out, size_t outLen) {
   return true;
 }
 
+// Stored cert metadata. The sizes travel with the type, so no caller can hand
+// getCertInfo a cap larger than a buffer. A serial past 47 bytes does not fit.
+struct CertInfo {
+  char cn[128];
+  char serial[96];
+  char notBefore[32];
+  char notAfter[32];
+};
+
+// Lowercase hex of a cert serial, whole or not at all: a clipped serial names
+// another cert. in: bytes, count, out, cap. out: false when it does not fit.
+inline bool certSerialHex(const uint8_t* p, size_t len, char* out, size_t outLen) {
+  if (!out || outLen == 0) return false;
+  out[0] = '\0';
+  if (!p || len == 0 || len > (outLen - 1) / 2) return false;
+  static const char kHex[] = "0123456789abcdef";
+  for (size_t i = 0; i < len; i++) {
+    out[2 * i]     = kHex[p[i] >> 4];
+    out[2 * i + 1] = kHex[p[i] & 0x0f];
+  }
+  out[2 * len] = '\0';
+  return true;
+}
+
 // What the stored-pair check found. NoHeap: a buffer would not allocate, so
 // the pair was never read and nothing is known about it.
 enum class PairCheck : uint8_t { Valid, Invalid, NoHeap };

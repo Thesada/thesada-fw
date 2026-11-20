@@ -20,8 +20,15 @@ using DeferredFn = std::function<void()>;
 
 using ShellCommand = std::function<void(int argc, char** argv, ShellOutput out)>;
 
-// Result of Shell::writeChecked.
-enum FsWrite { FS_WRITE_OK, FS_WRITE_OPEN_FAILED, FS_WRITE_SHORT };
+// Result of Shell::writeChecked and Shell::writeRouted. The CONFIG_ values are
+// refusals on the live config file with nothing written.
+enum FsWrite {
+  FS_WRITE_OK,
+  FS_WRITE_OPEN_FAILED,
+  FS_WRITE_SHORT,
+  FS_WRITE_CONFIG_APPEND,
+  FS_WRITE_CONFIG_NOT_OBJECT,
+};
 
 // Disk-usage probe a module supplies for its mount; fs::FS has no byte counts
 // (subclass-specific). Returns bytes, 0 = empty / not mounted.
@@ -121,6 +128,15 @@ public:
   // out: OPEN_FAILED if open fails, OK only when write() and growth both equal len, *onDisk = growth.
   static FsWrite writeChecked(fs::FS* fs, const char* path, bool append,
                               const uint8_t* data, size_t len, size_t* onDisk);
+
+  // fs.write / fs.append on every transport. The live config file is written
+  // whole through Config::writeRaw (tmp + rename), never in place.
+  // in: as writeChecked. out: as writeChecked, or a CONFIG_ refusal.
+  static FsWrite writeRouted(fs::FS* fs, const char* path, bool append,
+                             const uint8_t* data, size_t len, size_t* onDisk);
+
+  // in: a writeRouted result. out: the reply line for a refusal, else nullptr.
+  static const char* fsWriteRefusal(FsWrite w);
 
   // Validate an externally-supplied FS path before any LittleFS call. Every
   // transport that accepts a path (HTTP, Shell over serial / WS / MQTT CLI,

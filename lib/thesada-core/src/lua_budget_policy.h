@@ -62,3 +62,31 @@ inline bool luaBudgetLeave(LuaBudget& b) {
   b.depth--;
   return b.hit;
 }
+
+// A reload closes the state, so it never runs with a call into Lua on the
+// stack. in: budget, latch. out: true to reload now, else the latch is set.
+inline bool luaReloadNow(const LuaBudget& b, bool* pending) {
+  if (luaBudgetActive(b)) {
+    *pending = true;
+    return false;
+  }
+  *pending = false;
+  return true;
+}
+
+// MQTT side of the latch. No loop runs after the sleep shutdown starts and
+// deep sleep clears the latch, so a request then is refused.
+// in: sleep shutdown running, latch. out: true when latched.
+inline bool luaReloadRequest(bool shuttingDown, bool* pending) {
+  if (shuttingDown) return false;
+  *pending = true;
+  return true;
+}
+
+// Loop side of the latch. in: budget, latch. out: true to run the latched
+// reload now, latch cleared.
+inline bool luaReloadDue(const LuaBudget& b, bool* pending) {
+  if (!*pending || luaBudgetActive(b)) return false;
+  *pending = false;
+  return true;
+}

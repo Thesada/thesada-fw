@@ -72,6 +72,29 @@ void test_disagreeing_or_empty_sizes_fail(void) {
   TEST_ASSERT_FALSE(configWriteLanded(0, 0, 0));
 }
 
+// --- fs.write / fs.append routing ---------------------------------------------
+
+// fs.write onto the live config file goes whole through tmp + rename.
+void test_fs_write_of_the_config_file_is_staged(void) {
+  TEST_ASSERT_EQUAL_INT(FS_ROUTE_CONFIG, fsWriteRoute(true, "/config.json", false));
+  TEST_ASSERT_EQUAL_INT(FS_ROUTE_CONFIG, fsWriteRoute(true, "/./config.json", false));
+}
+
+// An append cannot be made atomic, so it never reaches the config file.
+void test_fs_append_to_the_config_file_is_refused(void) {
+  TEST_ASSERT_EQUAL_INT(FS_ROUTE_CONFIG_APPEND, fsWriteRoute(true, "/config.json", true));
+  TEST_ASSERT_EQUAL_INT(FS_ROUTE_CONFIG_APPEND, fsWriteRoute(true, "//config.json", true));
+}
+
+// Other files, the app's staging copy and anything on SD keep the plain path.
+void test_other_writes_stay_plain(void) {
+  TEST_ASSERT_EQUAL_INT(FS_ROUTE_PLAIN, fsWriteRoute(true, "/config.json.new", false));
+  TEST_ASSERT_EQUAL_INT(FS_ROUTE_PLAIN, fsWriteRoute(true, "/config.json.new", true));
+  TEST_ASSERT_EQUAL_INT(FS_ROUTE_PLAIN, fsWriteRoute(true, "/scripts/rules.lua", false));
+  TEST_ASSERT_EQUAL_INT(FS_ROUTE_PLAIN, fsWriteRoute(false, "/config.json", false));
+  TEST_ASSERT_EQUAL_INT(FS_ROUTE_PLAIN, fsWriteRoute(true, nullptr, false));
+}
+
 // --- fileWriteLanded / uploadTmpPath (#67) ------------------------------------
 
 // An empty upload is a legitimate empty file, unlike an empty config.
@@ -230,8 +253,47 @@ void test_fat_commit_reports_a_bak_it_could_not_remove(void) {
   TEST_ASSERT_EQUAL_STRING("new", fs.files[P].c_str());
 }
 
+void test_saved_reply_is_ok_once_reloaded(void) {
+  char buf[200];
+  configSavedReply(buf, sizeof(buf), "mqtt.port", "8883");
+  TEST_ASSERT_NOT_NULL(strstr(buf, "Set mqtt.port = 8883 (saved"));
+  configSavedReply(buf, sizeof(buf), "lora", nullptr);
+  TEST_ASSERT_EQUAL_STRING("Deleted lora (saved)", buf);
+}
+
+// A prefix that waits for a restart says so, for a set and a delete alike.
+void test_saved_reply_pending_prefix_applies_after_restart(void) {
+  char buf[200];
+  configSavedReply(buf, sizeof(buf), "mqtt.topic_prefix", "b/node", true);
+  TEST_ASSERT_EQUAL_STRING("Set mqtt.topic_prefix = b/node (saved, new prefix applies after restart)", buf);
+  configSavedReply(buf, sizeof(buf), "mqtt.topic_prefix", nullptr, true);
+  TEST_ASSERT_EQUAL_STRING("Deleted mqtt.topic_prefix (saved, new prefix applies after restart)", buf);
+  configSavedReply(buf, sizeof(buf), "mqtt", nullptr, true);
+  TEST_ASSERT_EQUAL_STRING("Deleted mqtt (saved, new prefix applies after restart)", buf);
+  configSavedReply(buf, sizeof(buf), "mqtt.port", "8883", true);
+  TEST_ASSERT_NULL(strstr(buf, "after restart"));
+  configSavedReply(buf, sizeof(buf), "mqtt.topic_prefix", "b/node", false);
+  TEST_ASSERT_EQUAL_STRING("Set mqtt.topic_prefix = b/node (saved - run config.reload to apply network changes)", buf);
+  configSavedReply(buf, sizeof(buf), "mqtt.topic_prefix", nullptr, false);
+  TEST_ASSERT_EQUAL_STRING("Deleted mqtt.topic_prefix (saved)", buf);
+}
+
+// Only the prefix and the section that holds it defer to a restart.
+void test_prefix_keys(void) {
+  TEST_ASSERT_TRUE(configKeyIsPrefix("mqtt.topic_prefix"));
+  TEST_ASSERT_TRUE(configKeyIsPrefix("mqtt"));
+  TEST_ASSERT_FALSE(configKeyIsPrefix("mqtt.port"));
+  TEST_ASSERT_FALSE(configKeyIsPrefix("mqtt.topic_prefix.x"));
+  TEST_ASSERT_FALSE(configKeyIsPrefix("mqttx"));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
+  RUN_TEST(test_saved_reply_pending_prefix_applies_after_restart);
+  RUN_TEST(test_prefix_keys);
+  RUN_TEST(test_fs_write_of_the_config_file_is_staged);
+  RUN_TEST(test_fs_append_to_the_config_file_is_refused);
+  RUN_TEST(test_other_writes_stay_plain);
   RUN_TEST(test_plain_config_path_is_live);
   RUN_TEST(test_dot_segment_spellings_are_live);
   RUN_TEST(test_path_after_the_file_is_not_live);
@@ -253,5 +315,6 @@ int main(int, char**) {
   RUN_TEST(test_fat_commit_strands_both_copies_rather_than_delete_one);
   RUN_TEST(test_fat_commit_survives_a_writer_recreating_the_target);
   RUN_TEST(test_fat_commit_reports_a_bak_it_could_not_remove);
+  RUN_TEST(test_saved_reply_is_ok_once_reloaded);
   return UNITY_END();
 }

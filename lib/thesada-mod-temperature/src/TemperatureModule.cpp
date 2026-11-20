@@ -3,6 +3,7 @@
 #include <thesada_config.h>
 #include "TemperatureModule.h"
 #include <Config.h>
+#include <config_load_policy.h>
 #include <EventBus.h>
 #include <MQTTClient.h>
 #include <Log.h>
@@ -156,7 +157,12 @@ static bool loadConfigBase(JsonDocument& dst) {
   if (!LittleFS.exists("/config.json")) return Config::copyDiskDoc(dst);
   File f = LittleFS.open("/config.json", "r");
   if (!f) return false;
-  DeserializationError err = deserializeJson(dst, f);
+  if (f.size() > CONFIG_FILE_MAX) {
+    f.close();
+    return false;
+  }
+  DeserializationError err;
+  configParseWhole(f, dst, err);
   f.close();
   return !err && dst.is<JsonObject>();
 }

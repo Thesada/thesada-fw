@@ -7,6 +7,8 @@
 #include "Shell.h"
 #include "MQTTClient.h"
 #include "WiFiManager.h"
+#include "OTAUpdate.h"
+#include "ota_health_policy.h"
 #include "sleep_policy.h"
 #include <WiFi.h>
 #include <esp_sleep.h>
@@ -17,6 +19,7 @@ static const char* TAG = "Sleep";
 RTC_DATA_ATTR static RtcData _rtc;
 
 bool     SleepManager::_enabled      = false;
+bool     SleepManager::_shuttingDown = false;
 uint64_t SleepManager::_sleepUs      = 0;
 uint32_t SleepManager::_wakeStart    = 0;
 uint32_t SleepManager::_wakeSpanMs   = 0;
@@ -75,10 +78,23 @@ void SleepManager::begin() {
            (unsigned long)(_wakeSpanMs / 1000), (unsigned long)sleepS, (unsigned long)_rtc.bootCount);
 }
 
-// Enter deep sleep when the wake deadline has passed
+// Enter deep sleep when the wake deadline has passed and no pending OTA image
+// still waits for its confirm (sleepHeldForOta).
 void SleepManager::loop() {
   if (!_enabled) return;
   if (!sleepWakeDone(millis(), _wakeStart, _wakeSpanMs)) return;
+
+  static bool heldLogged = false;
+  bool pending = false;
+  if (sleepHeldForOtaNow<OTAUpdate>(millis(), OTA_HEALTH_MIN_MS, pending)) {
+    if (!heldLogged) {
+      Log::kvf(TAG, "sleep.state_change from=awake to=held reason=ota_pending max_uptime_s=%lu",
+               (unsigned long)((OTA_HEALTH_MIN_MS + SLEEP_OTA_GRACE_MS) / 1000));
+      heldLogged = true;
+    }
+    return;
+  }
+  if (pending) Log::kvfw(TAG, "sleep.ota_unconfirmed action=sleep result=rollback_at_wake");
 
   gracefulShutdown();
 }
@@ -103,8 +119,13 @@ void SleepManager::setLastOtaCheck(time_t t) {
   _rtc.lastOtaCheck = t;
 }
 
+bool SleepManager::shuttingDown() {
+  return _shuttingDown;
+}
+
 // Flush MQTT, disconnect WiFi, and enter deep sleep
 void SleepManager::gracefulShutdown() {
+  _shuttingDown = true;
   Log::info(TAG, "sleep.shutdown_start");
 
   // Publish sleep status and flush the MQTT queue.

@@ -4,19 +4,37 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
-// in: path after pathSafePolicy. out: true when littlefs 2.10+ resolves it to
-// /config.json. lfs_dir_find skips "." segments and refuses any path after a file.
-inline bool configPathIsLive(const char* path) {
-  if (!path) return false;
-  const char* p = path;
+// lfs_dir_find skips "." segments. in: path. out: path past its leading
+// slashes and "." segments, "" for the root.
+inline const char* fsSkipRootDots(const char* p) {
   for (;;) {
     while (*p == '/') p++;
     if (p[0] == '.' && (p[1] == '/' || p[1] == '\0')) { p++; continue; }
-    break;
+    return p;
   }
-  return strcmp(p, "config.json") == 0;
+}
+
+// in: path after pathSafePolicy. out: true when littlefs 2.10+ resolves it to
+// /config.json. lfs_dir_find refuses any path after a file.
+inline bool configPathIsLive(const char* path) {
+  if (!path) return false;
+  return strcmp(fsSkipRootDots(path), "config.json") == 0;
+}
+
+enum FsWriteRoute {
+  FS_ROUTE_PLAIN = 0,      // writeChecked on the file itself
+  FS_ROUTE_CONFIG,         // whole JSON object, tmp + rename (Config::writeRaw)
+  FS_ROUTE_CONFIG_APPEND,  // refused: an append to the config file is in place
+};
+
+// How fs.write / fs.append reach a path. Only LittleFS holds the config file.
+// in: target is LittleFS, path after stripPrefix, append. out: route.
+inline FsWriteRoute fsWriteRoute(bool littleFs, const char* path, bool append) {
+  if (!littleFs || !configPathIsLive(path)) return FS_ROUTE_PLAIN;
+  return append ? FS_ROUTE_CONFIG_APPEND : FS_ROUTE_CONFIG;
 }
 
 // in: bytes handed to the File, tmp size read back after close, intended size.
@@ -95,4 +113,24 @@ inline FatCommit fatCommit(Fs& fs, const char* tmp, const char* bak, const char*
   }
   if (parked && !fs.remove(bak)) return FAT_COMMIT_OK_BAK_LEFT;
   return FAT_COMMIT_OK;
+}
+
+// in: shell config key. out: true for the prefix and the section that holds it.
+inline bool configKeyIsPrefix(const char* key) {
+  return strcmp(key, "mqtt.topic_prefix") == 0 || strcmp(key, "mqtt") == 0;
+}
+
+// The reply config.set / config.del give once the edit is on disk and live.
+// in: buf, key, value (null for a delete), file prefix not live yet. out: buf filled.
+inline void configSavedReply(char* buf, size_t cap, const char* key, const char* value, bool pending = false) {
+  const bool restart = pending && configKeyIsPrefix(key);
+  if (value && restart) {
+    (void)snprintf(buf, cap, "Set %s = %s (saved, new prefix applies after restart)", key, value);
+  } else if (value) {
+    (void)snprintf(buf, cap, "Set %s = %s (saved - run config.reload to apply network changes)", key, value);
+  } else if (restart) {
+    (void)snprintf(buf, cap, "Deleted %s (saved, new prefix applies after restart)", key);
+  } else {
+    (void)snprintf(buf, cap, "Deleted %s (saved)", key);
+  }
 }
