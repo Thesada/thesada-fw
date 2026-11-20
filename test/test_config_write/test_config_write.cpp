@@ -261,8 +261,36 @@ void test_saved_reply_is_ok_once_reloaded(void) {
   TEST_ASSERT_EQUAL_STRING("Deleted lora (saved)", buf);
 }
 
+// A prefix that waits for a restart says so, for a set and a delete alike.
+void test_saved_reply_pending_prefix_applies_after_restart(void) {
+  char buf[200];
+  configSavedReply(buf, sizeof(buf), "mqtt.topic_prefix", "b/node", true);
+  TEST_ASSERT_EQUAL_STRING("Set mqtt.topic_prefix = b/node (saved, new prefix applies after restart)", buf);
+  configSavedReply(buf, sizeof(buf), "mqtt.topic_prefix", nullptr, true);
+  TEST_ASSERT_EQUAL_STRING("Deleted mqtt.topic_prefix (saved, new prefix applies after restart)", buf);
+  configSavedReply(buf, sizeof(buf), "mqtt", nullptr, true);
+  TEST_ASSERT_EQUAL_STRING("Deleted mqtt (saved, new prefix applies after restart)", buf);
+  configSavedReply(buf, sizeof(buf), "mqtt.port", "8883", true);
+  TEST_ASSERT_NULL(strstr(buf, "after restart"));
+  configSavedReply(buf, sizeof(buf), "mqtt.topic_prefix", "b/node", false);
+  TEST_ASSERT_EQUAL_STRING("Set mqtt.topic_prefix = b/node (saved - run config.reload to apply network changes)", buf);
+  configSavedReply(buf, sizeof(buf), "mqtt.topic_prefix", nullptr, false);
+  TEST_ASSERT_EQUAL_STRING("Deleted mqtt.topic_prefix (saved)", buf);
+}
+
+// Only the prefix and the section that holds it defer to a restart.
+void test_prefix_keys(void) {
+  TEST_ASSERT_TRUE(configKeyIsPrefix("mqtt.topic_prefix"));
+  TEST_ASSERT_TRUE(configKeyIsPrefix("mqtt"));
+  TEST_ASSERT_FALSE(configKeyIsPrefix("mqtt.port"));
+  TEST_ASSERT_FALSE(configKeyIsPrefix("mqtt.topic_prefix.x"));
+  TEST_ASSERT_FALSE(configKeyIsPrefix("mqttx"));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
+  RUN_TEST(test_saved_reply_pending_prefix_applies_after_restart);
+  RUN_TEST(test_prefix_keys);
   RUN_TEST(test_fs_write_of_the_config_file_is_staged);
   RUN_TEST(test_fs_append_to_the_config_file_is_refused);
   RUN_TEST(test_other_writes_stay_plain);

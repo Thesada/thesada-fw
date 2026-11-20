@@ -52,3 +52,15 @@ inline bool mqttDefragRebootDue(unsigned retryCount, bool resolved, int rc,
                                 unsigned maxAllocHeap, bool halted) {
   return retryCount >= 3 && resolved && rc == -2 && maxAllocHeap < 40000 && !halted;
 }
+
+// A rollback whose persist failed still dials last-good this session, as long
+// as the live critical config is the failing one it replaced. An edit since wins.
+// in: persist failed, failing candidate, live critical config, snapshot text.
+// out: true with lg parsed and carrying a broker.
+inline bool mqttRollbackSessionLastGood(bool persistFailed, const char* failing, const char* cur,
+                                        const char* lgText, JsonDocument& lg) {
+  if (!persistFailed || !failing || !*failing || !cur || strcmp(failing, cur) != 0) return false;
+  if (!lgText || deserializeJson(lg, lgText) || !lg.is<JsonObject>()) return false;
+  const char* broker = lg["broker"] | "";
+  return *broker != '\0';
+}

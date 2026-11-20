@@ -115,11 +115,21 @@ inline FatCommit fatCommit(Fs& fs, const char* tmp, const char* bak, const char*
   return FAT_COMMIT_OK;
 }
 
+// in: shell config key. out: true for the prefix and the section that holds it.
+inline bool configKeyIsPrefix(const char* key) {
+  return strcmp(key, "mqtt.topic_prefix") == 0 || strcmp(key, "mqtt") == 0;
+}
+
 // The reply config.set / config.del give once the edit is on disk and live.
-// in: buf, key, value (null for a delete). out: buf filled.
-inline void configSavedReply(char* buf, size_t cap, const char* key, const char* value) {
-  if (value) {
+// in: buf, key, value (null for a delete), file prefix not live yet. out: buf filled.
+inline void configSavedReply(char* buf, size_t cap, const char* key, const char* value, bool pending = false) {
+  const bool restart = pending && configKeyIsPrefix(key);
+  if (value && restart) {
+    (void)snprintf(buf, cap, "Set %s = %s (saved, new prefix applies after restart)", key, value);
+  } else if (value) {
     (void)snprintf(buf, cap, "Set %s = %s (saved - run config.reload to apply network changes)", key, value);
+  } else if (restart) {
+    (void)snprintf(buf, cap, "Deleted %s (saved, new prefix applies after restart)", key);
   } else {
     (void)snprintf(buf, cap, "Deleted %s (saved)", key);
   }

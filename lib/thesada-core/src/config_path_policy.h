@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #include <ArduinoJson.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include "config_bounds.h"
@@ -12,28 +13,39 @@
 // Longest key config.set and config.get take, NUL included.
 constexpr size_t CONFIG_KEY_MAX = 128;
 
-// in: token. out: true and idx set when tok is all digits, at least one.
+// in: token. out: true and idx set when tok is all digits, at least one, and fits size_t.
 inline bool configArrayIndex(const char* tok, size_t& idx) {
   if (!tok || !*tok) return false;
   size_t v = 0;
   for (const char* p = tok; *p; ++p) {
     if (*p < '0' || *p > '9') return false;
-    v = v * 10 + (size_t)(*p - '0');
+    const size_t d = (size_t)(*p - '0');
+    if (v > (SIZE_MAX - d) / 10) return false;
+    v = v * 10 + d;
   }
   idx = v;
   return true;
 }
 
+enum ConfigStore {
+  CONFIG_STORE_OK = 0,
+  CONFIG_STORE_TOO_DEEP,
+  CONFIG_STORE_NO_HEAP,
+};
+
 // Store value in target: a JSON literal when it parses within depth levels,
-// else a bool, number or the string as typed. out: false when the literal is too deep.
-inline bool configPathStore(JsonVariant target, const char* value, int depth) {
+// else a bool, number or the string as typed. A literal that runs out of heap
+// is refused, never stored as its text. alloc: the literal's, null for the default.
+inline ConfigStore configPathStore(JsonVariant target, const char* value, int depth,
+                                   ArduinoJson::Allocator* alloc = nullptr) {
   const char* v = value;
   while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n') v++;
   if (*v == '{' || *v == '[') {
-    JsonDocument lit;
+    JsonDocument lit(alloc ? alloc : ArduinoJson::detail::DefaultAllocator::instance());
     const DeserializationError err = deserializeJson(lit, v, DeserializationOption::NestingLimit(depth));
-    if (err == DeserializationError::TooDeep) return false;
-    if (!err) return target.set(lit.as<JsonVariant>());
+    if (err == DeserializationError::TooDeep) return CONFIG_STORE_TOO_DEEP;
+    if (err == DeserializationError::NoMemory) return CONFIG_STORE_NO_HEAP;
+    if (!err) return target.set(lit.as<JsonVariant>()) ? CONFIG_STORE_OK : CONFIG_STORE_NO_HEAP;
   }
   bool bv;
   long long iv;
@@ -44,13 +56,15 @@ inline bool configPathStore(JsonVariant target, const char* value, int depth) {
     case CFG_SCALAR_FLOAT: target.set(fv); break;
     default:               target.set(value); break;
   }
-  return true;
+  return CONFIG_STORE_OK;
 }
 
 // Set key to value, or delete it when value is null. Missing parent objects
 // are created, never arrays. An array slot is nulled, so sibling indices stay.
-// in: root, dotted key, value or null, msg buffer. out: false with msg set when refused.
-inline bool configPathApply(JsonObject root, const char* keyIn, const char* value, char* msg, size_t cap) {
+// in: root, dotted key, value or null, msg buffer, literal allocator or null.
+// out: false with msg set when refused.
+inline bool configPathApply(JsonObject root, const char* keyIn, const char* value, char* msg, size_t cap,
+                            ArduinoJson::Allocator* alloc = nullptr) {
   msg[0] = '\0';
   char key[CONFIG_KEY_MAX];
   const size_t klen = strnlen(keyIn, sizeof(key));
@@ -151,9 +165,15 @@ inline bool configPathApply(JsonObject root, const char* keyIn, const char* valu
     (void)snprintf(msg, cap, "Parent is not an object or array");
     return false;
   }
-  if (!configPathStore(target, value, CONFIG_MAX_DEPTH - segs)) {
-    (void)snprintf(msg, cap, "Value nested past %d levels", CONFIG_MAX_DEPTH);
-    return false;
+  switch (configPathStore(target, value, CONFIG_MAX_DEPTH - segs, alloc)) {
+    case CONFIG_STORE_OK:
+      return true;
+    case CONFIG_STORE_TOO_DEEP:
+      (void)snprintf(msg, cap, "Value nested past %d levels", CONFIG_MAX_DEPTH);
+      return false;
+    case CONFIG_STORE_NO_HEAP:
+      break;
   }
-  return true;
+  (void)snprintf(msg, cap, "Value out of memory");
+  return false;
 }

@@ -843,14 +843,14 @@ static void cmd_config_get(int argc, char** argv, ShellOutput out) {
 }
 
 // Set a dotted key (value) or delete it (null) through Config::edit, then reply.
-// A refused path writes nothing.
+// A refused path writes nothing. A new prefix waits for a restart.
 static void shellConfigApply(const char* key, const char* value, ShellOutput out) {
   char msg[200];
   bool refused = false;
   const bool saved = Config::edit([&](JsonObject root) {
     refused = !configPathApply(root, key, value, msg, sizeof(msg));
     return !refused;
-  });
+  }, configKeyIsPrefix(key));
   if (refused) {
     Shell::fail(out, msg);
     return;
@@ -859,7 +859,7 @@ static void shellConfigApply(const char* key, const char* value, ShellOutput out
     Shell::fail(out, "Failed to write config.json (fs full or file unreadable?)");
     return;
   }
-  configSavedReply(msg, sizeof(msg), key, value);
+  configSavedReply(msg, sizeof(msg), key, value, Config::topicPrefixPending());
   out(msg);
 }
 
@@ -2159,9 +2159,9 @@ void Shell::registerBuiltins() {
 
   // Config
   registerCommand("config.get",    "Read config key (dot notation)",   cmd_config_get);
-  registerCommand("config.set",    "Set config key (saves, live at once)", cmd_config_set, 2);
+  registerCommand("config.set",    "Set config key (saves, live at once, prefix at restart)", cmd_config_set, 2);
   registerCommand("config.del",    "Delete config key or section",     cmd_config_del);
-  registerCommand("config.save",   "Save current config to flash",     cmd_config_save);
+  registerCommand("config.save",   "Rewrite /config.json, make it live (MQTT on restart)", cmd_config_save);
   registerCommand("config.reload", "Reload config from flash",         cmd_config_reload);
   registerCommand("config.dump",   "Print full config JSON",           cmd_config_dump);
 

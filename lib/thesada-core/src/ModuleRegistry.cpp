@@ -5,6 +5,8 @@
 #include "MQTTClient.h"
 #include "Config.h"
 #include "Log.h"
+#include "Watchdog.h"
+#include "module_begin_policy.h"
 
 
 struct ModuleEntry { Module* mod; uint8_t priority; bool enabled; };
@@ -31,7 +33,7 @@ void ModuleRegistry::beginAll() {
   }
 
   JsonObject cfg = Config::get();
-  for (uint8_t i = 0; i < _count; i++) {
+  beginModulesFed(_count, [&cfg](uint8_t i) {
     Module* m = _entries[i].mod;
     // Gate, see Module.h: optional default off, core default on.
     bool en = cfg[m->configKey()]["enabled"] | m->coreModule();
@@ -39,7 +41,7 @@ void ModuleRegistry::beginAll() {
     if (!en) {
       Log::kvf("Registry", "registry.module_skip priority=%d name=%s reason=disabled",
                _entries[i].priority, m->name());
-      continue;
+      return;
     }
     Log::kvf("Registry", "registry.module_init priority=%d name=%s",
              _entries[i].priority, m->name());
@@ -48,7 +50,7 @@ void ModuleRegistry::beginAll() {
     // seconds (TFT init, Lua script load, SD mount) and the total init
     // time can exceed the MQTT keepalive window, dropping the connection.
     MQTTClient::tick();
-  }
+  }, [] { Watchdog::feed(); });
 }
 
 // Disabled modules never ran begin(); skip their loop() too.

@@ -80,6 +80,14 @@ inline ConfigSchemaVerdict configMigrate(JsonDocument& doc,
   return CFG_SCHEMA_MIGRATED;
 }
 
+// A whole doc pushed to replace the file: migrated and stamped before its
+// commit, so no later load migrates it again. in: staged doc. out: verdict.
+inline ConfigSchemaVerdict configMigratePushed(JsonDocument& doc,
+                                               void (*step)(int from, const char* name, size_t changed)) {
+  if (!doc.is<JsonObject>()) return CFG_SCHEMA_INVALID;
+  return configMigrate(doc, step);
+}
+
 enum ConfigMigrateResult {
   CFG_MIGRATE_NONE,           // current, nothing written
   CFG_MIGRATE_REREAD_FAILED,  // the file did not parse a second time

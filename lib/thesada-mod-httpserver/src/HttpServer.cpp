@@ -36,9 +36,11 @@
 #include <esp_timer.h>
 #include <esp_random.h>
 #include <enroll_policy.h>
+#include <config_load_policy.h>
 #include <config_write_policy.h>
 #include <web_snapshot_policy.h>
 #include <shell_mode_policy.h>
+#include <glob_policy.h>
 #include <string.h>
 #include <atomic>
 
@@ -454,8 +456,8 @@ static size_t _configWriteOrReply(AsyncWebServerRequest* req, const char* body, 
     return 0;
   }
   auto doc = std::make_shared<JsonDocument>();
-  if (deserializeJson(*doc, body, DeserializationOption::NestingLimit(CONFIG_MAX_DEPTH)) ||
-      !doc->is<JsonObject>()) {
+  // The whole body: content after the object is refused, not dropped.
+  if (!configParseObjectBytes(*doc, body, req->contentLength())) {
     req->send(400, "application/json", "{\"ok\":false,\"error\":\"config must be a JSON object\"}");
     return 0;
   }
@@ -1179,6 +1181,10 @@ void HttpServer::setupRoutes() {
     bool useLFS     = (src == "littlefs");
     bool useScripts = (src == "scripts");
     if (useScripts) path = "/scripts" + path;
+    if (useLFS && rmPathProtected(path.c_str())) {
+      req->send(403, "application/json", "{\"ok\":false,\"error\":\"config.json and ca.crt are protected, use fs.rm\"}");
+      return;
+    }
     bool ok = (useLFS || useScripts) ? LittleFS.remove(path.c_str()) : SD_MMC.remove(path.c_str());
     req->send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"delete failed\"}");
   });

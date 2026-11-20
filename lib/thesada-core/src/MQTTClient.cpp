@@ -481,6 +481,28 @@ static void mqttApplyCmdConfig(const char* json) {
   Log::info(TAG, "mqtt.cmd_config_applied");
 }
 
+// Set when the boot rollback could not persist last-good: this session dials it anyway.
+static bool s_rbPersistFailed = false;
+
+// in: doc for the snapshot. out: true with lg filled when this session dials
+// last-good in place of the live config. An edit since ends it for the session.
+static bool rollbackSessionLastGood(JsonDocument& lg) {
+  if (!s_rbPersistFailed) return false;
+  char failing[LG_MAX_LEN] = {0};
+  char lgText[LG_MAX_LEN]  = {0};
+  char cur[LG_MAX_LEN];
+  Preferences prefs;
+  if (!prefs.begin(BOOT_NS, true)) return false;
+  prefs.getString(RB_KEY_RBCFG, failing, sizeof(failing));
+  prefs.getString(RB_KEY_LG, lgText, sizeof(lgText));
+  prefs.end();
+  if (mqttCriticalJson(cur, sizeof(cur)) == 0) return false;
+  if (mqttRollbackSessionLastGood(true, failing, cur, lgText, lg)) return true;
+  s_rbPersistFailed = false;
+  Log::kvfw(TAG, "mqtt.config_rollback_session_end reason=config_changed");
+  return false;
+}
+
 // Initialize MQTT: load config, TLS certs, set up subscriptions, connect.
 // in: none (reads Config, LittleFS /ca.crt, NVS cert namespace).
 // out: none.
@@ -497,6 +519,11 @@ void MQTTClient::begin() {
   uint16_t    port = cfg["mqtt"]["port"]            | 8883;
   uint32_t    ivs  = cfg["mqtt"]["send_interval_s"] | 0;
   _minIntervalMs   = ivs * 1000UL;
+  JsonDocument lg;
+  if (rollbackSessionLastGood(lg)) {
+    host = lg["broker"] | "";
+    port = lg["port"]   | 8883;
+  }
 
   // Not a return: the callback, CA and subscriptions below must be in place
   // for a broker a later config.reload sets. connect() decides on dialing.
@@ -790,7 +817,9 @@ void MQTTClient::rollbackIfUncommitted() {
     mqttClearRbCfg();
     Log::warn(TAG, "mqtt.config_rollback");
   } else {
-    Log::error(TAG, "mqtt.config_rollback_save_failed");
+    // Markers stay, so the next boot retries the write. This session dials last-good.
+    s_rbPersistFailed = true;
+    Log::error(TAG, "mqtt.config_rollback_save_failed action=dial_last_good");
   }
 }
 
@@ -832,10 +861,13 @@ void MQTTClient::connect() {
   idleLogged = false;
 
   JsonObject  cfg      = Config::get();
+  JsonDocument lg;
+  const bool  lastGood = rollbackSessionLastGood(lg);
+  JsonVariantConst creds = lastGood ? lg.as<JsonVariantConst>() : cfg["mqtt"].as<JsonVariantConst>();
   const char* clientId = Identity::nodeName();
-  const char* user     = cfg["mqtt"]["user"]      | "";
+  const char* user     = creds["user"] | "";
   char        passwordBuf[Secret::MAX_LEN];
-  const char* password = Secret::resolve("mqtt_password", cfg["mqtt"]["password"] | "",
+  const char* password = Secret::resolve("mqtt_password", creds["password"] | "",
                                          passwordBuf, sizeof(passwordBuf));
   const char* prefix   = cfg["mqtt"]["topic_prefix"] | "thesada/node";
 
@@ -955,9 +987,12 @@ void MQTTClient::connect() {
     // Clear the reboot guard: a future failure starts a fresh streak.
     _rebootHalted  = false;
     mqttRebootCountClear();
-    mqttClearRbCfg();   // this config connected: it is no longer a failing candidate
-    // This config just connected: commit it as the last-good rollback target.
-    snapshotGoodConfig();
+    // Last-good connected, not the live config: it stays the failing candidate.
+    if (!lastGood) {
+      mqttClearRbCfg();   // this config connected: it is no longer a failing candidate
+      // This config just connected: commit it as the last-good rollback target.
+      snapshotGoodConfig();
+    }
     _lastSuccessMs    = millis();
     _connectedSinceMs = millis();
     Log::kvf(TAG, "mqtt.state_change from=disconnected to=connected broker=%s transport=%s",
@@ -1140,6 +1175,11 @@ void MQTTClient::loop() {
     JsonObject  cfgR = Config::get();
     const char* host = cfgR["mqtt"]["broker"] | "";
     uint16_t    port = cfgR["mqtt"]["port"]   | 8883;
+    JsonDocument lg;
+    if (rollbackSessionLastGood(lg)) {
+      host = lg["broker"] | "";
+      port = lg["port"]   | 8883;
+    }
     // Refresh persistent buffer, as the re-parsed pool invalidates the prior
     // pointer. A host that does not fit keeps the previous broker and port.
     if (mqttHostCopy(_brokerHost, sizeof(_brokerHost), host)) {

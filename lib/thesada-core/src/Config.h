@@ -28,7 +28,8 @@ public:
   static bool replace(const char* json);
   // Run fn on a copy staged from /config.json (the live doc if the file is
   // missing), write it, then make it live. fn returns false to write nothing.
-  static bool edit(const std::function<bool(JsonObject)>& fn);
+  // deferPrefix: a moved topic prefix is written and the old one held until restart.
+  static bool edit(const std::function<bool(JsonObject)>& fn, bool deferPrefix = false);
   // As edit, but a corrupt, oversized or non-object file is replaced by a
   // fresh doc plus fn. Setup portal only: every other writer fails closed.
   static bool rescueEdit(const std::function<bool(JsonObject)>& fn);
@@ -41,6 +42,8 @@ public:
   static bool holdTopicPrefix(const char* prefix);
   // in: none. out: true while a boot prefix is overlaid on the live doc.
   static bool topicPrefixHeld();
+  // in: none. out: true while the prefix in the file is not the live one.
+  static bool topicPrefixPending();
   // Copy the live doc as it is on disk, a held boot prefix left out.
   // in: destination document. out: false if the copy did not land.
   static bool copyDiskDoc(JsonDocument& dst);
@@ -54,6 +57,6 @@ public:
   static const char* schemaAlert();
 private:
   // Write staged and move it in. in: staged doc, log event. out: false if live stayed.
-  static bool commit(JsonDocument& staged, const char* event);
+  static bool commit(JsonDocument& staged, const char* event, bool deferPrefix = false);
   static JsonDocument _doc;
 };

@@ -181,16 +181,23 @@ static bool writeFail(JsonVariantConst) {
 
 // An allocator that runs out on demand and counts its allocations.
 struct FlakyAllocator : ArduinoJson::Allocator {
-  bool fail   = false;
-  int  allocs = 0;
+  bool fail     = false;
+  int  failNext = 0;  // fail this many allocations, then serve again
+  int  allocs   = 0;
+  bool refuse() {
+    if (fail) return true;
+    if (failNext <= 0) return false;
+    failNext--;
+    return true;
+  }
   void* allocate(size_t n) override {
-    if (fail) return nullptr;
+    if (refuse()) return nullptr;
     allocs++;
     return malloc(n);
   }
   void deallocate(void* p) override { free(p); }
   void* reallocate(void* p, size_t n) override {
-    if (fail) return nullptr;
+    if (refuse()) return nullptr;
     allocs++;
     return realloc(p, n);
   }
@@ -297,6 +304,8 @@ void test_commit_refuses_an_edit_that_made_root_an_array(void) {
 // A stage source: the FakeFs file, or the live doc when there is none.
 struct StageFs : FakeFs {
   bool liveCopies = true;
+  bool opens      = true;
+  bool parse(JsonDocument& doc, DeserializationError& err) { return opens && FakeFs::parse(doc, err); }
   bool copyLive(JsonDocument& doc) {
     if (!liveCopies) return false;
     doc["mqtt"]["broker"] = "live.example";
@@ -358,17 +367,29 @@ void test_commit_keeps_the_boot_prefix_hold(void) {
 }
 
 // No heap for the overlay: the prefix on disk goes live and the hold is dropped.
+// The failed assignment cleared the disk value first, so it is put back.
 void test_commit_without_room_for_the_hold_drops_it(void) {
   JsonDocument live;
   live["mqtt"]["topic_prefix"] = std::string("boot");
   ConfigPrefixHold hold        = {"disk", true, true};
   FlakyAllocator heap;
   JsonDocument staged(&heap);
-  staged["mqtt"]["topic_prefix"] = "disk";
-  heap.fail = true;
+  staged["mqtt"]["topic_prefix"] = std::string("disk");
+  heap.failNext = 1;
   TEST_ASSERT_EQUAL_INT(CONFIG_COMMIT_OK, configCommit(live, staged, writeOk, &hold));
-  heap.fail = false;
   TEST_ASSERT_FALSE(hold.held);
+  TEST_ASSERT_EQUAL_STRING("disk", live["mqtt"]["topic_prefix"] | "");
+  // No prefix on disk: none goes live, not a null member.
+  live["mqtt"]["topic_prefix"] = std::string("boot");
+  hold = {"", false, true};
+  JsonDocument bare(&heap);
+  bare["mqtt"]["broker"] = std::string("disk.example");
+  heap.failNext = 1;
+  TEST_ASSERT_EQUAL_INT(CONFIG_COMMIT_OK, configCommit(live, bare, writeOk, &hold));
+  TEST_ASSERT_FALSE(hold.held);
+  JsonObjectConst m = live["mqtt"];
+  TEST_ASSERT_TRUE(m["topic_prefix"].isUnbound());
+  TEST_ASSERT_EQUAL_STRING("disk.example", m["broker"] | "");
 }
 
 // The pushed text is read one byte at a time or in blocks.
@@ -406,6 +427,124 @@ void test_hold_refuses_a_non_string_or_long_prefix(void) {
   TEST_ASSERT_EQUAL_INT(CONFIG_HOLD_OK, configHoldPrefix(doc, hold, "boot"));
   TEST_ASSERT_FALSE(hold.diskPresent);
   TEST_ASSERT_EQUAL_STRING("boot", doc["mqtt"]["topic_prefix"] | "");
+}
+
+// A live doc on prefix p with a broker, the way it booted.
+static void liveOnPrefix(JsonDocument& live, const char* p) {
+  live.clear();
+  live["mqtt"]["topic_prefix"] = p;
+  live["mqtt"]["broker"]       = "old.example";
+}
+
+// Shell set of a new prefix with nothing held: the file moves, live and every
+// topic built from it stay on the boot prefix until restart.
+void test_shell_prefix_set_holds_the_boot_prefix(void) {
+  JsonDocument live;
+  liveOnPrefix(live, "boot");
+  ConfigPrefixHold hold = {};
+  JsonDocument staged;
+  staged["mqtt"]["topic_prefix"] = "new";
+  staged["mqtt"]["broker"]       = "old.example";
+  writes = 0;
+  TEST_ASSERT_EQUAL_INT(CONFIG_COMMIT_OK, configCommitDeferPrefix(live, staged, writeOk, hold));
+  TEST_ASSERT_EQUAL_INT(1, writes);
+  TEST_ASSERT_TRUE(written.find("\"new\"") != std::string::npos);
+  TEST_ASSERT_TRUE(written.find("boot") == std::string::npos);
+  TEST_ASSERT_EQUAL_STRING("boot", live["mqtt"]["topic_prefix"] | "");
+  TEST_ASSERT_TRUE(hold.held);
+  TEST_ASSERT_TRUE(hold.diskPresent);
+  TEST_ASSERT_EQUAL_STRING("new", hold.disk);
+  TEST_ASSERT_TRUE(configPrefixPending(live, hold));
+}
+
+// A hold already present behaves as configCommit: boot stays, disk moves on.
+void test_shell_prefix_set_under_a_hold_keeps_it(void) {
+  JsonDocument live;
+  liveOnPrefix(live, "boot");
+  ConfigPrefixHold hold = {"pushed", true, true};
+  JsonDocument staged;
+  staged["mqtt"]["topic_prefix"] = "typed";
+  TEST_ASSERT_EQUAL_INT(CONFIG_COMMIT_OK, configCommitDeferPrefix(live, staged, writeOk, hold));
+  TEST_ASSERT_EQUAL_STRING("boot", live["mqtt"]["topic_prefix"] | "");
+  TEST_ASSERT_TRUE(hold.held);
+  TEST_ASSERT_EQUAL_STRING("typed", hold.disk);
+  TEST_ASSERT_TRUE(configPrefixPending(live, hold));
+  // Typed back to the live value: nothing waits for a restart.
+  JsonDocument back;
+  back["mqtt"]["topic_prefix"] = "boot";
+  TEST_ASSERT_EQUAL_INT(CONFIG_COMMIT_OK, configCommitDeferPrefix(live, back, writeOk, hold));
+  TEST_ASSERT_EQUAL_STRING("boot", live["mqtt"]["topic_prefix"] | "");
+  TEST_ASSERT_FALSE(configPrefixPending(live, hold));
+}
+
+// The same value as live, spelled out or by default: no hold, nothing pending.
+void test_shell_prefix_set_to_the_live_value_takes_no_hold(void) {
+  JsonDocument live;
+  liveOnPrefix(live, "boot");
+  ConfigPrefixHold hold = {};
+  JsonDocument same;
+  same["mqtt"]["topic_prefix"] = "boot";
+  TEST_ASSERT_EQUAL_INT(CONFIG_COMMIT_OK, configCommitDeferPrefix(live, same, writeOk, hold));
+  TEST_ASSERT_FALSE(hold.held);
+  TEST_ASSERT_FALSE(configPrefixPending(live, hold));
+  live.clear();
+  live["mqtt"]["broker"] = "old.example";
+  JsonDocument dflt;
+  dflt["mqtt"]["topic_prefix"] = CONFIG_PREFIX_DEFAULT;
+  TEST_ASSERT_EQUAL_INT(CONFIG_COMMIT_OK, configCommitDeferPrefix(live, dflt, writeOk, hold));
+  TEST_ASSERT_FALSE(hold.held);
+  TEST_ASSERT_EQUAL_STRING(CONFIG_PREFIX_DEFAULT, live["mqtt"]["topic_prefix"] | "");
+}
+
+// A delete moves the file to the default prefix: boot is held, the file has none.
+void test_shell_prefix_delete_holds_the_boot_prefix(void) {
+  JsonDocument live;
+  liveOnPrefix(live, "boot");
+  ConfigPrefixHold hold = {};
+  JsonDocument staged;
+  staged["mqtt"]["broker"] = "old.example";
+  TEST_ASSERT_EQUAL_INT(CONFIG_COMMIT_OK, configCommitDeferPrefix(live, staged, writeOk, hold));
+  TEST_ASSERT_TRUE(written.find("topic_prefix") == std::string::npos);
+  TEST_ASSERT_EQUAL_STRING("boot", live["mqtt"]["topic_prefix"] | "");
+  TEST_ASSERT_TRUE(hold.held);
+  TEST_ASSERT_FALSE(hold.diskPresent);
+  TEST_ASSERT_TRUE(configPrefixPending(live, hold));
+  // The whole mqtt section deleted: the boot prefix still stays live.
+  liveOnPrefix(live, "boot");
+  hold = ConfigPrefixHold();
+  JsonDocument bare;
+  bare["wifi"]["enabled"] = true;
+  TEST_ASSERT_EQUAL_INT(CONFIG_COMMIT_OK, configCommitDeferPrefix(live, bare, writeOk, hold));
+  TEST_ASSERT_TRUE(written.find("mqtt") == std::string::npos);
+  TEST_ASSERT_EQUAL_STRING("boot", live["mqtt"]["topic_prefix"] | "");
+  TEST_ASSERT_TRUE(configPrefixPending(live, hold));
+}
+
+// No hold when it cannot be kept: a failed write, no heap, a prefix too long.
+void test_shell_prefix_hold_that_cannot_be_kept(void) {
+  JsonDocument live;
+  liveOnPrefix(live, "boot");
+  ConfigPrefixHold hold = {};
+  JsonDocument staged;
+  staged["mqtt"]["topic_prefix"] = "new";
+  TEST_ASSERT_EQUAL_INT(CONFIG_COMMIT_PERSIST_FAILED, configCommitDeferPrefix(live, staged, writeFail, hold));
+  TEST_ASSERT_FALSE(hold.held);
+  TEST_ASSERT_EQUAL_STRING("boot", live["mqtt"]["topic_prefix"] | "");
+  FlakyAllocator heap;
+  JsonDocument tight(&heap);
+  tight["mqtt"]["topic_prefix"] = std::string("new");
+  heap.failNext = 1;
+  TEST_ASSERT_EQUAL_INT(CONFIG_COMMIT_OK, configCommitDeferPrefix(live, tight, writeOk, hold));
+  TEST_ASSERT_FALSE(hold.held);
+  TEST_ASSERT_EQUAL_STRING("new", live["mqtt"]["topic_prefix"] | "");
+  TEST_ASSERT_FALSE(configPrefixPending(live, hold));
+  std::string longPrefix(CONFIG_PREFIX_CAP, 'x');
+  liveOnPrefix(live, longPrefix.c_str());
+  JsonDocument next;
+  next["mqtt"]["topic_prefix"] = "short";
+  TEST_ASSERT_EQUAL_INT(CONFIG_COMMIT_OK, configCommitDeferPrefix(live, next, writeOk, hold));
+  TEST_ASSERT_FALSE(hold.held);
+  TEST_ASSERT_EQUAL_STRING("short", live["mqtt"]["topic_prefix"] | "");
 }
 
 // A config object of exactly n bytes of JSON text.
@@ -506,8 +645,6 @@ void test_rescue_stage_keeps_a_good_file(void) {
   fs.exists = false;
   TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_LIVE, configStageRescue(fs, staged, err, 3));
   TEST_ASSERT_EQUAL_STRING("live.example", staged["mqtt"]["broker"] | "");
-  fs.liveCopies = false;
-  TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_NO_LIVE, configStageRescue(fs, staged, err, 3));
 }
 
 // The rescued doc plus the form goes through the commit and replaces the file.
@@ -524,6 +661,72 @@ void test_rescue_commit_writes_only_the_form(void) {
   TEST_ASSERT_EQUAL_INT(1, writes);
   TEST_ASSERT_EQUAL_STRING("{\"schema\":1,\"wifi\":{\"networks\":[{\"ssid\":\"home\"}]}}", written.c_str());
   TEST_ASSERT_EQUAL_STRING("home", live["wifi"]["networks"][0]["ssid"] | "");
+}
+
+// A factory-fresh or wiped unit has no file and no live doc: the portal
+// stages a fresh doc. A file that exists but cannot be read is not rescued.
+void test_rescue_stage_fresh_doc_on_a_blank_filesystem(void) {
+  StageFs fs;
+  fs.exists     = false;
+  fs.liveCopies = false;
+  JsonDocument staged;
+  DeserializationError err;
+  TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_RESCUED, configStageRescue(fs, staged, err, 3));
+  TEST_ASSERT_EQUAL_STRING("{\"schema\":3}", json(staged).c_str());
+  TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_NO_LIVE, configStage(fs, staged, err));
+  fs.exists = true;
+  fs.opens  = false;
+  fs.text   = "{\"mqtt\":{}}";
+  TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_NO_LIVE, configStageRescue(fs, staged, err, 3));
+}
+
+// A valid file that ran out of heap while it was parsed is not broken:
+// an edit is refused and the portal does not replace it.
+void test_stage_out_of_heap_is_not_rescued(void) {
+  StageFs fs;
+  fs.text = "{\"mqtt\":{\"broker\":\"disk.example\"},\"wifi\":{}}";
+  FlakyAllocator heap;
+  JsonDocument staged(&heap);
+  DeserializationError err;
+  heap.fail = true;
+  TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_NO_HEAP, configStage(fs, staged, err));
+  TEST_ASSERT_TRUE(err == DeserializationError::NoMemory);
+  TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_NO_HEAP, configStageRescue(fs, staged, err, 3));
+  heap.fail = false;
+  TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_FILE, configStageRescue(fs, staged, err, 3));
+}
+
+// A scalar mqtt cannot take the overlay: refused, hold unchanged.
+void test_hold_refuses_a_non_object_mqtt(void) {
+  const char* scalars[] = {"{\"mqtt\":false}", "{\"mqtt\":\"x\"}", "{\"mqtt\":[1]}", "{\"mqtt\":3}"};
+  for (const char* text : scalars) {
+    JsonDocument doc;
+    deserializeJson(doc, text);
+    ConfigPrefixHold hold = {};
+    TEST_ASSERT_EQUAL_INT_MESSAGE(CONFIG_HOLD_TYPE, configHoldPrefix(doc, hold, "boot"), text);
+    TEST_ASSERT_FALSE(hold.held);
+    TEST_ASSERT_EQUAL_STRING(text, json(doc).c_str());
+  }
+  JsonDocument nul;
+  deserializeJson(nul, "{\"mqtt\":null}");
+  ConfigPrefixHold hold = {};
+  TEST_ASSERT_EQUAL_INT(CONFIG_HOLD_OK, configHoldPrefix(nul, hold, "boot"));
+  TEST_ASSERT_EQUAL_STRING("boot", nul["mqtt"]["topic_prefix"] | "");
+}
+
+// An HTTP config body is one object and nothing after it, a NUL included.
+void test_config_object_bytes_parse_into_the_doc(void) {
+  JsonDocument doc;
+  const char good[] = "{\"mqtt\":{\"broker\":\"new.example\"}}\n";
+  TEST_ASSERT_TRUE(configParseObjectBytes(doc, good, sizeof(good) - 1));
+  TEST_ASSERT_EQUAL_STRING("new.example", doc["mqtt"]["broker"] | "");
+  const char two[] = "{\"mqtt\":{\"broker\":\"new.example\"}}{\"wifi\":{}}";
+  TEST_ASSERT_FALSE(configParseObjectBytes(doc, two, sizeof(two) - 1));
+  const char nul[] = "{\"a\":1}\0{\"b\":2}";
+  TEST_ASSERT_FALSE(configParseObjectBytes(doc, nul, sizeof(nul) - 1));
+  TEST_ASSERT_FALSE(configParseObjectBytes(doc, "[1]", 3));
+  TEST_ASSERT_FALSE(configParseObjectBytes(doc, "", 0));
+  TEST_ASSERT_FALSE(configParseObjectBytes(doc, nullptr, 4));
 }
 
 int main(int, char**) {
@@ -556,5 +759,14 @@ int main(int, char**) {
   RUN_TEST(test_rescue_stage_replaces_a_broken_file);
   RUN_TEST(test_rescue_stage_keeps_a_good_file);
   RUN_TEST(test_rescue_commit_writes_only_the_form);
+  RUN_TEST(test_rescue_stage_fresh_doc_on_a_blank_filesystem);
+  RUN_TEST(test_stage_out_of_heap_is_not_rescued);
+  RUN_TEST(test_hold_refuses_a_non_object_mqtt);
+  RUN_TEST(test_config_object_bytes_parse_into_the_doc);
+  RUN_TEST(test_shell_prefix_set_holds_the_boot_prefix);
+  RUN_TEST(test_shell_prefix_set_under_a_hold_keeps_it);
+  RUN_TEST(test_shell_prefix_set_to_the_live_value_takes_no_hold);
+  RUN_TEST(test_shell_prefix_delete_holds_the_boot_prefix);
+  RUN_TEST(test_shell_prefix_hold_that_cannot_be_kept);
   return UNITY_END();
 }

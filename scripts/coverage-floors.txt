@@ -57,3 +57,5 @@ lib/thesada-core/src/config_schema_policy.h      95
 lib/thesada-core/src/config_scalar_policy.h      95
 lib/thesada-core/src/elapsed_policy.h            95
 lib/thesada-core/src/sleep_policy.h              95
+lib/thesada-core/src/console_drop_policy.h     95
+lib/thesada-core/src/module_begin_policy.h     95

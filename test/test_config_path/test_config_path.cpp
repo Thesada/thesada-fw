@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include <unity.h>
 #include "config_path_policy.h"
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <string>
 
@@ -119,6 +121,47 @@ void test_array_index_is_digits_only(void) {
   TEST_ASSERT_FALSE(configArrayIndex(nullptr, idx));
 }
 
+// An allocator that refuses every allocation while fail is set.
+struct NoHeap : ArduinoJson::Allocator {
+  bool fail = true;
+  void* allocate(size_t n) override { return fail ? nullptr : malloc(n); }
+  void deallocate(void* p) override { free(p); }
+  void* reallocate(void* p, size_t n) override { return fail ? nullptr : realloc(p, n); }
+};
+
+// A literal that runs out of heap is refused, never stored as its text.
+void test_literal_out_of_heap_is_refused(void) {
+  JsonDocument doc;
+  deserializeJson(doc, "{}");
+  JsonObject root = doc.as<JsonObject>();
+  NoHeap heap;
+  TEST_ASSERT_FALSE(configPathApply(root, "wifi.networks", "[{\"ssid\":\"home\"}]", msg, sizeof(msg), &heap));
+  TEST_ASSERT_EQUAL_STRING("Value out of memory", msg);
+  TEST_ASSERT_FALSE(doc["wifi"]["networks"].is<const char*>());
+  heap.fail = false;
+  TEST_ASSERT_TRUE(configPathApply(root, "wifi.networks", "[{\"ssid\":\"home\"}]", msg, sizeof(msg), &heap));
+  TEST_ASSERT_EQUAL_STRING("home", doc["wifi"]["networks"][0]["ssid"] | "");
+}
+
+// An index past size_t is refused, never wrapped onto a small one.
+void test_array_index_refuses_overflow(void) {
+  size_t idx = 99;
+  const std::string max = std::to_string((unsigned long long)SIZE_MAX);
+  TEST_ASSERT_TRUE(configArrayIndex(max.c_str(), idx));
+  TEST_ASSERT_TRUE(idx == SIZE_MAX);
+  std::string over = max;
+  over.back() = (char)(over.back() + 1);
+  TEST_ASSERT_FALSE(configArrayIndex(over.c_str(), idx));
+  TEST_ASSERT_FALSE(configArrayIndex((max + "0").c_str(), idx));
+  const std::string wraps = std::to_string((unsigned long long)SIZE_MAX / 10 + 1) + "0";
+  TEST_ASSERT_FALSE(configArrayIndex(wraps.c_str(), idx));
+  JsonDocument doc;
+  deserializeJson(doc, "{\"l\":[1]}");
+  JsonObject root = doc.as<JsonObject>();
+  TEST_ASSERT_FALSE(configPathApply(root, ("l." + over).c_str(), "2", msg, sizeof(msg)));
+  TEST_ASSERT_EQUAL_STRING("{\"l\":[1]}", json(doc).c_str());
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_set_creates_missing_sections);
@@ -129,5 +172,7 @@ int main(int, char**) {
   RUN_TEST(test_config_path_refuses_depth_past_8);
   RUN_TEST(test_delete_removes_members_and_nulls_array_slots);
   RUN_TEST(test_array_index_is_digits_only);
+  RUN_TEST(test_literal_out_of_heap_is_refused);
+  RUN_TEST(test_array_index_refuses_overflow);
   return UNITY_END();
 }

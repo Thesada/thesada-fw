@@ -236,10 +236,12 @@ struct LittleFsStageSource {
 };
 
 // Write staged and move it into _doc. in: staged doc, log event. out: false if live stayed.
-bool Config::commit(JsonDocument& staged, const char* event) {
+bool Config::commit(JsonDocument& staged, const char* event, bool deferPrefix) {
   const bool wasHeld = _hold.held;
   auto write = [](JsonVariantConst src) { return Config::writeFile(src, false); };
-  switch (configCommit(_doc, staged, write, &_hold)) {
+  const ConfigCommit r = deferPrefix ? configCommitDeferPrefix(_doc, staged, write, _hold)
+                                     : configCommit(_doc, staged, write, &_hold);
+  switch (r) {
     case CONFIG_COMMIT_OK:
       break;
     case CONFIG_COMMIT_NOT_OBJECT:
@@ -256,6 +258,7 @@ bool Config::commit(JsonDocument& staged, const char* event) {
       return false;
   }
   if (wasHeld && !_hold.held) Log::error(TAG, "config.topic_prefix_hold_lost");
+  if (!wasHeld && _hold.held) Log::info(TAG, "config.topic_prefix_deferred");
   configChanged();
   return true;
 }
@@ -272,6 +275,7 @@ bool Config::replace(const char* json) {
     Log::kvfe(TAG, "config.replace_failed err=%s action=keep_live", err.c_str());
     return false;
   }
+  configMigratePushed(staged, logSchemaStep);
   if (!commit(staged, "config.replace_failed")) return false;
   Log::info(TAG, "config.replaced source=mqtt");
   return true;
@@ -281,33 +285,37 @@ bool Config::rescueEdit(const std::function<bool(JsonObject)>& fn) {
   JsonDocument staged;
   DeserializationError err;
   LittleFsStageSource src;
-  const bool tooLarge  = src.size() > (long)CONFIG_FILE_MAX;
+  const long size = src.size();
   const ConfigStage from = configStageRescue(src, staged, err, CONFIG_SCHEMA_CURRENT);
-  if (from == CONFIG_STAGE_NO_LIVE) {
-    Log::error(TAG, "config.edit_failed reason=no_source action=keep_live");
+  if (from != CONFIG_STAGE_FILE && from != CONFIG_STAGE_LIVE && from != CONFIG_STAGE_RESCUED) {
+    Log::kvfe(TAG, "config.edit_failed reason=%s err=%s action=keep_live",
+              from == CONFIG_STAGE_NO_HEAP ? "no_heap" : "no_source", err ? err.c_str() : "none");
     return false;
   }
   if (!fn(staged.as<JsonObject>())) return false;
   if (!commit(staged, "config.edit_failed")) return false;
   if (from == CONFIG_STAGE_RESCUED) {
-    Log::kvfw(TAG, "config.rescued reason=%s err=%s action=replaced_file source=setup",
-              tooLarge ? "too_large" : "file_unreadable", err ? err.c_str() : "none");
+    const char* why = size < 0 ? "file_missing" : size > (long)CONFIG_FILE_MAX ? "too_large" : "file_unreadable";
+    Log::kvfw(TAG, "config.rescued reason=%s err=%s action=replaced_file source=setup", why, err ? err.c_str() : "none");
   }
   return true;
 }
 
-bool Config::edit(const std::function<bool(JsonObject)>& fn) {
+bool Config::edit(const std::function<bool(JsonObject)>& fn, bool deferPrefix) {
   JsonDocument staged;
   DeserializationError err;
   LittleFsStageSource src;
   const ConfigStage from = configStage(src, staged, err);
   if (from != CONFIG_STAGE_FILE && from != CONFIG_STAGE_LIVE) {
-    const char* why = from == CONFIG_STAGE_NO_LIVE ? "no_source" : from == CONFIG_STAGE_TOO_LARGE ? "too_large" : "file_unreadable";
+    const char* why = from == CONFIG_STAGE_NO_LIVE    ? "no_source"
+                      : from == CONFIG_STAGE_TOO_LARGE ? "too_large"
+                      : from == CONFIG_STAGE_NO_HEAP   ? "no_heap"
+                                                       : "file_unreadable";
     Log::kvfe(TAG, "config.edit_failed reason=%s err=%s action=keep_live", why, err ? err.c_str() : "none");
     return false;
   }
   if (!fn(staged.as<JsonObject>())) return false;
-  return commit(staged, "config.edit_failed");
+  return commit(staged, "config.edit_failed", deferPrefix);
 }
 
 // Keep `prefix` as the live topic prefix. The value already in the doc
@@ -333,6 +341,10 @@ bool Config::holdTopicPrefix(const char* prefix) {
 
 bool Config::topicPrefixHeld() {
   return _hold.held;
+}
+
+bool Config::topicPrefixPending() {
+  return configPrefixPending(_doc, _hold);
 }
 
 bool Config::copyDiskDoc(JsonDocument& dst) {

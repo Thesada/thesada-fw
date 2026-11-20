@@ -174,6 +174,31 @@ void test_migrate_live_untouched_verdicts() {
   }
 }
 
+// L13: a pushed doc goes to disk migrated and stamped, so the next load
+// neither migrates it again nor overwrites the backup.
+void test_pushed_doc_lands_current() {
+  JsonDocument d; deserializeJson(d, OLD_CFG);
+  TEST_ASSERT_EQUAL(CFG_SCHEMA_MIGRATED, configMigratePushed(d, onStep));
+  TEST_ASSERT_TRUE(holdsInt(d["schema"], CONFIG_SCHEMA_CURRENT));
+  TEST_ASSERT_EQUAL_STRING("u", d["mqtt"]["user"] | "");
+  MigrateFs fs; fs.text = out(d);
+  JsonDocument live; liveFrom(live, fs.text.c_str());
+  TEST_ASSERT_EQUAL(CFG_MIGRATE_NONE, configMigrateLive(fs, live, onStep));
+  TEST_ASSERT_FALSE(fs.backedUp);
+}
+
+// A push the commit refuses stays as sent: no stamp turns it into an object.
+void test_pushed_non_object_untouched() {
+  const char* in[] = {"[]", "[1,2]", "7", "\"x\""};
+  for (const char* j : in) {
+    JsonDocument d; deserializeJson(d, j);
+    TEST_ASSERT_EQUAL(CFG_SCHEMA_INVALID, configMigratePushed(d, onStep));
+    TEST_ASSERT_FALSE(d.is<JsonObject>());
+    JsonDocument ref; deserializeJson(ref, j);
+    TEST_ASSERT_EQUAL_STRING(out(ref).c_str(), out(d).c_str());
+  }
+}
+
 int main() {
   UNITY_BEGIN();
   RUN_TEST(test_absent_schema_is_zero);
@@ -189,5 +214,7 @@ int main() {
   RUN_TEST(test_migrate_live_never_reads_back_after_write);
   RUN_TEST(test_migrate_live_failures_keep_live);
   RUN_TEST(test_migrate_live_untouched_verdicts);
+  RUN_TEST(test_pushed_doc_lands_current);
+  RUN_TEST(test_pushed_non_object_untouched);
   return UNITY_END();
 }

@@ -62,3 +62,10 @@ inline bool globRmProtected(const char* dir, const char* name) {
   if (*fsSkipRootDots(dir) != '\0') return false;
   return strcmp(name, "config.json") == 0 || strcmp(name, "ca.crt") == 0;
 }
+
+// The same two as an exact path: HTTP DELETE refuses them, shell fs.rm does not.
+inline bool rmPathProtected(const char* path) {
+  if (!path || *path != '/') return false;
+  const char* name = fsSkipRootDots(path);
+  return strcmp(name, "config.json") == 0 || strcmp(name, "ca.crt") == 0;
+}

@@ -111,6 +111,19 @@ void test_rm_protected_sees_through_dot_segments(void) {
   TEST_ASSERT_FALSE(globRmProtected("/..", "config.json"));
 }
 
+// L26: the HTTP DELETE of an exact path refuses the same two root files.
+void test_exact_rm_path_protected(void) {
+  TEST_ASSERT_TRUE(rmPathProtected("/config.json"));
+  TEST_ASSERT_TRUE(rmPathProtected("/ca.crt"));
+  TEST_ASSERT_TRUE(rmPathProtected("/./config.json"));
+  TEST_ASSERT_TRUE(rmPathProtected("//ca.crt"));
+  TEST_ASSERT_FALSE(rmPathProtected("/config.json.bak"));
+  TEST_ASSERT_FALSE(rmPathProtected("/sd/config.json"));
+  TEST_ASSERT_FALSE(rmPathProtected("/scripts/ca.crt"));
+  TEST_ASSERT_FALSE(rmPathProtected("config.json"));
+  TEST_ASSERT_FALSE(rmPathProtected(nullptr));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_detects_wildcards);
@@ -127,5 +140,6 @@ int main(int, char**) {
   RUN_TEST(test_other_root_files_are_not_protected);
   RUN_TEST(test_same_names_off_root_are_not_protected);
   RUN_TEST(test_rm_protected_sees_through_dot_segments);
+  RUN_TEST(test_exact_rm_path_protected);
   return UNITY_END();
 }
