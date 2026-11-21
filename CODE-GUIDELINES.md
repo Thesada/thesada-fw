@@ -4,7 +4,7 @@ How to write firmware in this repo. Reference material for PR review.
 Sibling to [docs/invariants.md](docs/invariants.md) (the load-bearing
 rules).
 
-Dated 2026-11-05. Bump on every edit.
+Dated 2026-11-20. Bump on every edit.
 
 ---
 
@@ -352,7 +352,7 @@ Process:
 3. Grep the rest of the codebase for the same pattern.
 4. Fix all instances in one PR (or document why some are different).
 5. Update [docs/invariants.md](docs/invariants.md) in the SAME commit -
-   add the pattern if missing, and bump the `Dated` line. See "Ledger
+   add the pattern if missing, with the entry's own `Dated` line. See "Ledger
    discipline" below.
 
 ---
@@ -407,9 +407,11 @@ What does not need a ledger entry (use the `INVARIANT_OK=1` bypass):
 - Pure refactor that preserves all invariants in their existing files.
 - New feature behind a flag that has no security/correctness coupling.
 
-Date bump: every edit to `docs/invariants.md` updates the `Dated`
-line to today's date. That line is the heartbeat - a stale date is
-a signal the ledger has drifted.
+Dates: an entry you add or change carries its own `Dated YYYY-MM-DD`
+line, on its own line above its `Source:` line. The ledger has no
+file-wide date line, so two PRs that change different entries merge
+without a conflict. The gate fails a `Dated` line above the first `##`
+heading. The file's heartbeat is `git log -1 docs/invariants.md`.
 
 ---
 

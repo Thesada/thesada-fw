@@ -25,6 +25,7 @@
 #include <http_fetch_policy.h>
 #include <boot_wait_policy.h>
 #include <cell_recover_policy.h>
+#include <cell_at_policy.h>
 #include <elapsed_policy.h>
 #include <http_url_policy.h>
 #include <atomic>
@@ -81,10 +82,25 @@ static bool atTake(SemaphoreHandle_t m, uint32_t timeoutMs) {
   return false;
 }
 
+// Console pumps running inside a held exchange (pumpConsoleHeld).
+static unsigned s_heldPumps = 0;
+
 Cellular::ATGuard::ATGuard(uint32_t timeoutMs) : _held(false) {
   atMutexInit();
   if (_atMutex == nullptr) return;  // OOM at create time - degrade open
+  if (cellAtNestedRefused(s_heldPumps, xSemaphoreGetMutexHolder(_atMutex),
+                          xTaskGetCurrentTaskHandle())) {
+    Log::kvfw(TAG, "cellular.at_refused reason=console_in_exchange");
+    return;
+  }
   _held = atTake(_atMutex, timeoutMs);
+}
+
+// Pump from a wait that holds the bus. A typed line that needs it is refused.
+static void pumpConsoleHeld() {
+  ++s_heldPumps;
+  Shell::pumpConsole();
+  --s_heldPumps;
 }
 Cellular::ATGuard::~ATGuard() {
   if (_held) xSemaphoreGiveRecursive(_atMutex);
@@ -172,6 +188,7 @@ class ModemSocket : public TinyGsm::GsmClientSim7080 {
   // Ask the next maintain() for a fresh modem-side byte count now instead
   // of after TinyGSM's 500 ms idle throttle.
   void   pollNow()        { got_data = true; prev_check = millis(); }
+  void   markClosed()     { sock_connected = false; }
 };
 
 // Per-socket counters for the httpsGet done line: where a slow transfer
@@ -276,6 +293,11 @@ class ModemClient : public Client {
   uint8_t connected() override { return (_s.isOpen() || _s.buffered() > 0) ? 1 : 0; }
   operator bool() override { return connected(); }
   void forget() { _s.forget(); }
+  // A socket URC read outside TinyGSM. Caller holds the bus.
+  void urc(uint8_t kind) {
+    if (kind == CELL_URC_CLOSED) _s.markClosed();
+    else if (kind == CELL_URC_DATA) _s.pollNow();
+  }
 
  private:
   ModemSocket _s;
@@ -288,6 +310,30 @@ class ModemClient : public Client {
 static ModemClient  s_sock0(modem, 0);
 static ModemClient  s_sock1(modem, 1);
 static ModemClient* const s_sockets[Cellular::TCP_SLOTS] = { &s_sock0, &s_sock1 };
+
+// Raw readers (cellAT, the +CDNSGIP and +CNTP waits) pass every line here.
+static void noteSocketUrc(const char* line) {
+  const CellUrc u = cellSocketUrc(line, Cellular::TCP_SLOTS);
+  if (u.kind != CELL_URC_NONE) s_sockets[u.mux]->urc(u.kind);
+}
+
+// Read lines until one holds prefix. Caller holds the bus.
+// out: true with that line in line.buf.
+template <size_t N>
+static bool waitUrcLine(const char* prefix, uint32_t timeoutMs, CellLine<N>& line, bool pump) {
+  const uint32_t t0 = millis();
+  while (msWithin(millis(), t0, timeoutMs)) {
+    while (Serial1.available()) {
+      if (!line.feed((char)Serial1.read())) continue;
+      if (strstr(line.buf, prefix)) return true;
+      noteSocketUrc(line.buf);
+    }
+    delay(20);
+    esp_task_wdt_reset();
+    if (pump) pumpConsoleHeld();
+  }
+  return false;
+}
 
 // Sample AT+CSQ at most every 30 s to keep AT bus clean.
 static constexpr uint32_t SIGNAL_SAMPLE_MS = 30UL * 1000UL;
@@ -394,7 +440,7 @@ static bool modemSoftReset() {
   while (msWithin(millis(), t0, REBOOT_BUDGET_MS)) {
     delay(1000);
     esp_task_wdt_reset();
-    Shell::pumpConsole();
+    pumpConsoleHeld();
     if (modem.testAT(1000UL)) {
       Log::info(TAG, "cellular.modem_reset_ok");
       modem.sendAT("+CMEE=2");
@@ -519,7 +565,7 @@ void Cellular::radioConfigure() {
     uint32_t step = remaining > 500UL ? 500UL : remaining;
     delay(step);
     esp_task_wdt_reset();
-    Shell::pumpConsole();
+    pumpConsoleHeld();
     remaining -= step;
   }
 }
@@ -627,6 +673,7 @@ int Cellular::cellAT(const char* cmd, const char* expect, uint32_t timeoutMs,
         line[lineLen] = '\0';
         // Empty line: skip (the modem prefixes responses with a CRLF).
         if (lineLen == 0) continue;
+        noteSocketUrc(line);
 
         // Terminator?
         if (strcmp(line, expect) == 0) return 1;
@@ -811,7 +858,7 @@ Cellular::ActStatus Cellular::tickActivation() {
         for (int i = 0; i < 20 && modem.getSimStatus() != SIM_READY; i++) {
           delay(500);
           esp_task_wdt_reset();
-          Shell::pumpConsole();
+          pumpConsoleHeld();
         }
       }
       if (modem.getSimStatus() != SIM_READY) {
@@ -1009,7 +1056,7 @@ bool Cellular::gpsAcquireFix(uint32_t timeoutMs,
       // 60 s stay TWDT-safe.
       delay(1000);
       esp_task_wdt_reset();
-      Shell::pumpConsole();
+      pumpConsoleHeld();
     }
     modem.disableGPS();
   }
@@ -1025,7 +1072,7 @@ bool Cellular::gpsAcquireFix(uint32_t timeoutMs,
   while (msWithin(millis(), settleT0, 5000UL) && !isGprsConnectedRaw()) {
     delay(250);
     esp_task_wdt_reset();
-    Shell::pumpConsole();
+    pumpConsoleHeld();
   }
 
   return fix;
@@ -1462,43 +1509,10 @@ bool Cellular::resolveHost(const char* host, char* out, size_t outLen) {
 
   if (cellAT(cmd, "OK", 8000UL, nullptr) != 1) return false;
 
-  // Drain Serial1 for the +CDNSGIP: URC (arrives after the OK).
-  char     foundIp[48] = {0};
-  bool     resolved    = false;
-  uint32_t t0          = millis();
-  String   buf;
-  buf.reserve(256);
-  while (millis() - t0 < 10000UL) {
-    while (Serial1.available()) buf += (char)Serial1.read();
-    int idx = buf.indexOf("+CDNSGIP:");
-    if (idx >= 0) {
-      int nl = buf.indexOf('\n', idx);
-      if (nl < 0) { delay(20); esp_task_wdt_reset(); continue; }
-      String l = buf.substring(idx, nl);
-      // +CDNSGIP: 1,"host","ip"...  -> status field is 1
-      int firstComma = l.indexOf(',');
-      if (firstComma > 0 && l.substring(9, firstComma).indexOf('1') >= 0) {
-        int q1 = l.indexOf('"', firstComma);          // open host
-        int q2 = l.indexOf('"', q1 + 1);              // close host
-        int q3 = l.indexOf('"', q2 + 1);              // open ip
-        int q4 = l.indexOf('"', q3 + 1);              // close ip
-        if (q3 > 0 && q4 > q3) {
-          String ipStr = l.substring(q3 + 1, q4);
-          strncpy(foundIp, ipStr.c_str(), sizeof(foundIp) - 1);
-          resolved = true;
-        }
-      }
-      break;
-    }
-    delay(20);
-    esp_task_wdt_reset();
-  }
-
-  if (resolved) {
-    strncpy(out, foundIp, outLen - 1);
-    out[outLen - 1] = '\0';
-  }
-  return resolved;
+  // The +CDNSGIP: URC arrives after the OK. Sized for the longest host.
+  CellLine<sizeof(cmd) + 128> line;
+  if (!waitUrcLine("+CDNSGIP:", 10000UL, line, false)) return false;
+  return cellDnsgipIp(line.buf, out, outLen);
 }
 
 // Sync the ESP32 system clock off the modem. Runs AT+CNTP against
@@ -1542,23 +1556,9 @@ bool Cellular::ntpSync(const char* server, uint32_t timeoutMs) {
     return false;
   }
 
-  int      code = 0;
-  uint32_t t0   = millis();
-  String   buf;
-  buf.reserve(128);
-  while (millis() - t0 < timeoutMs) {
-    while (Serial1.available()) buf += (char)Serial1.read();
-    int idx = buf.indexOf("+CNTP:");
-    if (idx >= 0) {
-      int nl = buf.indexOf('\n', idx);
-      if (nl < 0) { delay(20); esp_task_wdt_reset(); continue; }
-      code = atoi(buf.c_str() + idx + 6);
-      break;
-    }
-    delay(50);
-    esp_task_wdt_reset();
-    Shell::pumpConsole();
-  }
+  const uint32_t t0 = millis();
+  CellLine<64>   line;
+  const int code = waitUrcLine("+CNTP:", timeoutMs, line, true) ? cellNtpCode(line.buf) : 0;
   if (code != 1) {
     Log::kvfw(TAG, "cellular.ntp_failed step=result code=%d ms=%lu", code,
               (unsigned long)(millis() - t0));

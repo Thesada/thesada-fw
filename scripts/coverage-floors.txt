@@ -8,6 +8,7 @@
 # path                                        floor
 lib/thesada-core/src/ap_policy.h                95
 lib/thesada-core/src/cell_recover_policy.h      95
+lib/thesada-core/src/cell_at_policy.h           95
 lib/thesada-core/src/cli_authz_policy.h         95
 lib/thesada-core/src/cli_payload.h              90
 lib/thesada-core/src/cli_page_policy.h          95

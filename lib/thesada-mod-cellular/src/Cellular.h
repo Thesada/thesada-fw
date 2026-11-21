@@ -21,7 +21,8 @@ public:
   // A FreeRTOS recursive mutex serializes the socket clients, the loop()
   // health probe and shell AT passthrough.
   //
-  // Recursive: nested helpers can re-acquire without self-deadlock.
+  // Recursive: nested helpers can re-acquire without self-deadlock. A
+  // console line pumped from a wait that holds the bus is refused it.
   //
   // Default 30 s acquire window: a wedged AT bus surfaces as a returnable
   // failure rather than an infinite block. The wait is fed in 1 s slices,
@@ -249,7 +250,7 @@ private:
   static void sampleSignalQuality();
 
   // Line-oriented AT helper over Serial1. Straggler URCs are handed to
-  // TinyGSM first so socket state stays right.
+  // TinyGSM first, and a socket URC inside the window reaches its socket.
   //
   // Caller must hold the AT-bus mutex (ATGuard).
   //
