@@ -76,5 +76,15 @@ got=0
 printf '%s\n' src/main.cpp | INVARIANT_LEDGER="$tmp/missing.md" "$gate" >/dev/null 2>&1 || got=$?
 check 2 "$got" "a missing ledger fails"
 
+printf '# t\n\nDated 2026-11-20 (a note).\n\n## A\n\nSource: `src/main.cpp`.\n' >"$tmp/header.md"
+got=0
+printf '%s\n' src/main.cpp docs/invariants.md | INVARIANT_LEDGER="$tmp/header.md" "$gate" >/dev/null 2>&1 || got=$?
+check 1 "$got" "a file-wide Dated line above the first ## fails"
+
+printf '# t\n\n## A\n\n### e\n\nDated 2026-11-20\n\nSource: `src/main.cpp`.\n' >"$tmp/entry.md"
+got=0
+printf '%s\n' src/main.cpp docs/invariants.md | INVARIANT_LEDGER="$tmp/entry.md" "$gate" >/dev/null 2>&1 || got=$?
+check 0 "$got" "a Dated line inside an entry passes"
+
 [ "$fail" -eq 0 ] && echo "test_invariant_ledger: ok"
 exit "$fail"

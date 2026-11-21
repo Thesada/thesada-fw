@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include <unity.h>
 #include "ota_verify_policy.h"
+#include <string>
 
 void setUp(void) {}
 void tearDown(void) {}
@@ -452,7 +453,7 @@ void test_https_url_is_always_allowed(void) {
 // Plain http lets an on-path host pick the binary and its sha256 together.
 void test_http_url_needs_the_insecure_optin(void) {
   TEST_ASSERT_FALSE(otaUrlAllowed("http://example.com/firmware.json", false));
-  TEST_ASSERT_FALSE(otaUrlAllowed("http://10.0.0.5:8080/firmware.bin", false));
+  TEST_ASSERT_FALSE(otaUrlAllowed("http://192.0.2.5:8080/firmware.bin", false));
   // Negative control: the opt-in lets it through.
   TEST_ASSERT_TRUE(otaUrlAllowed("http://example.com/firmware.json", true));
 }
@@ -489,6 +490,53 @@ void test_redirect_refuses_relative_and_junk(void) {
   TEST_ASSERT_FALSE(otaRedirectAllowed("ftp://a.example/f", "ftp://b.example/g"));
   TEST_ASSERT_FALSE(otaRedirectAllowed(nullptr, "https://b.example/g"));
   TEST_ASSERT_FALSE(otaRedirectAllowed("https://a.example/f", nullptr));
+}
+
+static bool        qRequested;
+static bool        qForce;
+static std::string qUrl;
+static std::string ranUrl;
+static bool        ranForce;
+static int         runs;
+
+static void queue(const char* url, bool force) {
+  qUrl = url ? url : "";
+  qForce = force;
+  qRequested = true;
+}
+
+// One Check type, so gcov sees a single instantiation.
+static void (*onCheck)(const char*, bool);
+static void recordCheck(const char* u, bool f) { runs++; ranUrl = u ? u : "(null)"; ranForce = f; }
+static void queueB(const char*, bool) { queue("https://b/m.json", true); }
+static bool runRequested() { return otaRunRequested(qRequested, qForce, qUrl, onCheck); }
+
+void test_requested_check_runs_once_with_its_url(void) {
+  runs = 0;
+  onCheck = recordCheck;
+  queue("https://a/m.json", true);
+  TEST_ASSERT_TRUE(runRequested());
+  TEST_ASSERT_EQUAL_STRING("https://a/m.json", ranUrl.c_str());
+  TEST_ASSERT_TRUE(ranForce);
+  TEST_ASSERT_FALSE(runRequested());
+  TEST_ASSERT_EQUAL_INT(1, runs);
+  queue(nullptr, false);
+  TEST_ASSERT_TRUE(runRequested());
+  TEST_ASSERT_EQUAL_STRING("(null)", ranUrl.c_str());
+  TEST_ASSERT_FALSE(ranForce);
+}
+
+// CR #128: an ota.check typed during the fetch queued B, and clearing the URL
+// after check() dropped B, so the next turn checked the configured manifest.
+void test_check_queued_during_a_check_keeps_its_url(void) {
+  queue("https://a/m.json", false);
+  onCheck = queueB;
+  runRequested();
+  TEST_ASSERT_TRUE(qRequested);
+  onCheck = recordCheck;
+  runRequested();
+  TEST_ASSERT_EQUAL_STRING("https://b/m.json", ranUrl.c_str());
+  TEST_ASSERT_TRUE(ranForce);
 }
 
 int main(int, char**) {
@@ -538,5 +586,7 @@ int main(int, char**) {
   RUN_TEST(test_redirect_codes);
   RUN_TEST(test_redirect_keeps_scheme);
   RUN_TEST(test_redirect_refuses_relative_and_junk);
+  RUN_TEST(test_requested_check_runs_once_with_its_url);
+  RUN_TEST(test_check_queued_during_a_check_keeps_its_url);
   return UNITY_END();
 }

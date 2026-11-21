@@ -8,6 +8,7 @@
 # path                                        floor
 lib/thesada-core/src/ap_policy.h                95
 lib/thesada-core/src/cell_recover_policy.h      95
+lib/thesada-core/src/cell_at_policy.h           95
 lib/thesada-core/src/cli_authz_policy.h         95
 lib/thesada-core/src/cli_payload.h              90
 lib/thesada-core/src/cli_page_policy.h          95
@@ -49,9 +50,13 @@ lib/thesada-core/src/lua_budget_policy.h        95
 lib/thesada-core/src/temp_guard_policy.h        95
 lib/thesada-core/src/ads_sample_policy.h        95
 lib/thesada-core/src/config_write_policy.h       95
+lib/thesada-core/src/config_load_policy.h        95
+lib/thesada-core/src/config_path_policy.h        95
 lib/thesada-core/src/web_snapshot_policy.h       95
 lib/thesada-core/src/alert_payload_policy.h      95
 lib/thesada-core/src/config_schema_policy.h      95
 lib/thesada-core/src/config_scalar_policy.h      95
 lib/thesada-core/src/elapsed_policy.h            95
 lib/thesada-core/src/sleep_policy.h              95
+lib/thesada-core/src/console_drop_policy.h     95
+lib/thesada-core/src/module_begin_policy.h     95

@@ -43,4 +43,16 @@ if [ "$rc" -ne 1 ]; then
   echo "static-check: grep failed rc=$rc" >&2
   exit 1
 fi
+# A deep copy of a config doc recurses about 1 KB of stack per level on the 8 KB loop task.
+copy_re='\.set\([[:space:]]*(_doc|Config::get\(\)|live)[[:space:]]*\)|JsonDocument[[:space:]]+[A-Za-z_]+[[:space:]]*(\(|=|\{)[[:space:]]*(_doc|Config::get\(\)|live)[[:space:]]*[);}]'
+rc=0
+grep -rnE "$copy_re" lib/thesada-core/src lib/thesada-mod-*/src src --include='*.cpp' --include='*.h' || rc=$?
+if [ "$rc" -eq 0 ]; then
+  echo "static-check: deep copy of a config doc, stage from the file through Config::edit instead" >&2
+  exit 1
+fi
+if [ "$rc" -ne 1 ]; then
+  echo "static-check: grep failed rc=$rc" >&2
+  exit 1
+fi
 echo "static-check: OK"

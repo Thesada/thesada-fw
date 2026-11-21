@@ -36,9 +36,11 @@
 #include <esp_timer.h>
 #include <esp_random.h>
 #include <enroll_policy.h>
+#include <config_load_policy.h>
 #include <config_write_policy.h>
 #include <web_snapshot_policy.h>
 #include <shell_mode_policy.h>
+#include <glob_policy.h>
 #include <string.h>
 #include <atomic>
 
@@ -449,12 +451,13 @@ static bool _fileWriteAtomic(bool lfs, const char* path, const char* data, size_
 // main loop task. Replies on failure. out: bytes on disk, 0 if nothing landed.
 static size_t _configWriteOrReply(AsyncWebServerRequest* req, const char* body, bool restart) {
   // One config cap for every route, /api/file buffers up to the file cap.
-  if (req->contentLength() > HTTP_BODY_CFG_MAX) {
+  if (req->contentLength() > CONFIG_FILE_MAX) {
     req->send(413, "application/json", "{\"ok\":false,\"error\":\"config larger than 16 KB\"}");
     return 0;
   }
   auto doc = std::make_shared<JsonDocument>();
-  if (deserializeJson(*doc, body) || !doc->is<JsonObject>()) {
+  // The whole body: content after the object is refused, not dropped.
+  if (!configParseObjectBytes(*doc, body, req->contentLength())) {
     req->send(400, "application/json", "{\"ok\":false,\"error\":\"config must be a JSON object\"}");
     return 0;
   }
@@ -917,10 +920,10 @@ void HttpServer::setupRoutes() {
   cfgHandler->setMethod(HTTP_POST);
   cfgHandler->onBody([](AsyncWebServerRequest* req, uint8_t* data, size_t len,
                         size_t index, size_t total) {
-    _bodyChunk(req, data, len, index, total, HTTP_BODY_CFG_MAX);
+    _bodyChunk(req, data, len, index, total, CONFIG_FILE_MAX);
   });
   cfgHandler->onRequest([](AsyncWebServerRequest* req) {
-    const char* body = _bodyOrReply(req, HTTP_BODY_CFG_MAX);
+    const char* body = _bodyOrReply(req, CONFIG_FILE_MAX);
     if (!body) return;
     if (_configWriteOrReply(req, body, /*restart=*/true) == 0) return;
     req->send(200, "application/json", "{\"ok\":true}");
@@ -1178,6 +1181,10 @@ void HttpServer::setupRoutes() {
     bool useLFS     = (src == "littlefs");
     bool useScripts = (src == "scripts");
     if (useScripts) path = "/scripts" + path;
+    if (useLFS && rmPathProtected(path.c_str())) {
+      req->send(403, "application/json", "{\"ok\":false,\"error\":\"config.json and ca.crt are protected, use fs.rm\"}");
+      return;
+    }
     bool ok = (useLFS || useScripts) ? LittleFS.remove(path.c_str()) : SD_MMC.remove(path.c_str());
     req->send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"delete failed\"}");
   });

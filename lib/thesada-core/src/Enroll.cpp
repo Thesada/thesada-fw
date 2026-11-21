@@ -231,20 +231,17 @@ static bool onCert(const String& reply) {
     Log::kvfw(TAG, "enroll.reply_refused reason=cert_pair");
     return false;
   }
-  // A held boot prefix makes save() write the old prefix instead of this one.
-  if (Config::topicPrefixHeld()) {
-    Log::kvfw(TAG, "enroll.reply_refused reason=prefix_held");
-    return false;
-  }
   if (!ackPendingSet(true)) return false;
 
-  JsonObject cfg = Config::get();
-  JsonObject m   = cfg["mqtt"].is<JsonObject>() ? cfg["mqtt"].as<JsonObject>()
+  bool saved = Config::edit([&](JsonObject cfg) {
+    JsonObject m = cfg["mqtt"].is<JsonObject>() ? cfg["mqtt"].as<JsonObject>()
                                                 : cfg["mqtt"].to<JsonObject>();
-  m["broker"]       = String(host);
-  m["port"]         = port;
-  m["topic_prefix"] = String(prefix);
-  if (!Config::save() || !MQTTClient::storeClientCert(cert, key)) {
+    m["broker"]       = String(host);
+    m["port"]         = port;
+    m["topic_prefix"] = String(prefix);
+    return true;
+  });
+  if (!saved || !MQTTClient::storeClientCert(cert, key)) {
     ackPendingSet(false);
     Log::error(TAG, "enroll.store_failed");
     return false;
@@ -336,9 +333,9 @@ static void checkUnanswered(int status) {
 // in: none. out: none.
 static void startCheck() {
   _check.due = false;
-  char cn[96], raw[96], nb[96], na[96];
-  if (!MQTTClient::getCertInfo(cn, raw, nb, na, sizeof(cn)) ||
-      !enrollSerialCanonical(raw, _check.serial, sizeof(_check.serial))) {
+  CertInfo info;
+  if (!MQTTClient::getCertInfo(info) ||
+      !enrollSerialCanonical(info.serial, _check.serial, sizeof(_check.serial))) {
     // No readable cert: nothing to check until the next boot decides again.
     Log::kvfw(TAG, "enroll.status_skipped reason=no_cert");
     return;

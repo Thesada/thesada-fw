@@ -269,3 +269,19 @@ inline bool otaRedirectAllowed(const char* from, const char* to) {
   size_t n = strlen(scheme);
   return strncmp(to, scheme, n) == 0 && to[n] != '\0' && to[n] != '/';
 }
+
+// Run a check asked for by triggerCheck. The slot is emptied before check(),
+// so a request queued during the fetch waits for the next turn.
+// in: requested, force, URL ("" for the configured one), check(url|nullptr, force).
+// out: false when none was asked.
+template <typename Str, typename Check>
+inline bool otaRunRequested(bool& requested, bool& force, Str& url, Check check) {
+  if (!requested) return false;
+  requested = false;
+  const bool f = force;
+  force = false;
+  const Str taken = url;
+  url = "";
+  check(taken.length() > 0 ? taken.c_str() : nullptr, f);
+  return true;
+}

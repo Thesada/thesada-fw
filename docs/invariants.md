@@ -4,32 +4,12 @@ The load-bearing rules this firmware relies on. Every PR that touches a
 listed area must keep these true. Violations require this file to be
 updated with a justification, not silent landing.
 
-Dated 2026-11-11 (a form or `text/plain` body past 1 KB, or a multipart body off `/ota`, is refused at the end of its headers and its bytes are skipped, never parsed outside the body budget. A core MQTT reinit re-registers the Lua reload trigger through `MQTTClient::onReinit`. One EventBus publish runs at most the callbacks it started with plus 64, and one event holds at most 128 live callbacks, so a callback that subscribes itself cannot spin the loop or grow the list. The deep-sleep awake window is a span from boot with `sleep.wake_s` held to 10 s .. 1 day. A DS18B20 reading of exactly 85.0 C is taken only near the last accepted reading, never because it repeats). Previously 2026-11-10 (a POST body to `/api/config`, `/api/cmd` or `/api/file` with no `Content-Length` header is refused with 411 like a chunked one, so a request with neither header no longer reads as an empty body and truncates the `/api/file` target). Previously 2026-11-09 (the web terminal opens only on a single-use 128-bit token from `/api/ws/token`, bound to the caller's IP and spent at the `/ws/serial` handshake, so a refused upgrade gets no log line and two clients behind one NAT each get their own. A full grant table refuses, never evicts). Previously 2026-11-09 (an older `/config.json` is migrated at boot on a copy, the old file kept as `/config.json.bak`, and the live doc switches only after the write landed. A failed, newer or invalid schema runs unmigrated and alerts the app). Previously 2026-11-08 (the app alert goes out on every `Telegram.broadcast`, before any chat check, and the rules example publishes it itself without the Telegram module. `temperature.interval_s` is bounded to 5 s .. 1 day from its signed value. A cellular GET with an empty body (`Content-Length: 0`, 204, 304) completes at once. An `/ota` upload whose chunk 0 was accepted is not re-authenticated at completion). Previously 2026-11-08 (no Telegram or webhook TLS runs inside a Lua, shell, MQTT or timer chain: `Telegram.send` and `Telegram.broadcast` publish the app alert at once and queue the chat and webhook sends, four deep, and `TelegramModule::loop()` delivers one per pass. The rules example raises one alert per firing through `Telegram.broadcast(msg, code)` and publishes no alert JSON of its own. Shell `config.set` types a bare number as a 64-bit integer and keeps an out-of-range value as a string, and a numeric `telegram.chat_ids` entry is sent as stored. A body or `/ota` chunk 0 authenticates through the counted, lockout-first path, so a locked client buffers nothing, a guess dropped before completion still counts once, and the guess that starts a lockout answers 401 like on every other route. The alert relay scrubs control bytes, cuts the code on a UTF-8 boundary and keeps room for the heap breadcrumb. The SD event log counts only the bytes the file grew by. The route-auth gate matches identifiers, each allowed raw `_checkAuth` exactly once). Previously 2026-11-07 (`temperature.interval_s` is floored at 5 s for both the sampler and the HA expiry). Previously 2026-11-07 (loop-written state reaches async_tcp only as a copy under a portMUX: the sensor state, the log ring and the setup result, with atomic flags for `/api/cmd`, config writes and restart, and `gmtime_r` everywhere. `Shell::enqueue` moves the sink into its slot). Previously 2026-11-07 (the login lockout covers every authenticated route through `_authOrReply`, kept by a lint gate. `fs.write` and `fs.append` ack only bytes read back after close. The Telegram relay publishes the app alert JSON within the 256 B slot. The USB console waits up to 50 ms instead of dropping long lines). Previously 2026-11-05 (every call from C into Lua runs under one 10 s budget, not only the boot files: EventBus, MQTT and timer callbacks, `lua.exec` and `lua.load` go through `luaBudgetedCall`, and a nested call shares the outer budget, so no script holds the main loop past it. Time `Telegram.send`, `Telegram.broadcast` and `MQTT.publish` spend blocked is given back to the script, at most 60 s per outermost call. The invariant-ledger gate covers every file a `Source:` line cites, and CI hands it the range, so a range it cannot diff fails the job. A file every release or dependency bump changes (`src/thesada_config.h`, `platformio.ini`, `scripts/coverage-floors.txt`) is named in prose, never on a `Source:` line. `Config::set` is removed, the shell is the only dot-path writer. The rules example keys per-probe streaks by address, publishes its alert as the JSON the app stores, and publishes and starts the cooldown before the Telegram send. The Lua `string`, `table` and `math` globals are the library tables, not their names). Previously 2026-11-05 (every config writer except the generic `fs.write` / `fs.append` commands goes tmp + rename through `Config::writeFile`, which `Config::save` and the shell config writers share. It runs on the main loop only, because every writer shares `/config.json.tmp`, and renames only after the tmp, read back after close, holds the full measured size, since the lfs write happens inside an `fclose` whose result is dropped. HTTP `POST /api/config`, an `/api/file` write that resolves to the LittleFS `/config.json` and temperature discover and prune write the file only, leave the live config untouched and keep the last good file on any failure. The HTTP writers refuse a body that is not one JSON object. `/api/config` replies ok and restarts only once the new file is on disk. No HTTP handler walks the config doc: they read a main-loop copy refreshed on `Config::revision()`. A narrowed `shell.mode` closes `POST` and `DELETE /api/file` with the command surface, while `/api/config` and `/ota` stay open as the way back. A chunked POST body is refused with 411. `GET /api/file` streams any size, POST caps at 64 KB (16 KB for the config file), and every target is written through a tmp in the same directory, on SD with the old file parked and restored so no failure loses the last copy. The web snapshot refreshes from a `Config::onChange` hook, and a too-long credential locks only when it is the one in use, answers 403 with its reason and is not counted as a guess. `/api/state` reads a cached MQTT state instead of touching the client). Previously 2026-11-05 (a full login lockout table evicts no entry: an IP with no free slot counts on one shared overflow entry, and while that entry is locked every IP without a slot gets 429. Key-bearing heap copies are wiped before they return to the heap: the client cert and key buffers on every free, the MQTT payload copies, the CLI request envelope, the enroll cert reply and the shell `secret.set` value. The HTTP command path, the Telegram Bot API request and a secret kept in `config.json` are not covered. `cert.set` stores each half unchecked, and `cert.apply` reboots onto a stored pair only when it validates. A refused `cert.apply` records the broken verdict, so `cert.clear` opens on the same password session, and a check the heap could not run replies low heap and leaves the verdict alone). Previously 2026-11-05 (a publish or subscribe topic that does not fit its buffer is refused and logged, never clipped: every prefixed topic goes through `MQTTClient::formatTopic`, `publish`, `publishRetained` and `publishNow` refuse an empty topic, the subscription table refuses a topic it cannot hold, and the HA discovery uid holds a full slug. HA discovery clears the retained config a long slug left under its clipped 26.11.1 uid, so no old entity stays fed beside the new one. A `cli_response` line no page holds goes out in pieces, each page that ends inside a line carrying `cont: true`, and a page with its `cont` stays within the page limit, 160 bytes under the reply cap. A reply that still does not fit is refused, never clipped. Pages are sized to what one PubSubClient publish carries, and replies go out outside `mqtt.send_interval_s`. A chunked `fs.cat` sends only the bytes whose escaped form fits and reports them in `length`. An `mqtt.broker` host past the 96-byte host buffer is refused and logged, never dialed clipped: at boot the client has no broker and the reboot budget rolls back to last-good, a reinit keeps the previous broker and port, and `cmd/config` refuses it before saving. A connect snapshots last-good only when the configured host and port are the ones that session dialed). Previously 2026-11-05 (`net.http` runs its TLS on the 12 KB `net.http` task on both transports, so a cellular fetch no longer runs mbedTLS deep in the CLI chain on the 8 KB loop task. The shell's wait ticks MQTT once a second, so the keepalive runs through the fetch, and gives the loop back after 60 s on WiFi and 30 s on cellular. `MQTTClient::tick` does nothing inside another call into the client. A cellular GET's read loop stops 25 s after its connect began, checked on every pass, so a stalled header or body stops too, and a fetch still running at the wait ends on its task, which then frees the job. One `Cellular::httpsGet` at a time owns modem socket slot 1, and a chunked cellular OTA waits out a busy slot before each try instead of spending one. Every `ATGuard` wait feeds the task watchdog in slices of 1 s at most. A bearer recycle or modem hard reset that a socket failure earns on another task is queued for the loop's next health probe. `Shell::pumpConsole` runs only on the task that ran `Shell::begin`). Previously 2026-11-05 (an ADS1115 channel read probes the chip, waits on each conversion for at most 10 ms and probes again, so a chip off the bus is marked offline instead of holding `loop()` until the task watchdog, and it comes back on its next full read. A channel scales its counts by the PGA range the chip runs at, and its reading is AC RMS with the DC mean removed, unless `"dc": true` makes it the mean. No ADS1115 path calls the library's spinning `readADC_*`). Previously 2026-11-05 (OTA fetches a manifest or binary only from an `https://` URL. `http://` needs `ota.allow_insecure`, any other scheme never passes, and a refusal publishes `insecure-url` and fetches nothing). Previously 2026-11-05 (the planned restart into an installed update, which boots it pending, starts that image's crash streak at one instead of carrying the installer's, so a fix installed by a crash-looping image with no rollback target is not rolled back at its first boot. Once the update has set the boot slot the installer records the build as the fled release unless the record already names it, so a build that is aborted or rolled back before it confirms is skipped for 24 h instead of downloaded at every check, and a confirmed image drops a record that names its own build). Previously 2026-11-05 (a config string that lwIP keeps, or that is held across a console pump, is a copy, never a pointer into the config doc: the NTP server names live in two file-static slots that alternate per `configTime`, and the WiFi scan candidates hold their SSID by value. An NTP host that does not fit 255 bytes, which lwIP would refuse anyway, falls back to the default instead of being clipped). Previously 2026-11-05 (cellular NTP runs from ACTIVE, not in the activation step. The first try waits 30 s after activation, because the modem cannot resolve straight after `CNACT` (`+CNTP: 62`), and a failed attempt retries 60 s later, doubling to a 30 min cap, until NTP has synced this boot. Each attempt tries `ntp.server`, then `ntp.server2`, then `pool.ntp.org`, at most two, one per loop pass 2 s apart, and never a host a carrier cannot reach or the modem command cannot carry: a private, loopback, link-local or zero IPv4 literal, a `.local` name, or a name over 111 bytes (one trailing dot ignored, `cell_ntp_policy.h`). One scheduled `+CNTP` wait is capped at 15 s (`ntp.cell_timeout_s` above that is clamped, `net.ntp sync` still waits the full value), so a hold stays under the 20 s the cellular MQTT keepalive is sized for. The MQTT session no longer waits on the sync. Nothing on the cellular path needs the real time first: enrollment status checks wait for WiFi and `ntpSynced()`, and TLS never checks certificate dates). Previously 2026-11-04 (a lost cellular network or bearer in steady state clears `_started` and re-runs the non-blocking activation under its deadline, so no module stops ticking while the modem recovers. Cellular activation syncs the clock off the modem whenever NTP has not run this boot, not only below the sane-epoch floor, and that sync counts as `WiFiManager::ntpSynced()`. The long cellular waits pump the console. Failed modem sends count toward the same bearer-recycle and hard-reset streak as failed opens. A TLS write that times out closes the session. A cellular OTA chunk writes only its requested range, from a 206 or a whole-image 200. A modem dial failure does not count toward the low-heap reboot budget). Previously 2026-11-04 (one TLS stack on every transport: MQTT and HTTPS over cellular run `TlsClient`, mbedTLS on the ESP32, over a plain modem TCP socket, so the server chain and host name are checked exactly as on WiFi; the modem's own MQTT and SSL stacks are not used, and the modem sockets live for the whole program). Previously 2026-11-03 (cellular HTTPS binds a CA: OTA passes the WiFi CA to `Cellular::httpsGet`, which uploads, converts and binds it to the socket past TinyGSM's shadowed `certificates` array before connect and refuses on failure; `net.http` over cellular needs `/ca.crt` or `--insecure`). Previously 2026-11-03 (a POST body to `/api/config`, `/api/cmd` or `/api/file` is buffered per request in `req->_tempObject`, only after auth passes at chunk 0 and only up to the endpoint cap, and is acted on only when it arrived whole). Previously 2026-11-03 (an `ota.cmd_topic` publish only requests a check against `ota.manifest_url`; its payload never sets the manifest URL). Previously 2026-11-01 (HA discovery for a DS18B20 sets `expire_after` to three `temperature.interval_s`, so a stale probe, which skips its per-sensor topic, goes unavailable in HA instead of holding its last value). Previously 2026-11-01 (a shell error, an unknown command or a failed `config.set` / `config.del` / `config.save` / `secret.set` / `lua.exec` replies `ok:false` on `cli_response` and `/api/cmd`; a console line run while a command blocks parses into its own buffer and a deeper one is refused; `config.set`, `secret.set`, `fs.write`, `fs.append`, `cell.at`, `lora.send` and `lua.exec` take their value as the rest of the line, inner whitespace intact). Previously 2026-11-01 (the cellular `+SMPUB` command holds a full 159-byte topic, and a `+SMPUB`, `+CDNSGIP` or `+CNTP` command that does not fit its buffer is refused, never sent clipped). Previously 2026-11-01 (Lua `Node.uptime()` and `Node.setTimeout` deadlines count 64-bit `esp_timer` ms, so neither breaks at the 49.7-day `millis()` wrap; a NaN delay is refused, a negative one fires next pass, one past 30 days is capped). Previously 2026-11-01 (the shell refuses a line or a token it cannot hold instead of clipping it: the parser holds the 1023 bytes `runCli` accepts and 16 words, the WS terminal and serial console refuse a line past their 255-byte buffers, and shell `config.set` / `config.get` refuse a key past 127 bytes; `fs.mv` refuses a move between filesystems). Previously 2026-11-01 (a DS18B20 probe without a usable reading is published as `stale` with no `temp_c`/`temp` and no per-sensor value, never its last reading; a jump past `max_delta_c` is held and accepted when the next reading agrees with it, so one real step cannot lock a probe out). Previously 2026-11-01 (bearer-token and WS-grant expiry count 64-bit uptime, so an expired token or unused grant does not validate again 2^31 ms after it expired; the login lockout counts 64-bit uptime too, so no IP is locked out by the `millis()` wrap; after a lockout one wrong guess re-locks, an IP is forgotten on success or after 10 min with no failure, and a full table evicts the fewest-fails entry, else the soonest release, so a new IP is always counted). Previously 2026-10-26 (a Telegram or webhook POST resolves its host first, fed, skips on a failed resolve, and reads only the status line under a hard deadline after capped connect, handshake and write, so a stalled or slow-drip reply inside a boot script stays inside the task watchdog; a caught Lua budget error is re-raised by `pcall`/`xpcall` and fails the file, and the budget hook is inert after the file ends). Previously 2026-10-25 (MQTT dials the resolved broker address itself, so PubSubClient never repeats the lookup, and a DNS outage never spends the low-heap reboot budget; an SD directory named like a log holds its slot but is never resumed). Previously 2026-10-25 (no boot step blocks past the task watchdog without feeding it: the WiFi connect and NTP waits feed per poll step through `Watchdog::waitStep`, the OTA GET resolves and feeds before each redirect hop, and a boot Lua script is cut off after 10 s). Previously 2026-10-25 (the SD log to resume or open is picked from one root listing, so a card with hundreds of logs boots inside the 30 s watchdog). Previously 2026-10-25 (a failed healthy-uptime clear or USB mark is retried one hour after that failure, not on the next whole hour of uptime, so a first failure late in uptime does not retry on the next loop turn). Previously 2026-10-24 (a refused fled try puts back the age and try count its failed save overwrote in RAM, so a failed save spends no try; the age it holds is the 24 h cap, which adds no writes). Previously 2026-10-24 (a fled-release try whose save before the download fails does not download, so a lost write cannot let every boot install the build again). Previously 2026-10-24 (a fled release is refused for 24 h of skip age, then installed again, two tries before a new day starts, and the next switch starts a new record; the age is uptime carried over resets in RTC memory and saved at a boot's first refusal and at most every 10 min, and a synced clock adds at most an hour of time off per reset and is not read inside a boot, so a clock that jumps neither ends the skip more than an hour early nor makes it permanent). Previously 2026-10-24 (a slot switch from a confirmed image records its own `FIRMWARE_VERSION` as the fled release once the boot slot is set, and the update check refuses a manifest entry with that version as `fled-release`, so the image the switch booted does not pull the fled build straight back; another manifest version, `ota.check --force` and a firmware upload still install, and a power-on does not lift the refusal). Previously 2026-10-24 (the image a slot switch boots records the slot it came from by slot address and app ELF sha256, not by descriptor strings that match every build, and any boot of that slot removes the record, so a reinstalled build is a rollback target again and the old strings record blocks nothing; a switch target must verify as a whole image, and the rescue flag confirms only on a boot that no planned restart led to). Previously 2026-10-24 (a USB-flashed image that stays up an hour with a known crash streak is marked valid, so the first OTA after it can roll back to it; a switch target is still a valid slot only). Previously 2026-10-24 (the hourly healthy-uptime clear counts 64-bit uptime, so its retry still fires after the 49.7-day `millis()` wrap). Previously 2026-10-24 (a USB-flashed image, which otadata reads as undefined, counts as confirmed, so its operator restarts hold the crash streak; a failed healthy-uptime clear is tried again an hour later instead of settling). Previously 2026-10-23 (a CA, cert or key PEM handed to `WiFiClientSecure` is static, owned for the client's lifetime, or declared before the client in the same scope; `net.http` no longer drops its CA PEM before the handshake). Previously 2026-10-23 (an operator restart on a confirmed image holds the crash streak, and so does an MQTT budget reboot once that image has reached the broker since it was installed; a confirmed image that never reached the broker still counts its budget reboots and escapes to the other slot. A pending image counts every reset, and panic and watchdog resets always count). Previously 2026-10-22 (a valid image that stays up an hour clears its crash streak, so restarts weeks apart never add up to a slot switch; a loop that crashes within the hour still reaches the limit). Previously 2026-10-06 (a slot switch and a healthy confirm clear the crash streak, so the image that comes up next is not already at the limit). Previously 2026-10-06 (a pending image rolls back only when the other slot is a different valid image that is not the one just left; otherwise it is confirmed so the bootloader cannot boot that slot. A streak write that fails is treated as unread). Previously 2026-10-06 (a software reset counts toward the crash limit, so three restart loops abandon the image and one OTA reboot stays under it; power-on and deep sleep still clear the streak). Previously 2026-10-06 (three panic or watchdog resets abandon the running image: a pending image is marked invalid, a valid image boots the other valid slot and that slot is not the image just left, and a brownout holds the streak). Previously 2026-09-28 (a `cert.clear` that removed a cert reboots 3 s later, so the next boot starts enrollment; a unit that can re-enroll asks the app whether its cert serial is revoked and wipes only on an explicit, serial-matched "revoked"). Previously 2026-09-26 (a failed setup passphrase does not leave a station network, the claim link drops trailing slashes, and a timed-out enroll POST is reaped before the next one starts). Previously 2026-09-25 (the setup page exists only while the fallback AP is up and no station network is saved, unless a result from this boot is still on screen; the form is applied on the main loop and the claim link is text. A pending OTA image is marked valid after the first MQTT session or five minutes up, and a crash loop meets neither. Publish topic buffers are 160 bytes so a long tenant slug is not clipped. The enrollment claim code is an 8-digit serial-seeded
-secret that never rotates and that password-session `secret.set` refuses;
-enrollment only talks to an `https://` base. The cert arrives by HTTPS pull,
-not over the AP. A stored enrollment cert is never polled for again, a reply
-is stored only when it names this unit and its pair validates, and the ack
-waits for the first mTLS session. Prior: 2026-09-23 `cmd/config` keeps a pushed `topic_prefix` at the boot
-value until restart. A prefix that does not fit is refused, a shell edit
-of another key keeps the boot value, and `config.save` still writes the
-prefix already on disk. Reconnects broker changes without clearing
-subscriptions. Prior: 2026-09-22 `cmd/config` accepts a JSON document on a
-CA-verified TLS session only, including a password session, and refuses a
-blob that drops `mqtt.broker`. It is not gated by `shell.mode`. Prior: 2026-09-17 OTA version compare rejects anything that is not N.N.N.
-Prior: 2026-09-06 wildcard fs.rm needs --yes and never takes config.json
-or ca.crt. Prior: certificate validity dates are not enforced by the
-shipped mbedtls build. Prior: shell.mode gates all three command transports. Prior:
-Basic auth is refused on cross-site state-changing requests, including the
-two side-effect GETs, and the login lockout counts only real credential
-guesses. Prior: Config.h carries the single-task note. Prior: OTA verification and cert/key structural decisions extracted
-to `ota_verify_policy.h` and `cert_policy.h`, host-tested under a 95% coverage
-floor; `certKeyInputsUsable` newly requires PEM structure on the mTLS install
-path; the mbedtls pair check itself is unchanged and still untested. Prior:
-MQTT CLI authorization gate; the mTLS verdict is bound
-to the mTLS listener port; `cert.clear` recovery on a broken stored cert;
-first-boot device identity; fallback AP refuses a default or absent
-passphrase and the recovery window that leaves; LiteServer module
-removed; the HTTP bind waits for a netif). Bump the date on every edit.
+Each entry carries its own `Dated YYYY-MM-DD` line, on its own line
+above the entry's `Source:` line, set when the entry is added or
+changed. Two changes to different entries never share a line. There is
+no file-wide date line: the last change to the file is
+`git log -1 docs/invariants.md`, and the change notes up to 2026-11-20
+are kept under History at the end.
 
 ---
 
@@ -114,10 +94,19 @@ and judges it with `fileWriteLanded`: the shell and the MQTT CLI answer
 payload. The SD CSV log counts what `printf` wrote and warns once a minute on a
 short row.
 
-How enforced: `fileWriteLanded` in `config_write_policy.h`, host-tested in
-`test/test_config_write`, benched on a full LittleFS on 2026-11-07.
+Both transports go through `Shell::writeRouted`. On LittleFS a path that
+`configPathIsLive` resolves to `/config.json` never reaches `writeChecked`:
+`fs.write` must carry one JSON object with nothing but JSON whitespace after it (ArduinoJson stops at
+the first value, so the next boot would drop the rest) and goes through `Config::writeRaw`
+(tmp + rename, bytes kept as sent), anything else is refused with nothing
+written, and `fs.append` is refused (`fsWriteRoute`).
 
-Source: `lib/thesada-core/src/Shell.cpp` (`writeChecked`, `cmd_write`),
+How enforced: `fileWriteLanded` and `fsWriteRoute` in `config_write_policy.h`,
+host-tested in `test/test_config_write`, `configBytesAreObject` in
+`config_load_policy.h`, host-tested in `test/test_config_load`. Benched on a
+full LittleFS on 2026-11-07.
+
+Source: `lib/thesada-core/src/Shell.cpp` (`writeChecked`, `writeRouted`, `cmd_write`),
 `lib/thesada-core/src/MQTTClient.cpp`, `lib/thesada-mod-sd/src/SDModule.cpp`.
 
 ---
@@ -240,13 +229,18 @@ cleared. The topic is not authz-gated, so a password, `allow_insecure` or
 unverified cellular session that can publish there would otherwise point the
 device at its own manifest, binary and sha256 under any publicly trusted
 cert. A URL override is `ota.check <url>`, which `cliAuthzPasswordCmdAllowed`
-keeps to mTLS, serial and HTTP.
+keeps to mTLS, serial and HTTP. A changed `ota.cmd_topic` takes effect
+after a restart.
+
+A request made while a check runs (an `ota.check <url>` typed during the
+fetch) is kept for the next loop turn: `otaRunRequested` empties the slot
+before it calls `check()`, never after.
 
 How enforced: code review of `OTAUpdate::registerCommandTopic`; the
-callback must not read `payload`.
+callback must not read `payload`. `otaRunRequested` in `test/test_ota_verify`.
 
 Source: `lib/thesada-core/src/OTAUpdate.cpp::registerCommandTopic`,
-`triggerCheck`.
+`triggerCheck`, `loop`, `lib/thesada-core/src/ota_verify_policy.h`.
 
 ### OTA-over-cellular shares the WiFi cert-verification gate
 
@@ -385,7 +379,7 @@ Source: `lib/thesada-core/src/Shell.cpp`, `lib/thesada-core/src/Enroll.cpp`,
 
 ### A config string that outlives a doc rebuild is a copy
 
-`Config::load` and `Config::replace` rebuild `_doc`, and the rebuild frees
+`Config::load`, `Config::replace` and `Config::edit` rebuild `_doc`, and the rebuild frees
 every string in it. Shell `config.set` / `config.del` / `config.reload`, MQTT
 `cmd/config` and the setup portal all do this at runtime. A `const char*`
 read from `Config::get()` is therefore good only until the next rebuild. Two
@@ -400,13 +394,14 @@ kinds of holder must copy instead:
 | `WiFiManager.cpp` `scanAndConnect()` NTP block | lwIP SNTP keeps the `configTime` server names and re-resolves them on every poll | file-static `s_ntpHost[2][2][DNS_MAX_NAME_LENGTH]` (256). The slot flips on each `configTime`, so SNTP is moved onto the fresh slot before the old one is written again. A host that does not fit falls back to the default |
 | `WiFiManager.cpp` `scanAndConnect()` candidates | `tryConnect` waits in `waitStep` between candidates | `Candidate::ssid[33]` by value, beside the password buffer |
 | `MQTTClient.cpp` `begin()` and the `loop()` reinit | `PubSubClient::setServer` keeps the host pointer | `_brokerHost[96]`. A longer host is still clipped, not refused (fw #78) |
+| `OTAUpdate.cpp` `check()` and the deferred check in `loop()` | the manifest fetch pumps the console, where `config.set` rebuilds the doc and `ota.check <url>` reassigns `_pendingManifestUrl` | the manifest URL as a `String` copy, and `cfg` read again after the fetch |
 
 How enforced: code review. A new pointer handed to a storing library, or a
 new wait that pumps the console while holding a config pointer, adds its
 row here naming the copy.
 
 Source: `lib/thesada-core/src/WiFiManager.cpp::scanAndConnect`,
-`lib/thesada-core/src/MQTTClient.cpp::begin`.
+`lib/thesada-core/src/MQTTClient.cpp::begin`, `lib/thesada-core/src/OTAUpdate.cpp::check`.
 
 ---
 
@@ -620,6 +615,7 @@ Source: `lib/thesada-core/src/setup_portal_policy.h`, `lib/thesada-core/src/Setu
 | an unread crash streak refuses confirm and does not switch slots | a missing counter must not look like a healthy zero |
 | power-on and deep sleep clear the streak; a slot switch, a healthy confirm, and a valid image one hour up write it back to zero. Panic, watchdog, and unmarked software resets count. On a confirmed image, one that otadata reads valid or undefined, an operator restart holds, and an MQTT budget reboot holds only when the image is proven on the broker. On a pending image either one is the restart into an installed update and starts a new streak of one, and on an image whose state is unread both count. Brownout, external, SDIO, and unknown hold | the counter must survive a brownout. Three crash resets reach the limit when no boot between them stays up an hour. Config saves and other operator restarts on a confirmed image do not count, and neither do broker-outage reboots on an image that has connected before, or a long outage would boot the old image. A new image is confirmed at five minutes, long before its first budget reboot after `mqtt.reboot_after_fails` failed connects, so a confirmed image that never reached the broker must count those reboots: with the default `mqtt.max_exhaust_reboots` of 3 the third one reaches the limit, and a valid image switches slots under the rule above. An undefined USB image does not switch; after the healthy hour it is marked valid, below. A budget below 3 stops rebooting first, and that image stays. A pending image counts every other reset. Its install restart starts at one because the streak before it is the installer's: a crash-looping image with no rollback target that installs a fix would hand it a streak at the limit, and the guard would roll the fix back at its first boot. One OTA reboot still stays under the limit. An image of 26.10.2 or older restarts into an update without a marker, so its install still hands the streak over. A switch that left the streak at the limit would make the next update roll back at once. The pending path with no safe other slot still confirms if that write fails, because leaving the image pending boots the slot just refused |
 | `confirmIfHealthy` runs on every main-loop turn, and `loop` calls it before the enabled and transport returns | `loop` itself is skipped when OTA is disabled or no transport is up, and that unit must still confirm or stay pending |
+| with deep sleep on, `SleepManager::loop` runs `confirmIfHealthy` first (`sleepHeldForOtaNow`), then does not sleep while `OTAUpdate::awaitingConfirm` (pending, not yet confirmed) and uptime is under `OTA_HEALTH_MIN_MS` plus `SLEEP_OTA_GRACE_MS` (30 s), logging `sleep.state_change from=awake to=held reason=ota_pending` once. Past that it sleeps and logs `sleep.ota_unconfirmed action=sleep result=rollback_at_wake` | a wake runs the bootloader, which aborts an image still pending, so a unit with `sleep.wake_s` under five minutes and no broker rolled back every good build and pulled it again. The health gate is unchanged: the hold only lets it run. A long OTA check or other loop work can pass the gate after the main loop's confirm try, so sleep tries again before it reads the state. The hold ends, so an image that will not confirm (streak at the limit, unread streak) does not keep a battery unit awake |
 | `OTAUpdate::plannedRestart` and `OTAUpdate::brokerRestart` set an `RTC_NOINIT` word to their own magic value and restart; `recordBootStreak` reads and clears it on every boot. It holds only a software reset that carries a marker on an image whose state reads `ESP_OTA_IMG_VALID` or `ESP_OTA_IMG_UNDEFINED`, and for the broker marker only when that image is proven. On an image that reads `ESP_OTA_IMG_PENDING_VERIFY` a software reset with either marker starts the streak at one and logs `ota.crash_streak_restarted reason=install previous= streak=` | a power-on clears the streak whatever the word holds, and clears the word. Any other value reads as unplanned, and a marker read once cannot excuse a later unplanned reset. An unreadable image state counts. `plannedRestart`: shell `restart`, `fs.format`, `identity.reset`, the web restart, config save, and firmware upload, `Node.restart()`, the cert reboot, and the OTA apply. `brokerRestart`: both MQTT budget reboots. The heap watchdog and both slot switches restart without a marker and count; the switches clear the streak first |
 | an image is proven on the broker when NVS `boot` key `proven_id` holds its id: the running slot address, then the app ELF sha256 from its app descriptor. `confirmIfHealthy` writes it on its first call after the boot's first MQTT session, WiFi or cellular, unless that boot already read a match. A boot tries the write at most once; after a failed write the next boot tries again | the record names one slot and one build, so a new build, or the same build in the other slot, starts unproven. A proven image writes nothing on later boots. An unreadable descriptor or an all-zero hash never matches, so that image counts its budget reboots. One record is kept, for the last image to connect; any other image reads unproven until it connects |
 | the slot a switch came from is recorded in NVS `boot` key `left_id` by the image the switch booted: on a boot that finds the rescue flag on a pending image, `recordBootStreak` writes the other slot's address and app ELF sha256, the same id as `proven_id`. A flag of 2 always records; a flag of 1, from the older guard, records only when the two images' descriptor version, date and time differ. Every boot first removes a `left_id` that names its own slot. The other slot is not booted while its id matches the record. No `left_id`, one of any other length, or a candidate with an all-zero hash is no match. An unreadable candidate descriptor, an NVS that will not open, or a running image whose own id cannot be built refuses the switch. `left_ver`, `left_date` and `left_time` are never read, written or removed | the record stops the second switch of a ping-pong, where both images crash-loop and the left slot is not booted in between, and nothing else. A boot of the recorded slot means that slot was rewritten or the bootloader fell back to it, so the image there is not the one left even when it is the same build; a record that outlived a reinstall refused that build as a rollback target and kept a broken update. Writing it on arrival means a failed switch leaves no record. The descriptor's version, date and time come from the prebuilt IDF (`esp-idf: v4.4.7 38eeba213a`, `Mar  5 2024`, `12:12:53` on espressif32 6.13.0) and match every build on one platform, so matching on them refused every candidate, and a unit that holds only them has no record. The older guard refuses any image with its own strings, which bounds a same-platform pair, and recording its arrival there would also name an image that only installed this one after a failed switch of its own. Across platforms the strings differ and only this record bounds the pair. With every write landing, two images of this guard switch once and an old and a new image at most three times. A failed record write costs one more switch, after which the other image records this one. An image from 26.10.2 or older applies an update without a restart marker, so a flag its failed switch left still confirms the build it installs without the health gate, and across platforms that build records it as left |
@@ -629,7 +625,8 @@ Source: `lib/thesada-core/src/setup_portal_policy.h`, `lib/thesada-core/src/Setu
 This is not the MQTT config rollback. That one restores a broker config that never connected. This one confirms the firmware image.
 
 Source: `lib/thesada-core/src/ota_health_policy.h`, `lib/thesada-core/src/OTAUpdate.cpp`,
-the `OTAUpdate::plannedRestart` and `OTAUpdate::brokerRestart` callers, `test/test_ota_health/`;
+`lib/thesada-core/src/SleepManager.cpp::loop`, `lib/thesada-core/src/sleep_policy.h::sleepHeldForOta`,
+the `OTAUpdate::plannedRestart` and `OTAUpdate::brokerRestart` callers, `test/test_ota_health/`, `test/test_sleep_policy/`;
 the fled-release skip and its expiry are `otaFledAction` and the `otaFled*` helpers in `lib/thesada-core/src/ota_verify_policy.h`, `test/test_ota_verify/`.
 
 ### A publish topic buffer holds 160 bytes, and a topic that does not fit is refused
@@ -969,6 +966,26 @@ pair check itself is unchanged and remains untested** - `cert_policy.h`
 covers structure, CN extraction, the `cert.apply` verdict and the broken
 verdict it records, not `mbedtls_pk_check_pair`.
 
+### Cert metadata is read into buffers whose sizes travel with them
+
+`MQTTClient::getCertInfo` fills a `CertInfo` (`cert_policy.h`: CN 128,
+serial 96, the two dates 32 bytes each) and bounds every field by its own
+`sizeof`. A caller cannot pass a cap larger than a buffer, which is how
+`cert.info` once handed 128 into a 96-byte serial and 32-byte dates. An X.509
+serial has no length limit in ASN.1, so `certSerialHex` writes the whole
+serial or nothing: past 47 bytes it refuses, `getCertInfo` logs
+`mqtt.cert_info_refused reason=serial_length` and returns false, `cert.info`
+says unparseable and the enroll status check skips. A clipped serial would
+name another cert in the revocation check.
+
+How enforced: `test/test_cert_policy` writes a serial of exactly the cap,
+one byte past it and 64 bytes into a `CertInfo`-sized buffer with a canary
+behind it.
+
+Source: `lib/thesada-core/src/cert_policy.h::certSerialHex`,
+`lib/thesada-core/src/MQTTClient.cpp::getCertInfo`,
+`lib/thesada-core/src/Shell.cpp::cmd_cert_info`, `lib/thesada-core/src/Enroll.cpp::startCheck`.
+
 ### mTLS context reset between connect attempts
 
 `_wifiClient.stop()` before every reconnect releases the stale mbedtls
@@ -1151,9 +1168,18 @@ counts rather than going quiet.
 wildcard, whatever the pattern: `fs.rm /* --yes` clears the root but
 leaves the device bootable and still able to verify TLS. An exact
 `fs.rm /config.json` still works - the veto is about a pattern reaching
-them by accident, not about making them undeletable.
+them by accident, not about making them undeletable. littlefs skips "."
+segments, so `fs.rm /./config.* --yes` and `//` reach the root too:
+`globRmProtected` strips them with `fsSkipRootDots`, the walk
+`configPathIsLive` uses. Before, a dot segment walked past the veto.
+
+HTTP `DELETE /api/file` with `source=littlefs` refuses the same two by
+exact path with 403 (`rmPathProtected`, same dot walk), so one dashboard
+click cannot leave a unit without its config or CA. The shell `fs.rm` on
+the exact path stays the deliberate way to remove them.
 
 How enforced: `globMatch` / `globSplit` / `globRmProtected`
+/ `rmPathProtected`
 (`glob_policy.h`, host-tested in `test/test_glob` under a 95% floor).
 `cmd_rm` routes to the glob path only when `globHasWildcard` says so, so
 the exact-path behaviour is unchanged. The matcher is iterative with a
@@ -1161,7 +1187,9 @@ single backtrack point - no recursion, because this runs on the shell's
 4 KB stack.
 
 Source: `lib/thesada-core/src/glob_policy.h`,
-`lib/thesada-core/src/Shell.cpp` (`cmd_rm`, `_rmGlob`, `cmd_ls`).
+`lib/thesada-core/src/config_write_policy.h::fsSkipRootDots`,
+`lib/thesada-core/src/Shell.cpp` (`cmd_rm`, `_rmGlob`, `cmd_ls`),
+`lib/thesada-mod-httpserver/src/HttpServer.cpp` (`/api/file` DELETE).
 
 ### Auth-state deadlines count 64-bit uptime, never `millis()`
 
@@ -1460,7 +1488,9 @@ Pump call is a one-line drop-in: reentrant-safe (single console,
 single static buffer), idempotent on partial-line state, and
 dispatches whole lines via `Shell::execute()` which has its own ring.
 Worst case a typed command runs inside the inner loop's stack frame
-instead of the main one - acceptable for debug operations. The pump runs
+instead of the main one - acceptable for debug operations. A cellular wait
+that holds the AT bus pumps through `pumpConsoleHeld`, and a line typed
+there that needs the bus is refused it (see the AT bus entry). The pump runs
 only on the task that ran `Shell::begin` (`shellPumpAllowed`). A call from
 any other task returns at once, so a worker that reaches a pumping wait
 never runs a line. None reaches one today: the modem hard reset, the
@@ -1516,6 +1546,7 @@ still reboot.
 | MQTT connect (`MQTTClient::connect`) | dial: TCP 10 s + TLS 10 s, after a fed DNS resolve; then CONNECT write 10 s + CONNACK 5 s | one attempt per retry interval |
 | OTA GET hop (`otaHttpGetWiFiHop`) | TCP 10 s + TLS 10 s + headers 5 s idle per line (a trickling origin can outlast it; the TWDT then reboots), after a fed DNS resolve | 5 same-scheme redirects; body loop fed per read, 5 min cap |
 | Telegram and webhook POST (`TelegramModule::sendTo`, `broadcast`) | TCP 5 s + TLS 10 s + write 5 s + status line 5 s (a hard deadline, not an inactivity timer), after a fed DNS resolve; a failed resolve skips the send | one POST per chat and one webhook, fed after each |
+| Module begins (`ModuleRegistry::beginAll`) | one module's `begin()`, fed before the first and after each, never inside one | the modules' own caps |
 | Any call from C into Lua (`luaBudgetedCall`): `main.lua` / `rules.lua`, EventBus, MQTT and `Node.setTimeout` callbacks, `lua.exec`, `lua.load` | 1000 VM instructions | 10 s of script time per outermost call, shared by the calls nested in it, then `script.budget_exceeded` aborts it. Time `Telegram.send`, `Telegram.broadcast` and `MQTT.publish` spend blocked is given back, at most 60 s per outermost call, so wall time can pass 10 s by those fed sends |
 
 The poll steps go through one helper, `Watchdog::waitStep(ms)` (pump the
@@ -1549,7 +1580,10 @@ tick after it aborted the callback before its MQTT alert.
 How enforced: `test/test_boot_wait_policy` (every poll step under half the
 period, clamps on every config key, the 40 s default case, rollover-safe
 budget), `test/test_ota_verify` (redirect codes, scheme kept, relative and
-junk Locations refused), and the coverage floor on `boot_wait_policy.h`. The
+junk Locations refused), and the coverage floor on `boot_wait_policy.h`.
+`test/test_module_begin` runs the begin loop against a simulated watchdog:
+three 20 s modules pass, work before `beginAll` does not count against the
+first module, and a module that runs 40 s still trips. The
 Lua budget: `test/test_lua_budget` (a nested call cannot restart the clock,
 a caught overrun fails the call, the next call re-arms, rollover-safe, a
 credit is capped per outermost call and never revives a spent budget), the
@@ -1577,7 +1611,8 @@ Source: `lib/thesada-core/src/Watchdog.cpp`, `boot_wait_policy.h`,
 `TelegramModule.cpp::sendTo`, `boundedPost`; `http_url_policy.h`;
 `ScriptEngine.cpp::createState`, `creditNative`, `lua_mqtt_publish`,
 `lua_budget_hooks.h`, `lua_budget_policy.h`, `scripts/check-lua-entry.sh`,
-`TelegramModule.cpp::begin` (the `Telegram` bindings).
+`TelegramModule.cpp::begin` (the `Telegram` bindings),
+`ModuleRegistry.cpp::beginAll`, `module_begin_policy.h`.
 
 ---
 
@@ -1596,6 +1631,29 @@ through `Log::`, command responses through `Console::reply`.
 
 Source: `lib/thesada-core/src/Console.cpp`, `Console.h`, `Log.cpp`,
 `Shell.cpp::pumpConsole`, `src/main.cpp`.
+
+### A log line never waits on the USB host
+
+On the USB-CDC builds (`ARDUINO_USB_CDC_ON_BOOT` with `ARDUINO_USB_MODE`,
+the debug envs) `Console::log` writes a line only when the HWCDC TX ring has
+room for all of it, line and CRLF in one write. A host that has the port
+open but stopped reading would otherwise hold each write for 20 x the TX
+timeout (about 1 s at 50 ms), and about 15 boot lines tripped the 30 s
+watchdog in `setup()`. Without room, the log call waits at most
+`CONSOLE_GRACE_MS` (10 ms) once, then drops the line whole and counts it.
+Later lines drop at once until room returns. The first line that fits after
+a drop is preceded by `[WRN][Console] console.dropped n=<count>`. The
+ring buffer and the WS remote handler still get every line. UART builds
+(`esp32-owb`, rescue) keep `Serial.println`, which waits only on the baud
+rate. `Console::reply` and `endReply` are unchanged: a reply answers a
+reader.
+
+How enforced: `test/test_console_drop` against a model of the 3.3.12 HWCDC
+write (15 lines on a stalled host cost at most the grace, whole lines only,
+one count notice, identical bytes on a reading host) and the coverage floor
+on `console_drop_policy.h`.
+
+Source: `lib/thesada-core/src/Console.cpp::log`, `console_drop_policy.h`.
 
 ### Command mode frames each response with a sequence marker
 
@@ -1693,16 +1751,22 @@ a hold longer than the 30 s task watchdog. Every wait is fed:
 |---|---|
 | The constructor and `pause()` take the mutex in slices of 1 s at most (`waitSliceMs`) and feed the watchdog between them when the calling task is watched (`esp_task_wdt_status`). A zero timeout is still one try | the probe's 30 s default wait sat in one unfed take while `net.http` held the bus through a 40 s bearer recycle, and the TWDT panics at 30 s |
 | Socket-failure recovery runs on the task that drives activation and the probe (`cellRecoverHere`). A streak on another task counts and queues its step (`cellular.socket_recover_queued`), and the next `Cellular::loop` probe runs it under its guard. A hard reset or a fresh bearer clears the queue | the bearer recycle (up to 40 s) and the hard reset (a 120 s guard, up to 60 s for AT) held the bus from `net.http` and changed `_started` under the loop's state machine |
+| A console line pumped from a wait that holds the bus (`pumpConsoleHeld`: SIM, RF settle, hard reset, GNSS, `+CNTP:`) gets no guard (`cellAtNestedRefused`, log `cellular.at_refused reason=console_in_exchange`). The holder re-takes a recursive mutex freely, and the refusal comes before any streak count | a `cell.at` or `net.ntp` typed during the `+CNTP:` wait ran on the bus in the middle of the exchange and could eat the URC the wait was reading |
+| `cellAT` and the `+CDNSGIP:` and `+CNTP:` waits read whole lines (`CellLine`, an overlong line dropped whole) and hand every `+CASTATE:` close and `+CADATAIND:` to its socket (`cellSocketUrc`) | those readers dropped socket URCs, so a close was seen only on the next socket read |
 | The open and send failure streaks are kept per socket slot (`CellFailStreaks`). A success clears only its own slot, and the power cycle one slot earns clears every slot | one shared open streak let an HTTPS success on slot 1 wipe the count of an MQTT slot 0 that kept failing, so it never reached the recycle |
 
-How enforced: `test/test_boot_wait_policy` (slices walk any budget, fed)
-and `test/test_cell_recover` (step per streak, reset over recycle, driver
-task, one slot's success keeps the other slot's streak) under the 95% floors on `boot_wait_policy.h` and
-`cell_recover_policy.h`. The fed take itself runs only on hardware.
+How enforced: `test/test_boot_wait_policy` (slices walk any budget, fed),
+`test/test_cell_recover` (step per streak, reset over recycle, driver
+task, one slot's success keeps the other slot's streak) and
+`test/test_cell_at` (nested console refused, recursion and other tasks
+not, line reader, socket URCs, `+CNTP:` and `+CDNSGIP:` parse) under the
+95% floors on `boot_wait_policy.h`, `cell_recover_policy.h` and
+`cell_at_policy.h`. The fed take and the refusal itself run only on hardware.
 
 Source: `lib/thesada-mod-cellular/src/Cellular.cpp` (`atTake`, `ATGuard`,
-`socketRecover`, `Cellular::loop`), `lib/thesada-core/src/boot_wait_policy.h`,
-`lib/thesada-core/src/cell_recover_policy.h`.
+`pumpConsoleHeld`, `noteSocketUrc`, `waitUrcLine`, `socketRecover`,
+`Cellular::loop`), `lib/thesada-core/src/boot_wait_policy.h`,
+`lib/thesada-core/src/cell_recover_policy.h`, `lib/thesada-core/src/cell_at_policy.h`.
 
 ### A `millis()` deadline or span holds across the 49.7-day wrap
 
@@ -1907,6 +1971,30 @@ Source: `lib/thesada-core/src/lua_timer_policy.h`,
 `lib/thesada-mod-scriptengine/src/ScriptEngine.cpp`
 (`lua_node_uptime`, `lua_node_setTimeout`, `ScriptEngine::loop`).
 
+### A Lua reload never runs with Lua on the stack
+
+`ScriptEngine::runReload` calls `lua_close` on the one state. Run from
+inside a binding, or from a callback nested in one, it frees the frame the
+binding returns into. So:
+
+| Rule | Why |
+|---|---|
+| `MQTTClient::subscribe` sends SUBSCRIBE and never calls `_client.loop()` | the pump read and dispatched inbound messages inside `MQTT.subscribe`, so a Lua callback ran nested in the chunk still registering it, and a reload-topic message closed the state under it. The SUBSCRIBE packet is itself traffic, so the broker keepalive does not need the pump |
+| the MQTT reload trigger only calls `ScriptEngine::requestReload`, a latch | it runs inside `MqttSubTable::dispatch`, which can be inside a binding that blocks |
+| once `SleepManager::gracefulShutdown` starts, `requestReload` refuses and logs `script.reload_refused reason=sleep_shutdown` (`luaReloadRequest`) | the shutdown pumps MQTT for about a second but runs no `ScriptEngine::loop`, and deep sleep clears the latch, so a latched request was lost without a record |
+| `ScriptEngine::reload` (shell `lua.reload` on every transport) runs at once only while no call into Lua is active (`luaReloadNow`, the budget depth is 0), else it latches and logs `script.reload_deferred`, and `lua.reload` answers that it is queued | a console line runs wherever `Shell::pumpConsole` is reached, and a binding that blocks in a modem or `waitStep` wait reaches it |
+| `ScriptEngine::loop` runs a latched reload first, before the timers, once the depth is 0 (`luaReloadDue`) | the loop is the one place no Lua frame exists |
+
+How enforced: `luaReloadNow`, `luaReloadDue` and `luaReloadRequest` in `lua_budget_policy.h`,
+host-tested in `test/test_lua_budget`, and in `test/test_lua_budget_hooks`
+from a real binding inside a `pcall` on the host-built Lua fork.
+
+Source: `lib/thesada-core/src/lua_budget_policy.h`,
+`lib/thesada-mod-scriptengine/src/ScriptEngine.cpp` (`reload`, `requestReload`,
+`runReload`, `subscribeReloadTrigger`, `ScriptEngine::loop`),
+`lib/thesada-core/src/MQTTClient.cpp::subscribe`,
+`lib/thesada-core/src/SleepManager.cpp::gracefulShutdown`.
+
 ---
 
 ## MQTT
@@ -1942,9 +2030,21 @@ new prefix. Before, a network-setting change killed the reload trigger
 until reboot. A Lua reload
 (`ScriptEngine::reload`) frees the Lua slots, unsubscribes each topic no other
 slot still holds and lets the new scripts subscribe again, so reloads never
-fill the table. Slots are marked free, never moved, so a reload that runs
-inside `dispatch()` (the MQTT reload topic) leaves the walk on a stable
-table. EventBus entries carry an owner too (`event_bus_table.h`): a reload
+fill the table. Slots are marked, never moved, so a drop that runs
+inside `dispatch()` leaves the walk on a stable table. Each slot holds its
+callback inline and is FREE, ACTIVE or ZOMBIE. `dispatch()` raises a depth
+counter and calls each callback in its slot, so a mutable callback keeps its
+state from one delivery to the next. A `removeOwner()` or `reset()` inside a
+dispatch turns ACTIVE slots ZOMBIE, and the outermost dispatch sweeps them to
+FREE (destroying the callback) once it returns, so a callback that frees its
+owner's slots and subscribes again runs to the end on its own captures.
+`add()` takes a FREE slot below the count or appends, never a ZOMBIE, so the
+sweep cannot free a registration made during the call. The table allocates
+nothing: a `std::function` keeps a trivially copyable target of up to 16
+bytes inline, and every registration's captures fit that. Before, each slot
+held a heap box with a manual reference count, and out of heap `add()` had to
+refuse. The MQTT reload topic only latches the reload (see
+"A Lua reload never runs with Lua on the stack"). EventBus entries carry an owner too (`event_bus_table.h`): a reload
 drops the Lua callbacks, and a drop inside `publish()` skips the dropped
 entries and sweeps them once the outermost publish returns. A callback
 added during a publish still runs in it, but one publish runs at most the
@@ -1959,7 +2059,10 @@ slots and EventBus callbacks behind.
 
 How enforced: the table is a type with no public way to clear one field
 (`mqtt_sub_table.h`, host-tested in `test/test_mqtt_sub_table` under a 95%
-floor, including ten reloads, a core reinit beside Lua slots and slot reuse).
+floor, including ten reloads, a core reinit beside Lua slots, slot reuse and
+a callback that subscribes again from inside its own call, a mutable callback
+delivered twice, removes and adds inside a dispatch, a nested dispatch that
+sweeps once at depth zero, and a counting callback destroyed at the sweep).
 `test/test_event_bus_table` covers ten reloads, a drop and a subscribe from
 inside a publish, a self-subscribing callback and the per-event cap, under a 95% floor on `event_bus_table.h`. Anything that
 empties the table calls `reset()`. `mqtt.diag` prints
@@ -2225,15 +2328,37 @@ Source: `lib/thesada-core/src/Shell.cpp::cmd_config_set`, `cmd_config_get`,
 `lib/thesada-core/src/cli_payload.h::cliSplitFieldValue` (`secret.set`,
 `cert.set`, host-unit-tested in `test/test_cli_payload`).
 
-### `Config::load` leaves a clean doc on a malformed `/config.json`
+### `Config::load` replaces the doc only with a whole parsed object
 
-A deserialize failure clears `_doc` and logs, rather than leaving it
-half-parsed. `Config::get()` then returns an empty object and every
-`cfg[...] | default` read falls back to its default - a corrupt config
-file degrades to defaults, never to garbage values read out of a
-partially-populated document.
+`configLoadInto` parses `/config.json` into a fresh document and moves it
+into `_doc` only when it is one JSON object, never half-parsed. Every other
+outcome keeps the doc and its held boot prefix as they were, logs at error
+and makes `load()` return false:
 
-Source: `lib/thesada-core/src/Config.cpp::load`.
+| Case | Log | Live doc |
+|---|---|---|
+| LittleFS does not mount | `config.mount_failed` | kept |
+| no `/config.json` | `config.file_missing` | kept |
+| malformed, valid JSON that is not an object, or anything but whitespace after the object | `config.parse_failed err=` | kept |
+
+Each line ends `action=use_defaults` at boot, where the kept doc is empty
+and every `cfg[...] | default` read falls back to its default, and
+`action=keep_previous` on a reload. Before, a missing file kept the old doc
+with no log and a parse error cleared it, so `config.reload` behaved two ways
+for one broken file. `config.reload` now answers `ok:false` and reinitializes
+nothing. `Config::replace` parses the pushed document aside too, so a
+malformed push, valid JSON that is not one object, or an object with content
+after it, touches neither the doc nor the hold. ArduinoJson stops at the end
+of the first value, so `configParseWhole` reads the rest of the file or the
+pushed text, for every writer that parses config.
+
+How enforced: `configLoadInto` in `config_load_policy.h`, host-tested in
+`test/test_config_load` under a 95% floor against a fake filesystem for
+each case.
+
+Source: `lib/thesada-core/src/config_load_policy.h`,
+`lib/thesada-core/src/Config.cpp::load`, `replace`,
+`lib/thesada-core/src/Shell.cpp::cmd_config_reload`.
 
 ### An older `/config.json` is migrated at boot, all or nothing
 
@@ -2243,7 +2368,8 @@ copy of the doc. Each one is a pure, idempotent function from schema N to
 N+1 and logs `config.schema_step`. Only when every step ran does it copy the
 old file to `/config.json.bak` (tmp, rename, size read back) and write the
 migrated doc through `Config::writeFile`. The live doc switches to the
-migrated copy only after that write landed.
+migrated copy only after that write landed, and it is that copy: the file
+is not read back, so a failed read-back cannot leave the unit on defaults.
 
 | Case | Result |
 |---|---|
@@ -2252,6 +2378,12 @@ migrated copy only after that write landed.
 | backup or write fails | live doc and file stay unmigrated, `config.schema_migrate_failed`, app alert `config_schema` |
 | schema newer than the firmware knows | untouched, `config.schema_newer`, app alert, runs with the keys it understands |
 | `schema` not a whole number | untouched, `config.schema_invalid`, app alert |
+
+A whole doc pushed over MQTT `cmd/config` (`Config::replace`) runs the same
+migrations in memory before its commit (`configMigratePushed`), so it lands
+stamped with the current schema and the next load writes neither a migration
+nor a `.bak` over the previous backup. A push that is not one object is left
+as sent for the commit to refuse.
 
 The alert goes out through `EventBus("alert")` after `ModuleRegistry::beginAll`,
 so MQTT queues it until the first session. A migration never runs on a
@@ -2262,34 +2394,126 @@ malformed file (that case is the entry above).
 | 0 to 1 | `drop_colon_keys`: a key saved with a trailing colon (`"password:"`, `"user:"` on the 2026-04 OWB config) is dropped when the plain key exists, else renamed to it, in every object and array |
 
 A new migration bumps `CONFIG_SCHEMA_CURRENT`, appends to
-`CONFIG_MIGRATIONS` and gets a host test. How enforced:
-`test/test_config_schema` under a 95% floor.
+`CONFIG_MIGRATIONS` and gets a host test. How enforced: `configMigrateLive`
+and the migrations in `test/test_config_schema` under a 95% floor.
 
 Source: `lib/thesada-core/src/config_schema_policy.h`,
-`lib/thesada-core/src/Config.cpp::load`, `src/main.cpp`.
+`lib/thesada-core/src/Config.cpp::load`, `Config.cpp::replace`, `src/main.cpp`.
 
-### `Config::replace` and the shell config writers never report success on a failed persist
+### The live config changes only by a move of a doc already on disk
 
-`Config::save()` returns `false` when `/config.json` cannot be opened
-or the serialize comes up short of `measureJson` (LittleFS full,
-truncated write). `replace()` then logs `config.replace_failed
-reason=persist` instead of "replaced" and reloads the on-disk file, so
-the in-memory `_doc` is back at the last persisted state, never a value
-that was never written. The shell writers (`config.set`, `config.del`,
-`config.save`) reply `ok:false` on a failed `shellConfigWrite` and
-reload nothing, so the live doc stays as it was before the command. A config write that
-did not hit flash must never surface to the operator as applied -
-otherwise a full filesystem silently discards every change while the
-device reports success.
+`configCommit(live, staged, write)` in `config_load_policy.h` is the one way
+a change reaches the live doc. It refuses a staged doc that is not one JSON
+object (`NOT_OBJECT`) or that overflowed while it was built (`NO_HEAP`)
+before any write, writes it, and only then moves it into live. A failed
+write (`PERSIST_FAILED`) leaves live untouched, so there is nothing to roll
+back and no copy of the live doc exists anywhere. Before, `Config::edit`
+edited live in place and kept a deep copy for the rollback (`prev.set(live)`,
+recursive on the 8 KB loop stack), and an edit that ran out of heap half way
+was written to flash.
 
-How enforced: every caller that persists config checks the write's
-return before logging or returning success; a failed persist in a
-mutate-then-save path reloads the persisted state.
+| Writer | Staged from | Then |
+|---|---|---|
+| `Config::rescueEdit(fn)` (setup page) | as `edit`, a broken file or a blank filesystem replaced by `{"schema": n}` | `fn(staged)`, commit |
+| `Config::edit(fn)` (enrollment, MQTT rollback, shell `config.set` / `config.del` / `config.save`) | `/config.json` stream-parsed by `configStage`, the live doc through text only when the file is missing | `fn(staged)`, commit |
+| `Config::replace(json)` (MQTT `cmd/config`) | the pushed text, through `configParseWhole`, migrated to the current schema | commit |
+| `Config::load()` | `/config.json` (`configLoadInto`) | move |
 
-Source: `lib/thesada-core/src/Config.cpp::save`, `replace`,
-`lib/thesada-core/src/Shell.cpp::shellConfigWrite`.
+A file that is malformed, has content after the object or is not one object
+refuses the edit (`config.edit_failed reason=file_unreadable`), so an edit
+applies on top of what is on disk and never merges into a file the next boot
+would refuse. The one exception is the setup portal, the way back from a
+broken file: `Config::rescueEdit` stages `{"schema": CONFIG_SCHEMA_CURRENT}`
+instead (`configStageRescue`), the form adds the network and enroll URL,
+the commit replaces the file, every other key reads its compiled default,
+and it logs `config.rescued reason=file_unreadable|too_large|file_missing
+action=replaced_file source=setup`. A missing file still stages from live,
+and with no live doc either (a factory-fresh or wiped unit, `data/` ships no
+config) it stages the fresh doc too (`file_missing`). A missing file with a
+live doc that cannot be copied (`Config::hasLiveDoc` true, `copyDiskDoc`
+false) is not a blank filesystem: every writer refuses it as
+`config.edit_failed reason=copy_failed` (`CONFIG_STAGE_COPY_FAILED`) and the
+portal shows its save error. A file that exists but
+cannot be opened is not rescued. A file that ran out of heap while it was
+parsed (`NoMemory`) is valid JSON, not a broken file: every writer, the
+portal included, refuses it as `config.edit_failed reason=no_heap`
+(`CONFIG_STAGE_NO_HEAP`). The portal form goes through `setupFormToConfig`
+(`setup_portal_policy.h`): a `wifi`, `wifi.networks` or `enroll` of the
+wrong type is replaced, and a write that does not land returns false, so
+the page reports the save error instead of saving nothing. A held boot prefix (see `cmd/config`) is captured from live
+before the write and put back over the written doc before the move, once,
+inside the commit: the file keeps the prefix it has, live keeps the boot one.
+`configChanged()` runs after every move, the MQTT rollback included, which
+before edited live in place and never ran the change hooks. `Config::save()`
+is gone. Shell `config.save` is `Config::edit` with no change: it writes the
+file back and makes it live. MQTT changes in the file reach the config, the
+running session picks them up at restart.
 
-### `/config.json` is never truncated in place by a config writer - tmp + rename (fs.write / fs.append excepted, see Gap)
+`fn` returns false to write nothing. Shell `config.set` and `config.del`
+walk the dotted key with `configPathApply` (`config_path_policy.h`) on the
+staged doc: a key it cannot address (a top-level set, a hole in an array,
+a missing array, more than `CONFIG_MAX_DEPTH` segments, a JSON literal
+nested past the levels the key leaves) replies `ok:false` with the reason
+and writes nothing, and a refused or failed write replies `ok:false` and
+leaves live as it was. A saved key is live when the reply goes out, so
+there is no "saved but not reloaded" state left. A config write that did
+not hit flash never surfaces to the operator as applied.
+
+Two bounds hold for every config parse and writer (`config_bounds.h`):
+`CONFIG_FILE_MAX` (16 KB) and `CONFIG_MAX_DEPTH` (8 levels).
+
+| Path | File size | Depth |
+|---|---|---|
+| `Config::load`, `configStage` | `size()` checked before the parse, `config.too_large` | `configParseWhole` `NestingLimit` |
+| `configCommit` | `measureJson` of the staged doc, `TOO_LARGE` before the write | the parse that built it |
+| `Config::writeFile` (every file writer) | `measureJson` before the tmp opens, `reason=too_large` | the parse that built it |
+| `Config::writeRaw`, `/api/config`, `cmd/config`, temperature edit base, shell readers, `copyDiskDoc` | body or file cap | `NestingLimit` |
+
+`/api/config` and the config path of `/api/file` parse the whole body with
+`configParseObjectBytes`: one object and nothing after it, a NUL included,
+the same rule `fs.write` and `cmd/config` apply. A literal `config.set`
+value that runs out of heap is refused (`Value out of memory`), never stored
+as its text, and an array index past `size_t` is not an index. A key that
+is empty or has an empty segment (`.mqtt`, `mqtt.`, `mqtt..topic_prefix`)
+is refused by `configKeyValid` in `config.get`, `config.set`, `config.del`
+and `configPathApply`, before the prefix hold sees it: the walk skips empty
+segments, so the key would land on another name than the one checked.
+
+The parse and the serializer both recurse per level on the 8 KB loop stack,
+so depth is the stack bound. A deep copy of a config doc (`JsonDocument::set`
+or a copy construct from `_doc`, `live` or `Config::get()`) recurses the same
+way and fails `scripts/static-check.sh`.
+
+How enforced: `configCommit`, `configStage` and `configHoldPrefix` in
+`config_load_policy.h`, host-tested in `test/test_config_load` under a 95%
+floor: an overflowed edit refused with no write, a root turned into an
+array refused, a failed write leaving live alone, a commit that allocates
+nothing, the file preferred over live, trailing content refused and the
+boot prefix kept across a commit, a file and a doc past 16 KB, and a parse
+nine levels deep, the blank-filesystem rescue, a failed live copy not
+rescued, a `NoMemory` file not
+rescued, a scalar `mqtt` refusing the hold, the disk prefix back after a
+failed overlay and an HTTP body with trailing content. `setupFormToConfig`
+in `test/test_setup_portal`, a literal out of heap and an index past
+`size_t` in `test/test_config_path`. `configPathApply` in `test/test_config_path` under a 95%
+floor, a nine-segment key and empty segments included, `configKeyValid`
+by table. The shell prefix hold
+(`configCommitDeferPrefix`, `configPrefixPending`) in `test/test_config_load`:
+a set and a delete with no hold, under a hold, to the live value, and a hold
+that cannot be kept. `configSavedReply` and `configKeyIsPrefix` in
+`config_write_policy.h`, host-tested in `test/test_config_write`.
+
+Source: `lib/thesada-core/src/config_load_policy.h`, `lib/thesada-core/src/config_bounds.h`,
+`scripts/static-check.sh`,
+`lib/thesada-core/src/Config.cpp::edit`, `rescueEdit`, `replace`, `commit`, `writeFile`,
+`lib/thesada-core/src/SetupPortal.cpp::applyForm`, `lib/thesada-core/src/Enroll.cpp::onCert`,
+`lib/thesada-core/src/MQTTClient.cpp::rollbackIfUncommitted`,
+`lib/thesada-core/src/Shell.cpp::shellConfigApply`, `cmd_config_set`,
+`cmd_config_del`, `cmd_config_save`, `lib/thesada-core/src/config_write_policy.h`,
+`lib/thesada-core/src/config_path_policy.h`, `lib/thesada-core/src/setup_portal_policy.h::setupFormToConfig`,
+`lib/thesada-mod-httpserver/src/HttpServer.cpp::_configWriteOrReply`.
+
+### `/config.json` is never truncated in place by a config writer - tmp + rename
 
 Opening `/config.json` with `"w"` truncates the last good config before
 the new bytes are known to fit. A short write (LittleFS full, flash
@@ -2317,13 +2541,20 @@ live doc. Its callers:
 
 | Caller | Writes | Live doc |
 |---|---|---|
-| `Config::save()` (portal, enrollment, MQTT rollback, `Config::replace` for MQTT `cmd/config`) | the live doc, held boot prefix swapped out | is the source |
-| `Shell.cpp::shellConfigWrite` | config.set / config.del: an edited copy of the file. config.save: a copy of the live doc | config.set / config.del reload it |
+| `Config::edit` / `Config::replace` through `configCommit` (portal, enrollment, MQTT rollback, shell `config.save`, MQTT `cmd/config`) | the staged doc: the file plus the edit, or the push | the written doc moves in |
 | HTTP `POST /api/config` | the request body | untouched, restart on success |
 | HTTP `POST /api/file`, `source=littlefs`, path resolves to `/config.json` (403 in a narrowed `shell.mode`, use `/api/config`) | the request body | untouched until restart or `config.reload` |
 | temperature discover / prune | an edited copy of the file | untouched until restart or `config.reload` |
+| `Config::writeRaw` from `Shell::writeRouted`: shell `fs.write` and the MQTT CLI `fs.write` binary handler on a path that resolves to the LittleFS `/config.json` | the payload bytes as sent, refused unless they parse as one JSON object | untouched until restart or `config.reload` |
 
-Any new code path that persists config routes through `writeFile`, never
+`writeRaw` shares the tmp, the read-back and the rename with `writeFile`
+(`commitTmp`). `fs.append` onto `/config.json` is refused with nothing
+written, because an append cannot be staged. The app's config editor writes
+`/config.json.new` in chunks, checks the size and `fs.mv`s it over the
+target, and `fs.mv` is an lfs rename, so that path never touched the file
+in place.
+
+Any new code path that persists config routes through `writeFile` or `writeRaw`, never
 a direct `LittleFS.open("/config.json", "w")`. `configPathIsLive`
 (`config_write_policy.h`, host-tested in `test/test_config_write`) decides
 which `/api/file` paths are the config file. It counts `"."` segments
@@ -2357,17 +2588,9 @@ Temperature discover edits the file on disk, not the live doc, because
 `fs.write` can leave the file ahead of the live doc until a restart. A
 file that exists but does not parse as an object is never overwritten.
 
-Gap: `fs.write` / `fs.append` (Shell `cmd_write` and the MQTT CLI binary
-handler in `MQTTClient::runCli`) still open any path that passes
-`pathSafe` with `"w"` / `"a"`, `/config.json` included, and write in
-place. The app's config editor pushes `/config.json` that way as an
-`fs.write` plus `fs.append` chain of 3900-byte chunks, so a chunk that
-fails mid-chain leaves a truncated file and the next boot runs defaults.
-`fs.mv` onto `/config.json` is an lfs rename and replaces it atomically.
-
-Source: `lib/thesada-core/src/Config.cpp::writeFile`, `::save`,
+Source: `lib/thesada-core/src/Config.cpp::writeFile`, `::writeRaw`, `::commit`,
+`lib/thesada-core/src/Shell.cpp::writeRouted`,
 `lib/thesada-core/src/config_write_policy.h::configWriteLanded`,
-`lib/thesada-core/src/Shell.cpp::shellConfigWrite`,
 `lib/thesada-mod-httpserver/src/HttpServer.cpp::_configWriteOrReply`,
 `lib/thesada-mod-temperature/src/TemperatureModule.cpp::commitConfig`.
 
@@ -2412,13 +2635,27 @@ toward the OTA crash streak, so a long outage cannot switch slots. On a
 pending image, or one that never connected, they count, so a new image
 that cannot reach the broker still escapes.
 
+An empty `mqtt.broker` is not a broker outage. `begin()` logs
+`mqtt.config_missing key=broker` and still sets up the callback, CA and
+subscriptions, so a broker a later `config.reload` sets connects normally.
+`connect()` dials only when `mqttShouldDial` says so: a host is set, or a
+last-good snapshot exists. `mqtt_lg_set` and `mqtt_lg` are two NVS writes,
+so the snapshot counts only when `mqttLastGoodUsable` reads it back as an
+object with a broker. With neither, a fresh unit or a
+standalone config, it logs `mqtt.state_change from=disconnected to=idle
+reason=no_broker` once and returns before any failure is counted, so the
+budget is never spent on a config the firmware already knows is missing.
+With a snapshot, an emptied broker still fails and reboots, because that is
+how the rollback below restores it on a remote unit.
+
 How enforced: BOTH reboot branches in `connect()` are gated by
 `!_rebootHalted` and the `mqttRebootCount()` budget check. The fast-reboot
 gate is `mqttDefragRebootDue()` in `mqtt_rollback_policy.h`, host-tested in
-`test/test_rollback` (the DNS-failure case included). Any new
-reboot trigger in this file must justify why it cannot loop.
+`test/test_rollback` (the DNS-failure case included), as is `mqttShouldDial`.
+Any new reboot trigger in this file must justify why it cannot loop.
 
-Source: `lib/thesada-core/src/MQTTClient.cpp::connect`.
+Source: `lib/thesada-core/src/MQTTClient.cpp::connect`, `begin`,
+`lib/thesada-core/src/mqtt_rollback_policy.h::mqttShouldDial`, `mqttLastGoodUsable`.
 
 ### A critical mqtt config that never connects rolls back to the last-good snapshot
 
@@ -2436,13 +2673,33 @@ unrelated offline streak (config differs from the recorded candidate).
 `mqtt_rb_cfg` is cleared on the next successful connect and after a
 rollback. Boot-time only, mirrors OTA commit / pending-verify.
 
+The restore goes through `Config::edit`. When that write fails, the live
+doc keeps the failing config, so the session still dials last-good:
+`rollbackIfUncommitted` sets a session flag (`mqtt.config_rollback_save_failed
+action=dial_last_good`), and `begin()`, the deferred reinit and `connect()`
+take broker, port, user and password from the `mqtt_lg` snapshot while the
+live critical config still equals `mqtt_rb_cfg` (`mqttRollbackSessionLastGood`).
+An edit since ends it (`mqtt.config_rollback_session_end`), and so does a
+snapshot that is not a valid object with a broker. A snapshot parse that
+runs out of heap, an NVS open or a critical-config read that fails keeps
+the flag (`mqtt.config_rollback_session_retry`) and that `connect()` dials
+nothing (`mqttRollbackSessionDecide` RETRY). `connect()` sets the server
+from the same source as the credentials. A connect on
+last-good keeps `mqtt_rb_cfg` and takes no snapshot, so the next boot
+retries the write instead of dialing the failing broker.
+
 How enforced: the decision lives in the pure `mqttRollbackShould()` predicate
 (host-unit-tested in `test/test_rollback`); `rollbackIfUncommitted()` only does
 the NVS I/O around it and runs before the first `connect()` in `main.cpp`.
+`mqttRollbackSessionLastGood()` in the same test file: an edit since, a
+missing candidate and a snapshot without a broker all dial the live config.
+`mqttRollbackSessionDecide()` in `test/test_rollback_session`: a parse with no heap is RETRY, a
+truncated, non-object, too deep or brokerless snapshot is LIVE.
 `snapshotGoodConfig()` checks `mqttSnapshotProven()` first, same test file.
 
 Source: `lib/thesada-core/src/mqtt_rollback_policy.h::mqttRollbackShould`, `mqttSnapshotProven`,
-`MQTTClient.cpp::snapshotGoodConfig`, `rollbackIfUncommitted`;
+`mqttRollbackSessionLastGood`, `mqttRollbackSessionDecide`,
+`MQTTClient.cpp::snapshotGoodConfig`, `rollbackIfUncommitted`, `rollbackSessionState`, `connect`;
 `src/main.cpp` boot call.
 
 ---
@@ -2714,19 +2971,28 @@ How enforced: `cmdConfigVerdict` (`cmd_config_policy.h`, host-tested in
 document with no non-empty `mqtt.broker`. The session bit is set only when
 a CA was configured and the live `TlsClient` session verified against it,
 on either transport. `Config::replace`
-reloads the on-disk file when the write fails and puts a held boot prefix
-back. The apply does not reconnect unless that write succeeded, and it
+leaves the doc and held boot prefix as they were when the write fails. The apply does not reconnect unless that write succeeded, and it
 refuses a prefix that cannot form `/cmd/config`, and a prefix that is
 not a string. An omitted
 `topic_prefix` stays omitted on the next save. The reconnect leaves the
-subscription table in place. `Config::save` and shell `config.save` write
-the prefix already on disk. Shell `config.set` and `config.del` put the
-boot prefix back unless the key is `mqtt` or `mqtt.topic_prefix`.
+subscription table in place. Every `Config::edit`, shell `config.save`
+included, stages from the file, so it writes the prefix already on disk, and
+the commit keeps the boot prefix live. Shell `config.set mqtt.topic_prefix`,
+`config.del mqtt.topic_prefix` and `config.del mqtt` write the file and,
+when that moves the prefix, hold the boot one live whether or not a hold was
+already there, so publishes and subscriptions stay on the boot prefix. The
+reply then ends `(saved, new prefix applies after restart)`. A set to the
+live prefix takes no hold and gives the normal reply. A hold that cannot be
+kept (a live prefix past the cap, no heap for the overlay) lets the new
+prefix go live with the normal reply. `config.set mqtt` is a top-level set
+and is refused. A restart or `config.reload` applies the file's prefix:
+`Config::load` drops the hold and the reload resubscribes the core topics
+and the reinit hooks under it, Lua slots keep their whole topics.
 A prefix that does not fit the CLI topic still subscribes `cmd/config`.
 
 Source: `lib/thesada-core/src/cmd_config_policy.h`,
-`lib/thesada-core/src/Config.cpp` (`replace`, `holdTopicPrefix`, `save`,
-`set`, `load`, `copyDiskDoc`),
+`lib/thesada-core/src/Config.cpp` (`replace`, `edit`, `holdTopicPrefix`,
+`load`, `copyDiskDoc`),
 `lib/thesada-core/src/MQTTClient.cpp` (`mqttApplyCmdConfig`,
 `mqttSubscribeCmdConfig`, `begin`, `reconnectWithCurrentConfig`,
 `reinitSubscriptions`, `onMessage`),
@@ -2867,3 +3133,37 @@ files. Update it before merging anything that violates an entry, or
 the entry is wrong.
 
 Related: [CODE-GUIDELINES.md](../CODE-GUIDELINES.md).
+
+---
+
+## History to 2026-11-20
+
+Frozen. The file-wide date line as it stood when entries took their own
+`Dated` line. Not edited again.
+
+Dated 2026-11-19 (a missing file with a live doc that cannot be copied is refused as `copy_failed` by every writer, the portal included, never rescued as a blank filesystem. A key with an empty segment, a leading, trailing or doubled dot, is refused by `config.get`, `config.set` and `config.del` before any hold or write. A last-good snapshot that runs out of heap while it is parsed keeps the session fallback and skips that dial, only an edit or a bad snapshot ends it. Prior: 2026-11-18 the setup portal also saves on a blank filesystem, no file and no live doc, and a `wifi` that is not an object is replaced, never a silent no-op. A config file that runs out of heap while it is parsed is refused as `no_heap` and never rescued. A boot rollback whose write fails dials last-good for the session and keeps its markers. `/api/config` and `/api/file` refuse content after the config object. A scalar `mqtt` refuses the boot-prefix hold, and a hold overlay that runs out of heap puts the disk prefix back. A `config.set` literal that runs out of heap and an array index past `size_t` are refused. Earlier the same day: the setup portal replaces a corrupt, oversized or non-object `/config.json` with a fresh doc from its form and logs `config.rescued`, every other config writer fails closed. A wildcard `fs.rm` through a "." segment, `/./config.*`, skips the root config and CA like `/config.*`. Shell `config.set` and `config.del` run through `Config::edit`, so a refused key writes nothing and a saved one is live at once, and a key deeper than 8 levels is refused. A config file past 16 KB or nested past 8 levels is refused by every config parse and writer, and a deep copy of a config doc fails lint. Every config change stages a doc from `/config.json`, writes it and only then moves it into live, so no rollback copy of the live doc exists and `Config::save` is gone. An MQTT subscription holds its callback inline, and a slot removed during a dispatch is swept after the outermost one returns, with no heap in the table. An MQTT reload request during the deep-sleep shutdown is refused and logged. Prior: 2026-11-17 a subscription callback runs through a shared handle to its one target, so a mutable callback keeps its state between deliveries. `config.set` and `config.del` reply `ok:false` when the file landed but the reload after it failed. Same day, earlier: `Config::load` and `Config::replace` refuse content after the top-level object, keeping the live doc. An empty broker dials for the rollback only when the last-good snapshot itself reads back with a broker, not on the `mqtt_lg_set` marker alone. Same day, earlier: `Config::replace` refuses a push that is not one object and puts the previous doc and prefix hold back on a failed save without reading flash. The boot migration makes the migrated doc live without reading it back. `fs.write` to the config refuses bytes after the object. An `ota.check` queued during a check keeps its URL. `SleepManager::loop` tries the OTA confirm before it reads the pending state. Prior: 2026-11-16 `MQTTClient::subscribe` no longer pumps the client, so no Lua callback runs inside the chunk that registers it. A Lua reload asked for with a call into Lua on the stack, and every MQTT reload trigger, is latched and run by `ScriptEngine::loop`. A subscription callback runs from a copy, so one that subscribes again cannot free its own captures. `cert.info` and the enroll status check read cert metadata into a `CertInfo` whose field sizes the reader uses, and a serial past 47 bytes is refused, never clipped. With no `mqtt.broker` and no last-good snapshot the client stays idle and spends no reboot budget. `fs.write` onto `/config.json` writes one JSON object through tmp + rename, and `fs.append` onto it is refused. `Config::load` keeps the doc it had on a mount failure, a missing file or a file that is not one JSON object, and logs each. A deep-sleep unit stays awake while its pending OTA image waits for the health gate, at most 5.5 min. The OTA check copies its manifest URL before the console-pumping fetch). Previously 2026-11-11 (a form or `text/plain` body past 1 KB, or a multipart body off `/ota`, is refused at the end of its headers and its bytes are skipped, never parsed outside the body budget. A core MQTT reinit re-registers the Lua reload trigger through `MQTTClient::onReinit`. One EventBus publish runs at most the callbacks it started with plus 64, and one event holds at most 128 live callbacks, so a callback that subscribes itself cannot spin the loop or grow the list. The deep-sleep awake window is a span from boot with `sleep.wake_s` held to 10 s .. 1 day. A DS18B20 reading of exactly 85.0 C is taken only near the last accepted reading, never because it repeats). Previously 2026-11-10 (a POST body to `/api/config`, `/api/cmd` or `/api/file` with no `Content-Length` header is refused with 411 like a chunked one, so a request with neither header no longer reads as an empty body and truncates the `/api/file` target). Previously 2026-11-09 (the web terminal opens only on a single-use 128-bit token from `/api/ws/token`, bound to the caller's IP and spent at the `/ws/serial` handshake, so a refused upgrade gets no log line and two clients behind one NAT each get their own. A full grant table refuses, never evicts). Previously 2026-11-09 (an older `/config.json` is migrated at boot on a copy, the old file kept as `/config.json.bak`, and the live doc switches only after the write landed. A failed, newer or invalid schema runs unmigrated and alerts the app). Previously 2026-11-08 (the app alert goes out on every `Telegram.broadcast`, before any chat check, and the rules example publishes it itself without the Telegram module. `temperature.interval_s` is bounded to 5 s .. 1 day from its signed value. A cellular GET with an empty body (`Content-Length: 0`, 204, 304) completes at once. An `/ota` upload whose chunk 0 was accepted is not re-authenticated at completion). Previously 2026-11-08 (no Telegram or webhook TLS runs inside a Lua, shell, MQTT or timer chain: `Telegram.send` and `Telegram.broadcast` publish the app alert at once and queue the chat and webhook sends, four deep, and `TelegramModule::loop()` delivers one per pass. The rules example raises one alert per firing through `Telegram.broadcast(msg, code)` and publishes no alert JSON of its own. Shell `config.set` types a bare number as a 64-bit integer and keeps an out-of-range value as a string, and a numeric `telegram.chat_ids` entry is sent as stored. A body or `/ota` chunk 0 authenticates through the counted, lockout-first path, so a locked client buffers nothing, a guess dropped before completion still counts once, and the guess that starts a lockout answers 401 like on every other route. The alert relay scrubs control bytes, cuts the code on a UTF-8 boundary and keeps room for the heap breadcrumb. The SD event log counts only the bytes the file grew by. The route-auth gate matches identifiers, each allowed raw `_checkAuth` exactly once). Previously 2026-11-07 (`temperature.interval_s` is floored at 5 s for both the sampler and the HA expiry). Previously 2026-11-07 (loop-written state reaches async_tcp only as a copy under a portMUX: the sensor state, the log ring and the setup result, with atomic flags for `/api/cmd`, config writes and restart, and `gmtime_r` everywhere. `Shell::enqueue` moves the sink into its slot). Previously 2026-11-07 (the login lockout covers every authenticated route through `_authOrReply`, kept by a lint gate. `fs.write` and `fs.append` ack only bytes read back after close. The Telegram relay publishes the app alert JSON within the 256 B slot. The USB console waits up to 50 ms instead of dropping long lines). Previously 2026-11-05 (every call from C into Lua runs under one 10 s budget, not only the boot files: EventBus, MQTT and timer callbacks, `lua.exec` and `lua.load` go through `luaBudgetedCall`, and a nested call shares the outer budget, so no script holds the main loop past it. Time `Telegram.send`, `Telegram.broadcast` and `MQTT.publish` spend blocked is given back to the script, at most 60 s per outermost call. The invariant-ledger gate covers every file a `Source:` line cites, and CI hands it the range, so a range it cannot diff fails the job. A file every release or dependency bump changes (`src/thesada_config.h`, `platformio.ini`, `scripts/coverage-floors.txt`) is named in prose, never on a `Source:` line. `Config::set` is removed, the shell is the only dot-path writer. The rules example keys per-probe streaks by address, publishes its alert as the JSON the app stores, and publishes and starts the cooldown before the Telegram send. The Lua `string`, `table` and `math` globals are the library tables, not their names). Previously 2026-11-05 (every config writer except the generic `fs.write` / `fs.append` commands goes tmp + rename through `Config::writeFile`, which `Config::save` and the shell config writers share. It runs on the main loop only, because every writer shares `/config.json.tmp`, and renames only after the tmp, read back after close, holds the full measured size, since the lfs write happens inside an `fclose` whose result is dropped. HTTP `POST /api/config`, an `/api/file` write that resolves to the LittleFS `/config.json` and temperature discover and prune write the file only, leave the live config untouched and keep the last good file on any failure. The HTTP writers refuse a body that is not one JSON object. `/api/config` replies ok and restarts only once the new file is on disk. No HTTP handler walks the config doc: they read a main-loop copy refreshed on `Config::revision()`. A narrowed `shell.mode` closes `POST` and `DELETE /api/file` with the command surface, while `/api/config` and `/ota` stay open as the way back. A chunked POST body is refused with 411. `GET /api/file` streams any size, POST caps at 64 KB (16 KB for the config file), and every target is written through a tmp in the same directory, on SD with the old file parked and restored so no failure loses the last copy. The web snapshot refreshes from a `Config::onChange` hook, and a too-long credential locks only when it is the one in use, answers 403 with its reason and is not counted as a guess. `/api/state` reads a cached MQTT state instead of touching the client). Previously 2026-11-05 (a full login lockout table evicts no entry: an IP with no free slot counts on one shared overflow entry, and while that entry is locked every IP without a slot gets 429. Key-bearing heap copies are wiped before they return to the heap: the client cert and key buffers on every free, the MQTT payload copies, the CLI request envelope, the enroll cert reply and the shell `secret.set` value. The HTTP command path, the Telegram Bot API request and a secret kept in `config.json` are not covered. `cert.set` stores each half unchecked, and `cert.apply` reboots onto a stored pair only when it validates. A refused `cert.apply` records the broken verdict, so `cert.clear` opens on the same password session, and a check the heap could not run replies low heap and leaves the verdict alone). Previously 2026-11-05 (a publish or subscribe topic that does not fit its buffer is refused and logged, never clipped: every prefixed topic goes through `MQTTClient::formatTopic`, `publish`, `publishRetained` and `publishNow` refuse an empty topic, the subscription table refuses a topic it cannot hold, and the HA discovery uid holds a full slug. HA discovery clears the retained config a long slug left under its clipped 26.11.1 uid, so no old entity stays fed beside the new one. A `cli_response` line no page holds goes out in pieces, each page that ends inside a line carrying `cont: true`, and a page with its `cont` stays within the page limit, 160 bytes under the reply cap. A reply that still does not fit is refused, never clipped. Pages are sized to what one PubSubClient publish carries, and replies go out outside `mqtt.send_interval_s`. A chunked `fs.cat` sends only the bytes whose escaped form fits and reports them in `length`. An `mqtt.broker` host past the 96-byte host buffer is refused and logged, never dialed clipped: at boot the client has no broker and the reboot budget rolls back to last-good, a reinit keeps the previous broker and port, and `cmd/config` refuses it before saving. A connect snapshots last-good only when the configured host and port are the ones that session dialed). Previously 2026-11-05 (`net.http` runs its TLS on the 12 KB `net.http` task on both transports, so a cellular fetch no longer runs mbedTLS deep in the CLI chain on the 8 KB loop task. The shell's wait ticks MQTT once a second, so the keepalive runs through the fetch, and gives the loop back after 60 s on WiFi and 30 s on cellular. `MQTTClient::tick` does nothing inside another call into the client. A cellular GET's read loop stops 25 s after its connect began, checked on every pass, so a stalled header or body stops too, and a fetch still running at the wait ends on its task, which then frees the job. One `Cellular::httpsGet` at a time owns modem socket slot 1, and a chunked cellular OTA waits out a busy slot before each try instead of spending one. Every `ATGuard` wait feeds the task watchdog in slices of 1 s at most. A bearer recycle or modem hard reset that a socket failure earns on another task is queued for the loop's next health probe. `Shell::pumpConsole` runs only on the task that ran `Shell::begin`). Previously 2026-11-05 (an ADS1115 channel read probes the chip, waits on each conversion for at most 10 ms and probes again, so a chip off the bus is marked offline instead of holding `loop()` until the task watchdog, and it comes back on its next full read. A channel scales its counts by the PGA range the chip runs at, and its reading is AC RMS with the DC mean removed, unless `"dc": true` makes it the mean. No ADS1115 path calls the library's spinning `readADC_*`). Previously 2026-11-05 (OTA fetches a manifest or binary only from an `https://` URL. `http://` needs `ota.allow_insecure`, any other scheme never passes, and a refusal publishes `insecure-url` and fetches nothing). Previously 2026-11-05 (the planned restart into an installed update, which boots it pending, starts that image's crash streak at one instead of carrying the installer's, so a fix installed by a crash-looping image with no rollback target is not rolled back at its first boot. Once the update has set the boot slot the installer records the build as the fled release unless the record already names it, so a build that is aborted or rolled back before it confirms is skipped for 24 h instead of downloaded at every check, and a confirmed image drops a record that names its own build). Previously 2026-11-05 (a config string that lwIP keeps, or that is held across a console pump, is a copy, never a pointer into the config doc: the NTP server names live in two file-static slots that alternate per `configTime`, and the WiFi scan candidates hold their SSID by value. An NTP host that does not fit 255 bytes, which lwIP would refuse anyway, falls back to the default instead of being clipped). Previously 2026-11-05 (cellular NTP runs from ACTIVE, not in the activation step. The first try waits 30 s after activation, because the modem cannot resolve straight after `CNACT` (`+CNTP: 62`), and a failed attempt retries 60 s later, doubling to a 30 min cap, until NTP has synced this boot. Each attempt tries `ntp.server`, then `ntp.server2`, then `pool.ntp.org`, at most two, one per loop pass 2 s apart, and never a host a carrier cannot reach or the modem command cannot carry: a private, loopback, link-local or zero IPv4 literal, a `.local` name, or a name over 111 bytes (one trailing dot ignored, `cell_ntp_policy.h`). One scheduled `+CNTP` wait is capped at 15 s (`ntp.cell_timeout_s` above that is clamped, `net.ntp sync` still waits the full value), so a hold stays under the 20 s the cellular MQTT keepalive is sized for. The MQTT session no longer waits on the sync. Nothing on the cellular path needs the real time first: enrollment status checks wait for WiFi and `ntpSynced()`, and TLS never checks certificate dates). Previously 2026-11-04 (a lost cellular network or bearer in steady state clears `_started` and re-runs the non-blocking activation under its deadline, so no module stops ticking while the modem recovers. Cellular activation syncs the clock off the modem whenever NTP has not run this boot, not only below the sane-epoch floor, and that sync counts as `WiFiManager::ntpSynced()`. The long cellular waits pump the console. Failed modem sends count toward the same bearer-recycle and hard-reset streak as failed opens. A TLS write that times out closes the session. A cellular OTA chunk writes only its requested range, from a 206 or a whole-image 200. A modem dial failure does not count toward the low-heap reboot budget). Previously 2026-11-04 (one TLS stack on every transport: MQTT and HTTPS over cellular run `TlsClient`, mbedTLS on the ESP32, over a plain modem TCP socket, so the server chain and host name are checked exactly as on WiFi; the modem's own MQTT and SSL stacks are not used, and the modem sockets live for the whole program). Previously 2026-11-03 (cellular HTTPS binds a CA: OTA passes the WiFi CA to `Cellular::httpsGet`, which uploads, converts and binds it to the socket past TinyGSM's shadowed `certificates` array before connect and refuses on failure; `net.http` over cellular needs `/ca.crt` or `--insecure`). Previously 2026-11-03 (a POST body to `/api/config`, `/api/cmd` or `/api/file` is buffered per request in `req->_tempObject`, only after auth passes at chunk 0 and only up to the endpoint cap, and is acted on only when it arrived whole). Previously 2026-11-03 (an `ota.cmd_topic` publish only requests a check against `ota.manifest_url`; its payload never sets the manifest URL). Previously 2026-11-01 (HA discovery for a DS18B20 sets `expire_after` to three `temperature.interval_s`, so a stale probe, which skips its per-sensor topic, goes unavailable in HA instead of holding its last value). Previously 2026-11-01 (a shell error, an unknown command or a failed `config.set` / `config.del` / `config.save` / `secret.set` / `lua.exec` replies `ok:false` on `cli_response` and `/api/cmd`; a console line run while a command blocks parses into its own buffer and a deeper one is refused; `config.set`, `secret.set`, `fs.write`, `fs.append`, `cell.at`, `lora.send` and `lua.exec` take their value as the rest of the line, inner whitespace intact). Previously 2026-11-01 (the cellular `+SMPUB` command holds a full 159-byte topic, and a `+SMPUB`, `+CDNSGIP` or `+CNTP` command that does not fit its buffer is refused, never sent clipped). Previously 2026-11-01 (Lua `Node.uptime()` and `Node.setTimeout` deadlines count 64-bit `esp_timer` ms, so neither breaks at the 49.7-day `millis()` wrap; a NaN delay is refused, a negative one fires next pass, one past 30 days is capped). Previously 2026-11-01 (the shell refuses a line or a token it cannot hold instead of clipping it: the parser holds the 1023 bytes `runCli` accepts and 16 words, the WS terminal and serial console refuse a line past their 255-byte buffers, and shell `config.set` / `config.get` refuse a key past 127 bytes; `fs.mv` refuses a move between filesystems). Previously 2026-11-01 (a DS18B20 probe without a usable reading is published as `stale` with no `temp_c`/`temp` and no per-sensor value, never its last reading; a jump past `max_delta_c` is held and accepted when the next reading agrees with it, so one real step cannot lock a probe out). Previously 2026-11-01 (bearer-token and WS-grant expiry count 64-bit uptime, so an expired token or unused grant does not validate again 2^31 ms after it expired; the login lockout counts 64-bit uptime too, so no IP is locked out by the `millis()` wrap; after a lockout one wrong guess re-locks, an IP is forgotten on success or after 10 min with no failure, and a full table evicts the fewest-fails entry, else the soonest release, so a new IP is always counted). Previously 2026-10-26 (a Telegram or webhook POST resolves its host first, fed, skips on a failed resolve, and reads only the status line under a hard deadline after capped connect, handshake and write, so a stalled or slow-drip reply inside a boot script stays inside the task watchdog; a caught Lua budget error is re-raised by `pcall`/`xpcall` and fails the file, and the budget hook is inert after the file ends). Previously 2026-10-25 (MQTT dials the resolved broker address itself, so PubSubClient never repeats the lookup, and a DNS outage never spends the low-heap reboot budget; an SD directory named like a log holds its slot but is never resumed). Previously 2026-10-25 (no boot step blocks past the task watchdog without feeding it: the WiFi connect and NTP waits feed per poll step through `Watchdog::waitStep`, the OTA GET resolves and feeds before each redirect hop, and a boot Lua script is cut off after 10 s). Previously 2026-10-25 (the SD log to resume or open is picked from one root listing, so a card with hundreds of logs boots inside the 30 s watchdog). Previously 2026-10-25 (a failed healthy-uptime clear or USB mark is retried one hour after that failure, not on the next whole hour of uptime, so a first failure late in uptime does not retry on the next loop turn). Previously 2026-10-24 (a refused fled try puts back the age and try count its failed save overwrote in RAM, so a failed save spends no try; the age it holds is the 24 h cap, which adds no writes). Previously 2026-10-24 (a fled-release try whose save before the download fails does not download, so a lost write cannot let every boot install the build again). Previously 2026-10-24 (a fled release is refused for 24 h of skip age, then installed again, two tries before a new day starts, and the next switch starts a new record; the age is uptime carried over resets in RTC memory and saved at a boot's first refusal and at most every 10 min, and a synced clock adds at most an hour of time off per reset and is not read inside a boot, so a clock that jumps neither ends the skip more than an hour early nor makes it permanent). Previously 2026-10-24 (a slot switch from a confirmed image records its own `FIRMWARE_VERSION` as the fled release once the boot slot is set, and the update check refuses a manifest entry with that version as `fled-release`, so the image the switch booted does not pull the fled build straight back; another manifest version, `ota.check --force` and a firmware upload still install, and a power-on does not lift the refusal). Previously 2026-10-24 (the image a slot switch boots records the slot it came from by slot address and app ELF sha256, not by descriptor strings that match every build, and any boot of that slot removes the record, so a reinstalled build is a rollback target again and the old strings record blocks nothing; a switch target must verify as a whole image, and the rescue flag confirms only on a boot that no planned restart led to). Previously 2026-10-24 (a USB-flashed image that stays up an hour with a known crash streak is marked valid, so the first OTA after it can roll back to it; a switch target is still a valid slot only). Previously 2026-10-24 (the hourly healthy-uptime clear counts 64-bit uptime, so its retry still fires after the 49.7-day `millis()` wrap). Previously 2026-10-24 (a USB-flashed image, which otadata reads as undefined, counts as confirmed, so its operator restarts hold the crash streak; a failed healthy-uptime clear is tried again an hour later instead of settling). Previously 2026-10-23 (a CA, cert or key PEM handed to `WiFiClientSecure` is static, owned for the client's lifetime, or declared before the client in the same scope; `net.http` no longer drops its CA PEM before the handshake). Previously 2026-10-23 (an operator restart on a confirmed image holds the crash streak, and so does an MQTT budget reboot once that image has reached the broker since it was installed; a confirmed image that never reached the broker still counts its budget reboots and escapes to the other slot. A pending image counts every reset, and panic and watchdog resets always count). Previously 2026-10-22 (a valid image that stays up an hour clears its crash streak, so restarts weeks apart never add up to a slot switch; a loop that crashes within the hour still reaches the limit). Previously 2026-10-06 (a slot switch and a healthy confirm clear the crash streak, so the image that comes up next is not already at the limit). Previously 2026-10-06 (a pending image rolls back only when the other slot is a different valid image that is not the one just left; otherwise it is confirmed so the bootloader cannot boot that slot. A streak write that fails is treated as unread). Previously 2026-10-06 (a software reset counts toward the crash limit, so three restart loops abandon the image and one OTA reboot stays under it; power-on and deep sleep still clear the streak). Previously 2026-10-06 (three panic or watchdog resets abandon the running image: a pending image is marked invalid, a valid image boots the other valid slot and that slot is not the image just left, and a brownout holds the streak). Previously 2026-09-28 (a `cert.clear` that removed a cert reboots 3 s later, so the next boot starts enrollment; a unit that can re-enroll asks the app whether its cert serial is revoked and wipes only on an explicit, serial-matched "revoked"). Previously 2026-09-26 (a failed setup passphrase does not leave a station network, the claim link drops trailing slashes, and a timed-out enroll POST is reaped before the next one starts). Previously 2026-09-25 (the setup page exists only while the fallback AP is up and no station network is saved, unless a result from this boot is still on screen; the form is applied on the main loop and the claim link is text. A pending OTA image is marked valid after the first MQTT session or five minutes up, and a crash loop meets neither. Publish topic buffers are 160 bytes so a long tenant slug is not clipped. The enrollment claim code is an 8-digit serial-seeded
+secret that never rotates and that password-session `secret.set` refuses;
+enrollment only talks to an `https://` base. The cert arrives by HTTPS pull,
+not over the AP. A stored enrollment cert is never polled for again, a reply
+is stored only when it names this unit and its pair validates, and the ack
+waits for the first mTLS session. Prior: 2026-09-23 `cmd/config` keeps a pushed `topic_prefix` at the boot
+value until restart. A prefix that does not fit is refused, a shell edit
+of another key keeps the boot value, and `config.save` still writes the
+prefix already on disk. Reconnects broker changes without clearing
+subscriptions. Prior: 2026-09-22 `cmd/config` accepts a JSON document on a
+CA-verified TLS session only, including a password session, and refuses a
+blob that drops `mqtt.broker`. It is not gated by `shell.mode`. Prior: 2026-09-17 OTA version compare rejects anything that is not N.N.N.
+Prior: 2026-09-06 wildcard fs.rm needs --yes and never takes config.json
+or ca.crt. Prior: certificate validity dates are not enforced by the
+shipped mbedtls build. Prior: shell.mode gates all three command transports. Prior:
+Basic auth is refused on cross-site state-changing requests, including the
+two side-effect GETs, and the login lockout counts only real credential
+guesses. Prior: Config.h carries the single-task note. Prior: OTA verification and cert/key structural decisions extracted
+to `ota_verify_policy.h` and `cert_policy.h`, host-tested under a 95% coverage
+floor; `certKeyInputsUsable` newly requires PEM structure on the mTLS install
+path; the mbedtls pair check itself is unchanged and still untested. Prior:
+MQTT CLI authorization gate; the mTLS verdict is bound
+to the mTLS listener port; `cert.clear` recovery on a broken stored cert;
+first-boot device identity; fallback AP refuses a default or absent
+passphrase and the recovery window that leaves; LiteServer module
+removed; the HTTP bind waits for a netif).

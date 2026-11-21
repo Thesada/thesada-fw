@@ -22,7 +22,8 @@
 // Hot reload:
 //   ScriptEngine::reload() bumps generation counter, frees the Lua-owned MQTT
 //   slots and EventBus callbacks, destroys Lua state, creates fresh state,
-//   re-executes both scripts.
+//   re-executes both scripts. Asked for while Lua is on the stack, or from
+//   the MQTT reload topic, it is latched and loop() runs it.
 //
 // SPDX-License-Identifier: GPL-3.0-only
 
@@ -33,6 +34,7 @@
 #include <OTAUpdate.h>
 #include <Log.h>
 #include <Shell.h>
+#include <SleepManager.h>
 #include <ModuleRegistry.h>
 #include <Watchdog.h>
 #include <boot_wait_policy.h>
@@ -543,7 +545,7 @@ static void subscribeReloadTrigger() {
 
   if (reloadTopic) MQTTClient::subscribe(reloadTopic, [](const char* topic, const char* payload) {
     Log::info(TAG, "script.reload_trigger source=mqtt");
-    ScriptEngine::reload();
+    ScriptEngine::requestReload();
   });
 
   Log::kvf(TAG, "script.ready reload_topic=%s", reloadTopic ? reloadTopic : "");
@@ -621,7 +623,10 @@ void ScriptEngine::begin() {
 
   Shell::registerCommand("lua.reload", "Hot-reload Lua scripts",
       [](int argc, char** argv, ShellOutput out) {
-        ScriptEngine::reload();
+        if (!ScriptEngine::reload()) {
+          out("Lua reload queued, it runs once the running script returns");
+          return;
+        }
         bool hasMain  = LittleFS.exists("/scripts/main.lua");
         bool hasRules = LittleFS.exists("/scripts/rules.lua");
         char msg[96];
@@ -631,8 +636,27 @@ void ScriptEngine::begin() {
       });
 }
 
-// Hot-reload scripts by bumping generation and re-creating the Lua state
-void ScriptEngine::reload() {
+// Set by a reload asked for while Lua was on the stack, run by loop().
+static bool s_reloadPending = false;
+
+bool ScriptEngine::reload() {
+  if (luaReloadNow(_budget.budget, &s_reloadPending)) {
+    runReload();
+    return true;
+  }
+  Log::info(TAG, "script.reload_deferred reason=lua_running");
+  return false;
+}
+
+void ScriptEngine::requestReload() {
+  if (!luaReloadRequest(SleepManager::shuttingDown(), &s_reloadPending)) {
+    Log::kvfw(TAG, "script.reload_refused reason=sleep_shutdown");
+  }
+}
+
+// Hot-reload scripts by bumping generation and re-creating the Lua state.
+// Never with a call into Lua on the stack: lua_close frees that frame.
+void ScriptEngine::runReload() {
   Log::info(TAG, "script.reload_start");
   _generation++;
   // The old state's subscriptions go with it: the new scripts register their own.
@@ -654,8 +678,9 @@ uint32_t ScriptEngine::generation() {
   return _generation;
 }
 
-// Fire any expired Lua timers registered via Node.setTimeout
+// Run a latched reload, then fire any expired Lua timers (Node.setTimeout)
 void ScriptEngine::loop() {
+  if (luaReloadDue(_budget.budget, &s_reloadPending)) runReload();
   if (!gL) return;
   uint64_t upMs = uptimeMs();
 

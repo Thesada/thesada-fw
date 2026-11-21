@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -50,7 +50,7 @@ jobs:
     # Host-side Lua harness - exercises data/scripts/*.lua against the
     # mocked firmware bindings (tests/lua/). Fast, no PlatformIO needed;
     # runs in parallel with the board builds and gates the release.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -65,7 +65,7 @@ jobs:
   native-tests:
     # Host-native unit tests for the pure security logic (parse bounds, key
     # mapping, rollback policy). No board, fast, gates the release.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -87,7 +87,7 @@ jobs:
     # Line coverage over the same pure units the native tests exercise, floored
     # per file in scripts/coverage-floors.txt. Separate job from native-tests so
     # the fast unit run is not slowed by the instrumented build.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -115,7 +115,7 @@ jobs:
   static-analysis:
     # cppcheck and clang-tidy over the pure security units, then the
     # path-safety gate. Gates the release alongside the native unit tests.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -144,7 +144,7 @@ jobs:
     # arrives via a direct push or a contributor who has not installed
     # the hooks. Bypass with `INVARIANT_OK: 1` trailer in any commit in
     # the range.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -186,6 +186,9 @@ jobs:
       - name: Self-test the ledger gate
         run: ./tests/test_invariant_ledger.sh
 
+      - name: Self-test the release tag check
+        run: ./tests/test_release_target.sh
+
       # The gate runs git diff itself, so a range it cannot diff fails the job.
       - name: Run ledger check
         if: steps.bypass.outputs.found != 'true'
@@ -199,7 +202,7 @@ jobs:
   # squash commit on dev/main is written by the merge box, not a contributor.
   dco:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -229,7 +232,7 @@ jobs:
   release:
     needs: [build, lua-tests, native-tests, coverage, static-analysis, invariant-ledger]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:
@@ -245,21 +248,25 @@ jobs:
         id: version
         run: |
           VERSION=$(grep -oP '(?<=")\d+\.\d+\.\d+(?=")' src/thesada_config.h)
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           # CalVer tags carry no v-prefix (26.06.1), aligned with the app.
-          echo "tag=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
 
+      # The build job and this checkout are both github.sha. Skips only when
+      # the tag and its release already sit on this commit, fails on any other tag.
       - name: Check if release already exists
         id: check_tag
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
-          if gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-            echo "Release ${{ steps.version.outputs.tag }} already exists - skipping"
+          plan="$(./scripts/release-target.sh plan "$TAG" "$GITHUB_SHA")"
+          if [ "$plan" = skip ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already exists on $GITHUB_SHA - skipping"
           else
-            echo "exists=false" >> $GITHUB_OUTPUT
-            echo "New version ${{ steps.version.outputs.tag }} - will create release"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "New version $TAG - will create release on $GITHUB_SHA"
           fi
 
       - name: Download build artifacts
@@ -280,7 +287,7 @@ jobs:
             LOG=$(git log --pretty=format:"- %s" --no-merges -20 | grep -v "^- release:" || true)
           fi
           echo "$LOG" > /tmp/changelog.txt
-          echo "prev_tag=$PREV_TAG" >> $GITHUB_OUTPUT
+          echo "prev_tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Create release
         if: steps.check_tag.outputs.exists == 'false'
@@ -298,11 +305,10 @@ jobs:
           **Full diff:** https://github.com/${{ github.repository }}/compare/${PREV:-main}...${TAG}
           EOF
 
-          gh release create "$TAG" \
+          # Tags the built commit, then fails unless the tag landed on it.
+          ./scripts/release-target.sh create "$TAG" "$GITHUB_SHA" /tmp/notes.md \
             artifacts/firmware.bin \
             artifacts/firmware_minimal.bin \
             artifacts/firmware.json \
             artifacts/boards/firmware-owb.bin \
-            artifacts/boards/firmware-owb-rescue.bin \
-            --title "thesada-fw $TAG" \
-            --notes-file /tmp/notes.md
+            artifacts/boards/firmware-owb-rescue.bin

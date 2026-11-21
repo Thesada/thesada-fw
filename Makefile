@@ -95,8 +95,9 @@ test-lua: ## Lua rules harness against the mocked bindings
 	$(LUA) tests/lua/run_all.lua
 
 .PHONY: test-gates
-test-gates: ## Self-test the invariant-ledger gate (CI runs it in the invariant-ledger job)
+test-gates: ## Self-test the invariant-ledger gate and the release tag check (CI runs both in the invariant-ledger job)
 	./tests/test_invariant_ledger.sh
+	./tests/test_release_target.sh
 
 .PHONY: coverage
 coverage: ## Per-file line-coverage floors from scripts/coverage-floors.txt

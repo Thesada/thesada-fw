@@ -11,10 +11,12 @@ usage: git diff --cached --name-only | check-invariant-ledger.sh
 
 A change to a file that docs/invariants.md cites on a Source: line must also
 change the ledger. Citing a file there puts it under the gate. --list prints
-the gated files in the work tree, tracked or not ignored.
+the gated files in the work tree, tracked or not ignored. Each entry carries
+its own Dated line, and a Dated line above the first ## heading fails, so no
+file-wide line makes every two ledger changes conflict.
 Bypass: INVARIANT_OK=1, or an `INVARIANT_OK: 1` trailer in the CI range.
-Exit 0 clean, 1 ledger not in the change (--list: a cited name matches no
-file), 2 the ledger or the range could not be read.
+Exit 0 clean, 1 ledger not in the change or a file-wide Dated line (--list:
+a cited name matches no file), 2 the ledger or the range could not be read.
 EOF
   exit 2
 }
@@ -24,6 +26,12 @@ ledger="${INVARIANT_LEDGER:-$root/docs/invariants.md}"
 if [ ! -r "$ledger" ]; then
   echo "invariant-ledger check: cannot read $ledger" >&2
   exit 2
+fi
+
+if awk '/^## /{exit} /^Dated /{f=1; exit} END{exit !f}' "$ledger"; then
+  echo "invariant-ledger check: a Dated line above the first ## heading of $ledger." >&2
+  echo "Date the entry you change, on its own line above its Source: line." >&2
+  exit 1
 fi
 
 # Print the stdin paths the ledger cites, a bare name matching any path ending
@@ -113,7 +121,7 @@ Sensitive files in this change (cited on a Source: line of the ledger):
 $touched_sensitive
 
 If this change establishes or relies on a new invariant, update
-docs/invariants.md (bump the Dated line) and include it.
+docs/invariants.md (the entry and its own Dated line) and include it.
 
 If it does not, bypass with:
     INVARIANT_OK=1   (env var for the commit / workflow run)

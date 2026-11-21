@@ -24,6 +24,14 @@ static int slowSend(lua_State* S) {
   return 0;
 }
 
+// reloadFromBinding(): what a binding that reaches lua.reload sees.
+static bool reloadPending = false;
+static bool reloadRanInside = true;
+static int reloadFromBinding(lua_State*) {
+  reloadRanInside = luaReloadNow(host.budget, &reloadPending);
+  return 0;
+}
+
 void setUp(void) {
   clockMs = 0;
   stepMs = 0;
@@ -34,6 +42,7 @@ void setUp(void) {
   luaOpenLibs(L);
   luaBudgetWrapProtectedCalls(L);
   lua_register(L, "slowSend", slowSend);
+  lua_register(L, "reloadFromBinding", reloadFromBinding);
 }
 
 void tearDown(void) {
@@ -121,8 +130,21 @@ void test_loop_of_slow_sends_ends(void) {
   lua_pop(L, 1);
 }
 
+// A reload reached from a binding, or a callback nested in one, is latched
+// and runs once the outermost call has returned.
+void test_reload_from_a_binding_waits_for_the_loop(void) {
+  reloadPending = false;
+  reloadRanInside = true;
+  TEST_ASSERT_EQUAL_INT(LUA_OK, run("pcall(function() reloadFromBinding() end)"));
+  TEST_ASSERT_FALSE(reloadRanInside);
+  TEST_ASSERT_TRUE(reloadPending);
+  TEST_ASSERT_TRUE(luaReloadDue(host.budget, &reloadPending));
+  TEST_ASSERT_FALSE(reloadPending);
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
+  RUN_TEST(test_reload_from_a_binding_waits_for_the_loop);
   RUN_TEST(test_runaway_call_raises);
   RUN_TEST(test_call_inside_budget_returns_and_feeds);
   RUN_TEST(test_coroutine_created_after_setup_is_budgeted);

@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include <string.h>
 #include <string>
+#include <utility>
 #include <vector>
 
 // Bump with every new migration and append it to CONFIG_MIGRATIONS.
@@ -77,4 +78,45 @@ inline ConfigSchemaVerdict configMigrate(JsonDocument& doc,
   }
   doc["schema"] = CONFIG_SCHEMA_CURRENT;
   return CFG_SCHEMA_MIGRATED;
+}
+
+// A whole doc pushed to replace the file: migrated and stamped before its
+// commit, so no later load migrates it again. in: staged doc. out: verdict.
+inline ConfigSchemaVerdict configMigratePushed(JsonDocument& doc,
+                                               void (*step)(int from, const char* name, size_t changed)) {
+  if (!doc.is<JsonObject>()) return CFG_SCHEMA_INVALID;
+  return configMigrate(doc, step);
+}
+
+enum ConfigMigrateResult {
+  CFG_MIGRATE_NONE,           // current, nothing written
+  CFG_MIGRATE_REREAD_FAILED,  // the file did not parse a second time
+  CFG_MIGRATE_NEWER,
+  CFG_MIGRATE_INVALID,
+  CFG_MIGRATE_BACKUP_FAILED,
+  CFG_MIGRATE_WRITE_FAILED,
+  CFG_MIGRATE_DONE,           // migrated doc on disk and live
+};
+
+// Migrate the live doc through a fresh parse of the file, since a deep copy of
+// it overflows the boot stack. live becomes the migrated doc once it is on
+// disk and is never read back, so live always holds a usable doc.
+// Fs: parse(JsonDocument&), backup(), write(JsonVariantConst), each -> bool.
+// in: fs, parsed live doc, step callback. out: result.
+template <typename Fs>
+inline ConfigMigrateResult configMigrateLive(Fs& fs, JsonDocument& live,
+                                             void (*step)(int from, const char* name, size_t changed)) {
+  if (configSchemaVersion(live.as<JsonVariantConst>()) == CONFIG_SCHEMA_CURRENT) return CFG_MIGRATE_NONE;
+  JsonDocument work;
+  if (!fs.parse(work)) return CFG_MIGRATE_REREAD_FAILED;
+  switch (configMigrate(work, step)) {
+    case CFG_SCHEMA_CURRENT: return CFG_MIGRATE_NONE;
+    case CFG_SCHEMA_NEWER:   return CFG_MIGRATE_NEWER;
+    case CFG_SCHEMA_INVALID: return CFG_MIGRATE_INVALID;
+    case CFG_SCHEMA_MIGRATED: break;
+  }
+  if (!fs.backup()) return CFG_MIGRATE_BACKUP_FAILED;
+  if (!fs.write(work.as<JsonVariantConst>())) return CFG_MIGRATE_WRITE_FAILED;
+  live = std::move(work);
+  return CFG_MIGRATE_DONE;
 }

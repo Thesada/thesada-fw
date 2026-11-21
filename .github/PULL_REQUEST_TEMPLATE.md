@@ -19,7 +19,7 @@
 ## Invariant ledger
 
 - [ ] Touches a file `docs/invariants.md` cites on a `Source:` line (`scripts/check-invariant-ledger.sh --list`)
-- [ ] `docs/invariants.md` updated (and `Dated` line bumped) in this PR
+- [ ] `docs/invariants.md` updated in this PR, each changed entry with its own `Dated` line
 - [ ] OR: bypass justified - explain why no invariant is established or relied on
 
 The `invariant-ledger` CI job enforces this for every cited file.

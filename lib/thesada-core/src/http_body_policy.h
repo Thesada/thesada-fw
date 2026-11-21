@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include "config_bounds.h"
 
 struct HttpBody {
   size_t len;      // bytes received, SIZE_MAX once a chunk was refused
@@ -21,13 +22,12 @@ struct HttpBody {
 static const size_t HTTP_FILE_MAX = 65536;
 
 // Body caps per endpoint, bytes.
-static const size_t HTTP_BODY_CFG_MAX  = 16384;
 static const size_t HTTP_BODY_CMD_MAX  = 2048;
 static const size_t HTTP_BODY_FILE_MAX = HTTP_FILE_MAX;
 
 // Bytes all POST bodies may hold at once: one full file write beside one
 // config push. Without it, concurrent authed POSTs each malloc their cap.
-static const size_t HTTP_BODY_BUDGET = HTTP_BODY_FILE_MAX + HTTP_BODY_CFG_MAX;
+static const size_t HTTP_BODY_BUDGET = HTTP_BODY_FILE_MAX + CONFIG_FILE_MAX;
 
 // in: bytes held now, bytes wanted, budget. out: true, and held grows, when it fits.
 inline bool httpBodyReserve(size_t& held, size_t want, size_t budget) {
