@@ -22,6 +22,7 @@ struct Dev {
   int  cfgWrites = 0;
   bool failAck = false, failCert = false, failKey = false, failCfg = false;
   bool failClear = false, failStageClear = false;
+  bool failAckRead = false;  // NVS open fails on the ack read
 
   bool write() {
     if (budget == 0) return false;
@@ -33,7 +34,11 @@ struct Dev {
     ack = v;
     return true;
   }
-  bool ackPending() { return ack; }
+  bool ackRead(bool& v) {
+    if (failAckRead) return false;
+    v = ack;
+    return true;
+  }
   bool stagePut() {
     if (!write()) return false;
     stgGen = reply;
@@ -78,7 +83,7 @@ struct Dev {
   // Power back on, faults gone: recovery reads the staged fields.
   EnrollRecover boot() {
     budget = -1;
-    failAck = failCert = failKey = failCfg = failClear = failStageClear = false;
+    failAck = failCert = failKey = failCfg = failClear = failStageClear = failAckRead = false;
     target = stgGen;
     EnrollRecover r = enrollRecover(*this);
     if (!(cert && key) && ack) ack = false;  // Enroll::begin drops an ack with no cert
@@ -223,6 +228,36 @@ void test_sealed_stage_is_only_cleared(void) {
   TEST_ASSERT_EQUAL(0, d.cfgWrites);
 }
 
+// The ack read fails: neither sealed nor pending is known, so nothing is touched.
+void test_ack_read_failure_keeps_stage_for_boot(void) {
+  for (int sealed = 0; sealed <= 1; sealed++) {
+    Dev d;
+    d.stg = true;
+    d.stgGen = 1;
+    d.target = 1;
+    d.cert = d.key = 1;
+    d.cfg = 0;
+    d.ack = !sealed;
+    d.failAckRead = true;
+    TEST_ASSERT_EQUAL(EnrollRecover::Left, enrollRecover(d));
+    TEST_ASSERT_TRUE(d.stg);
+    TEST_ASSERT_EQUAL(!sealed, d.ack);
+    TEST_ASSERT_EQUAL(1, d.cert);
+    TEST_ASSERT_EQUAL(0, d.cfgWrites);
+  }
+  // Read works on the next boot: a pending ack rolls forward.
+  Dev d;
+  d.stg = true;
+  d.stgGen = 1;
+  d.cert = d.key = 1;
+  d.ack = true;
+  d.failAckRead = true;
+  d.target = 1;
+  TEST_ASSERT_EQUAL(EnrollRecover::Left, enrollRecover(d));
+  TEST_ASSERT_EQUAL(EnrollRecover::RolledForward, d.boot());
+  TEST_ASSERT_TRUE(d.isNew(1));
+}
+
 // A stray key half from an older cert.set must not pass as the new pair.
 void test_mismatched_half_pair_rolls_back(void) {
   Dev d;
@@ -320,6 +355,7 @@ int main(int, char**) {
   RUN_TEST(test_stage_put_failure_changes_nothing);
   RUN_TEST(test_boot_without_stage_is_idle);
   RUN_TEST(test_sealed_stage_is_only_cleared);
+  RUN_TEST(test_ack_read_failure_keeps_stage_for_boot);
   RUN_TEST(test_mismatched_half_pair_rolls_back);
   RUN_TEST(test_power_cut_at_every_write_recovers_old_or_new);
   RUN_TEST(test_power_cut_during_recovery_recovers_on_next_boot);

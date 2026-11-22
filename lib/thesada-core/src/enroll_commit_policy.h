@@ -7,7 +7,7 @@
 
 // Ops is any type with these members, each one NVS or config write or read:
 //   bool ackSet(bool)            the ack_pending flag
-//   bool ackPending()
+//   bool ackRead(bool& pending)  false when the flag could not be read
 //   bool stagePut()              the reply's mqtt fields, then the stage marker
 //   bool stagePresent()          the marker
 //   bool stageClear()            the marker first, then the fields
@@ -64,13 +64,15 @@ EnrollCommit enrollCommit(Ops& ops) {
 
 // Boot path, before enrollment picks its step. A marker with a usable cert
 // rolls forward, any other marker rolls back. A cleared ack means the app
-// already sealed this cert, so the config is left alone.
+// already sealed this cert, so the config is left alone. An unread ack leaves all for the next boot.
 // in: ops. out: outcome.
 template <class Ops>
 EnrollRecover enrollRecover(Ops& ops) {
   if (!ops.stagePresent()) return EnrollRecover::Idle;
   if (ops.certUsable()) {
-    if (!ops.ackPending()) {
+    bool pending = false;
+    if (!ops.ackRead(pending)) return EnrollRecover::Left;
+    if (!pending) {
       ops.stageClear();
       return EnrollRecover::Kept;
     }

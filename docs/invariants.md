@@ -579,11 +579,13 @@ each issue revokes the one before. The ack seals the enrollment row for good.
 | a reply is stored only when its `device_id` is this unit, host, port and prefix are usable (`enrollReplyUsable`), and the cert and key validate as a pair | a cert for another unit, or a broker the device cannot reach, strands it with nothing to retry |
 | write order is the NVS `ack_pending` flag, the staged `mqtt.*` fields with their `stg` marker set last, the cert, then `mqtt.*` config, then the marker cleared (`enrollCommit`) | the config is the commit point, so it never names the enrolled broker while no cert for it is stored |
 | a failed cert or config write clears the cert, the marker and the ack, so config and cert are both what they were and the next poll stores again. A cert that will not clear keeps the marker and reboots | a stored cert with the old config would sit in `await_mtls` and never poll again |
-| at boot, before the start step, a set marker with a stored pair that validates and a pending ack rolls forward: config from the staged fields, then a reboot when it changed. Any other marker rolls back to no cert. A marker with a cleared ack is only removed (`enrollRecover`) | a power cut anywhere in the store ends fully old and re-enrollable, or fully new. The app re-signs on every poll until the ack, so a rollback costs one poll |
+| at boot, before the start step, a set marker with a stored pair that validates and a pending ack rolls forward: config from the staged fields, then a reboot when it changed. Any other marker rolls back to no cert. A marker with a cleared ack is only removed. An ack flag NVS cannot read leaves marker, ack, cert and config for the next boot (`enrollRecover`) | a power cut anywhere in the store ends fully old and re-enrollable, or fully new. The app re-signs on every poll until the ack, so a rollback costs one poll |
 | the ack goes out only after a WiFi broker session that presented the client cert | sealing a cert that never connected leaves the app no way to re-issue |
 | the enrollment POST verifies the server against `/ca.crt` or the baked roots, never `setInsecure` | the claim code goes out, and the private key comes back, on this link |
 | HTTPS runs on its own 12 KB task; Config, Secret and NVS are touched only from the main loop | the handshake overflows the loop stack, and Config is single-task |
 | a timed-out POST is kept until its task finishes, and no second POST starts while it is alive | dropping the job and starting another overlaps two handshakes and leaks the first |
+
+Dated 2026-11-22
 
 Source: `lib/thesada-core/src/Enroll.cpp`, `lib/thesada-core/src/enroll_policy.h`,
 `lib/thesada-core/src/enroll_commit_policy.h`, `test/test_enroll_commit/`,

@@ -128,13 +128,19 @@ static const char* stepSuffix(EnrollStep s) {
   }
 }
 
-// Whether a stored cert still owes an ack. in: none. out: true when the flag is set.
-static bool ackPendingGet() {
+// Read the ack flag. in: v. out: false when NVS did not open, v untouched.
+static bool ackPendingRead(bool& v) {
   Preferences p;
   if (!p.begin(NS, false)) return false;
-  bool v = p.getBool(K_ACK, false);
+  v = p.getBool(K_ACK, false);
   p.end();
-  return v;
+  return true;
+}
+
+// Whether a stored cert still owes an ack. in: none. out: true when the flag is set.
+static bool ackPendingGet() {
+  bool v = false;
+  return ackPendingRead(v) && v;
 }
 
 // Store whether a delivered cert still owes an ack.
@@ -265,7 +271,7 @@ struct EnrollStore {
   bool        compare = false;  // skip the write when disk already matches
 
   bool ackSet(bool v) { return ackPendingSet(v); }
-  bool ackPending() { return ackPendingGet(); }
+  bool ackRead(bool& v) { return ackPendingRead(v); }
 
   bool stagePut() {
     Preferences p;
