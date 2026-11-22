@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#include "config_mask_policy.h"
 
 // lfs_dir_find skips "." segments. in: path. out: path past its leading
 // slashes and "." segments, "" for the root.
@@ -122,8 +123,20 @@ inline bool configKeyIsPrefix(const char* key) {
 
 // The reply config.set / config.del give once the edit is on disk and live.
 // in: buf, key, value (null for a delete), file prefix not live yet. out: buf filled.
+// A secret value reads as its marker, a literal with secrets inside as its masked form.
 inline void configSavedReply(char* buf, size_t cap, const char* key, const char* value, bool pending = false) {
   const bool restart = pending && configKeyIsPrefix(key);
+  char shown[160];
+  if (value && configPathIsSecret(key)) {
+    value = *value ? CONFIG_MASK_SET : CONFIG_MASK_EMPTY;
+  } else if (value && (*value == '{' || *value == '[')) {
+    JsonDocument lit;
+    if (!deserializeJson(lit, value, DeserializationOption::NestingLimit(CONFIG_MAX_DEPTH)) &&
+        configMaskTree(lit.as<JsonVariant>()) > 0) {
+      serializeJson(lit, shown, sizeof(shown));
+      value = shown;
+    }
+  }
   if (value && restart) {
     (void)snprintf(buf, cap, "Set %s = %s (saved, new prefix applies after restart)", key, value);
   } else if (value) {

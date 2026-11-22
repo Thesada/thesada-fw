@@ -156,6 +156,26 @@ void test_claim_frees_the_slot_when_it_ends(void) {
   TEST_ASSERT_TRUE(next.held());
 }
 
+// A second TLS session on a fragmented heap OOMs: drop MQTT first, but never
+// from inside a client call, and only when the session is up and heap is short.
+void test_tls_heap_yield_only_when_mqtt_up_and_heap_short(void) {
+  TEST_ASSERT_TRUE(tlsHeapYieldDue(true, TLS_SECOND_SESSION_MIN_ALLOC - 1, false));
+  TEST_ASSERT_TRUE(tlsHeapYieldDue(true, 31732, false));
+  TEST_ASSERT_FALSE(tlsHeapYieldDue(true, TLS_SECOND_SESSION_MIN_ALLOC, false));
+  TEST_ASSERT_FALSE(tlsHeapYieldDue(false, 1000, false));
+  TEST_ASSERT_FALSE(tlsHeapYieldDue(true, 1000, true));
+}
+
+// The reconnect hold is rollover-safe and a zero hold holds nothing.
+void test_tls_hold_ends_after_its_span(void) {
+  TEST_ASSERT_TRUE(tlsHoldActive(1000, 1000, 500));
+  TEST_ASSERT_TRUE(tlsHoldActive(1499, 1000, 500));
+  TEST_ASSERT_FALSE(tlsHoldActive(1500, 1000, 500));
+  TEST_ASSERT_FALSE(tlsHoldActive(1000, 1000, 0));
+  TEST_ASSERT_TRUE(tlsHoldActive(100, 0xFFFFFF00u, 0x1000));
+  TEST_ASSERT_FALSE(tlsHoldActive(0x2000, 0xFFFFFF00u, 0x1000));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_keep_counts_every_byte_and_stops_copying_at_the_cap);
@@ -172,5 +192,7 @@ int main(int, char**) {
   RUN_TEST(test_finish_racing_the_give_up_keeps_one_owner);
   RUN_TEST(test_second_claim_is_refused_while_the_first_holds);
   RUN_TEST(test_claim_frees_the_slot_when_it_ends);
+  RUN_TEST(test_tls_heap_yield_only_when_mqtt_up_and_heap_short);
+  RUN_TEST(test_tls_hold_ends_after_its_span);
   return UNITY_END();
 }

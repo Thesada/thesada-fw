@@ -14,6 +14,7 @@
 #include "cli_authz_policy.h"
 #include "Identity.h"
 #include "mqtt_rollback_policy.h"
+#include "http_fetch_policy.h"
 #include "cmd_config_policy.h"
 #include "clock_floor_policy.h"
 #include "temp_guard_policy.h"
@@ -220,6 +221,8 @@ struct ClientCall {
   ~ClientCall() { --s_clientCalls; }
 };
 
+static void flushHeldCli();
+
 MQTTMessage      MQTTClient::_queue[MQTT_QUEUE_SIZE];
 uint8_t          MQTTClient::_queueHead     = 0;
 uint8_t          MQTTClient::_queueTail     = 0;
@@ -307,6 +310,28 @@ void MQTTClient::dropSession() {
   ClientCall c;
   _client.disconnect();
   closeSession();
+}
+
+static uint32_t s_tlsHoldSince = 0;
+static uint32_t s_tlsHoldMs    = 0;
+
+bool MQTTClient::yieldTlsHeap(const char* why, uint32_t holdMs) {
+  const uint32_t maxAlloc = ESP.getMaxAllocHeap();
+  if (!tlsHeapYieldDue(_client.connected(), maxAlloc, s_clientCalls > 0)) return false;
+  Log::kvfw(TAG, "mqtt.tls_heap_yield by=%s max_alloc=%u hold_ms=%u", why ? why : "?",
+            (unsigned)maxAlloc, (unsigned)holdMs);
+  dropSession();
+  s_tlsHoldSince = millis();
+  s_tlsHoldMs    = holdMs;
+  delay(200);  // TCP teardown frees the mbedtls context
+  return true;
+}
+
+void MQTTClient::releaseTlsHeap() {
+  if (s_tlsHoldMs == 0) return;
+  s_tlsHoldMs   = 0;
+  _retryInterval = RETRY_MIN_MS;
+  _lastAttempt   = millis() - RETRY_MIN_MS;
 }
 
 const char* MQTTClient::transportName() {
@@ -873,10 +898,17 @@ void MQTTClient::connect() {
   if (session == MQTT_LG_RETRY) return;
   const bool  lastGood = session == MQTT_LG_DIAL;
   // Host and credentials from one source: begin() may have decided before this.
-  if (lastGood || wasFallback) {
+  {
     JsonVariantConst src = lastGood ? lg.as<JsonVariantConst>() : cfg["mqtt"].as<JsonVariantConst>();
     const char* host = src["broker"] | "";
-    if (*host && mqttHostCopy(_brokerHost, sizeof(_brokerHost), host)) {
+    const MqttEndpoint ep = mqttSessionEndpoint(lastGood, wasFallback, host);
+    if (ep == MQTT_EP_CLEAR) {
+      // Live creds never dial the last-good broker. Later attempts follow mqttShouldDial.
+      _brokerHost[0] = '\0';
+      Log::kvfw(TAG, "mqtt.config_rollback_session_end reason=no_live_broker action=no_dial");
+      return;
+    }
+    if (ep == MQTT_EP_SET && mqttHostCopy(_brokerHost, sizeof(_brokerHost), host)) {
       _brokerPort = src["port"] | 8883;
       _client.setServer(_brokerHost, _brokerPort);
     }
@@ -1040,6 +1072,7 @@ void MQTTClient::connect() {
     // force=true: WiFi reconnect must not be blocked by a stale cellular flag.
     publishRetainedSet(true);
     flushQueue();
+    flushHeldCli();
   } else {
     // A failed resolve or dial never reached PubSubClient, so its state() is stale.
     const int rc = dialed ? _client.state() : MQTT_CONNECT_FAILED;
@@ -1268,6 +1301,7 @@ void MQTTClient::loop() {
   if (transportWanted() == MqttTransport::NONE) return;
 
   uint32_t now = millis();
+  if (tlsHoldActive(now, s_tlsHoldSince, s_tlsHoldMs)) return;
   if (now - _lastAttempt >= _retryInterval) {
     _lastAttempt = now;
     connect();
@@ -1486,6 +1520,22 @@ void MQTTClient::onMessage(char* topic, uint8_t* payload, unsigned int length) {
 // carrying this change or those devices go mute on CLI.
 // A reply over cap is refused and logged: clipped JSON reaches nobody intact.
 // in: prefix, resp, payload byte cap (cliReplyCap). out: none.
+// One CLI reply that met a dropped session (a TLS heap yield) waits here for
+// the next connect: the outage queue holds 256 B, a reply up to cap.
+static char* s_heldCliTopic = nullptr;
+static char* s_heldCliReply = nullptr;
+
+static void freeHeldCli() {
+  free(s_heldCliTopic); s_heldCliTopic = nullptr;
+  free(s_heldCliReply); s_heldCliReply = nullptr;
+}
+
+static void flushHeldCli() {
+  if (!s_heldCliTopic || !s_heldCliReply) return;
+  MQTTClient::publishNow(s_heldCliTopic, s_heldCliReply);
+  freeHeldCli();
+}
+
 static void publishCliResponse(const char* prefix, JsonDocument& resp,
                                size_t cap) {
   char topic[CLI_TOPIC_CAP];
@@ -1505,6 +1555,14 @@ static void publishCliResponse(const char* prefix, JsonDocument& resp,
     return;
   }
   serializeJson(resp, rp, need + 1);
+  if (!MQTTClient::connected()) {
+    freeHeldCli();
+    s_heldCliTopic = strdup(topic);
+    s_heldCliReply = rp;
+    if (!s_heldCliTopic) freeHeldCli();
+    Log::kvfw("MQTT", "mqtt.cli_response_held bytes=%u held=%d", (unsigned)need, s_heldCliReply ? 1 : 0);
+    return;
+  }
   MQTTClient::publishNow(topic, rp);
   free(rp);
 }
@@ -1682,12 +1740,18 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
 
         fs::FS* catfs = Shell::resolveFS(path);
         const char* catFsPath = Shell::stripPrefix(path);
+        // Ranges of a masked file are cut from its masked text, never the bytes.
+        String masked;
+        const ConfigFileRead mr = Config::readFileMasked(*catfs, catFsPath, path, masked);
         File f = catfs->open(catFsPath, "r");
         if (!f) {
           resp["ok"] = false;
           resp["output"][0] = "File not found";
+        } else if (mr == CFG_READ_REFUSE) {
+          resp["ok"] = false;
+          resp["output"][0] = "Refused: config file is not one JSON object or does not fit, not shown";
         } else {
-          size_t total = f.size();
+          size_t total = mr == CFG_READ_MASKED ? masked.length() : f.size();
           resp["ok"] = true;
           resp["total"] = (int)total;
           resp["offset"] = (int)offset;
@@ -1697,12 +1761,17 @@ void MQTTClient::runCli(const char* cmd, const char* payload, size_t plen,
             resp["done"] = true;
             resp["data"] = "";
           } else {
-            f.seek(offset);
             size_t avail = total - offset;
             size_t toRead = min(chunkLen, avail);
             char* buf = (char*)malloc(toRead + 1);
             if (buf) {
-              size_t got = f.read((uint8_t*)buf, toRead);
+              size_t got = toRead;
+              if (mr == CFG_READ_MASKED) {
+                memcpy(buf, masked.c_str() + offset, toRead);
+              } else {
+                f.seek(offset);
+                got = f.read((uint8_t*)buf, toRead);
+              }
               // Size the reply around empty data, then send only the bytes
               // whose escaped form fits. length tells the caller where to resume.
               resp["length"] = (int)got;

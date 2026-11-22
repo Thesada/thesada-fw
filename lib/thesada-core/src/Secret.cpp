@@ -4,6 +4,7 @@
 // Raw IDF nvs API, not Arduino Preferences: an absent namespace/key is the
 // normal standalone path and Preferences ERROR-logs every miss (un-maskable
 // ARDUINO tag); the nvs calls return ESP_ERR_NVS_NOT_FOUND quietly.
+#include "config_mask_policy.h"
 #include "Secret.h"
 #include "secret_keymap.h"
 #include <nvs.h>
@@ -44,6 +45,7 @@ bool Secret::set(const char* field, const char* value) {
   char key[16];
   if (!nvsKeyFor(field, key, sizeof(key))) return false;
   if (!value || !*value) return clear(field);   // empty value = clear
+  if (configIsMaskMarker(value)) return false;   // a config read mask is never a secret
   if (strlen(value) >= MAX_LEN) return false;    // must fit every read buffer
   nvs_handle_t h;
   if (nvs_open(SECRET_NS, NVS_READWRITE, &h) != ESP_OK) return false;

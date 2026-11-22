@@ -6,6 +6,7 @@
 #include "Identity.h"
 #include "Config.h"
 #include "Secret.h"
+#include "SecretJson.h"
 #include "Console.h"
 #include "Log.h"
 #include "WiFiManager.h"
@@ -568,6 +569,19 @@ static void cmd_cat(int argc, char** argv, ShellOutput out) {
   FS* fs = resolveFS(argv[1]);
   const char* fsPath = stripPrefix(argv[1]);
 
+  // The config file and any JSON object with secrets in it print masked.
+  String masked;
+  switch (Config::readFileMasked(*fs, fsPath, argv[1], masked)) {
+    case CFG_READ_REFUSE:
+      Shell::fail(out, "Refused: config file is not one JSON object or does not fit, not shown");
+      return;
+    case CFG_READ_MASKED:
+      out(masked.c_str());
+      return;
+    case CFG_READ_RAW:
+      break;
+  }
+
   File f = fs->open(fsPath, "r");
   if (!f) { out("File not found"); return; }
 
@@ -836,11 +850,15 @@ static void cmd_config_get(int argc, char** argv, ShellOutput out) {
 
   if (current.isNull()) {
     out("null");
-  } else {
-    String val;
-    serializeJsonPretty(current, val);
-    out(val.c_str());
+    return;
   }
+  // Secret fields read as their marker (config_mask_policy.h).
+  String val;
+  if (!configMaskedNodeText(argv[1], current, val, true, secretJsonAllocator())) {
+    Shell::fail(out, "Config read out of memory");
+    return;
+  }
+  out(val.c_str());
 }
 
 // Set a dotted key (value) or delete it (null) through Config::edit, then reply.
@@ -874,6 +892,13 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
   if (value.length() >= 2 && value.charAt(0) == '"' && value.charAt(value.length() - 1) == '"') {
     value.remove(value.length() - 1);
     value.remove(0, 1);
+  }
+  // A read mask sent back is not a value: the stored secret stays.
+  if (configSetKeepsSecret(argv[1], value.c_str())) {
+    char msg[160];
+    snprintf(msg, sizeof(msg), "Kept %s (read mask, stored secret unchanged)", argv[1]);
+    out(msg);
+    return;
   }
   shellConfigApply(argv[1], value == "--delete" ? nullptr : value.c_str(), out);
 }
@@ -952,7 +977,10 @@ static void cmd_config_reload(int argc, char** argv, ShellOutput out) {
 static void cmd_config_dump(int argc, char** argv, ShellOutput out) {
   JsonObject cfg = Config::get();
   String json;
-  serializeJsonPretty(cfg, json);
+  if (!configMaskedNodeText("", cfg, json, true, secretJsonAllocator())) {
+    Shell::fail(out, "Config read out of memory");
+    return;
+  }
   out(json.c_str());
 }
 
@@ -1240,6 +1268,7 @@ struct HttpFetchJob {
   bool          ok;
   const char*   err;        // static message, nullptr on success
   std::atomic<uint32_t> state;  // HTTP_JOB_*, the task's last write
+  int           tlsErr;     // WiFi mbedtls error of a failed GET, 0 if none
 };
 
 // The WiFi fetch. Every local, the CA PEM included, lives until return.
@@ -1277,6 +1306,10 @@ static void httpFetchRun(HttpFetchJob* job) {
   http.setTimeout(10000);
 
   job->status = http.GET();
+  if (job->status < 0 && job->https) {
+    char eb[64];
+    job->tlsErr = tls.lastError(eb, sizeof(eb));
+  }
   if (job->status > 0) {
     job->ok = true;
     int         len = http.getSize();  // -1 when chunked / unknown
@@ -1329,8 +1362,8 @@ static void httpFetchTask(void* arg) {
   } else {
     httpFetchRun(job);
   }
-  Log::kvf("Shell", "shell.http_done via=%s status=%d body=%u cut=%d stack_free=%u",
-           job->cellGet ? "cellular" : "wifi", job->status, (unsigned)job->body.total,
+  Log::kvf("Shell", "shell.http_done via=%s status=%d tls_err=%d body=%u cut=%d stack_free=%u",
+           job->cellGet ? "cellular" : "wifi", job->status, job->tlsErr, (unsigned)job->body.total,
            (int)job->body.cut, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
   if (httpJobFinish(job->state)) delete job;
   vTaskDelete(nullptr);
@@ -1410,8 +1443,10 @@ static void cmd_http(int argc, char** argv, ShellOutput out) {
     job->port    = port;
   }
 
+  const bool yielded = MQTTClient::yieldTlsHeap("net.http", waitMs);
   if (xTaskCreate(httpFetchTask, "net.http", 12288, job,
                   tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
+    if (yielded) MQTTClient::releaseTlsHeap();
     out("net.http: failed to spawn fetch task");
     delete job;
     return;
@@ -1432,6 +1467,7 @@ static void cmd_http(int argc, char** argv, ShellOutput out) {
   }
   Log::kvf("Shell", "shell.http_wait via=%s waited_ms=%u mqtt_ticks=%u loop_stack_free=%u", via,
            (unsigned)(millis() - t0), ticks, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+  if (yielded) MQTTClient::releaseTlsHeap();
   if (job->state.load() != HTTP_JOB_DONE && !httpJobAbandon(job->state)) {
     // The task owns the job now and frees it when its own bounds end the GET.
     Log::kvfw("Shell", "shell.http_abandoned via=%s wait_ms=%u", via, (unsigned)waitMs);

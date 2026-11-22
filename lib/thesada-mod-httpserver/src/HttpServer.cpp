@@ -464,7 +464,8 @@ static size_t _configWriteOrReply(AsyncWebServerRequest* req, const char* body, 
   auto done  = std::make_shared<std::atomic<bool>>(false);
   auto bytes = std::make_shared<size_t>(0);
   bool queued = Shell::enqueueDeferred([doc, done, bytes, restart]() {
-    bool ok = Config::writeFile(doc->as<JsonVariantConst>(), true, bytes.get());
+    // An editor save of a masked read keeps the stored secrets.
+    bool ok = Config::keepStoredSecrets(*doc) && Config::writeFile(doc->as<JsonVariantConst>(), true, bytes.get());
     if (!ok) *bytes = 0;
     // Set here, not after the wait, so a 504 still restarts into what landed.
     if (ok && restart) _restartPending = true;
@@ -485,6 +486,24 @@ static size_t _configWriteOrReply(AsyncWebServerRequest* req, const char* body, 
     return 0;
   }
   return *bytes;
+}
+
+// A file the mask policy covers is answered here: masked text, or 403.
+// in: request, fs, path, content type. out: true when a reply was sent.
+static bool _sendMaskedOrReply(AsyncWebServerRequest* req, fs::FS& fs, const char* path, const char* shown,
+                               const char* type) {
+  String masked;
+  switch (Config::readFileMasked(fs, path, shown, masked)) {
+    case CFG_READ_RAW:
+      return false;
+    case CFG_READ_MASKED:
+      req->send(200, type, masked);
+      return true;
+    case CFG_READ_REFUSE:
+      break;
+  }
+  req->send(403, "application/json", "{\"ok\":false,\"error\":\"config file is not one JSON object or does not fit, not shown\"}");
+  return true;
 }
 
 // Single-use WS grants (ws_grant_policy.h): /api/ws/token mints a random token
@@ -902,13 +921,14 @@ void HttpServer::setupRoutes() {
     req->send(200, "application/json", out);
   });
 
-  // ── GET /api/config - read config.json ────────────────────────────────────
+  // ── GET /api/config - read config.json, secret fields masked ─────────────
   server.on("/api/config", HTTP_GET, [](AsyncWebServerRequest* req) {
     if (!_authOrReply(req)) return;
     if (!LittleFS.exists("/config.json")) {
       req->send(404, "application/json", "{\"error\":\"config.json not found\"}");
       return;
     }
+    if (_sendMaskedOrReply(req, LittleFS, "/config.json", "/config.json", "application/json")) return;
     req->send(LittleFS, "/config.json", "application/json");
   });
 
@@ -937,6 +957,13 @@ void HttpServer::setupRoutes() {
       req->send(200, "application/json", "{\"ok\":false,\"error\":\"config.json not found\"}");
       return;
     }
+    // The backup holds the masked form: a restore keeps the stored secrets.
+    String masked;
+    const ConfigFileRead mr = Config::readFileMasked(LittleFS, "/config.json", "/config.json", masked);
+    if (mr == CFG_READ_REFUSE) {
+      req->send(200, "application/json", "{\"ok\":false,\"error\":\"config.json is not one JSON object\"}");
+      return;
+    }
     File src = LittleFS.open("/config.json", "r");
     if (!src) {
       req->send(200, "application/json", "{\"ok\":false,\"error\":\"read failed\"}");
@@ -948,10 +975,14 @@ void HttpServer::setupRoutes() {
       req->send(200, "application/json", "{\"ok\":false,\"error\":\"SD write failed - is card mounted?\"}");
       return;
     }
-    uint8_t buf[512];
-    bool    copied = true;
-    for (int n; copied && (n = src.read(buf, sizeof(buf))) > 0;) {
-      copied = dst.write(buf, (size_t)n) == (size_t)n;
+    bool copied = true;
+    if (mr == CFG_READ_MASKED) {
+      copied = dst.write((const uint8_t*)masked.c_str(), masked.length()) == masked.length();
+    } else {
+      uint8_t buf[512];
+      for (int n; copied && (n = src.read(buf, sizeof(buf))) > 0;) {
+        copied = dst.write(buf, (size_t)n) == (size_t)n;
+      }
     }
     src.close(); dst.close();
     if (!copied) {
@@ -1161,7 +1192,9 @@ void HttpServer::setupRoutes() {
     bool useLFS     = (src == "littlefs");
     bool useScripts = (src == "scripts");
     if (useScripts) path = "/scripts" + path;
-    File f = (useLFS || useScripts) ? LittleFS.open(path.c_str(), FILE_READ) : SD_MMC.open(path.c_str(), FILE_READ);
+    fs::FS& rfs = (useLFS || useScripts) ? (fs::FS&)LittleFS : (fs::FS&)SD_MMC;
+    if (_sendMaskedOrReply(req, rfs, path.c_str(), path.c_str(), "text/plain")) return;
+    File f = rfs.open(path.c_str(), FILE_READ);
     if (!f || f.isDirectory()) { req->send(404, "text/plain", "not found"); return; }
     // Streamed whole, never clipped. The response owns f and closes it.
     req->send(f, path, "text/plain");

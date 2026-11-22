@@ -29,6 +29,20 @@ inline bool httpWaitTickDue(uint32_t lastMs, uint32_t nowMs) {
   return (uint32_t)(nowMs - lastMs) >= HTTP_WAIT_TICK_MS;
 }
 
+// Under this largest free block a second TLS session next to MQTT's OOMs.
+static constexpr uint32_t TLS_SECOND_SESSION_MIN_ALLOC = 40000;
+
+// Drop the MQTT session before another TLS session: up, heap short, and not
+// from inside a client call. in: session up, max alloc, in a call. out: drop.
+inline bool tlsHeapYieldDue(bool mqttUp, uint32_t maxAlloc, bool inClientCall) {
+  return mqttUp && maxAlloc < TLS_SECOND_SESSION_MIN_ALLOC && !inClientCall;
+}
+
+// Rollover-safe. in: now, hold start, hold length (0 = none). out: still held.
+inline bool tlsHoldActive(uint32_t nowMs, uint32_t sinceMs, uint32_t holdMs) {
+  return (uint32_t)(nowMs - sinceMs) < holdMs;
+}
+
 struct HttpPreview {
   char   data[HTTP_PREVIEW_CAP];
   size_t len;    // bytes kept in data

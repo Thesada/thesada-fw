@@ -26,9 +26,10 @@ struct FakeFile {
 struct FakeFs {
   bool        mounts = true;
   bool        exists = true;
+  bool        unreadable = false;
   std::string text;
   bool mount() { return mounts; }
-  long size() const { return exists ? (long)text.size() : -1; }
+  long size() const { return unreadable ? CONFIG_SIZE_UNREADABLE : exists ? (long)text.size() : -1; }
   bool parse(JsonDocument& doc, DeserializationError& err) {
     if (!exists) return false;
     FakeFile f{text};
@@ -681,7 +682,7 @@ void test_rescue_stage_fresh_doc_on_a_blank_filesystem(void) {
   fs.exists = true;
   fs.opens  = false;
   fs.text   = "{\"mqtt\":{}}";
-  TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_NO_LIVE, configStageRescue(fs, staged, err, 3));
+  TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_READ_FAILED, configStageRescue(fs, staged, err, 3));
 }
 
 // A live doc that exists but could not be copied (no heap) is not a blank
@@ -749,6 +750,43 @@ void test_config_object_bytes_parse_into_the_doc(void) {
   TEST_ASSERT_FALSE(configParseObjectBytes(doc, nullptr, 4));
 }
 
+// A file that exists but cannot be read is a staging failure, never the live
+// doc: an edit on live would overwrite newer disk-only settings.
+void test_stage_refuses_an_existing_file_it_cannot_read(void) {
+  StageFs fs;
+  fs.text  = "{\"mqtt\":{\"broker\":\"disk.example\"}}";
+  fs.opens = false;
+  JsonDocument staged;
+  DeserializationError err;
+  TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_READ_FAILED, configStage(fs, staged, err));
+  TEST_ASSERT_TRUE(staged.isNull());
+  TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_READ_FAILED, configStageRescue(fs, staged, err, 3));
+  fs.opens = true;
+  TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_FILE, configStage(fs, staged, err));
+}
+
+// size() reports an existing file it cannot open apart from a missing one.
+void test_stage_refuses_a_file_whose_size_cannot_be_read(void) {
+  StageFs fs;
+  fs.unreadable = true;
+  JsonDocument staged;
+  DeserializationError err;
+  TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_READ_FAILED, configStage(fs, staged, err));
+  TEST_ASSERT_EQUAL_INT(CONFIG_STAGE_READ_FAILED, configStageRescue(fs, staged, err, 3));
+}
+
+// A writer refuses a doc the next load would refuse for depth, and keeps one at the limit.
+void test_depth_check_matches_the_load_limit(void) {
+  for (int levels = CONFIG_MAX_DEPTH; levels <= CONFIG_MAX_DEPTH + 1; levels++) {
+    const std::string text = nested(levels);
+    JsonDocument doc;
+    TEST_ASSERT_FALSE(deserializeJson(doc, text, DeserializationOption::NestingLimit(CONFIG_MAX_DEPTH + 4)));
+    const bool fits = levels <= CONFIG_MAX_DEPTH;
+    TEST_ASSERT_EQUAL(fits, configDepthOk(doc.as<JsonVariantConst>()));
+    TEST_ASSERT_EQUAL(fits, configBytesAreObject(text.c_str(), text.size()));
+  }
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_good_file_replaces_the_live_doc);
@@ -789,5 +827,8 @@ int main(int, char**) {
   RUN_TEST(test_shell_prefix_delete_holds_the_boot_prefix);
   RUN_TEST(test_shell_prefix_hold_that_cannot_be_kept);
   RUN_TEST(test_failed_live_copy_is_not_a_blank_filesystem);
+  RUN_TEST(test_stage_refuses_an_existing_file_it_cannot_read);
+  RUN_TEST(test_stage_refuses_a_file_whose_size_cannot_be_read);
+  RUN_TEST(test_depth_check_matches_the_load_limit);
   return UNITY_END();
 }

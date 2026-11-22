@@ -259,6 +259,9 @@ static int lua_config_get(lua_State* L) {
 
   if (current.isNull()) {
     lua_pushnil(L);
+  } else if (configPathIsSecret(key)) {
+    // Native bindings use secrets themselves. A script reads the mask only.
+    lua_pushstring(L, configMaskFor(current));
   } else if (current.is<bool>()) {
     lua_pushboolean(L, current.as<bool>());
   } else if (current.is<int>()) {
@@ -269,7 +272,10 @@ static int lua_config_get(lua_State* L) {
     lua_pushstring(L, current.as<const char*>());
   } else {
     String json;
-    serializeJson(current, json);
+    if (!configMaskedNodeText(key, current, json, false)) {
+      lua_pushnil(L);
+      return 1;
+    }
     lua_pushstring(L, json.c_str());
   }
   return 1;

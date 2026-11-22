@@ -121,7 +121,8 @@ struct ConfigTextReader {
 // Where an edit's working copy came from. PARSE_FAILED covers malformed,
 // trailing content and not one object, NO_LIVE a missing file and no live doc,
 // NO_HEAP a file that ran out of heap while it was parsed, COPY_FAILED a missing
-// file and a live doc that could not be copied.
+// file and a live doc that could not be copied, READ_FAILED a file that exists
+// and cannot be read.
 enum ConfigStage {
   CONFIG_STAGE_FILE = 0,
   CONFIG_STAGE_LIVE,
@@ -131,17 +132,32 @@ enum ConfigStage {
   CONFIG_STAGE_RESCUED,
   CONFIG_STAGE_NO_HEAP,
   CONFIG_STAGE_COPY_FAILED,
+  CONFIG_STAGE_READ_FAILED,
 };
 
+// size() for a file that exists but cannot be opened. -1 stays missing.
+constexpr long CONFIG_SIZE_UNREADABLE = -2;
+
+// in: doc. out: true when its nesting is within what every config parse accepts.
+inline bool configDepthOk(JsonVariantConst doc) {
+  return doc.nesting() <= CONFIG_MAX_DEPTH;
+}
+
 // Stage an edit from the file, the live doc only when the file is missing.
-// Fs: size() -> bytes or -1, parse(doc, err), copyLive(doc) -> bool, hasLive(). out: source.
+// Fs: size() -> bytes, -1 missing or CONFIG_SIZE_UNREADABLE, parse(doc, err),
+// copyLive(doc) -> bool, hasLive(). out: source.
 template <typename Fs>
 inline ConfigStage configStage(Fs& fs, JsonDocument& staged, DeserializationError& err) {
   err = DeserializationError::Ok;
   staged.clear();
   const long size = fs.size();
+  if (size == CONFIG_SIZE_UNREADABLE) return CONFIG_STAGE_READ_FAILED;
   if (size > (long)CONFIG_FILE_MAX) return CONFIG_STAGE_TOO_LARGE;
-  if (size >= 0 && fs.parse(staged, err)) {
+  if (size >= 0) {
+    if (!fs.parse(staged, err)) {
+      staged.clear();
+      return CONFIG_STAGE_READ_FAILED;
+    }
     if (err == DeserializationError::NoMemory) return CONFIG_STAGE_NO_HEAP;
     return err || !staged.is<JsonObject>() ? CONFIG_STAGE_PARSE_FAILED : CONFIG_STAGE_FILE;
   }

@@ -998,6 +998,62 @@ Source: `lib/thesada-core/src/MQTTClient.cpp::connect`.
 
 ---
 
+## Config secrets
+
+### No read path returns a secret config value
+
+A config field whose key names a secret reads as `(set)`, or `(empty)` for an
+empty string, never its value or length. That holds for `config.get` (leaf,
+section, array path), `config.dump`, `fs.cat` and the chunked MQTT `fs.cat`,
+`GET /api/config`, `GET /api/file`, the SD backup from `/api/backup`, the
+`config.set` reply and Lua `Config.get`, on every transport. A file named like
+the config (`config.json`, `.bak`, `.tmp`, `config_backup.json`, any case or
+trailing `/` `.` space) or any JSON object file is served masked, and a
+config-named file that is not one object is refused, never streamed. Secret
+keys: long words as a suffix (`password`, `passwd`, `secret`, `token`, `key`,
+`passphrase`, `credential`, `claim_code`), short ones as the whole key or after
+`_` `.` `-` (`pass`, `pwd`, `psk`, `seed`, `sim_pin`). A bare `pin` is a GPIO
+number and stays readable. Native modules read secrets from the live doc and
+NVS, scripts get the marker.
+
+How enforced: one predicate and serializer in `config_mask_policy.h`,
+host-tested in `test/test_config_mask` with a key-name table that covers every
+`secret_keymap.h` field. `scripts/check-config-mask.sh` (in `make lint`) fails
+when a read site stops calling it.
+
+Dated 2026-11-19
+
+Source: `lib/thesada-core/src/config_mask_policy.h`,
+`lib/thesada-core/src/Shell.cpp::cmd_config_get`,
+`lib/thesada-core/src/Config.cpp::readFileMasked`,
+`lib/thesada-mod-httpserver/src/HttpServer.cpp::_sendMaskedOrReply`,
+`lib/thesada-mod-scriptengine/src/ScriptEngine.cpp::lua_config_get`,
+`scripts/check-config-mask.sh`.
+
+### A read mask written back never replaces a stored secret
+
+A client that stores a masked read and pushes it back (the companion app, the
+web config editor, a restored SD backup) must not overwrite a real secret with
+the marker. Every whole-config write (`Config::edit`, `Config::replace`,
+`fs.write /config.json`, `POST /api/config`, `POST /api/file` to the config
+path) resolves a marker under a secret key to the value `/config.json` holds at
+the same place, else the live doc, or drops the key when there is none. A live
+doc that cannot be copied refuses the write as `copy_failed`, so a marker save
+never lands without the secrets. Wi-Fi networks match by `ssid`, so a
+reordered list keeps each password. `config.set` with a marker on a secret key
+writes nothing and replies `Kept`, a key with an empty segment is refused as
+invalid first. `secret.set` refuses a marker.
+
+How enforced: `configKeepStoredSecrets` runs in `Config::commit`,
+`Config::writeRaw` and `_configWriteOrReply`. Round trip, reorder,
+no-stored-value, copy-failed and invalid-key cases are host-tested in
+`test/test_config_mask`.
+
+Dated 2026-11-19
+
+Source: `lib/thesada-core/src/Config.cpp::keepStoredSecrets`,
+`lib/thesada-core/src/Secret.cpp::set`.
+
 ## HTTP server
 
 ### The server binds only once a netif exists
@@ -1502,6 +1558,8 @@ check this on PRs that introduce new wait loops. Async/state-machine
 refactors of these modules are out of scope - the pump call is the
 contract.
 
+Dated 2026-11-18
+
 Source: `lib/thesada-core/src/Shell.cpp::pumpConsole` and call sites
 in `Watchdog.cpp` (every `waitStep`), `OTAUpdate.cpp`, `Cellular.cpp`,
 `main.cpp`.
@@ -1763,6 +1821,11 @@ not, line reader, socket URCs, `+CNTP:` and `+CDNSGIP:` parse) under the
 95% floors on `boot_wait_policy.h`, `cell_recover_policy.h` and
 `cell_at_policy.h`. The fed take and the refusal itself run only on hardware.
 
+The held-pump count (`s_heldPumps`) is a `std::atomic`: `ATGuard` reads it
+before it takes the mutex, from any task.
+
+Dated 2026-11-21
+
 Source: `lib/thesada-mod-cellular/src/Cellular.cpp` (`atTake`, `ATGuard`,
 `pumpConsoleHeld`, `noteSocketUrc`, `waitUrcLine`, `socketRecover`,
 `Cellular::loop`), `lib/thesada-core/src/boot_wait_policy.h`,
@@ -1871,10 +1934,26 @@ session stays up (no `mqtt.state_change ... to=disconnected`),
 `loop_stack_free=` shows the loop-task margin with the tick, and
 `shell.http_done ... stack_free=` the fetch task's.
 
+A second TLS session next to MQTT's OOMs on a fragmented heap. `net.http`
+(both transports) and every enroll POST, the revocation status check
+included, call `MQTTClient::yieldTlsHeap` first: with MQTT up, the largest
+free block under `TLS_SECOND_SESSION_MIN_ALLOC` (40000) and no client call
+under way (`tlsHeapYieldDue`), it drops the session
+(`mqtt.tls_heap_yield by=... max_alloc=...`) and holds the reconnect
+(`tlsHoldActive`) for the caller's ceiling. The caller ends the hold when its
+fetch is done (`releaseTlsHeap`), and `loop()` reconnects at once. CLI replies
+of the held session queue and go out after it. A failed WiFi GET logs the
+mbedTLS error (`shell.http_done ... tls_err=`, `enroll.post_failed tls_err=`).
+`tlsHeapYieldDue` and `tlsHoldActive` are host-tested in `test/test_http_fetch`.
+
+Dated 2026-11-21
+
 Source: `lib/thesada-core/src/http_fetch_policy.h`,
 `lib/thesada-core/src/Shell.cpp` (`httpFetchTask`, `httpFetchRunCellular`,
 `cmd_http`, `pumpConsole`, `begin`),
-`lib/thesada-core/src/MQTTClient.cpp` (`tick`, `ClientCall`),
+`lib/thesada-core/src/MQTTClient.cpp` (`tick`, `ClientCall`, `yieldTlsHeap`,
+`releaseTlsHeap`, `loop`), `lib/thesada-core/src/Enroll.cpp` (`startJob`,
+`startCheck`, `enrollTask`, `loop`),
 `lib/thesada-mod-cellular/src/Cellular.cpp` (`httpsGet`, `httpsBusy`),
 `lib/thesada-core/src/OTAUpdate.cpp::downloadBinaryChunkedCellular`.
 
@@ -2091,9 +2170,15 @@ canonical in-memory form (key ordering, whitespace, numeric formatting
 from `serializeJson`) produces a different value for identical
 content and breaks drift detection silently.
 
+A file that still holds a secret in clear reads masked on every path, so
+its `config.dump` or `fs.cat` bytes no longer hash to `config_hash`. Only a
+file with no secret value in it reads back byte for byte.
+
 How enforced: hash via `sha256File("/config.json")`, never
 `serializeJson(Config::get(), ...)` into a hash. Any future
 config-hash producer (e.g. a `cli/info` handler) must use the file.
+
+Dated 2026-11-19
 
 Source: `lib/thesada-core/src/MQTTClient.cpp::publishDeviceInfo`.
 
@@ -2503,6 +2588,15 @@ a set and a delete with no hold, under a hold, to the live value, and a hold
 that cannot be kept. `configSavedReply` and `configKeyIsPrefix` in
 `config_write_policy.h`, host-tested in `test/test_config_write`.
 
+A `/config.json` that exists but cannot be opened (`size()` returns
+`CONFIG_SIZE_UNREADABLE`, or the parse cannot reopen it) stages nothing:
+`CONFIG_STAGE_READ_FAILED`, `config.edit_failed reason=file_unreadable`, from
+`edit` and the portal alike. Only a confirmed missing file stages from live,
+so an edit never writes the older live doc over newer disk-only settings.
+Host-tested in `test/test_config_load`.
+
+Dated 2026-11-21
+
 Source: `lib/thesada-core/src/config_load_policy.h`, `lib/thesada-core/src/config_bounds.h`,
 `scripts/static-check.sh`,
 `lib/thesada-core/src/Config.cpp::edit`, `rescueEdit`, `replace`, `commit`, `writeFile`,
@@ -2587,6 +2681,13 @@ step replies:
 Temperature discover edits the file on disk, not the live doc, because
 `fs.write` can leave the file ahead of the live doc until a restart. A
 file that exists but does not parse as an object is never overwritten.
+
+`writeFile` refuses a doc nested past `CONFIG_MAX_DEPTH` before it opens the
+tmp (`config.save_failed reason=too_deep`, `configDepthOk`), so it never saves
+a file the next load refuses. `writeRaw` gets the same bound from its parse.
+`configDepthOk` against the load parse is host-tested in `test/test_config_load`.
+
+Dated 2026-11-21
 
 Source: `lib/thesada-core/src/Config.cpp::writeFile`, `::writeRaw`, `::commit`,
 `lib/thesada-core/src/Shell.cpp::writeRouted`,
@@ -2697,8 +2798,17 @@ missing candidate and a snapshot without a broker all dial the live config.
 truncated, non-object, too deep or brokerless snapshot is LIVE.
 `snapshotGoodConfig()` checks `mqttSnapshotProven()` first, same test file.
 
+When the fallback ends on a live config with no broker, `connect()` clears
+the cached broker and dials nothing in that call
+(`mqtt.config_rollback_session_end reason=no_live_broker action=no_dial`,
+`mqttSessionEndpoint` CLEAR), so live credentials never reach the last-good
+broker. Later attempts follow `mqttShouldDial`. `mqttSessionEndpoint` is
+host-tested in `test/test_rollback_session`.
+
+Dated 2026-11-21
+
 Source: `lib/thesada-core/src/mqtt_rollback_policy.h::mqttRollbackShould`, `mqttSnapshotProven`,
-`mqttRollbackSessionLastGood`, `mqttRollbackSessionDecide`,
+`mqttRollbackSessionLastGood`, `mqttRollbackSessionDecide`, `mqttSessionEndpoint`,
 `MQTTClient.cpp::snapshotGoodConfig`, `rollbackIfUncommitted`, `rollbackSessionState`, `connect`;
 `src/main.cpp` boot call.
 

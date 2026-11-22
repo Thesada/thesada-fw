@@ -157,6 +157,10 @@ static void enrollTask(void* arg) {
       http.setTimeout(10000);
       http.addHeader("Content-Type", "application/json");
       job->status = http.POST((uint8_t*)job->body, strlen(job->body));
+      if (job->status < 0) {
+        char eb[64];
+        Log::kvfw(TAG, "enroll.post_failed status=%d tls_err=%d", job->status, tls.lastError(eb, sizeof(eb)));
+      }
       if (job->status == 200) {
         if (http.getSize() > (int)REPLY_CAP) {
           job->status = ST_OVERSIZE;
@@ -309,7 +313,9 @@ static void startJob() {
     Log::kvfe(TAG, "enroll.disabled reason=request_unbuildable step=%s", stepName(_step));
     return;
   }
+  const bool yielded = MQTTClient::yieldTlsHeap("enroll", JOB_CEILING_MS);
   if (xTaskCreate(enrollTask, "enroll", TASK_STACK, job, tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
+    if (yielded) MQTTClient::releaseTlsHeap();
     mbedtls_platform_zeroize(job->body, sizeof(job->body));
     delete job;
     advance(ST_LOCAL);
@@ -356,8 +362,10 @@ static void startCheck() {
                enrollEndpoint(_url, ENROLL_STATUS_SUFFIX, job->url, sizeof(job->url)) &&
                enrollStatusBody(job->body, sizeof(job->body), Identity::deviceId(),
                                 Identity::publicKeyHex(), _check.serial, ts, sigHex);
+  const bool yielded = built && MQTTClient::yieldTlsHeap("enroll.status", JOB_CEILING_MS);
   if (!built ||
       xTaskCreate(enrollTask, "enroll", TASK_STACK, job, tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
+    if (yielded) MQTTClient::releaseTlsHeap();
     delete job;
     checkUnanswered(ST_LOCAL);
     return;
@@ -471,6 +479,7 @@ void Enroll::loop() {
   if (_stale) return;
   if (_job) {
     if (_job->done) {
+      MQTTClient::releaseTlsHeap();
       finishJob();
     } else if (millis() - _jobAt > JOB_CEILING_MS) {
       // The task still owns the job. Reap it once done; do not start another.

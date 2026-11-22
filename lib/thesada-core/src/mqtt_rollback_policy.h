@@ -81,3 +81,18 @@ inline bool mqttRollbackSessionLastGood(bool persistFailed, const char* failing,
                                         const char* lgText, JsonDocument& lg) {
   return mqttRollbackSessionDecide(persistFailed, failing, cur, lgText, lg) == MQTT_LG_DIAL;
 }
+
+// KEEP: the endpoint begin() set. SET: the host given. CLEAR: no broker, dial nothing.
+enum MqttEndpoint {
+  MQTT_EP_KEEP = 0,
+  MQTT_EP_SET,
+  MQTT_EP_CLEAR,
+};
+
+// A fallback that ends on a live config without a broker must not keep the
+// last-good host, or live credentials dial it. in: DIAL, fallback was on, host.
+inline MqttEndpoint mqttSessionEndpoint(bool lastGood, bool wasFallback, const char* host) {
+  if (!lastGood && !wasFallback) return MQTT_EP_KEEP;
+  if (host && *host) return MQTT_EP_SET;
+  return lastGood ? MQTT_EP_KEEP : MQTT_EP_CLEAR;
+}

@@ -35,8 +35,22 @@ void test_rollback_session_survives_a_no_heap_parse(void) {
   TEST_ASSERT_EQUAL_INT(MQTT_LG_LIVE, mqttRollbackSessionDecide(true, BAD, BAD, "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]", lg));
 }
 
+// The session endpoint: a set host replaces it. A fallback that ended on a live
+// config with no broker clears it and dials nothing, so live creds never reach
+// the last-good broker. A plain live session keeps what begin() set.
+void test_session_endpoint_clears_when_fallback_ends_without_broker(void) {
+  TEST_ASSERT_EQUAL_INT(MQTT_EP_SET, mqttSessionEndpoint(true, true, "lg.example"));
+  TEST_ASSERT_EQUAL_INT(MQTT_EP_SET, mqttSessionEndpoint(false, true, "live.example"));
+  TEST_ASSERT_EQUAL_INT(MQTT_EP_CLEAR, mqttSessionEndpoint(false, true, ""));
+  TEST_ASSERT_EQUAL_INT(MQTT_EP_CLEAR, mqttSessionEndpoint(false, true, nullptr));
+  TEST_ASSERT_EQUAL_INT(MQTT_EP_KEEP, mqttSessionEndpoint(false, false, ""));
+  TEST_ASSERT_EQUAL_INT(MQTT_EP_KEEP, mqttSessionEndpoint(false, false, "live.example"));
+  TEST_ASSERT_EQUAL_INT(MQTT_EP_KEEP, mqttSessionEndpoint(true, false, ""));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_rollback_session_survives_a_no_heap_parse);
+  RUN_TEST(test_session_endpoint_clears_when_fallback_ends_without_broker);
   return UNITY_END();
 }
