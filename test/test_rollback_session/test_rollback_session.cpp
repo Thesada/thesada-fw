@@ -4,6 +4,8 @@
 #include <unity.h>
 #include <stdlib.h>
 #include "mqtt_rollback_policy.h"
+#include "mqtt_topic_policy.h"
+#include <string>
 
 void setUp(void) {}
 void tearDown(void) {}
@@ -48,9 +50,20 @@ void test_session_endpoint_clears_when_fallback_ends_without_broker(void) {
   TEST_ASSERT_EQUAL_INT(MQTT_EP_KEEP, mqttSessionEndpoint(true, false, ""));
 }
 
+
+// A live broker past the host buffer dials nothing, never the old host with live creds.
+void test_endpoint_overlong_host_clears(void) {
+  std::string host(MQTT_BROKER_HOST_CAP, 'h');
+  TEST_ASSERT_EQUAL_INT(MQTT_EP_CLEAR, mqttSessionEndpoint(false, true, host.c_str()));
+  TEST_ASSERT_EQUAL_INT(MQTT_EP_CLEAR, mqttSessionEndpoint(true, true, host.c_str()));
+  host.pop_back();
+  TEST_ASSERT_EQUAL_INT(MQTT_EP_SET, mqttSessionEndpoint(false, true, host.c_str()));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_rollback_session_survives_a_no_heap_parse);
   RUN_TEST(test_session_endpoint_clears_when_fallback_ends_without_broker);
+  RUN_TEST(test_endpoint_overlong_host_clears);
   return UNITY_END();
 }

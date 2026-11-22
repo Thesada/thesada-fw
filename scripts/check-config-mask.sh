@@ -44,6 +44,8 @@ need "$HTTP_CPP" 'server.on("/api/backup", HTTP_POST' "$ROUTE_END" 'Config::read
 need "$HTTP_CPP" 'static size_t _configWriteOrReply(' "$FN_END" 'Config::keepStoredSecrets('
 need "$LUA_CPP" 'static int lua_config_get(' "$FN_END" 'configPathIsSecret('
 need "$LUA_CPP" 'static int lua_config_get(' "$FN_END" 'configMaskedNodeText('
+need "$LUA_CPP" 'static int lua_config_get(' "$FN_END" 'configLookupKeyFits('
+need "$SHELL_CPP" 'static void cmd_mv(' "$FN_END" 'fsMoveRoute('
 
 # The live doc is never serialized straight into a reply.
 if grep -nE 'serializeJson(Pretty)?\((Config::get\(\)|cfg|current)[,)]' "$SHELL_CPP" "$LUA_CPP" >&2; then

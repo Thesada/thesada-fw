@@ -49,6 +49,24 @@ inline bool configWriteLanded(size_t written, size_t onDisk, size_t expected) {
   return expected > 0 && fileWriteLanded(written, onDisk, expected);
 }
 
+// The config editor stages a save here, then moves it over /config.json.
+static const char CONFIG_STAGED_NAME[] = "config.json.new";
+
+enum FsMoveRoute {
+  FS_MOVE_PLAIN = 0,       // rename as asked
+  FS_MOVE_CONFIG_STAGED,   // the staged save: written through Config::writeRaw, then removed
+  FS_MOVE_CONFIG_REFUSED,  // any other move onto the config file
+};
+
+// How fs.mv reaches dst. Only the staged save may become /config.json, and it
+// goes through the write path that keeps stored secrets, never a rename.
+// in: both on LittleFS, src and dst after stripPrefix. out: route.
+inline FsMoveRoute fsMoveRoute(bool littleFs, const char* src, const char* dst) {
+  if (!littleFs || !configPathIsLive(dst)) return FS_MOVE_PLAIN;
+  return src && strcmp(fsSkipRootDots(src), CONFIG_STAGED_NAME) == 0 ? FS_MOVE_CONFIG_STAGED
+                                                                    : FS_MOVE_CONFIG_REFUSED;
+}
+
 static const char UPLOAD_TMP_NAME[] = ".upload.tmp";
 static const char UPLOAD_BAK_NAME[] = ".upload.bak";
 
@@ -123,7 +141,8 @@ inline bool configKeyIsPrefix(const char* key) {
 
 // The reply config.set / config.del give once the edit is on disk and live.
 // in: buf, key, value (null for a delete), file prefix not live yet. out: buf filled.
-// A secret value reads as its marker, a literal with secrets inside as its masked form.
+// A secret value reads as its marker, a literal with secrets inside, or a
+// duplicate key, as its masked form cut to fit, a literal that does not parse not at all.
 inline void configSavedReply(char* buf, size_t cap, const char* key, const char* value, bool pending = false) {
   const bool restart = pending && configKeyIsPrefix(key);
   char shown[160];
@@ -131,10 +150,15 @@ inline void configSavedReply(char* buf, size_t cap, const char* key, const char*
     value = *value ? CONFIG_MASK_SET : CONFIG_MASK_EMPTY;
   } else if (value && (*value == '{' || *value == '[')) {
     JsonDocument lit;
-    if (!deserializeJson(lit, value, DeserializationOption::NestingLimit(CONFIG_MAX_DEPTH)) &&
-        configMaskTree(lit.as<JsonVariant>()) > 0) {
-      serializeJson(lit, shown, sizeof(shown));
-      value = shown;
+    if (deserializeJson(lit, value, DeserializationOption::NestingLimit(CONFIG_MAX_DEPTH))) {
+      value = "(value not shown)";
+    } else {
+      const bool whole = configParseKeptMembers(value, strlen(value), lit.as<JsonVariantConst>());
+      if (configMaskTree(lit.as<JsonVariant>()) > 0 || !whole) {
+        const size_t n = serializeJson(lit, shown, sizeof(shown) - 1);
+        shown[n] = '\0';
+        value = shown;
+      }
     }
   }
   if (value && restart) {

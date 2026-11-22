@@ -5,6 +5,7 @@
 #include "config_mask_policy.h"
 #include "config_write_policy.h"
 #include "secret_keymap.h"
+#include <stdlib.h>
 #include <string.h>
 #include <string>
 
@@ -346,6 +347,123 @@ void test_keep_stored_copy_failed_refuses(void) {
   TEST_ASSERT_EQUAL(CONFIG_KEEP_COPY_FAILED, configKeepStoredSecrets(corrupt, staged, stored));
 }
 
+
+// Fails every allocation once armed, so a set() that copies a string fails.
+struct ArmedAllocator : ArduinoJson::Allocator {
+  bool armed = false;
+  void* allocate(size_t n) override { return armed ? nullptr : malloc(n); }
+  void  deallocate(void* p) override { free(p); }
+  void* reallocate(void* p, size_t n) override { return armed ? nullptr : realloc(p, n); }
+};
+
+// A stored secret that cannot be copied into staged refuses the save and leaves nothing staged.
+void test_keep_stored_set_failure_refuses(void) {
+  ArmedAllocator alloc;
+  JsonDocument staged(&alloc), stored;
+  FakeKeepSource fromFile{"{\"mqtt\":{\"password\":\"S-mqtt-a-long-stored-secret-value\"}}", nullptr, false};
+  deserializeJson(staged, kMarked);
+  alloc.armed = true;
+  TEST_ASSERT_EQUAL(CONFIG_KEEP_SET_FAILED, configKeepStoredSecrets(fromFile, staged, stored));
+  alloc.armed = false;
+  TEST_ASSERT_TRUE(staged.isNull());
+}
+
+// One object and nothing after it: a second object would be served raw.
+void test_file_read_trailing_content_refused(void) {
+  std::string out;
+  const char two[] = "{}{\"password\":\"S-web\"}";
+  TEST_ASSERT_EQUAL(CFG_READ_REFUSE, configFileReadMasked("/config.json.tmp", two, strlen(two), out));
+  TEST_ASSERT_EQUAL(CFG_READ_REFUSE, configFileReadMasked("/notes.json", two, strlen(two), out));
+  const char spaced[] = "{\"device\":{\"name\":\"n1\"}}\n  \n";
+  TEST_ASSERT_EQUAL(CFG_READ_RAW, configFileReadMasked("/config.json", spaced, strlen(spaced), out));
+}
+
+// A duplicate key collapses in the parse, so the bytes are never served as they are.
+void test_file_read_duplicate_key_not_raw(void) {
+  std::string out;
+  const char dup[] = "{\"password\":\"S-web\",\"password\":null}";
+  const ConfigFileRead r = configFileReadMasked("/notes.json", dup, strlen(dup), out);
+  TEST_ASSERT_EQUAL(CFG_READ_MASKED, r);
+  assertNoSecret(out);
+  const char nested[] = "{\"a\":{\"x\":1,\"x\":2},\"b\":[{\"k\":1}]}";
+  TEST_ASSERT_EQUAL(CFG_READ_MASKED, configFileReadMasked("/config.json", nested, strlen(nested), out));
+  const char strs[] = "{\"a\":\"x:y\",'b':'c:d',\"e\":\"q\\\":\"}";
+  TEST_ASSERT_EQUAL(CFG_READ_RAW, configFileReadMasked("/config.json", strs, strlen(strs), out));
+}
+
+void test_member_marks_count_colons_outside_strings(void) {
+  const char t[] = "{\"a\":\"x:y\",\"b\":{\"c\":[1,{\"d\":2}]},'e':'\\':'}";
+  TEST_ASSERT_EQUAL(5, configJsonMemberMarks(t, strlen(t)));
+  JsonDocument doc;
+  parse(doc, t);
+  TEST_ASSERT_EQUAL(5, configTreeMembers(doc.as<JsonVariantConst>()));
+  TEST_ASSERT_TRUE(configParseKeptMembers(t, strlen(t), doc.as<JsonVariantConst>()));
+}
+
+struct TextReader {
+  const char* p;
+  int read() { return *p ? (unsigned char)*p++ : -1; }
+};
+
+// Leading JSON whitespace does not hide an object from the mask.
+void test_first_non_space_byte(void) {
+  TextReader a{" \t\r\n{\"password\":\"S-web\"}"};
+  const int first = configFirstNonSpace(a);
+  TEST_ASSERT_EQUAL('{', first);
+  TEST_ASSERT_TRUE(configFileNeedsMask("/notes.json", first));
+  TextReader b{"   "};
+  TEST_ASSERT_EQUAL(-1, configFirstNonSpace(b));
+  TextReader c{"print(1)"};
+  TEST_ASSERT_EQUAL('p', configFirstNonSpace(c));
+}
+
+// Before any byte is buffered: open failure, size and first byte decide.
+void test_file_pre_read(void) {
+  TEST_ASSERT_EQUAL(CFG_PRE_REFUSE, configFilePreRead("/config.json", false, true, -1, 0));
+  TEST_ASSERT_EQUAL(CFG_PRE_RAW, configFilePreRead("/config.json", false, false, -1, 0));
+  TEST_ASSERT_EQUAL(CFG_PRE_RAW, configFilePreRead("/notes.txt", false, true, -1, 0));
+  TEST_ASSERT_EQUAL(CFG_PRE_REFUSE, configFilePreRead("/notes.json", true, true, '{', CONFIG_FILE_MAX + 1));
+  TEST_ASSERT_EQUAL(CFG_PRE_REFUSE, configFilePreRead("/config.json", true, true, 'x', CONFIG_FILE_MAX + 1));
+  TEST_ASSERT_EQUAL(CFG_PRE_RAW, configFilePreRead("/log.txt", true, true, 'p', CONFIG_FILE_MAX + 1));
+  TEST_ASSERT_EQUAL(CFG_PRE_BUFFER, configFilePreRead("/notes.json", true, true, '{', 10));
+  TEST_ASSERT_EQUAL(CFG_PRE_RAW, configFilePreRead("/notes.json", true, true, 'p', 10));
+}
+
+// A marker is found after JSON decoding, escaped or not.
+void test_raw_write_plan(void) {
+  JsonDocument doc;
+  const char esc[] = "{\"mqtt\":{\"password\":\"\\u0028set)\"}}";
+  TEST_ASSERT_EQUAL(CFG_RAW_KEEP, configRawWritePlan(doc, esc, strlen(esc)));
+  const char plain[] = "{\"mqtt\":{\"password\":\"(set)\"}}";
+  TEST_ASSERT_EQUAL(CFG_RAW_KEEP, configRawWritePlan(doc, plain, strlen(plain)));
+  const char real[] = "{\"mqtt\":{\"password\":\"x\"},\"device\":{\"name\":\"(set)\"}}";
+  TEST_ASSERT_EQUAL(CFG_RAW_AS_IS, configRawWritePlan(doc, real, strlen(real)));
+  TEST_ASSERT_EQUAL(CFG_RAW_NOT_OBJECT, configRawWritePlan(doc, "[1]", 3));
+  TEST_ASSERT_EQUAL(CFG_RAW_NOT_OBJECT, configRawWritePlan(doc, "{}{}", 4));
+}
+
+// A masked literal past the reply buffer is cut and terminated, never read past.
+void test_saved_reply_long_literal_terminated(void) {
+  std::string lit = "{\"password\":\"S-web\",\"note\":\"" + std::string(300, 'n') + "\"}";
+  char buf[600];
+  configSavedReply(buf, sizeof(buf), "mqtt", lit.c_str());
+  assertNoSecret(buf);
+  std::string want = std::string("{\"password\":\"(set)\",\"note\":\"") + std::string(300, 'n');
+  want = want.substr(0, 159) + " (saved";
+  TEST_ASSERT_NOT_NULL_MESSAGE(strstr(buf, want.c_str()), buf);
+}
+
+// A literal that does not parse, or collapses a duplicate key, never echoes as typed.
+void test_saved_reply_unparsed_or_duplicate_not_echoed(void) {
+  char buf[300];
+  configSavedReply(buf, sizeof(buf), "mqtt", "{\"password\":\"S-web\"");
+  assertNoSecret(buf);
+  configSavedReply(buf, sizeof(buf), "mqtt", "{\"password\":\"S-web\",\"password\":null}");
+  assertNoSecret(buf);
+  configSavedReply(buf, sizeof(buf), "mqtt", "{\"broker\":\"b.example\"}");
+  TEST_ASSERT_NOT_NULL(strstr(buf, "mqtt = {\"broker\":\"b.example\"}"));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_keymap_fields_are_secret);
@@ -369,5 +487,14 @@ int main(int, char**) {
   RUN_TEST(test_set_invalid_key_not_kept);
   RUN_TEST(test_keep_stored_from_file_or_live);
   RUN_TEST(test_keep_stored_copy_failed_refuses);
+  RUN_TEST(test_keep_stored_set_failure_refuses);
+  RUN_TEST(test_file_read_trailing_content_refused);
+  RUN_TEST(test_file_read_duplicate_key_not_raw);
+  RUN_TEST(test_member_marks_count_colons_outside_strings);
+  RUN_TEST(test_first_non_space_byte);
+  RUN_TEST(test_file_pre_read);
+  RUN_TEST(test_raw_write_plan);
+  RUN_TEST(test_saved_reply_long_literal_terminated);
+  RUN_TEST(test_saved_reply_unparsed_or_duplicate_not_echoed);
   return UNITY_END();
 }

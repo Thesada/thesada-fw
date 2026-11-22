@@ -24,6 +24,7 @@
 #include "glob_policy.h"
 #include "http_fetch_policy.h"
 #include "cert_policy.h"
+#include "secret_heap.h"
 #include <thesada_config.h>
 #include <mbedtls/platform_util.h>
 #include <esp_ota_ops.h>
@@ -683,8 +684,42 @@ static void cmd_write(int argc, char** argv, ShellOutput out) {
   out(msg);
 }
 
+// The editor's staged save onto /config.json: its bytes go through
+// Config::writeRaw, which keeps stored secrets, then the staged copy goes.
+// in: staged path after stripPrefix, dst as shown. out: false with the reason sent.
+static bool moveStagedConfig(const char* src, const char* dst, ShellOutput out) {
+  File f = LittleFS.open(src, "r");
+  if (!f || f.isDirectory()) {
+    if (f) f.close();
+    Shell::fail(out, "Failed to rename");
+    return false;
+  }
+  const size_t size = f.size();
+  char* buf = size > 0 && size <= CONFIG_FILE_MAX ? (char*)secretAlloc(size) : nullptr;
+  if (!buf) {
+    f.close();
+    Shell::fail(out, "Refused: staged config is empty, too large or out of heap, /config.json unchanged");
+    return false;
+  }
+  const size_t got = f.read((uint8_t*)buf, size);
+  f.close();
+  size_t onDisk = 0;
+  const bool ok = got == size && Config::writeRaw(buf, size, &onDisk);
+  secretFree(buf);
+  if (!ok) {
+    Shell::fail(out, "Failed to rename: staged config not written, /config.json unchanged");
+    return false;
+  }
+  char msg[128];
+  snprintf(msg, sizeof(msg), "Renamed %s -> %s%s", src, dst,
+           LittleFS.remove(src) ? "" : " (staged copy left)");
+  out(msg);
+  return true;
+}
+
 // Rename or move a file. Both paths must resolve to one filesystem; rename
 // cannot cross mounts, and the stripped dst would land on the src mount.
+// /config.json takes only the staged save, through the secret-keeping write.
 static void cmd_mv(int argc, char** argv, ShellOutput out) {
   if (argc < 3) { out("Usage: mv <src> <dst>"); return; }
   if (!Shell::pathSafe(argv[1]) || !Shell::pathSafe(argv[2])) {
@@ -698,6 +733,16 @@ static void cmd_mv(int argc, char** argv, ShellOutput out) {
   const char* src = stripPrefix(argv[1]);
   const char* dst = stripPrefix(argv[2]);
 
+  switch (fsMoveRoute(fs == &LittleFS, src, dst)) {
+    case FS_MOVE_CONFIG_REFUSED:
+      Shell::fail(out, "Refused: /config.json takes only config.set, fs.write or the staged /config.json.new");
+      return;
+    case FS_MOVE_CONFIG_STAGED:
+      moveStagedConfig(src, dst, out);
+      return;
+    case FS_MOVE_PLAIN:
+      break;
+  }
   if (fs->rename(src, dst)) {
     char msg[128];
     snprintf(msg, sizeof(msg), "Renamed %s -> %s", src, dst);
@@ -1262,6 +1307,7 @@ struct HttpFetchJob {
   char          host[128];
   const char*   path;       // into url, or the literal "/"
   uint16_t      port;
+  bool          pinned;     // holds an MQTT reconnect pin the task drops when it ends
   // out
   HttpPreview   body;
   int           status;
@@ -1365,6 +1411,7 @@ static void httpFetchTask(void* arg) {
   Log::kvf("Shell", "shell.http_done via=%s status=%d tls_err=%d body=%u cut=%d stack_free=%u",
            job->cellGet ? "cellular" : "wifi", job->status, job->tlsErr, (unsigned)job->body.total,
            (int)job->body.cut, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+  if (job->pinned) MQTTClient::unpinTlsHold();
   if (httpJobFinish(job->state)) delete job;
   vTaskDelete(nullptr);
 }
@@ -1444,8 +1491,12 @@ static void cmd_http(int argc, char** argv, ShellOutput out) {
   }
 
   const bool yielded = MQTTClient::yieldTlsHeap("net.http", waitMs);
+  // The pin holds the reconnect until the task ends, past an abandoned wait too.
+  job->pinned = yielded;
+  if (yielded) MQTTClient::pinTlsHold();
   if (xTaskCreate(httpFetchTask, "net.http", 12288, job,
                   tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
+    if (yielded) MQTTClient::unpinTlsHold();
     if (yielded) MQTTClient::releaseTlsHeap();
     out("net.http: failed to spawn fetch task");
     delete job;

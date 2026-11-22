@@ -231,8 +231,13 @@ static int lua_config_get(lua_State* L) {
   const char* key = luaL_checkstring(L, 1);
   JsonObject cfg = Config::get();
 
+  // A key cut to the buffer would look up one path and be classified as another.
+  if (!configLookupKeyFits(key)) {
+    lua_pushnil(L);
+    return 1;
+  }
   JsonVariant current = cfg;  // JsonObject implicitly converts to JsonVariant in ArduinoJson v7
-  char buf[128];
+  char buf[CONFIG_KEY_MAX];
   strncpy(buf, key, sizeof(buf) - 1);
   buf[sizeof(buf) - 1] = '\0';
 

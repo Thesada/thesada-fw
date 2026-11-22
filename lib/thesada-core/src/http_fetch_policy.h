@@ -43,6 +43,24 @@ inline bool tlsHoldActive(uint32_t nowMs, uint32_t sinceMs, uint32_t holdMs) {
   return (uint32_t)(nowMs - sinceMs) < holdMs;
 }
 
+enum TlsYield {
+  TLS_YIELD_NONE = 0,  // session up with heap to spare, or inside a client call
+  TLS_YIELD_HOLD,      // no session: hold the reconnect so none starts beside the caller's
+  TLS_YIELD_DROP,      // drop the session and hold the reconnect
+};
+
+// in: as tlsHeapYieldDue. out: what the caller's TLS session needs from MQTT.
+inline TlsYield tlsHeapYieldPlan(bool mqttUp, uint32_t maxAlloc, bool inClientCall) {
+  if (inClientCall) return TLS_YIELD_NONE;
+  if (!mqttUp) return TLS_YIELD_HOLD;
+  return tlsHeapYieldDue(mqttUp, maxAlloc, inClientCall) ? TLS_YIELD_DROP : TLS_YIELD_NONE;
+}
+
+// A pin is a TLS session still running past its hold timer. in: pins, as tlsHoldActive. out: held.
+inline bool tlsReconnectHeld(uint32_t pins, uint32_t nowMs, uint32_t sinceMs, uint32_t holdMs) {
+  return pins > 0 || tlsHoldActive(nowMs, sinceMs, holdMs);
+}
+
 struct HttpPreview {
   char   data[HTTP_PREVIEW_CAP];
   size_t len;    // bytes kept in data

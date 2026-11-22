@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include <string.h>
 #include "config_bounds.h"
+#include "config_load_policy.h"
 #include "config_path_policy.h"
 
 static const char CONFIG_MASK_SET[] = "(set)";
@@ -91,6 +92,42 @@ inline size_t configMaskTree(JsonVariant v) {
   return n;
 }
 
+// in: JSON bytes, length. out: ':' outside strings, one per object member.
+inline size_t configJsonMemberMarks(const char* data, size_t len) {
+  size_t n = 0;
+  char quote = 0;  // ArduinoJson also takes single-quoted strings
+  for (size_t i = 0; data && i < len; i++) {
+    const char c = data[i];
+    if (quote) {
+      if (c == '\\') i++;
+      else if (c == quote) quote = 0;
+    } else if (c == '"' || c == '\'') {
+      quote = c;
+    } else if (c == ':') {
+      n++;
+    }
+  }
+  return n;
+}
+
+// out: object members at any depth under v.
+// NOLINTNEXTLINE(misc-no-recursion)
+inline size_t configTreeMembers(JsonVariantConst v) {
+  size_t n = 0;
+  if (v.is<JsonObjectConst>()) {
+    for (JsonPairConst kv : v.as<JsonObjectConst>()) n += 1 + configTreeMembers(kv.value());
+  } else if (v.is<JsonArrayConst>()) {
+    for (JsonVariantConst e : v.as<JsonArrayConst>()) n += configTreeMembers(e);
+  }
+  return n;
+}
+
+// A duplicate key collapses to one member in the parse, so the bytes say more
+// than the tree. in: bytes, length, their parse. out: true when no member was lost.
+inline bool configParseKeptMembers(const char* data, size_t len, JsonVariantConst v) {
+  return configJsonMemberMarks(data, len) == configTreeMembers(v);
+}
+
 // The read form of the node at path (config.get, config.dump, Lua). The live
 // doc is copied through text, never changed. out: false when the copy did not fit.
 template <typename S>
@@ -155,9 +192,10 @@ inline JsonVariantConst configKeepCounterpart(JsonVariantConst e, JsonArrayConst
 }
 
 // A marker under a secret key in staged takes the stored value at the same
-// place, or is dropped when there is none. out: markers resolved.
+// place, or is dropped when there is none. out: markers resolved, *failed set
+// when a stored value could not be copied in.
 // NOLINTNEXTLINE(misc-no-recursion)
-inline size_t configKeepMasked(JsonVariant staged, JsonVariantConst stored) {
+inline size_t configKeepMasked(JsonVariant staged, JsonVariantConst stored, bool* failed = nullptr) {
   size_t n = 0;
   if (staged.is<JsonObject>()) {
     JsonObject obj = staged.as<JsonObject>();
@@ -173,15 +211,15 @@ inline size_t configKeepMasked(JsonVariant staged, JsonVariantConst stored) {
           again = true;
           break;
         }
-        kv.value().set(was);
+        if (!kv.value().set(was) && failed) *failed = true;
       }
     }
-    for (JsonPair kv : obj) n += configKeepMasked(kv.value(), stored[kv.key().c_str()]);
+    for (JsonPair kv : obj) n += configKeepMasked(kv.value(), stored[kv.key().c_str()], failed);
   } else if (staged.is<JsonArray>()) {
     JsonArrayConst st = stored.as<JsonArrayConst>();
     size_t i = 0;
     for (JsonVariant e : staged.as<JsonArray>()) {
-      n += configKeepMasked(e, configKeepCounterpart(e, st, i));
+      n += configKeepMasked(e, configKeepCounterpart(e, st, i), failed);
       i++;
     }
   }
@@ -192,10 +230,12 @@ enum ConfigKeep {
   CONFIG_KEEP_NONE = 0,     // no marker under a secret key, nothing to keep
   CONFIG_KEEP_OK,           // markers resolved against the stored config
   CONFIG_KEEP_COPY_FAILED,  // a live doc holds the secrets but could not be copied
+  CONFIG_KEEP_SET_FAILED,   // a stored value did not fit staged, staged cleared
 };
 
 // Resolve the markers in staged against the file, else the live doc. Without
-// either the markers are dropped. A live doc that could not be copied refuses. Src: parse(doc, err), copyLive(doc), hasLive().
+// either the markers are dropped. A live doc that could not be copied, or a
+// stored value that did not fit, refuses. Src: parse(doc, err), copyLive(doc), hasLive().
 template <typename Src>
 inline ConfigKeep configKeepStoredSecrets(Src& src, JsonDocument& staged, JsonDocument& stored, size_t* kept = nullptr) {
   if (kept) *kept = 0;
@@ -210,7 +250,12 @@ inline ConfigKeep configKeepStoredSecrets(Src& src, JsonDocument& staged, JsonDo
       if (src.hasLive()) return CONFIG_KEEP_COPY_FAILED;
     }
   }
-  const size_t n = configKeepMasked(staged.as<JsonVariant>(), stored.as<JsonVariantConst>());
+  bool failed = false;
+  const size_t n = configKeepMasked(staged.as<JsonVariant>(), stored.as<JsonVariantConst>(), &failed);
+  if (failed) {
+    staged.clear();
+    return CONFIG_KEEP_SET_FAILED;
+  }
   if (kept) *kept = n;
   return CONFIG_KEEP_OK;
 }
@@ -248,16 +293,40 @@ inline bool configFileIsFamily(const char* path) {
   return false;
 }
 
-// in: path, first byte of the file (-1 when empty). out: true when a reader
-// must buffer it and run configFileReadMasked instead of streaming it.
+// in: path, first non-space byte of the file (-1 when none). out: true when a
+// reader must buffer it and run configFileReadMasked instead of streaming it.
 inline bool configFileNeedsMask(const char* path, int first) {
   return configFileIsFamily(path) || first == '{';
+}
+
+// in: reader with read() -> byte or -1. out: first byte that is not JSON whitespace, -1 at the end.
+template <typename Reader>
+inline int configFirstNonSpace(Reader& in) {
+  for (int c; (c = in.read()) >= 0;) {
+    if (!configIsJsonSpace((char)c)) return c;
+  }
+  return -1;
+}
+
+enum ConfigPreRead {
+  CFG_PRE_RAW = 0,  // stream the file, the mask does not cover it
+  CFG_PRE_REFUSE,   // serve nothing
+  CFG_PRE_BUFFER,   // read it whole and run configFileReadMasked
+};
+
+// What a read does before any byte is buffered. A covered file that failed to
+// open, or does not fit the buffer, is refused, never streamed by the caller.
+// in: shown path, opened, exists, first non-space byte, size. out: verdict.
+inline ConfigPreRead configFilePreRead(const char* path, bool opened, bool exists, int first, size_t size) {
+  if (!opened) return exists && configFileIsFamily(path) ? CFG_PRE_REFUSE : CFG_PRE_RAW;
+  if (!configFileNeedsMask(path, first)) return CFG_PRE_RAW;
+  return size > CONFIG_FILE_MAX ? CFG_PRE_REFUSE : CFG_PRE_BUFFER;
 }
 
 enum ConfigFileRead {
   CFG_READ_RAW = 0,  // serve the bytes as they are: no secret in them
   CFG_READ_MASKED,   // serve out instead
-  CFG_READ_REFUSE,   // config-named but not one object: serve nothing
+  CFG_READ_REFUSE,   // config-named but not one object, or content after the object: serve nothing
 };
 
 // What a file read (fs.cat, /api/file, /api/config, backup) serves.
@@ -273,7 +342,22 @@ inline ConfigFileRead configFileReadMasked(const char* path, const char* data, s
   const bool parsed = !deserializeJson(doc, data, len, DeserializationOption::NestingLimit(CONFIG_MAX_DEPTH)) &&
                       doc.is<JsonObject>();
   if (!parsed) return family ? CFG_READ_REFUSE : CFG_READ_RAW;
-  if (configMaskTree(doc.as<JsonVariant>()) == 0) return CFG_READ_RAW;
+  if (!configNothingAfterObject(data, len)) return CFG_READ_REFUSE;
+  const bool whole = configParseKeptMembers(data, len, doc.as<JsonVariantConst>());
+  if (configMaskTree(doc.as<JsonVariant>()) == 0 && whole) return CFG_READ_RAW;
   serializeJsonPretty(doc, out);
   return CFG_READ_MASKED;
+}
+
+enum ConfigRawWrite {
+  CFG_RAW_NOT_OBJECT = 0,  // refused, nothing written
+  CFG_RAW_AS_IS,           // no marker: the bytes are written as sent
+  CFG_RAW_KEEP,            // a marker: keep the stored secrets, rewrite from doc
+};
+
+// How fs.write bytes become /config.json. Markers are found in the decoded
+// values, so an escaped spelling keeps the secret too. in: doc, bytes, length.
+inline ConfigRawWrite configRawWritePlan(JsonDocument& doc, const char* data, size_t len) {
+  if (!configParseObjectBytes(doc, data, len)) return CFG_RAW_NOT_OBJECT;
+  return configHasMaskMarker(doc.as<JsonVariantConst>()) ? CFG_RAW_KEEP : CFG_RAW_AS_IS;
 }

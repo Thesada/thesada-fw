@@ -176,6 +176,24 @@ void test_tls_hold_ends_after_its_span(void) {
   TEST_ASSERT_FALSE(tlsHoldActive(0x2000, 0xFFFFFF00u, 0x1000));
 }
 
+
+// No session to drop still holds the reconnect, so none starts beside the caller's TLS.
+void test_tls_yield_plan(void) {
+  TEST_ASSERT_EQUAL(TLS_YIELD_HOLD, tlsHeapYieldPlan(false, 100000, false));
+  TEST_ASSERT_EQUAL(TLS_YIELD_HOLD, tlsHeapYieldPlan(false, 1000, false));
+  TEST_ASSERT_EQUAL(TLS_YIELD_DROP, tlsHeapYieldPlan(true, TLS_SECOND_SESSION_MIN_ALLOC - 1, false));
+  TEST_ASSERT_EQUAL(TLS_YIELD_NONE, tlsHeapYieldPlan(true, TLS_SECOND_SESSION_MIN_ALLOC, false));
+  TEST_ASSERT_EQUAL(TLS_YIELD_NONE, tlsHeapYieldPlan(true, 1000, true));
+}
+
+// A pinned hold outlasts its timer: an abandoned fetch still owns its TLS.
+void test_tls_reconnect_held_by_pin(void) {
+  TEST_ASSERT_TRUE(tlsReconnectHeld(1, 5000, 1000, 500));
+  TEST_ASSERT_TRUE(tlsReconnectHeld(1, 1000, 1000, 0));
+  TEST_ASSERT_TRUE(tlsReconnectHeld(0, 1200, 1000, 500));
+  TEST_ASSERT_FALSE(tlsReconnectHeld(0, 5000, 1000, 500));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_keep_counts_every_byte_and_stops_copying_at_the_cap);
@@ -194,5 +212,7 @@ int main(int, char**) {
   RUN_TEST(test_claim_frees_the_slot_when_it_ends);
   RUN_TEST(test_tls_heap_yield_only_when_mqtt_up_and_heap_short);
   RUN_TEST(test_tls_hold_ends_after_its_span);
+  RUN_TEST(test_tls_yield_plan);
+  RUN_TEST(test_tls_reconnect_held_by_pin);
   return UNITY_END();
 }

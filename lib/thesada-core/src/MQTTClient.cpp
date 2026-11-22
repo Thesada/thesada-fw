@@ -30,6 +30,7 @@
 #include <WiFi.h>
 #include <LittleFS.h>
 #include <Preferences.h>
+#include <atomic>
 #include <mbedtls/sha256.h>
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/pk.h>
@@ -314,17 +315,32 @@ void MQTTClient::dropSession() {
 
 static uint32_t s_tlsHoldSince = 0;
 static uint32_t s_tlsHoldMs    = 0;
+static std::atomic<uint32_t> s_tlsHoldPins{0};
+
+// out: true while no reconnect may start a TLS session.
+static bool tlsHeldNow() {
+  return tlsReconnectHeld(s_tlsHoldPins.load(), millis(), s_tlsHoldSince, s_tlsHoldMs);
+}
 
 bool MQTTClient::yieldTlsHeap(const char* why, uint32_t holdMs) {
   const uint32_t maxAlloc = ESP.getMaxAllocHeap();
-  if (!tlsHeapYieldDue(_client.connected(), maxAlloc, s_clientCalls > 0)) return false;
-  Log::kvfw(TAG, "mqtt.tls_heap_yield by=%s max_alloc=%u hold_ms=%u", why ? why : "?",
-            (unsigned)maxAlloc, (unsigned)holdMs);
-  dropSession();
+  const TlsYield plan = tlsHeapYieldPlan(_client.connected(), maxAlloc, s_clientCalls > 0);
+  if (plan == TLS_YIELD_NONE) return false;
+  Log::kvfw(TAG, "mqtt.tls_heap_yield by=%s max_alloc=%u hold_ms=%u drop=%d", why ? why : "?",
+            (unsigned)maxAlloc, (unsigned)holdMs, plan == TLS_YIELD_DROP ? 1 : 0);
+  if (plan == TLS_YIELD_DROP) dropSession();
   s_tlsHoldSince = millis();
   s_tlsHoldMs    = holdMs;
-  delay(200);  // TCP teardown frees the mbedtls context
+  if (plan == TLS_YIELD_DROP) delay(200);  // TCP teardown frees the mbedtls context
   return true;
+}
+
+void MQTTClient::pinTlsHold() { s_tlsHoldPins.fetch_add(1); }
+
+void MQTTClient::unpinTlsHold() {
+  uint32_t n = s_tlsHoldPins.load();
+  while (n > 0 && !s_tlsHoldPins.compare_exchange_weak(n, n - 1)) {
+  }
 }
 
 void MQTTClient::releaseTlsHeap() {
@@ -902,13 +918,19 @@ void MQTTClient::connect() {
     JsonVariantConst src = lastGood ? lg.as<JsonVariantConst>() : cfg["mqtt"].as<JsonVariantConst>();
     const char* host = src["broker"] | "";
     const MqttEndpoint ep = mqttSessionEndpoint(lastGood, wasFallback, host);
+    if (ep == MQTT_EP_SET && !mqttHostCopy(_brokerHost, sizeof(_brokerHost), host)) {
+      logBrokerRefused(host, "no_dial");
+      _brokerHost[0] = '\0';
+      return;
+    }
     if (ep == MQTT_EP_CLEAR) {
       // Live creds never dial the last-good broker. Later attempts follow mqttShouldDial.
       _brokerHost[0] = '\0';
-      Log::kvfw(TAG, "mqtt.config_rollback_session_end reason=no_live_broker action=no_dial");
+      Log::kvfw(TAG, "mqtt.config_rollback_session_end reason=%s action=no_dial",
+                *host ? "broker_too_long" : "no_live_broker");
       return;
     }
-    if (ep == MQTT_EP_SET && mqttHostCopy(_brokerHost, sizeof(_brokerHost), host)) {
+    if (ep == MQTT_EP_SET) {
       _brokerPort = src["port"] | 8883;
       _client.setServer(_brokerHost, _brokerPort);
     }
@@ -1221,7 +1243,7 @@ void MQTTClient::loop() {
 
   // Deferred reconnect after reinitSubscriptions(): clean stack gives
   // mbedtls enough room (~10 KB) for the TLS handshake.
-  if (_reinitPending) {
+  if (_reinitPending && !tlsHeldNow()) {
     _reinitPending = false;
     JsonObject  cfgR = Config::get();
     const char* host = cfgR["mqtt"]["broker"] | "";
@@ -1301,7 +1323,7 @@ void MQTTClient::loop() {
   if (transportWanted() == MqttTransport::NONE) return;
 
   uint32_t now = millis();
-  if (tlsHoldActive(now, s_tlsHoldSince, s_tlsHoldMs)) return;
+  if (tlsHeldNow()) return;
   if (now - _lastAttempt >= _retryInterval) {
     _lastAttempt = now;
     connect();

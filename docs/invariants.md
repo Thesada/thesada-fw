@@ -658,14 +658,17 @@ Source: `MQTTClient.h` `MQTT_TOPIC_CAP`, `cli_topics.h` `CLI_TOPIC_CAP`,
 | Path | A host of 96 bytes or more |
 |---|---|
 | `begin()` at boot | `mqtt.broker_refused reason=too_long len= cap=96 action=no_broker`. The rest of `begin()` runs, the host stays empty, every connect fails, and the reboot budget records the config and rolls it back to last-good on the next boot |
+| a rollback session that ends on the live config (`connect()`) | `mqttSessionEndpoint` reads `MQTT_EP_CLEAR`: the host is emptied, `mqtt.config_rollback_session_end reason=broker_too_long action=no_dial`, and live credentials dial nothing |
 | the deferred reinit in `loop()` (shell `config.reload`, `cmd/config`) | `mqtt.broker_refused ... action=keep_previous`. Host and port stay the pair last handed to `setServer`, so the unit stays on the broker it had |
 | `cmd/config` | `mqtt.cmd_config_refused reason=broker_too_long`, nothing saved |
 | enrollment reply | `enrollHostUsable` refuses it. A `static_assert` in `Enroll.cpp` keeps `ENROLL_HOST_CAP` within the buffer |
 
 A connect commits last-good (`snapshotGoodConfig`) only when the configured host and port are the ones the session dialed (`mqttSnapshotProven`), else it logs `mqtt.config_commit_skipped reason=broker_not_live`. Without that, a session kept on the previous broker would commit the refused host as last-good, and after the next reboot no rollback would be left. The same check covers an `mqtt.port` written but not applied yet.
 
+Dated 2026-11-22
+
 Source: `mqtt_topic_policy.h` (`mqttHostCopy`, `mqttHostFits`, `test/test_mqtt_topic`),
-`mqtt_rollback_policy.h` (`mqttSnapshotProven`, `test/test_rollback`),
+`mqtt_rollback_policy.h` (`mqttSnapshotProven`, `mqttSessionEndpoint`, `test/test_rollback`, `test/test_rollback_session`),
 `MQTTClient.cpp` (`begin`, `loop`, `snapshotGoodConfig`, `mqttApplyCmdConfig`),
 `Enroll.cpp`.
 
@@ -1009,7 +1012,13 @@ section, array path), `config.dump`, `fs.cat` and the chunked MQTT `fs.cat`,
 `config.set` reply and Lua `Config.get`, on every transport. A file named like
 the config (`config.json`, `.bak`, `.tmp`, `config_backup.json`, any case or
 trailing `/` `.` space) or any JSON object file is served masked, and a
-config-named file that is not one object is refused, never streamed. Secret
+config-named file that is not one object is refused, never streamed. The
+object check skips leading JSON whitespace, any object file with content after
+its closing brace is refused, a parse that collapsed a duplicate key serves
+the parsed form, never the bytes, and a covered file that does not fit
+`CONFIG_FILE_MAX` or exists and fails to open is refused. A `config.set` reply
+shows a literal masked and cut to fit, one that does not parse not at all, and
+Lua `Config.get` reads nil for a key past `CONFIG_KEY_MAX`. Secret
 keys: long words as a suffix (`password`, `passwd`, `secret`, `token`, `key`,
 `passphrase`, `credential`, `claim_code`), short ones as the whole key or after
 `_` `.` `-` (`pass`, `pwd`, `psk`, `seed`, `sim_pin`). A bare `pin` is a GPIO
@@ -1021,7 +1030,7 @@ host-tested in `test/test_config_mask` with a key-name table that covers every
 `secret_keymap.h` field. `scripts/check-config-mask.sh` (in `make lint`) fails
 when a read site stops calling it.
 
-Dated 2026-11-19
+Dated 2026-11-22
 
 Source: `lib/thesada-core/src/config_mask_policy.h`,
 `lib/thesada-core/src/Shell.cpp::cmd_config_get`,
@@ -1040,19 +1049,26 @@ path) resolves a marker under a secret key to the value `/config.json` holds at
 the same place, else the live doc, or drops the key when there is none. A live
 doc that cannot be copied refuses the write as `copy_failed`, so a marker save
 never lands without the secrets. Wi-Fi networks match by `ssid`, so a
-reordered list keeps each password. `config.set` with a marker on a secret key
+reordered list keeps each password. A marker counts in the decoded value, so an
+escaped spelling keeps the secret too, and a stored value that does not fit
+the staged doc refuses the write (`reason=no_heap step=mask_keep`). `fs.mv`
+onto `/config.json` takes only `/config.json.new`, the config editor's staged
+save, and writes it through `Config::writeRaw` before removing it. Any other
+move onto the config file is refused. `config.set` with a marker on a secret key
 writes nothing and replies `Kept`, a key with an empty segment is refused as
 invalid first. `secret.set` refuses a marker.
 
 How enforced: `configKeepStoredSecrets` runs in `Config::commit`,
 `Config::writeRaw` and `_configWriteOrReply`. Round trip, reorder,
-no-stored-value, copy-failed and invalid-key cases are host-tested in
-`test/test_config_mask`.
+no-stored-value, copy-failed, set-failed, escaped-marker and invalid-key cases
+are host-tested in `test/test_config_mask`, the move routes (`fsMoveRoute`) in
+`test/test_config_write`.
 
-Dated 2026-11-19
+Dated 2026-11-22
 
 Source: `lib/thesada-core/src/Config.cpp::keepStoredSecrets`,
-`lib/thesada-core/src/Secret.cpp::set`.
+`lib/thesada-core/src/Secret.cpp::set`,
+`lib/thesada-core/src/Shell.cpp::cmd_mv`.
 
 ## HTTP server
 
@@ -1939,14 +1955,19 @@ A second TLS session next to MQTT's OOMs on a fragmented heap. `net.http`
 included, call `MQTTClient::yieldTlsHeap` first: with MQTT up, the largest
 free block under `TLS_SECOND_SESSION_MIN_ALLOC` (40000) and no client call
 under way (`tlsHeapYieldDue`), it drops the session
-(`mqtt.tls_heap_yield by=... max_alloc=...`) and holds the reconnect
-(`tlsHoldActive`) for the caller's ceiling. The caller ends the hold when its
-fetch is done (`releaseTlsHeap`), and `loop()` reconnects at once. CLI replies
+(`mqtt.tls_heap_yield by=... max_alloc=... drop=1`) and holds the reconnect
+(`tlsHoldActive`) for the caller's ceiling. With MQTT down it holds the
+reconnect without a drop (`drop=0`, `tlsHeapYieldPlan`), so no session starts
+beside the caller's. The caller ends the hold when its fetch is done
+(`releaseTlsHeap`), and `loop()` reconnects at once. A held `net.http` also
+pins the hold (`pinTlsHold`) until its task ends, so an abandoned wait keeps
+it, and the deferred reinit in `loop()` waits for the hold too. CLI replies
 of the held session queue and go out after it. A failed WiFi GET logs the
 mbedTLS error (`shell.http_done ... tls_err=`, `enroll.post_failed tls_err=`).
-`tlsHeapYieldDue` and `tlsHoldActive` are host-tested in `test/test_http_fetch`.
+`tlsHeapYieldDue`, `tlsHeapYieldPlan`, `tlsHoldActive` and `tlsReconnectHeld`
+are host-tested in `test/test_http_fetch`.
 
-Dated 2026-11-21
+Dated 2026-11-22
 
 Source: `lib/thesada-core/src/http_fetch_policy.h`,
 `lib/thesada-core/src/Shell.cpp` (`httpFetchTask`, `httpFetchRunCellular`,

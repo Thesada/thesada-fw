@@ -37,6 +37,11 @@ inline bool configKeyValid(const char* key) {
   return true;
 }
 
+// in: dotted key. out: true when all of it fits a CONFIG_KEY_MAX lookup buffer.
+inline bool configLookupKeyFits(const char* key) {
+  return key && strnlen(key, CONFIG_KEY_MAX) < CONFIG_KEY_MAX;
+}
+
 enum ConfigStore {
   CONFIG_STORE_OK = 0,
   CONFIG_STORE_TOO_DEEP,

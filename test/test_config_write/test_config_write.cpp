@@ -287,6 +287,21 @@ void test_prefix_keys(void) {
   TEST_ASSERT_FALSE(configKeyIsPrefix("mqttx"));
 }
 
+
+// Only the editor's staged copy may become /config.json by a move; any other
+// move or copy onto it is refused, the rest of the tree moves as before.
+void test_move_onto_live_config(void) {
+  TEST_ASSERT_EQUAL(FS_MOVE_CONFIG_STAGED, fsMoveRoute(true, "/config.json.new", "/config.json"));
+  TEST_ASSERT_EQUAL(FS_MOVE_CONFIG_STAGED, fsMoveRoute(true, "/./config.json.new", "/./config.json"));
+  TEST_ASSERT_EQUAL(FS_MOVE_CONFIG_REFUSED, fsMoveRoute(true, "/config.json.bak", "/config.json"));
+  TEST_ASSERT_EQUAL(FS_MOVE_CONFIG_REFUSED, fsMoveRoute(true, "/x.json", "/config.json"));
+  TEST_ASSERT_EQUAL(FS_MOVE_CONFIG_REFUSED, fsMoveRoute(true, "/sub/config.json.new", "/config.json"));
+  TEST_ASSERT_EQUAL(FS_MOVE_CONFIG_REFUSED, fsMoveRoute(true, "/config.json.new/", "/config.json"));
+  TEST_ASSERT_EQUAL(FS_MOVE_PLAIN, fsMoveRoute(true, "/a.txt", "/b.txt"));
+  TEST_ASSERT_EQUAL(FS_MOVE_PLAIN, fsMoveRoute(true, "/config.json.new", "/config.json.old"));
+  TEST_ASSERT_EQUAL(FS_MOVE_PLAIN, fsMoveRoute(false, "/x.json", "/config.json"));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_saved_reply_pending_prefix_applies_after_restart);
@@ -316,5 +331,6 @@ int main(int, char**) {
   RUN_TEST(test_fat_commit_survives_a_writer_recreating_the_target);
   RUN_TEST(test_fat_commit_reports_a_bak_it_could_not_remove);
   RUN_TEST(test_saved_reply_is_ok_once_reloaded);
+  RUN_TEST(test_move_onto_live_config);
   return UNITY_END();
 }

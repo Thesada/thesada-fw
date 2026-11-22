@@ -192,19 +192,19 @@ bool Config::writeFile(JsonVariantConst src, bool pretty, size_t* bytes) {
 }
 
 bool Config::writeRaw(const char* data, size_t len, size_t* bytes) {
-  if (!configBytesAreObject(data, len)) {
-    Log::error(TAG, "config.save_failed reason=not_object");
-    return false;
-  }
-  // A read mask in the bytes is resolved first, so the file is rewritten whole.
-  if (configTextHasMarker(data, len)) {
+  // A read mask in the values is resolved first, so the file is rewritten whole.
+  {
     JsonDocument doc(secretJsonAllocator());
-    if (!configParseObjectBytes(doc, data, len)) {
-      Log::error(TAG, "config.save_failed reason=no_heap");
-      return false;
+    switch (configRawWritePlan(doc, data, len)) {
+      case CFG_RAW_NOT_OBJECT:
+        Log::error(TAG, "config.save_failed reason=not_object");
+        return false;
+      case CFG_RAW_KEEP:
+        if (!keepStoredSecrets(doc)) return false;
+        return writeFile(doc.as<JsonVariantConst>(), false, bytes);
+      case CFG_RAW_AS_IS:
+        break;
     }
-    if (!keepStoredSecrets(doc)) return false;
-    return writeFile(doc.as<JsonVariantConst>(), false, bytes);
   }
   File f = LittleFS.open("/config.json.tmp", "w");
   if (!f) {
@@ -405,6 +405,10 @@ bool Config::keepStoredSecrets(JsonDocument& staged) {
     Log::error(TAG, "config.save_failed reason=copy_failed");
     return false;
   }
+  if (r == CONFIG_KEEP_SET_FAILED) {
+    Log::error(TAG, "config.save_failed reason=no_heap step=mask_keep");
+    return false;
+  }
   if (r == CONFIG_KEEP_OK) Log::kvf(TAG, "config.mask_kept fields=%u", (unsigned)n);
   return true;
 }
@@ -412,16 +416,27 @@ bool Config::keepStoredSecrets(JsonDocument& staged) {
 ConfigFileRead Config::readFileMasked(fs::FS& fs, const char* path, const char* shownPath, String& out) {
   out = String();
   File f = fs.open(path, "r");
-  if (!f || f.isDirectory()) return CFG_READ_RAW;
-  const bool family = configFileIsFamily(shownPath);
-  if (!configFileNeedsMask(shownPath, f.peek())) {
+  if (f && f.isDirectory()) {
     f.close();
     return CFG_READ_RAW;
   }
-  const size_t size = f.size();
-  if (size > CONFIG_FILE_MAX) {
+  const bool opened = (bool)f;
+  const bool exists = opened || fs.exists(path);
+  const int first = opened ? configFirstNonSpace(f) : -1;
+  const size_t size = opened ? f.size() : 0;
+  switch (configFilePreRead(shownPath, opened, exists, first, size)) {
+    case CFG_PRE_RAW:
+      if (opened) f.close();
+      return CFG_READ_RAW;
+    case CFG_PRE_REFUSE:
+      if (opened) f.close();
+      return CFG_READ_REFUSE;
+    case CFG_PRE_BUFFER:
+      break;
+  }
+  if (!f.seek(0)) {
     f.close();
-    return family ? CFG_READ_REFUSE : CFG_READ_RAW;
+    return CFG_READ_REFUSE;
   }
   char* buf = (char*)secretAlloc(size + 1);
   if (!buf) {
