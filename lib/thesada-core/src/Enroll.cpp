@@ -9,6 +9,7 @@ static const char* TAG = "Enroll";
 
 #ifdef ENABLE_IDENTITY
 
+#include "enroll_commit_policy.h"
 #include "enroll_policy.h"
 #include "mqtt_topic_policy.h"
 #include "Config.h"
@@ -27,15 +28,22 @@ static const char* TAG = "Enroll";
 #include <mbedtls/platform_util.h>
 #include <new>
 
+static_assert(ENROLL_TASK_BUDGET_MS + ENROLL_IO_TIMEOUT_MS < ENROLL_JOB_CEILING_MS,
+              "the enroll task must end inside its TLS hold");
 static_assert(ENROLL_HOST_CAP <= MQTT_BROKER_HOST_CAP,
               "an enrolled broker host must fit MQTTClient's host buffer");
 
 static const char* NS    = "thesada-enroll";
 static const char* K_ACK = "ack_pending";
+// Staged mqtt fields of a cert store in flight. K_STG is the marker, set last.
+static const char* K_STG        = "stg";
+static const char* K_STG_HOST   = "stg_host";
+static const char* K_STG_PORT   = "stg_port";
+static const char* K_STG_PREFIX = "stg_prefix";
 
 static constexpr size_t   BODY_CAP        = 384;
 static constexpr size_t   REPLY_CAP       = 6144;
-static constexpr uint32_t JOB_CEILING_MS  = 60000;
+static constexpr uint32_t JOB_CEILING_MS  = ENROLL_JOB_CEILING_MS;
 static constexpr uint32_t TASK_STACK      = 12288;
 
 // Local outcomes recorded where an HTTP status would be.
@@ -50,7 +58,23 @@ struct EnrollJob {
   String        reply;
   int           status        = ST_LOCAL;
   bool          isStatusCheck = false;
+  bool          pinned        = false;  // holds the MQTT reconnect until the task ends
   volatile bool done          = false;
+};
+
+// Reads as closed once the task's deadline passed, so every HTTPClient loop
+// (headers, body, chunks) ends inside the job's TLS hold.
+class DeadlineTls : public WiFiClientSecure {
+ public:
+  explicit DeadlineTls(uint32_t startMs) : _start(startMs) {}
+  int available() override { return spent() ? 0 : WiFiClientSecure::available(); }
+  int read() override { return spent() ? -1 : WiFiClientSecure::read(); }
+  int read(uint8_t* buf, size_t size) override { return spent() ? -1 : WiFiClientSecure::read(buf, size); }
+  uint8_t connected() override { return spent() ? 0 : WiFiClientSecure::connected(); }
+  bool spent() const { return enrollTaskBudgetSpent(millis(), _start); }
+
+ private:
+  uint32_t _start;
 };
 
 // Revocation status check. Shares the job slot with enrollment, which only
@@ -144,17 +168,18 @@ static void wipeString(String& s) {
 // task. in: EnrollJob*. out: status and reply filled, done set last.
 static void enrollTask(void* arg) {
   EnrollJob* job = static_cast<EnrollJob*>(arg);
+  const bool pinned = job->pinned;
   {
     String ca;
     File f = LittleFS.open("/ca.crt", "r");
     if (f) { ca = f.readString(); f.close(); }
-    WiFiClientSecure tls;
-    tls.setHandshakeTimeout(10);
+    DeadlineTls tls(millis());
+    tls.setHandshakeTimeout(ENROLL_IO_TIMEOUT_MS / 1000);
     tls.setCACert(ca.length() ? ca.c_str() : OTA_CA_PROGMEM);
     HTTPClient http;
     if (http.begin(tls, job->url)) {
-      http.setConnectTimeout(10000);
-      http.setTimeout(10000);
+      http.setConnectTimeout(ENROLL_IO_TIMEOUT_MS);
+      http.setTimeout(ENROLL_IO_TIMEOUT_MS);
       http.addHeader("Content-Type", "application/json");
       job->status = http.POST((uint8_t*)job->body, strlen(job->body));
       if (job->status < 0) {
@@ -169,9 +194,16 @@ static void enrollTask(void* arg) {
           if (job->reply.length() > REPLY_CAP) { wipeString(job->reply); job->status = ST_OVERSIZE; }
         }
       }
+      if (tls.spent()) {
+        wipeString(job->reply);
+        job->status = ST_LOCAL;
+        Log::kvfw(TAG, "enroll.task_deadline budget_ms=%u", (unsigned)ENROLL_TASK_BUDGET_MS);
+      }
       http.end();
+      tls.stop();
     }
   }
+  if (pinned) MQTTClient::unpinTlsHold();
   job->done = true;
   vTaskDelete(nullptr);
 }
@@ -213,8 +245,95 @@ static bool onChallenge(const String& reply) {
   return identityHexEncode(sig, sizeof(sig), _sigHex, sizeof(_sigHex));
 }
 
-// Store a cert reply only when every field is usable. NVS ack, then mqtt, then cert.
-// in: reply body. out: true when it was stored.
+// Disk mqtt fields equal these. in: host, port, prefix. out: true on a match.
+static bool diskMqttMatches(const char* host, long port, const char* prefix) {
+  JsonDocument disk;
+  if (!Config::copyDiskDoc(disk)) return false;
+  JsonObject m = disk["mqtt"];
+  return strcmp(m["broker"] | "", host) == 0 && (long)(m["port"] | 0L) == port &&
+         strcmp(m["topic_prefix"] | "", prefix) == 0;
+}
+
+// NVS and config steps for enroll_commit_policy.h. Main loop only.
+struct EnrollStore {
+  char        host[ENROLL_HOST_CAP]           = "";
+  char        prefix[Config::TOPIC_PREFIX_CAP] = "";
+  long        port    = 0;
+  const char* cert    = nullptr;
+  const char* key     = nullptr;
+  bool        loaded  = false;  // fields usable for configApply
+  bool        compare = false;  // skip the write when disk already matches
+
+  bool ackSet(bool v) { return ackPendingSet(v); }
+  bool ackPending() { return ackPendingGet(); }
+
+  bool stagePut() {
+    Preferences p;
+    if (!p.begin(NS, false)) return false;
+    bool ok = p.putString(K_STG_HOST, host) > 0 && p.putInt(K_STG_PORT, (int32_t)port) > 0 &&
+              p.putString(K_STG_PREFIX, prefix) > 0 && p.putUChar(K_STG, 1) > 0;
+    p.end();
+    return ok;
+  }
+
+  bool stagePresent() {
+    Preferences p;
+    if (!p.begin(NS, true)) return false;
+    bool v = p.getUChar(K_STG, 0) != 0;
+    p.end();
+    return v;
+  }
+
+  bool stageClear() {
+    Preferences p;
+    if (!p.begin(NS, false)) return false;
+    bool ok = !p.isKey(K_STG) || p.remove(K_STG);
+    if (ok) {
+      if (p.isKey(K_STG_HOST))   p.remove(K_STG_HOST);
+      if (p.isKey(K_STG_PORT))   p.remove(K_STG_PORT);
+      if (p.isKey(K_STG_PREFIX)) p.remove(K_STG_PREFIX);
+    }
+    p.end();
+    return ok;
+  }
+
+  // Read the staged fields back. in: none. out: true when they are usable.
+  bool stageLoad() {
+    Preferences p;
+    if (!p.begin(NS, true)) return false;
+    bool got = p.getString(K_STG_HOST, host, sizeof(host)) > 0 &&
+               p.getString(K_STG_PREFIX, prefix, sizeof(prefix)) > 0;
+    port = p.getInt(K_STG_PORT, 0);
+    p.end();
+    loaded = got && enrollHostUsable(host) && port >= 1 && port <= 65535 &&
+             enrollPrefixUsable(prefix, sizeof(prefix));
+    return loaded;
+  }
+
+  bool certStore() { return MQTTClient::storeClientCert(cert, key); }
+  bool certClear() { return MQTTClient::clearClientCert(); }
+  bool certUsable() { return MQTTClient::checkStoredClientCert() == PairCheck::Valid; }
+
+  bool configApply(bool& changed) {
+    changed = true;
+    if (!loaded) return false;
+    if (compare && diskMqttMatches(host, port, prefix)) {
+      changed = false;
+      return true;
+    }
+    return Config::edit([&](JsonObject cfg) {
+      JsonObject m = cfg["mqtt"].is<JsonObject>() ? cfg["mqtt"].as<JsonObject>()
+                                                  : cfg["mqtt"].to<JsonObject>();
+      m["broker"]       = String(host);
+      m["port"]         = port;
+      m["topic_prefix"] = String(prefix);
+      return true;
+    });
+  }
+};
+
+// Store a cert reply only when every field is usable. Cert first, config
+// last, see enroll_commit_policy.h. in: reply body. out: true when stored.
 static bool onCert(const String& reply) {
   JsonDocument doc(secretJsonAllocator());  // key_pem: blocks wiped on free
   if (deserializeJson(doc, reply)) return false;
@@ -235,18 +354,21 @@ static bool onCert(const String& reply) {
     Log::kvfw(TAG, "enroll.reply_refused reason=cert_pair");
     return false;
   }
-  if (!ackPendingSet(true)) return false;
-
-  bool saved = Config::edit([&](JsonObject cfg) {
-    JsonObject m = cfg["mqtt"].is<JsonObject>() ? cfg["mqtt"].as<JsonObject>()
-                                                : cfg["mqtt"].to<JsonObject>();
-    m["broker"]       = String(host);
-    m["port"]         = port;
-    m["topic_prefix"] = String(prefix);
-    return true;
-  });
-  if (!saved || !MQTTClient::storeClientCert(cert, key)) {
-    ackPendingSet(false);
+  EnrollStore st;
+  strncpy(st.host, host, sizeof(st.host) - 1);
+  strncpy(st.prefix, prefix, sizeof(st.prefix) - 1);
+  st.port   = port;
+  st.cert   = cert;
+  st.key    = key;
+  st.loaded = true;
+  EnrollCommit res = enrollCommit(st);
+  if (res == EnrollCommit::Left) {
+    // A cert that would not clear: the boot path finishes or undoes it.
+    Log::error(TAG, "enroll.store_left action=reboot");
+    MQTTClient::scheduleCertReboot("enroll_store_left");
+    return false;
+  }
+  if (res != EnrollCommit::Stored) {
     Log::error(TAG, "enroll.store_failed");
     return false;
   }
@@ -314,7 +436,11 @@ static void startJob() {
     return;
   }
   const bool yielded = MQTTClient::yieldTlsHeap("enroll", JOB_CEILING_MS);
+  // A pin, not the shared timer alone: a net.http release clears that timer.
+  job->pinned = yielded;
+  if (yielded) MQTTClient::pinTlsHold();
   if (xTaskCreate(enrollTask, "enroll", TASK_STACK, job, tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
+    if (yielded) MQTTClient::unpinTlsHold();
     if (yielded) MQTTClient::releaseTlsHeap();
     mbedtls_platform_zeroize(job->body, sizeof(job->body));
     delete job;
@@ -363,8 +489,13 @@ static void startCheck() {
                enrollStatusBody(job->body, sizeof(job->body), Identity::deviceId(),
                                 Identity::publicKeyHex(), _check.serial, ts, sigHex);
   const bool yielded = built && MQTTClient::yieldTlsHeap("enroll.status", JOB_CEILING_MS);
+  if (yielded) {
+    job->pinned = true;
+    MQTTClient::pinTlsHold();
+  }
   if (!built ||
       xTaskCreate(enrollTask, "enroll", TASK_STACK, job, tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
+    if (yielded) MQTTClient::unpinTlsHold();
     if (yielded) MQTTClient::releaseTlsHeap();
     delete job;
     checkUnanswered(ST_LOCAL);
@@ -433,9 +564,37 @@ static void cmd_enroll_status(int, char**, ShellOutput out) {
   snprintf(line, sizeof(line), "check_last:  %d", _check.lastStatus);       out(line);
 }
 
+// Finish or undo a cert store a reset cut short. Before the start step.
+// in: none. out: false when it is still half done and enrollment waits a boot.
+static bool recoverStore() {
+  EnrollStore st;
+  st.compare = true;
+  if (st.stagePresent()) st.stageLoad();
+  switch (enrollRecover(st)) {
+    case EnrollRecover::Idle:
+      return true;
+    case EnrollRecover::Kept:
+      Log::kvf(TAG, "enroll.store_recovered action=kept");
+      return true;
+    case EnrollRecover::RolledForward:
+      Log::kvfw(TAG, "enroll.store_recovered action=forward reboot_in_ms=%lu",
+                (unsigned long)MQTTClient::CERT_REBOOT_DELAY_MS);
+      MQTTClient::scheduleCertReboot("enroll_store_forward");
+      return true;
+    case EnrollRecover::RolledBack:
+      Log::kvfw(TAG, "enroll.store_recovered action=back");
+      return true;
+    case EnrollRecover::Left:
+      break;
+  }
+  Log::kvfe(TAG, "enroll.store_recover_failed");
+  return false;
+}
+
 void Enroll::begin() {
   Shell::registerCommand("enroll.status", "First-boot enrollment step and next attempt",
                          cmd_enroll_status);
+  if (!recoverStore()) return;
   if (!Identity::canMint() || !Identity::deviceId()[0]) {
     Log::kvfw(TAG, "enroll.disabled reason=no_identity");
     return;
@@ -479,7 +638,7 @@ void Enroll::loop() {
   if (_stale) return;
   if (_job) {
     if (_job->done) {
-      MQTTClient::releaseTlsHeap();
+      if (_job->pinned) MQTTClient::releaseTlsHeap();
       finishJob();
     } else if (millis() - _jobAt > JOB_CEILING_MS) {
       // The task still owns the job. Reap it once done; do not start another.

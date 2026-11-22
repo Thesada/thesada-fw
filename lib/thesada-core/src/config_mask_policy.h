@@ -326,7 +326,7 @@ inline ConfigPreRead configFilePreRead(const char* path, bool opened, bool exist
 enum ConfigFileRead {
   CFG_READ_RAW = 0,  // serve the bytes as they are: no secret in them
   CFG_READ_MASKED,   // serve out instead
-  CFG_READ_REFUSE,   // config-named but not one object, or content after the object: serve nothing
+  CFG_READ_REFUSE,   // config-named but not one object, content after the object, or no heap or depth: serve nothing
 };
 
 // What a file read (fs.cat, /api/file, /api/config, backup) serves.
@@ -339,9 +339,11 @@ inline ConfigFileRead configFileReadMasked(const char* path, const char* data, s
   if (len == 0) return CFG_READ_RAW;
   if (!data) return CFG_READ_REFUSE;
   JsonDocument doc(alloc ? alloc : ArduinoJson::detail::DefaultAllocator::instance());
-  const bool parsed = !deserializeJson(doc, data, len, DeserializationOption::NestingLimit(CONFIG_MAX_DEPTH)) &&
-                      doc.is<JsonObject>();
-  if (!parsed) return family ? CFG_READ_REFUSE : CFG_READ_RAW;
+  const DeserializationError err =
+      deserializeJson(doc, data, len, DeserializationOption::NestingLimit(CONFIG_MAX_DEPTH));
+  // Heap or depth left the object uninspected: refused, never served raw.
+  if (err == DeserializationError::NoMemory || err == DeserializationError::TooDeep) return CFG_READ_REFUSE;
+  if (err || !doc.is<JsonObject>()) return family ? CFG_READ_REFUSE : CFG_READ_RAW;
   if (!configNothingAfterObject(data, len)) return CFG_READ_REFUSE;
   const bool whole = configParseKeptMembers(data, len, doc.as<JsonVariantConst>());
   if (configMaskTree(doc.as<JsonVariant>()) == 0 && whole) return CFG_READ_RAW;

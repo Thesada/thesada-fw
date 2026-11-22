@@ -378,6 +378,24 @@ void test_file_read_trailing_content_refused(void) {
   TEST_ASSERT_EQUAL(CFG_READ_RAW, configFileReadMasked("/config.json", spaced, strlen(spaced), out));
 }
 
+// An object file the parse cannot inspect for heap or depth is refused, never served raw.
+void test_file_read_resource_failure_refused(void) {
+  std::string out;
+  const char flat[] = "{\"password\":\"S-web\"}";
+  ArmedAllocator alloc;
+  alloc.armed = true;
+  TEST_ASSERT_EQUAL(CFG_READ_REFUSE, configFileReadMasked("/notes.json", flat, strlen(flat), out, &alloc));
+  TEST_ASSERT_EQUAL(CFG_READ_REFUSE, configFileReadMasked("/config.json", flat, strlen(flat), out, &alloc));
+  std::string deep;
+  for (int i = 0; i <= CONFIG_MAX_DEPTH; i++) deep += "{\"a\":";
+  deep += flat;
+  for (int i = 0; i <= CONFIG_MAX_DEPTH; i++) deep += "}";
+  TEST_ASSERT_EQUAL(CFG_READ_REFUSE, configFileReadMasked("/notes.json", deep.c_str(), deep.size(), out));
+  alloc.armed = false;
+  TEST_ASSERT_EQUAL(CFG_READ_MASKED, configFileReadMasked("/notes.json", flat, strlen(flat), out, &alloc));
+  assertNoSecret(out);
+}
+
 // A duplicate key collapses in the parse, so the bytes are never served as they are.
 void test_file_read_duplicate_key_not_raw(void) {
   std::string out;
@@ -464,6 +482,20 @@ void test_saved_reply_unparsed_or_duplicate_not_echoed(void) {
   TEST_ASSERT_NOT_NULL(strstr(buf, "mqtt = {\"broker\":\"b.example\"}"));
 }
 
+// A literal typed with leading spaces is stored as one, so its reply is masked too.
+void test_saved_reply_spaced_literal_masked(void) {
+  char buf[300];
+  configSavedReply(buf, sizeof(buf), "mqtt", "  \t{\"password\":\"S-mqtt\"}");
+  assertNoSecret(buf);
+  TEST_ASSERT_NOT_NULL_MESSAGE(strstr(buf, "(set)"), buf);
+  configSavedReply(buf, sizeof(buf), "wifi.networks", " [{\"ssid\":\"x\",\"password\":\"S-wifi0\"}]");
+  assertNoSecret(buf);
+  configSavedReply(buf, sizeof(buf), "mqtt", "\n {\"password\":\"S-mqtt\"");
+  assertNoSecret(buf);
+  configSavedReply(buf, sizeof(buf), "device.name", "  n1");
+  TEST_ASSERT_NOT_NULL_MESSAGE(strstr(buf, "device.name =   n1 "), buf);
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_keymap_fields_are_secret);
@@ -496,5 +528,7 @@ int main(int, char**) {
   RUN_TEST(test_raw_write_plan);
   RUN_TEST(test_saved_reply_long_literal_terminated);
   RUN_TEST(test_saved_reply_unparsed_or_duplicate_not_echoed);
+  RUN_TEST(test_file_read_resource_failure_refused);
+  RUN_TEST(test_saved_reply_spaced_literal_masked);
   return UNITY_END();
 }

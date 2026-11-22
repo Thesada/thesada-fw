@@ -146,14 +146,16 @@ inline bool configKeyIsPrefix(const char* key) {
 inline void configSavedReply(char* buf, size_t cap, const char* key, const char* value, bool pending = false) {
   const bool restart = pending && configKeyIsPrefix(key);
   char shown[160];
+  // configPathStore skips the same spaces, so a spaced literal is masked as stored.
+  const char* lv = value ? configSkipSpace(value) : nullptr;
   if (value && configPathIsSecret(key)) {
     value = *value ? CONFIG_MASK_SET : CONFIG_MASK_EMPTY;
-  } else if (value && (*value == '{' || *value == '[')) {
+  } else if (lv && (*lv == '{' || *lv == '[')) {
     JsonDocument lit;
-    if (deserializeJson(lit, value, DeserializationOption::NestingLimit(CONFIG_MAX_DEPTH))) {
+    if (deserializeJson(lit, lv, DeserializationOption::NestingLimit(CONFIG_MAX_DEPTH))) {
       value = "(value not shown)";
     } else {
-      const bool whole = configParseKeptMembers(value, strlen(value), lit.as<JsonVariantConst>());
+      const bool whole = configParseKeptMembers(lv, strlen(lv), lit.as<JsonVariantConst>());
       if (configMaskTree(lit.as<JsonVariant>()) > 0 || !whole) {
         const size_t n = serializeJson(lit, shown, sizeof(shown) - 1);
         shown[n] = '\0';

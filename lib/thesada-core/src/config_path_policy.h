@@ -42,6 +42,12 @@ inline bool configLookupKeyFits(const char* key) {
   return key && strnlen(key, CONFIG_KEY_MAX) < CONFIG_KEY_MAX;
 }
 
+// in: value. out: its first byte that is not a space, tab, CR or LF.
+inline const char* configSkipSpace(const char* v) {
+  while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n') v++;
+  return v;
+}
+
 enum ConfigStore {
   CONFIG_STORE_OK = 0,
   CONFIG_STORE_TOO_DEEP,
@@ -53,8 +59,7 @@ enum ConfigStore {
 // is refused, never stored as its text. alloc: the literal's, null for the default.
 inline ConfigStore configPathStore(JsonVariant target, const char* value, int depth,
                                    ArduinoJson::Allocator* alloc = nullptr) {
-  const char* v = value;
-  while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n') v++;
+  const char* v = configSkipSpace(value);
   if (*v == '{' || *v == '[') {
     JsonDocument lit(alloc ? alloc : ArduinoJson::detail::DefaultAllocator::instance());
     const DeserializationError err = deserializeJson(lit, v, DeserializationOption::NestingLimit(depth));

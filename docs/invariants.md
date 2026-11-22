@@ -577,13 +577,16 @@ each issue revokes the one before. The ack seals the enrollment row for good.
 |---|---|
 | once a cert is stored, the device never polls `/cert` again; it only acks | a re-poll revokes the cert the device just stored |
 | a reply is stored only when its `device_id` is this unit, host, port and prefix are usable (`enrollReplyUsable`), and the cert and key validate as a pair | a cert for another unit, or a broker the device cannot reach, strands it with nothing to retry |
-| write order is the NVS `ack_pending` flag, then `mqtt.*` config, then the cert | a power cut before the cert lands leaves no cert, so the next boot re-enrolls from announce |
+| write order is the NVS `ack_pending` flag, the staged `mqtt.*` fields with their `stg` marker set last, the cert, then `mqtt.*` config, then the marker cleared (`enrollCommit`) | the config is the commit point, so it never names the enrolled broker while no cert for it is stored |
+| a failed cert or config write clears the cert, the marker and the ack, so config and cert are both what they were and the next poll stores again. A cert that will not clear keeps the marker and reboots | a stored cert with the old config would sit in `await_mtls` and never poll again |
+| at boot, before the start step, a set marker with a stored pair that validates and a pending ack rolls forward: config from the staged fields, then a reboot when it changed. Any other marker rolls back to no cert. A marker with a cleared ack is only removed (`enrollRecover`) | a power cut anywhere in the store ends fully old and re-enrollable, or fully new. The app re-signs on every poll until the ack, so a rollback costs one poll |
 | the ack goes out only after a WiFi broker session that presented the client cert | sealing a cert that never connected leaves the app no way to re-issue |
 | the enrollment POST verifies the server against `/ca.crt` or the baked roots, never `setInsecure` | the claim code goes out, and the private key comes back, on this link |
 | HTTPS runs on its own 12 KB task; Config, Secret and NVS are touched only from the main loop | the handshake overflows the loop stack, and Config is single-task |
 | a timed-out POST is kept until its task finishes, and no second POST starts while it is alive | dropping the job and starting another overlaps two handshakes and leaks the first |
 
 Source: `lib/thesada-core/src/Enroll.cpp`, `lib/thesada-core/src/enroll_policy.h`,
+`lib/thesada-core/src/enroll_commit_policy.h`, `test/test_enroll_commit/`,
 `test/test_enroll_policy/`, `MQTTClient::clientCertPairValid`,
 `MQTTClient::mtlsSessionUp`.
 
@@ -1016,8 +1019,10 @@ config-named file that is not one object is refused, never streamed. The
 object check skips leading JSON whitespace, any object file with content after
 its closing brace is refused, a parse that collapsed a duplicate key serves
 the parsed form, never the bytes, and a covered file that does not fit
-`CONFIG_FILE_MAX` or exists and fails to open is refused. A `config.set` reply
-shows a literal masked and cut to fit, one that does not parse not at all, and
+`CONFIG_FILE_MAX` or exists and fails to open is refused. Any object file whose
+parse runs out of heap or nests past `CONFIG_MAX_DEPTH` is refused, never
+served raw. A `config.set` reply shows a literal masked and cut to fit, leading
+spaces skipped as the store skips them, one that does not parse not at all, and
 Lua `Config.get` reads nil for a key past `CONFIG_KEY_MAX`. Secret
 keys: long words as a suffix (`password`, `passwd`, `secret`, `token`, `key`,
 `passphrase`, `credential`, `claim_code`), short ones as the whole key or after
@@ -1961,7 +1966,13 @@ reconnect without a drop (`drop=0`, `tlsHeapYieldPlan`), so no session starts
 beside the caller's. The caller ends the hold when its fetch is done
 (`releaseTlsHeap`), and `loop()` reconnects at once. A held `net.http` also
 pins the hold (`pinTlsHold`) until its task ends, so an abandoned wait keeps
-it, and the deferred reinit in `loop()` waits for the hold too. CLI replies
+it, and the deferred reinit in `loop()` waits for the hold too. A held enroll
+POST or status check pins it the same way, so a `net.http` release that clears
+the shared timer cannot let MQTT dial beside it. Its task reads its TLS client
+as closed after `ENROLL_TASK_BUDGET_MS` (40 s, `enrollTaskBudgetSpent`), so a
+slow or silent server ends the task inside the 60 s job ceiling
+(`enroll.task_deadline`), and a `static_assert` keeps the budget plus one read
+timeout under it. CLI replies
 of the held session queue and go out after it. A failed WiFi GET logs the
 mbedTLS error (`shell.http_done ... tls_err=`, `enroll.post_failed tls_err=`).
 `tlsHeapYieldDue`, `tlsHeapYieldPlan`, `tlsHoldActive` and `tlsReconnectHeld`
@@ -1970,6 +1981,7 @@ are host-tested in `test/test_http_fetch`.
 Dated 2026-11-22
 
 Source: `lib/thesada-core/src/http_fetch_policy.h`,
+`lib/thesada-core/src/enroll_policy.h` (`enrollTaskBudgetSpent`, `test/test_enroll_policy`),
 `lib/thesada-core/src/Shell.cpp` (`httpFetchTask`, `httpFetchRunCellular`,
 `cmd_http`, `pumpConsole`, `begin`),
 `lib/thesada-core/src/MQTTClient.cpp` (`tick`, `ClientCall`, `yieldTlsHeap`,
