@@ -219,11 +219,19 @@ void SDModule::logEvent(const char* sensor, const char* json) {
     if (_logPath.isEmpty()) return;
   }
 
-  File f = fs()->open(_logPath, FILE_APPEND);
-  if (!f) return;
-  f.printf("%s,%s,%s\n", ts, sensor, json);
-  f.close();
-  _logBytes += rowSize;
+  static uint32_t lastWarnMs = 0;
+  static bool warned = false;
+  // Count what the file grew by after close, not what printf buffered.
+  String row = String(ts) + "," + sensor + "," + json + "\n";
+  size_t written = 0;
+  Shell::writeChecked(fs(), _logPath.c_str(), true, (const uint8_t*)row.c_str(), row.length(), &written);
+  _logBytes += written;
+  if (written != rowSize && (!warned || millis() - lastWarnMs >= 60000UL)) {
+    warned = true;
+    lastWarnMs = millis();
+    Log::kvfw("SD", "sd.log_write_failed path=%s wrote=%u want=%u",
+              _logPath.c_str(), (unsigned)written, (unsigned)rowSize);
+  }
 }
 
 // Subscribe to temperature, current, and battery EventBus events for SD logging
@@ -249,7 +257,6 @@ void SDModule::subscribeEvents() {
 
 // Report SD card module status
 void SDModule::status(ShellOutput out) {
-  fs::FS* sdfs = fs();
   uint64_t total = _spiMode ? SD.totalBytes() : SD_MMC.totalBytes();
   char line[64];
   if (_mounted && total > 0) {

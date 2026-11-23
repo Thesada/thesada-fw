@@ -7,6 +7,9 @@
 #include "Shell.h"
 #include "MQTTClient.h"
 #include "WiFiManager.h"
+#include "OTAUpdate.h"
+#include "ota_health_policy.h"
+#include "sleep_policy.h"
 #include <WiFi.h>
 #include <esp_sleep.h>
 
@@ -16,8 +19,10 @@ static const char* TAG = "Sleep";
 RTC_DATA_ATTR static RtcData _rtc;
 
 bool     SleepManager::_enabled      = false;
-uint32_t SleepManager::_sleepUs      = 0;
-uint32_t SleepManager::_wakeDeadline = 0;
+bool     SleepManager::_shuttingDown = false;
+uint64_t SleepManager::_sleepUs      = 0;
+uint32_t SleepManager::_wakeStart    = 0;
+uint32_t SleepManager::_wakeSpanMs   = 0;
 
 // Initialize RTC data, read sleep config, and set wake deadline
 void SleepManager::begin() {
@@ -43,7 +48,7 @@ void SleepManager::begin() {
         if (SleepManager::enabled()) {
           JsonObject cfg = Config::get();
           uint32_t sleepS = cfg["sleep"]["sleep_s"] | 300;
-          uint32_t wakeS  = cfg["sleep"]["wake_s"]  | 30;
+          uint32_t wakeS  = sleepWakeSpanMs(cfg["sleep"]["wake_s"] | 30u) / 1000;
           snprintf(line, sizeof(line), "  wake %lus  sleep %lus", (unsigned long)wakeS, (unsigned long)sleepS);
           out(line);
           time_t lastOta = SleepManager::lastOtaCheck();
@@ -57,22 +62,39 @@ void SleepManager::begin() {
   if (!_enabled) return;
 
   uint32_t sleepS = cfg["sleep"]["sleep_s"] | 300;
-  uint32_t wakeS  = cfg["sleep"]["wake_s"]  | 30;
+  uint32_t wakeS  = cfg["sleep"]["wake_s"]  | 30u;
 
   if (sleepS < 10)  sleepS = 10;   // minimum 10s sleep
-  if (wakeS  < 10)  wakeS  = 10;   // minimum 10s awake
 
-  _sleepUs      = (uint64_t)sleepS * 1000000ULL;
-  _wakeDeadline = millis() + (wakeS * 1000);
+  _sleepUs    = (uint64_t)sleepS * 1000000ULL;
+  _wakeSpanMs = sleepWakeSpanMs(wakeS);
+  _wakeStart  = millis();
+  if (wakeS > SLEEP_WAKE_S_MAX) {
+    Log::kvf(TAG, "sleep.wake_clamped wake_s=%lu max=%lu",
+             (unsigned long)wakeS, (unsigned long)SLEEP_WAKE_S_MAX);
+  }
 
   Log::kvf(TAG, "sleep.enabled awake_s=%lu sleep_s=%lu boot=%lu",
-           (unsigned long)wakeS, (unsigned long)sleepS, (unsigned long)_rtc.bootCount);
+           (unsigned long)(_wakeSpanMs / 1000), (unsigned long)sleepS, (unsigned long)_rtc.bootCount);
 }
 
-// Enter deep sleep when the wake deadline has passed
+// Enter deep sleep when the wake deadline has passed and no pending OTA image
+// still waits for its confirm (sleepHeldForOta).
 void SleepManager::loop() {
   if (!_enabled) return;
-  if (millis() < _wakeDeadline) return;
+  if (!sleepWakeDone(millis(), _wakeStart, _wakeSpanMs)) return;
+
+  static bool heldLogged = false;
+  bool pending = false;
+  if (sleepHeldForOtaNow<OTAUpdate>(millis(), OTA_HEALTH_MIN_MS, pending)) {
+    if (!heldLogged) {
+      Log::kvf(TAG, "sleep.state_change from=awake to=held reason=ota_pending max_uptime_s=%lu",
+               (unsigned long)((OTA_HEALTH_MIN_MS + SLEEP_OTA_GRACE_MS) / 1000));
+      heldLogged = true;
+    }
+    return;
+  }
+  if (pending) Log::kvfw(TAG, "sleep.ota_unconfirmed action=sleep result=rollback_at_wake");
 
   gracefulShutdown();
 }
@@ -97,8 +119,13 @@ void SleepManager::setLastOtaCheck(time_t t) {
   _rtc.lastOtaCheck = t;
 }
 
+bool SleepManager::shuttingDown() {
+  return _shuttingDown;
+}
+
 // Flush MQTT, disconnect WiFi, and enter deep sleep
 void SleepManager::gracefulShutdown() {
+  _shuttingDown = true;
   Log::info(TAG, "sleep.shutdown_start");
 
   // Publish sleep status and flush the MQTT queue.
@@ -106,8 +133,9 @@ void SleepManager::gracefulShutdown() {
     JsonObject cfg     = Config::get();
     const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
     char topic[MQTT_TOPIC_CAP];
-    snprintf(topic, sizeof(topic), "%s/status", prefix);
-    MQTTClient::publish(topic, "sleeping");
+    if (MQTTClient::formatTopic(topic, sizeof(topic), "%s/status", prefix)) {
+      MQTTClient::publish(topic, "sleeping");
+    }
 
     // Give PubSubClient time to send the queued messages.
     for (int i = 0; i < 20; i++) {

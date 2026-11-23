@@ -36,6 +36,7 @@ public:
 private:
   uint32_t _intervalMs    = 30000;
   uint32_t _lastReadMs    = 0;
+  bool     _readOnce      = false;
   uint32_t _coldFixMs     = 60000;  // upper bound for first fix
   uint32_t _warmFixMs     = 10000;  // upper bound for subsequent fixes
   bool     _publishWithoutFix = false;  // emit even if no fix yet

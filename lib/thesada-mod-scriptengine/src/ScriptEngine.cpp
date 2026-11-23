@@ -12,7 +12,7 @@
 //   Log.info(msg)                      - log at INFO level (tag: "Lua")
 //   Log.warn(msg)                      - log at WARN level
 //   Log.error(msg)                     - log at ERROR level
-//   EventBus.subscribe(event, func)    - subscribe to named event, func receives a table
+//   EventBus.subscribe(event, func)    - subscribe to named event, func receives a table, false when full
 //   MQTT.publish(topic, payload)       - publish a message to MQTT
 //   Config.get(key)                    - read config value by dot-notation key
 //   Node.restart()                     - reboot the device
@@ -20,9 +20,10 @@
 //   Node.uptime()                      - ms since boot, 64-bit, never wraps
 //
 // Hot reload:
-//   ScriptEngine::reload() bumps generation counter, destroys Lua state,
-//   creates fresh state, re-executes both scripts. Stale EventBus callbacks
-//   check generation and silently skip.
+//   ScriptEngine::reload() bumps generation counter, frees the Lua-owned MQTT
+//   slots and EventBus callbacks, destroys Lua state, creates fresh state,
+//   re-executes both scripts. Asked for while Lua is on the stack, or from
+//   the MQTT reload topic, it is latched and loop() runs it.
 //
 // SPDX-License-Identifier: GPL-3.0-only
 
@@ -33,6 +34,7 @@
 #include <OTAUpdate.h>
 #include <Log.h>
 #include <Shell.h>
+#include <SleepManager.h>
 #include <ModuleRegistry.h>
 #include <Watchdog.h>
 #include <boot_wait_policy.h>
@@ -44,11 +46,8 @@
 #include <WiFi.h>
 #include <ArduinoJson.h>
 
-extern "C" {
-#include <lua/lua.h>
-#include <lua/lualib.h>
-#include <lua/lauxlib.h>
-}
+#include "lua_stdlibs.h"
+#include "lua_budget_hooks.h"
 
 static const char* TAG = "Lua";
 
@@ -56,6 +55,18 @@ lua_State* gL = nullptr;
 uint32_t ScriptEngine::_generation = 0;
 LuaBindingRegistrar ScriptEngine::_registrars[ScriptEngine::MAX_REGISTRARS] = {};
 uint8_t ScriptEngine::_registrarCount = 0;
+
+// ---------------------------------------------------------------------------
+// Script budget: every call from C into Lua shares one wall-clock budget
+// ---------------------------------------------------------------------------
+
+static uint32_t budgetNow() { return millis(); }
+static LuaBudgetHost _budget = {{0, 0, 0, false}, budgetNow, Watchdog::feed};
+
+// Time a binding spent blocked is not script time. in: ms. out: none.
+void ScriptEngine::creditNative(uint32_t ms) {
+  luaBudgetCredit(_budget.budget, ms);
+}
 
 // ---------------------------------------------------------------------------
 // Lua binding: Log
@@ -98,7 +109,9 @@ static const luaL_Reg logLib[] = {
 static int lua_mqtt_publish(lua_State* L) {
   const char* topic   = luaL_checkstring(L, 1);
   const char* payload = luaL_checkstring(L, 2);
+  const uint32_t t0 = millis();
   MQTTClient::publish(topic, payload);
+  ScriptEngine::creditNative(millis() - t0);
   return 0;
 }
 
@@ -115,13 +128,13 @@ static int lua_mqtt_subscribe(lua_State* L) {
     lua_rawgeti(gL, LUA_REGISTRYINDEX, ref);
     lua_pushstring(gL, topic);
     lua_pushstring(gL, payload);
-    if (lua_pcall(gL, 2, 0, 0) != LUA_OK) {
+    if (luaBudgetedCall(gL, 2, 0) != LUA_OK) {
       const char* err = lua_tostring(gL, -1);
       Log::kvfe("Lua", "script.callback_error source=mqtt_sub err=\"%.100s\"",
                 err ? err : "unknown");
       lua_pop(gL, 1);
     }
-  });
+  }, MQTT_SUB_OWNER_LUA);
 
   Log::kvf("Lua", "script.mqtt_subscribed topic=%s", topic);
   return 0;
@@ -218,8 +231,13 @@ static int lua_config_get(lua_State* L) {
   const char* key = luaL_checkstring(L, 1);
   JsonObject cfg = Config::get();
 
+  // A key cut to the buffer would look up one path and be classified as another.
+  if (!configLookupKeyFits(key)) {
+    lua_pushnil(L);
+    return 1;
+  }
   JsonVariant current = cfg;  // JsonObject implicitly converts to JsonVariant in ArduinoJson v7
-  char buf[128];
+  char buf[CONFIG_KEY_MAX];
   strncpy(buf, key, sizeof(buf) - 1);
   buf[sizeof(buf) - 1] = '\0';
 
@@ -246,6 +264,9 @@ static int lua_config_get(lua_State* L) {
 
   if (current.isNull()) {
     lua_pushnil(L);
+  } else if (configPathIsSecret(key)) {
+    // Native bindings use secrets themselves. A script reads the mask only.
+    lua_pushstring(L, configMaskFor(current));
   } else if (current.is<bool>()) {
     lua_pushboolean(L, current.as<bool>());
   } else if (current.is<int>()) {
@@ -256,7 +277,10 @@ static int lua_config_get(lua_State* L) {
     lua_pushstring(L, current.as<const char*>());
   } else {
     String json;
-    serializeJson(current, json);
+    if (!configMaskedNodeText(key, current, json, false)) {
+      lua_pushnil(L);
+      return 1;
+    }
     lua_pushstring(L, json.c_str());
   }
   return 1;
@@ -271,49 +295,45 @@ static const luaL_Reg configLib[] = {
 // Lua binding: EventBus
 // ---------------------------------------------------------------------------
 
+static void pushJsonVariant(lua_State* L, JsonVariant v);
+
 // Recursively convert an ArduinoJson object to a Lua table on the stack
 static void jsonObjectToLuaTable(lua_State* L, JsonObject obj) {
   lua_newtable(L);
   for (JsonPair kv : obj) {
     lua_pushstring(L, kv.key().c_str());
-    JsonVariant v = kv.value();
-    if (v.is<bool>()) {
-      lua_pushboolean(L, v.as<bool>());
-    } else if (v.is<long>()) {
-      lua_pushinteger(L, v.as<long>());
-    } else if (v.is<double>()) {
-      lua_pushnumber(L, v.as<double>());
-    } else if (v.is<const char*>()) {
-      lua_pushstring(L, v.as<const char*>());
-    } else if (v.is<JsonArray>()) {
-      JsonArray arr = v.as<JsonArray>();
-      lua_newtable(L);
-      int idx = 1;
-      for (JsonVariant elem : arr) {
-        lua_pushinteger(L, idx++);
-        if (elem.is<JsonObject>()) {
-          jsonObjectToLuaTable(L, elem.as<JsonObject>());
-        } else if (elem.is<long>()) {
-          lua_pushinteger(L, elem.as<long>());
-        } else if (elem.is<double>()) {
-          lua_pushnumber(L, elem.as<double>());
-        } else if (elem.is<const char*>()) {
-          lua_pushstring(L, elem.as<const char*>());
-        } else {
-          String json;
-          serializeJson(elem, json);
-          lua_pushstring(L, json.c_str());
-        }
-        lua_settable(L, -3);
-      }
-    } else if (v.is<JsonObject>()) {
-      jsonObjectToLuaTable(L, v.as<JsonObject>());
-    } else {
-      String json;
-      serializeJson(v, json);
-      lua_pushstring(L, json.c_str());
-    }
+    pushJsonVariant(L, kv.value());
     lua_settable(L, -3);
+  }
+}
+
+// One JSON value as its Lua value: arrays and objects as tables at any depth,
+// null as nil. Shared by JSON.decode and the EventBus payloads.
+static void pushJsonVariant(lua_State* L, JsonVariant v) {
+  if (v.isNull()) {
+    lua_pushnil(L);
+  } else if (v.is<bool>()) {
+    lua_pushboolean(L, v.as<bool>());
+  } else if (v.is<long>()) {
+    lua_pushinteger(L, v.as<long>());
+  } else if (v.is<double>()) {
+    lua_pushnumber(L, v.as<double>());
+  } else if (v.is<const char*>()) {
+    lua_pushstring(L, v.as<const char*>());
+  } else if (v.is<JsonObject>()) {
+    jsonObjectToLuaTable(L, v.as<JsonObject>());
+  } else if (v.is<JsonArray>()) {
+    lua_newtable(L);
+    lua_Integer idx = 1;
+    for (JsonVariant elem : v.as<JsonArray>()) {
+      lua_pushinteger(L, idx++);
+      pushJsonVariant(L, elem);
+      lua_settable(L, -3);
+    }
+  } else {
+    String json;
+    serializeJson(v, json);
+    lua_pushstring(L, json.c_str());
   }
 }
 
@@ -327,7 +347,7 @@ static int lua_eventbus_subscribe(lua_State* L) {
 
   uint32_t gen = ScriptEngine::generation();
 
-  EventBus::subscribe(event, [gen, ref](JsonObject data) {
+  const bool added = EventBus::subscribe(event, [gen, ref](JsonObject data) {
     if (gen != ScriptEngine::generation()) return;
     if (gL == nullptr) return;
 
@@ -338,16 +358,24 @@ static int lua_eventbus_subscribe(lua_State* L) {
     }
 
     jsonObjectToLuaTable(gL, data);
-    if (lua_pcall(gL, 1, 0, 0) != LUA_OK) {
+    if (luaBudgetedCall(gL, 1, 0) != LUA_OK) {
       const char* err = lua_tostring(gL, -1);
       Log::kvfe("Lua", "script.callback_error source=eventbus err=\"%.100s\"",
                 err ? err : "unknown");
       lua_pop(gL, 1);
     }
-  });
+  }, EVENT_OWNER_LUA);
+  if (!added) {
+    luaL_unref(L, LUA_REGISTRYINDEX, ref);
+    Log::kvfw(TAG, "script.event_subscribe_refused event=%s reason=full max=%u",
+              event, (unsigned)EVENT_SUBS_MAX);
+    lua_pushboolean(L, 0);
+    return 1;
+  }
 
   Log::kvf(TAG, "script.event_subscribed event=%s", event);
-  return 0;
+  lua_pushboolean(L, 1);
+  return 1;
 }
 
 static const luaL_Reg eventbusLib[] = {
@@ -367,25 +395,8 @@ static int lua_json_decode(lua_State* L) {
     lua_pushnil(L);
     return 1;
   }
-  if (doc.is<JsonObject>()) {
-    jsonObjectToLuaTable(L, doc.as<JsonObject>());
-  } else if (doc.is<JsonArray>()) {
-    JsonArray arr = doc.as<JsonArray>();
-    lua_newtable(L);
-    int idx = 1;
-    for (JsonVariant elem : arr) {
-      lua_pushinteger(L, idx++);
-      if (elem.is<JsonObject>()) {
-        jsonObjectToLuaTable(L, elem.as<JsonObject>());
-      } else if (elem.is<double>()) {
-        lua_pushnumber(L, elem.as<double>());
-      } else if (elem.is<const char*>()) {
-        lua_pushstring(L, elem.as<const char*>());
-      } else {
-        lua_pushnil(L);
-      }
-      lua_settable(L, -3);
-    }
+  if (doc.is<JsonObject>() || doc.is<JsonArray>()) {
+    pushJsonVariant(L, doc.as<JsonVariant>());
   } else {
     lua_pushnil(L);
   }
@@ -414,13 +425,10 @@ void ScriptEngine::createState() {
     Log::error(TAG, "script.state_create_failed reason=oom");
     return;
   }
+  // Before any coroutine exists, so every thread inherits it.
+  luaBudgetInstall(gL, &_budget);
 
-  luaL_openlibs(gL);
-
-  // ESP-Arduino-Lua may not fully load all standard libs. Ensure they exist.
-  luaL_requiref(gL, "math",   luaopen_math,   1); lua_pop(gL, 1);
-  luaL_requiref(gL, "table",  luaopen_table,  1); lua_pop(gL, 1);
-  luaL_requiref(gL, "string", luaopen_string, 1); lua_pop(gL, 1);
+  luaOpenLibs(gL);
 
   // Sandbox: nil out dangerous globals. MQTT broker creds =
   // device root, so cli/lua.exec must NOT see io/os/debug/package. Native
@@ -480,55 +488,11 @@ void ScriptEngine::addBindings(LuaBindingRegistrar fn) {
 }
 
 // Call all registered binding functions (core + module)
-static void wrapProtectedCalls(lua_State* L);
-
 void ScriptEngine::callAllRegistrars() {
   registerCoreBindings();
-  wrapProtectedCalls(gL);
+  luaBudgetWrapProtectedCalls(gL);
   for (uint8_t i = 0; i < _registrarCount; i++) {
     if (_registrars[i]) _registrars[i](gL);
-  }
-}
-
-static uint32_t _scriptStartMs = 0;
-static bool _budgetActive = false;  // a file is running under the budget
-static bool _budgetHit = false;     // its budget ran out
-
-// Count hook while a script file runs: feed until the budget is spent, then
-// raise. Coroutines keep the hook after the file ends; it is inert then.
-static void scriptBudgetHook(lua_State* L, lua_Debug*) {
-  if (!_budgetActive) return;
-  if (waitBudgetSpent(_scriptStartMs, millis(), LUA_SCRIPT_BUDGET_MS)) {
-    _budgetHit = true;
-    luaL_error(L, "script.budget_exceeded budget_ms=%d", (int)LUA_SCRIPT_BUDGET_MS);
-    return;
-  }
-  Watchdog::feed();
-}
-
-// pcall/xpcall wrapper: once the budget is spent, re-raise after the protected
-// call, so a caught budget error climbs every pcall up to executeFile.
-static int budgetSafeCall(lua_State* L) {
-  const int n = lua_gettop(L);
-  lua_pushvalue(L, lua_upvalueindex(1));
-  lua_insert(L, 1);
-  lua_call(L, n, LUA_MULTRET);
-  if (_budgetActive && _budgetHit) {
-    return luaL_error(L, "script.budget_exceeded budget_ms=%d", (int)LUA_SCRIPT_BUDGET_MS);
-  }
-  return lua_gettop(L);
-}
-
-static void wrapProtectedCalls(lua_State* L) {
-  static const char* const names[] = {"pcall", "xpcall"};
-  for (const char* name : names) {
-    lua_getglobal(L, name);
-    if (lua_isfunction(L, -1)) {
-      lua_pushcclosure(L, budgetSafeCall, 1);
-      lua_setglobal(L, name);
-    } else {
-      lua_pop(L, 1);
-    }
   }
 }
 
@@ -563,20 +527,7 @@ bool ScriptEngine::executeFile(const char* path) {
 
   int result = lua_load(gL, reader, &ctx, path, nullptr);
   f.close();
-  if (result == LUA_OK) {
-    _scriptStartMs = millis();
-    _budgetHit = false;
-    _budgetActive = true;
-    Watchdog::feed();
-    lua_sethook(gL, scriptBudgetHook, LUA_MASKCOUNT, LUA_HOOK_COUNT);
-    result = lua_pcall(gL, 0, LUA_MULTRET, 0);
-    lua_sethook(gL, nullptr, 0, 0);
-    _budgetActive = false;
-    if (result == LUA_OK && _budgetHit) {
-      Log::kvfe(TAG, "script.exec_failed path=%s err=\"script.budget_exceeded caught\"", path);
-      return false;
-    }
-  }
+  if (result == LUA_OK) result = luaBudgetedCall(gL, 0, 0);
   if (result != LUA_OK) {
     const char* err = lua_tostring(gL, -1);
     Log::kvfe(TAG, "script.exec_failed path=%s err=\"%.160s\"",
@@ -593,6 +544,24 @@ bool ScriptEngine::executeFile(const char* path) {
 // Public interface
 // ---------------------------------------------------------------------------
 
+// Subscribe the MQTT reload trigger under the current lua.reload_topic / prefix.
+static void subscribeReloadTrigger() {
+  JsonObject cfg = Config::get();
+  const char* customTopic = cfg["lua"]["reload_topic"] | "";
+  // subscribe() copies a custom topic and refuses one past MQTT_TOPIC_CAP.
+  const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+  char topic[MQTT_TOPIC_CAP];
+  const char* reloadTopic = *customTopic ? customTopic
+      : (MQTTClient::formatTopic(topic, sizeof(topic), "%s/cmd/lua/reload", prefix) ? topic : nullptr);
+
+  if (reloadTopic) MQTTClient::subscribe(reloadTopic, [](const char* topic, const char* payload) {
+    Log::info(TAG, "script.reload_trigger source=mqtt");
+    ScriptEngine::requestReload();
+  });
+
+  Log::kvf(TAG, "script.ready reload_topic=%s", reloadTopic ? reloadTopic : "");
+}
+
 // Initialize Lua, run startup scripts, and subscribe to MQTT reload trigger
 void ScriptEngine::begin() {
   createState();
@@ -601,24 +570,9 @@ void ScriptEngine::begin() {
   executeFile("/scripts/main.lua");
   executeFile("/scripts/rules.lua");
 
-  // Subscribe to MQTT reload trigger.
-  JsonObject cfg = Config::get();
-  const char* customTopic = cfg["lua"]["reload_topic"] | "";
-  char topic[MQTT_TOPIC_CAP];
-  if (strlen(customTopic) > 0) {
-    strncpy(topic, customTopic, sizeof(topic) - 1);
-    topic[sizeof(topic) - 1] = '\0';
-  } else {
-    const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
-    snprintf(topic, sizeof(topic), "%s/cmd/lua/reload", prefix);
-  }
-
-  MQTTClient::subscribe(topic, [](const char* topic, const char* payload) {
-    Log::info(TAG, "script.reload_trigger source=mqtt");
-    ScriptEngine::reload();
-  });
-
-  Log::kvf(TAG, "script.ready reload_topic=%s", topic);
+  // A core-owned slot, so an MQTT reinit drops it and the hook puts it back.
+  subscribeReloadTrigger();
+  MQTTClient::onReinit(subscribeReloadTrigger);
 
   // Register Lua shell commands
   Shell::registerCommand("lua.exec", "Execute inline Lua code",
@@ -626,17 +580,13 @@ void ScriptEngine::begin() {
         if (argc < 2) { out("Usage: lua.exec <code>"); return; }
         extern lua_State* gL;
         if (!gL) { out("Lua state not initialized"); return; }
-        String code;
-        for (int i = 1; i < argc; i++) {
-          if (i > 1) code += " ";
-          code += argv[i];
-        }
-        int result = luaL_dostring(gL, code.c_str());
+        int result = luaL_loadstring(gL, argv[1]);  // restFrom 1: code as typed
+        if (result == LUA_OK) result = luaBudgetedCall(gL, 0, LUA_MULTRET);
         if (result != LUA_OK) {
           const char* err = lua_tostring(gL, -1);
           char msg[196];
           snprintf(msg, sizeof(msg), "Error: %.180s", err ? err : "unknown");
-          out(msg);
+          Shell::fail(out, msg);
           lua_pop(gL, 1);
         } else {
           if (lua_gettop(gL) > 0) {
@@ -647,7 +597,7 @@ void ScriptEngine::begin() {
             out("OK");
           }
         }
-      });
+      }, 1);
 
   Shell::registerCommand("lua.load", "Execute a Lua file from LittleFS",
       [](int argc, char** argv, ShellOutput out) {
@@ -667,12 +617,13 @@ void ScriptEngine::begin() {
         if (!f) { out("Failed to open file"); return; }
         String script = f.readString();
         f.close();
-        int result = luaL_dostring(gL, script.c_str());
+        int result = luaL_loadstring(gL, script.c_str());
+        if (result == LUA_OK) result = luaBudgetedCall(gL, 0, 0);
         if (result != LUA_OK) {
           const char* err = lua_tostring(gL, -1);
           char msg[196];
           snprintf(msg, sizeof(msg), "Error: %.180s", err ? err : "unknown");
-          out(msg);
+          Shell::fail(out, msg);
           lua_pop(gL, 1);
         } else {
           char msg[64];
@@ -683,7 +634,10 @@ void ScriptEngine::begin() {
 
   Shell::registerCommand("lua.reload", "Hot-reload Lua scripts",
       [](int argc, char** argv, ShellOutput out) {
-        ScriptEngine::reload();
+        if (!ScriptEngine::reload()) {
+          out("Lua reload queued, it runs once the running script returns");
+          return;
+        }
         bool hasMain  = LittleFS.exists("/scripts/main.lua");
         bool hasRules = LittleFS.exists("/scripts/rules.lua");
         char msg[96];
@@ -693,10 +647,32 @@ void ScriptEngine::begin() {
       });
 }
 
-// Hot-reload scripts by bumping generation and re-creating the Lua state
-void ScriptEngine::reload() {
+// Set by a reload asked for while Lua was on the stack, run by loop().
+static bool s_reloadPending = false;
+
+bool ScriptEngine::reload() {
+  if (luaReloadNow(_budget.budget, &s_reloadPending)) {
+    runReload();
+    return true;
+  }
+  Log::info(TAG, "script.reload_deferred reason=lua_running");
+  return false;
+}
+
+void ScriptEngine::requestReload() {
+  if (!luaReloadRequest(SleepManager::shuttingDown(), &s_reloadPending)) {
+    Log::kvfw(TAG, "script.reload_refused reason=sleep_shutdown");
+  }
+}
+
+// Hot-reload scripts by bumping generation and re-creating the Lua state.
+// Never with a call into Lua on the stack: lua_close frees that frame.
+void ScriptEngine::runReload() {
   Log::info(TAG, "script.reload_start");
   _generation++;
+  // The old state's subscriptions go with it: the new scripts register their own.
+  MQTTClient::unsubscribeOwner(MQTT_SUB_OWNER_LUA);
+  EventBus::unsubscribeOwner(EVENT_OWNER_LUA);
 
   destroyState();
   createState();
@@ -713,8 +689,9 @@ uint32_t ScriptEngine::generation() {
   return _generation;
 }
 
-// Fire any expired Lua timers registered via Node.setTimeout
+// Run a latched reload, then fire any expired Lua timers (Node.setTimeout)
 void ScriptEngine::loop() {
+  if (luaReloadDue(_budget.budget, &s_reloadPending)) runReload();
   if (!gL) return;
   uint64_t upMs = uptimeMs();
 
@@ -733,7 +710,7 @@ void ScriptEngine::loop() {
       int ref = _timers[i].callbackRef;
       _timers[i].callbackRef = LUA_NOREF;
       lua_rawgeti(gL, LUA_REGISTRYINDEX, ref);
-      if (lua_pcall(gL, 0, 0, 0) != LUA_OK) {
+      if (luaBudgetedCall(gL, 0, 0) != LUA_OK) {
         const char* err = lua_tostring(gL, -1);
         Log::kvfe("Lua", "script.timer_error err=\"%.100s\"",
                   err ? err : "unknown");

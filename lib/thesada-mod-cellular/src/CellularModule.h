@@ -21,9 +21,14 @@ private:
   void subscribeEvents();
   void emitActive(int active);
   void emitRssi();
+  void syncClock();
 
   static State    _state;
   static uint32_t _wifiDownSince;
   static uint32_t _wifiUpSince;
+  static uint8_t  _actFails;
   static uint32_t _lastTelemetryMs;
+  static uint8_t  _ntpTries;  // cellular NTP tries since activation
+  static uint32_t _ntpAt;     // millis() of the next try
+  static uint8_t  _ntpIdx;    // next server in the current attempt
 };

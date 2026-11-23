@@ -20,6 +20,16 @@ using DeferredFn = std::function<void()>;
 
 using ShellCommand = std::function<void(int argc, char** argv, ShellOutput out)>;
 
+// Result of Shell::writeChecked and Shell::writeRouted. The CONFIG_ values are
+// refusals on the live config file with nothing written.
+enum FsWrite {
+  FS_WRITE_OK,
+  FS_WRITE_OPEN_FAILED,
+  FS_WRITE_SHORT,
+  FS_WRITE_CONFIG_APPEND,
+  FS_WRITE_CONFIG_NOT_OBJECT,
+};
+
 // Disk-usage probe a module supplies for its mount; fs::FS has no byte counts
 // (subclass-specific). Returns bytes, 0 = empty / not mounted.
 using FSDfFn = uint64_t(*)();
@@ -28,6 +38,7 @@ struct ShellEntry {
   const char* name;
   const char* help;
   ShellCommand handler;
+  int restFrom;  // >0: argv[restFrom] is the raw rest of the line
 };
 
 class Shell {
@@ -42,9 +53,16 @@ public:
   // Run a command line synchronously on the caller's task. Callers in a
   // non-main context (AsyncTCP, PubSubClient callback) MUST use enqueue()
   // instead: running here from those task stacks risks overflow on commands
-  // that touch fs / MQTT / TLS.
-  // in: command line, output callback. out: none.
-  static void execute(const char* line, ShellOutput out);
+  // that touch fs / MQTT / TLS. One console line may run while a command
+  // blocks (SHELL_NEST_MAX); a deeper one is refused.
+  // in: command line, output callback.
+  // out: Failed on a refused line, an unknown command or a handler fail().
+  static ShellResult execute(const char* line, ShellOutput out);
+
+  // Print msg and mark the running command failed, so the transport replies
+  // ok:false. Outside execute() it only prints.
+  // in: output callback, message. out: none.
+  static void fail(ShellOutput out, const char* msg);
 
   // Stage a command for the main-loop drain. false if the ring is full (caller
   // surfaces "shell busy") or the line does not fit DEFERRED_LINE_LEN, which is
@@ -65,8 +83,10 @@ public:
   // in: none. out: none.
   static void loop();
 
-  // Register a command (name, one-line help, handler).
-  static void registerCommand(const char* name, const char* help, ShellCommand handler);
+  // Register a command (name, one-line help, handler). restFrom > 0 hands the
+  // handler argv[restFrom] as the rest of the line, inner whitespace intact.
+  static void registerCommand(const char* name, const char* help, ShellCommand handler,
+                              int restFrom = 0);
 
   // Map a mount prefix to a filesystem; modules with their own storage call
   // this after a successful mount. fs.* routes by leading path segment, with
@@ -104,6 +124,20 @@ public:
   // in: absolute path. out: path relative to the resolved FS root.
   static const char* stripPrefix(const char* path);
 
+  // in: onDisk non-null. Writes or appends len bytes, then reads the size back (littlefs commits in close()).
+  // out: OPEN_FAILED if open fails, OK only when write() and growth both equal len, *onDisk = growth.
+  static FsWrite writeChecked(fs::FS* fs, const char* path, bool append,
+                              const uint8_t* data, size_t len, size_t* onDisk);
+
+  // fs.write / fs.append on every transport. The live config file is written
+  // whole through Config::writeRaw (tmp + rename), never in place.
+  // in: as writeChecked. out: as writeChecked, or a CONFIG_ refusal.
+  static FsWrite writeRouted(fs::FS* fs, const char* path, bool append,
+                             const uint8_t* data, size_t len, size_t* onDisk);
+
+  // in: a writeRouted result. out: the reply line for a refusal, else nullptr.
+  static const char* fsWriteRefusal(FsWrite w);
+
   // Validate an externally-supplied FS path before any LittleFS call. Every
   // transport that accepts a path (HTTP, Shell over serial / WS / MQTT CLI,
   // future BLE) MUST run it through this - single-source so tightening the
@@ -126,7 +160,8 @@ public:
   // Read Serial and execute newline-terminated lines. The console buffer is a
   // shared singleton (USB-CDC / UART0), so this is safe to call from
   // main.loop() and from blocking inner loops that must keep the shell live
-  // (e.g. cellular connect polling).
+  // (e.g. cellular connect polling). Only the task that ran begin() pumps.
+  // A call from any other task returns at once.
   static void pumpConsole();
 
   static constexpr int MAX_COMMANDS = 60;
@@ -141,7 +176,10 @@ private:
 
   static ShellEntry _commands[MAX_COMMANDS];
   static int _commandCount;
-  static char _parseBuf[SHELL_LINE_MAX];  // mutable copy for tokenization
+  // One parse buffer and fail flag per nesting level (shellParseSlot).
+  static char _parseBuf[SHELL_NEST_MAX][SHELL_LINE_MAX];
+  static bool _failed[SHELL_NEST_MAX];
+  static int  _depth;
 
   // FS mount registry, walked in registration order by resolveFS.
   static constexpr int FS_MOUNTS_MAX = 4;

@@ -142,7 +142,10 @@ void SHT31Module::publishHaDiscovery() {
   const char* haUnit  = (unit[0] == 'F' || unit[0] == 'f') ? "\xC2\xB0""F" : "\xC2\xB0""C";
 
   char availTopic[MQTT_TOPIC_CAP];
-  snprintf(availTopic, sizeof(availTopic), "%s/status", prefix);
+  if (!MQTTClient::formatTopic(availTopic, sizeof(availTopic), "%s/status", prefix)) {
+    _haPublished = true;
+    return;
+  }
 
   auto disc = [&](const char* uid, const char* name, const char* stateTopic,
                   const char* dUnit, const char* devClass, const char* stateClass) {
@@ -159,20 +162,24 @@ void SHT31Module::publishHaDiscovery() {
     dev["name"] = devName;
     dev["mf"]   = "Thesada";
     dev["sw"]   = FIRMWARE_VERSION;
-    char topic[128], payload[512];
-    snprintf(topic, sizeof(topic), "homeassistant/sensor/%s/%s/config", devId, uid);
-    serializeJson(doc, payload, sizeof(payload));
-    MQTTClient::publishRetained(topic, payload);
+    char topic[MQTT_TOPIC_CAP];
+    if (!MQTTClient::formatTopic(topic, sizeof(topic), "homeassistant/sensor/%s/%s/config",
+                                 devId, uid)) {
+      return;
+    }
+    String payload;
+    serializeJson(doc, payload);
+    MQTTClient::publishRetained(topic, payload.c_str());
   };
 
   char uid[48], st[MQTT_TOPIC_CAP];
   snprintf(uid, sizeof(uid), "%s_sht31_temp", devId);
-  snprintf(st, sizeof(st), "%s/sensor/temperature/sht31", prefix);
-  disc(uid, "SHT31 Temperature", st, haUnit, "temperature", "measurement");
+  if (MQTTClient::formatTopic(st, sizeof(st), "%s/sensor/temperature/sht31", prefix))
+    disc(uid, "SHT31 Temperature", st, haUnit, "temperature", "measurement");
 
   snprintf(uid, sizeof(uid), "%s_sht31_humidity", devId);
-  snprintf(st, sizeof(st), "%s/sensor/humidity/sht31", prefix);
-  disc(uid, "SHT31 Humidity", st, "%", "humidity", "measurement");
+  if (MQTTClient::formatTopic(st, sizeof(st), "%s/sensor/humidity/sht31", prefix))
+    disc(uid, "SHT31 Humidity", st, "%", "humidity", "measurement");
 
   _haPublished = true;
   Log::info(TAG, "sht31.ha_discovery_published");
@@ -200,13 +207,15 @@ void SHT31Module::readAndPublish() {
 
   // Per-sensor MQTT topics (HA discovery compatible)
   char topic[MQTT_TOPIC_CAP], val[16];
-  snprintf(topic, sizeof(topic), "%s/sensor/temperature/sht31", prefix);
-  snprintf(val, sizeof(val), "%.1f", displayTemp);
-  MQTTClient::publish(topic, val);
+  if (MQTTClient::formatTopic(topic, sizeof(topic), "%s/sensor/temperature/sht31", prefix)) {
+    snprintf(val, sizeof(val), "%.1f", displayTemp);
+    MQTTClient::publish(topic, val);
+  }
 
-  snprintf(topic, sizeof(topic), "%s/sensor/humidity/sht31", prefix);
-  snprintf(val, sizeof(val), "%.1f", humid);
-  MQTTClient::publish(topic, val);
+  if (MQTTClient::formatTopic(topic, sizeof(topic), "%s/sensor/humidity/sht31", prefix)) {
+    snprintf(val, sizeof(val), "%.1f", humid);
+    MQTTClient::publish(topic, val);
+  }
 
   // EventBus for Lua alert rules
   JsonDocument doc;

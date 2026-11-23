@@ -60,13 +60,10 @@ void ExampleRemoteRelay::set(bool on) {
 void ExampleRemoteRelay::publishState() {
   JsonObject  cfg    = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+  // formatTopic logs and refuses a topic that does not fit, never clips it.
   char topic[MQTT_TOPIC_CAP];
-  int n = snprintf(topic, sizeof(topic), "%s/sensor/relay", prefix);
-  if (n < 0 || n >= (int)sizeof(topic)) {
-    Log::kvfw(TAG, "example_relay.topic_too_long prefix_len=%u", (unsigned)strlen(prefix));
-    return;
-  }
-  MQTTClient::publish(topic, _on ? "{\"on\":true}" : "{\"on\":false}");
+  if (MQTTClient::formatTopic(topic, sizeof(topic), "%s/sensor/relay", prefix))
+    MQTTClient::publish(topic, _on ? "{\"on\":true}" : "{\"on\":false}");
 
   JsonDocument doc;
   doc["on"] = _on;

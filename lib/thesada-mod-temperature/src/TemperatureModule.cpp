@@ -3,6 +3,7 @@
 #include <thesada_config.h>
 #include "TemperatureModule.h"
 #include <Config.h>
+#include <config_load_policy.h>
 #include <EventBus.h>
 #include <MQTTClient.h>
 #include <Log.h>
@@ -20,7 +21,7 @@ static_assert(TEMP_NO_READING == DEVICE_DISCONNECTED_C, "guard sentinel must mat
 void TemperatureModule::begin() {
   JsonObject cfg = Config::get();
 
-  _intervalMs     = (uint32_t)(cfg["temperature"]["interval_s"] | 60) * 1000;
+  _intervalMs     = tempIntervalS(cfg["temperature"]["interval_s"] | 60LL) * 1000UL;
   _autoDiscover   = cfg["temperature"]["auto_discover"]       | true;
   _conversionMs   = cfg["temperature"]["conversion_wait_ms"]  | 750;
   if (_conversionMs > 1000) _conversionMs = 1000;
@@ -149,15 +150,40 @@ void TemperatureModule::discoverSensors(bool addNew) {
   }
 }
 
+// Edit base: the file, since fs.write can leave it ahead of the live doc.
+// in: dst. out: false if the file exists but is not a JSON object.
+static bool loadConfigBase(JsonDocument& dst) {
+  if (!LittleFS.begin()) return false;
+  if (!LittleFS.exists("/config.json")) return Config::copyDiskDoc(dst);
+  File f = LittleFS.open("/config.json", "r");
+  if (!f) return false;
+  if (f.size() > CONFIG_FILE_MAX) {
+    f.close();
+    return false;
+  }
+  DeserializationError err;
+  configParseWhole(f, dst, err);
+  f.close();
+  return !err && dst.is<JsonObject>();
+}
+
+// Write the file only (tmp + rename). Live config picks it up on restart.
+// in: edited doc, op tag. out: false if the old file stayed.
+static bool commitConfig(const JsonDocument& doc, const char* op) {
+  if (!Config::writeFile(doc.as<JsonVariantConst>(), true)) {
+    Log::kvfe(TAG, "temp.config_write_failed op=%s", op);
+    return false;
+  }
+  Log::kvf(TAG, "temp.config_saved op=%s", op);
+  return true;
+}
+
 // Persist newly discovered sensors to config.json with auto-assigned names
 void TemperatureModule::saveDiscovered() {
-  if (!LittleFS.begin()) return;
-
-  // ── Load current config.json ───────────────────────────────────────────────
   JsonDocument cfgDoc;
-  {
-    File f = LittleFS.open("/config.json", "r");
-    if (f) { deserializeJson(cfgDoc, f); f.close(); }
+  if (!loadConfigBase(cfgDoc)) {
+    Log::error(TAG, "temp.config_write_failed op=save reason=read");
+    return;
   }
 
   // ── Merge new sensors into temperature.sensors with auto-assigned names ────
@@ -188,35 +214,7 @@ void TemperatureModule::saveDiscovered() {
 
   if (!anyNew) return; // nothing changed - skip rewrite
 
-  // ── Add default Telegram alert rules if section is empty ──────────────────
-  JsonArray alerts;
-  if (cfgDoc["telegram"]["alerts"].is<JsonArray>()) {
-    alerts = cfgDoc["telegram"]["alerts"].as<JsonArray>();
-  }
-  if (alerts.isNull() || alerts.size() == 0) {
-    JsonArray newAlerts = cfgDoc["telegram"]["alerts"].to<JsonArray>();
-    JsonObject hi = newAlerts.add<JsonObject>();
-    hi["enabled"]          = false;
-    hi["name"]             = "overheat";
-    hi["temp_high_c"]      = 40.0;
-    hi["message_template"] = "{{sensor.name}}: {{sensor.value}}C -- OVERHEAT (>= {{threshold}}C)";
-    JsonObject lo = newAlerts.add<JsonObject>();
-    lo["enabled"]          = false;
-    lo["name"]             = "freeze";
-    lo["temp_low_c"]       = 2.0;
-    lo["message_template"] = "{{sensor.name}}: {{sensor.value}}C -- FREEZE RISK (<= {{threshold}}C)";
-  }
-
-  // ── Write updated config.json back ─────────────────────────────────────────
-  File out = LittleFS.open("/config.json", "w");
-  if (!out) { Log::error(TAG, "temp.config_write_failed op=save file=config.json"); return; }
-  size_t written = serializeJson(cfgDoc, out);
-  out.close();
-  if (written < measureJson(cfgDoc)) {
-    Log::error(TAG, "temp.config_write_failed op=save reason=short_write");
-    return;
-  }
-  Log::info(TAG, "temp.config_saved file=config.json");
+  commitConfig(cfgDoc, "save");
 }
 
 // temp.discover [--prune]: re-search the live bus (begin() repopulates the
@@ -275,12 +273,10 @@ size_t TemperatureModule::pruneSensors() {
 
 // Remove the given addresses from temperature.sensors in config.json.
 void TemperatureModule::removeSensorsFromConfig(const std::vector<std::string>& addrs) {
-  if (!LittleFS.begin()) return;
-
   JsonDocument cfgDoc;
-  {
-    File f = LittleFS.open("/config.json", "r");
-    if (f) { deserializeJson(cfgDoc, f); f.close(); }
+  if (!loadConfigBase(cfgDoc)) {
+    Log::error(TAG, "temp.config_write_failed op=prune reason=read");
+    return;
   }
   if (!cfgDoc["temperature"]["sensors"].is<JsonArray>()) return;
 
@@ -295,13 +291,7 @@ void TemperatureModule::removeSensorsFromConfig(const std::vector<std::string>& 
   }
   cfgDoc["temperature"]["sensors"].set(kept);
 
-  File w = LittleFS.open("/config.json", "w");
-  if (!w) { Log::error(TAG, "temp.config_write_failed op=prune file=config.json"); return; }
-  size_t written = serializeJson(cfgDoc, w);
-  w.close();
-  if (written < measureJson(cfgDoc)) {
-    Log::error(TAG, "temp.config_write_failed op=prune reason=short_write");
-  }
+  commitConfig(cfgDoc, "prune");
 }
 
 // Read one probe with library retries (CRC-validated) plus the plausibility
@@ -320,6 +310,10 @@ float TemperatureModule::readSensorC(TempSensor& s) {
       return temp;
     case TempVerdict::Implausible:
       Log::kvfw(TAG, "temp.read_rejected addr=%s last=%.2f got=%.2f reason=implausible",
+                s.addressStr, last, temp);
+      break;
+    case TempVerdict::PowerOn:
+      Log::kvfw(TAG, "temp.read_rejected addr=%s last=%.2f got=%.2f reason=power_on",
                 s.addressStr, last, temp);
       break;
     case TempVerdict::NoReading:
@@ -379,7 +373,10 @@ void TemperatureModule::readAndPublish() {
     slug[sizeof(slug) - 1] = '\0';
     for (char* p = slug; *p; p++) { if (*p == ' ') *p = '_'; *p = tolower(*p); }
     char perTopic[MQTT_TOPIC_CAP];
-    snprintf(perTopic, sizeof(perTopic), "%s/sensor/temperature/%s", prefix, slug);
+    if (!MQTTClient::formatTopic(perTopic, sizeof(perTopic), "%s/sensor/temperature/%s",
+                                 prefix, slug)) {
+      continue;
+    }
     char val[16];
     snprintf(val, sizeof(val), "%.2f", t);
     MQTTClient::publish(perTopic, val);
@@ -389,11 +386,12 @@ void TemperatureModule::readAndPublish() {
   // Dynamic buffer - multi-bus probe counts can outgrow any fixed size and a
   // truncated payload would publish malformed JSON.
   char topic[MQTT_TOPIC_CAP];
-  snprintf(topic, sizeof(topic), "%s/sensor/temperature", prefix);
-  String payload;
-  payload.reserve(measureJson(doc) + 1);
-  serializeJson(doc, payload);
-  MQTTClient::publish(topic, payload.c_str());
+  if (MQTTClient::formatTopic(topic, sizeof(topic), "%s/sensor/temperature", prefix)) {
+    String payload;
+    payload.reserve(measureJson(doc) + 1);
+    serializeJson(doc, payload);
+    MQTTClient::publish(topic, payload.c_str());
+  }
 
   EventBus::publish("temperature", doc.as<JsonObject>());
 }

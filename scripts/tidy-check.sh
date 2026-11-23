@@ -13,19 +13,28 @@ fi
 [ -n "$TIDY" ] || { echo "tidy-check: clang-tidy not found - make setup-sys, or CLANG_TIDY=/path/to/clang-tidy"; exit 2; }
 
 UNITY=.pio/libdeps/native/Unity/src
-if [ ! -f "$UNITY/unity.h" ]; then
-  echo "tidy-check: fetching Unity for the native env"
+AJSON=.pio/libdeps/native/ArduinoJson/src
+if [ ! -f "$UNITY/unity.h" ] || [ ! -f "$AJSON/ArduinoJson.h" ]; then
+  echo "tidy-check: fetching Unity and ArduinoJson for the native env"
   pio test -e native --without-testing --without-uploading >/dev/null
 fi
 [ -f "$UNITY/unity.h" ] || { echo "tidy-check: Unity missing under $UNITY after pio test"; exit 2; }
+[ -f "$AJSON/ArduinoJson.h" ] || { echo "tidy-check: ArduinoJson missing under $AJSON after pio test"; exit 2; }
 
 shopt -s nullglob
-units=(test/test_*/test_*.cpp)
+units=()
+for u in test/test_*/test_*.cpp; do
+  # Need the Lua fork, built only in [env:native-lua].
+  case "$u" in
+    test/test_lua_stdlibs/*|test/test_lua_budget_hooks/*) continue ;;
+  esac
+  units+=("$u")
+done
 [ ${#units[@]} -gt 0 ] || { echo "tidy-check: no test units found"; exit 2; }
 
 echo "tidy-check: $TIDY over ${#units[@]} test units, headers lib/thesada-core/src"
 # The static analyzer skips header-defined functions nobody in the TU calls;
 # analyze-headers makes it walk every policy function, reached or not.
 "$TIDY" --quiet --extra-arg=-Xclang --extra-arg=-analyzer-opt-analyze-headers \
-  "${units[@]}" -- -std=gnu++14 -I lib/thesada-core/src -I "$UNITY"
+  "${units[@]}" -- -std=gnu++14 -I lib/thesada-core/src -I "$UNITY" -isystem "$AJSON"
 echo "tidy-check: OK"

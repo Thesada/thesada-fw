@@ -1,6 +1,7 @@
 // thesada-fw - Console.cpp
 // SPDX-License-Identifier: GPL-3.0-only
 #include "Console.h"
+#include "console_drop_policy.h"
 
 SemaphoreHandle_t Console::_mutex = nullptr;
 Console::Mode     Console::_mode  = Console::Mode::Normal;
@@ -18,11 +19,31 @@ void Console::writeLocked(const char* line) {
   if (_mutex) xSemaphoreGive(_mutex);
 }
 
+#if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
+// HWCDC waits up to 20 x the TX timeout per write on a host that stopped
+// reading, so log lines drop whole instead (console_drop_policy.h).
+namespace {
+struct CdcPort {
+  int availableForWrite() { return Serial.availableForWrite(); }
+  size_t write(const uint8_t* b, size_t n) { return Serial.write(b, n); }
+  uint32_t nowMs() { return millis(); }
+  void sleepMs(uint32_t ms) { delay(ms); }
+};
+ConsoleDropState _drop;
+}
+static void emitLog(const char* line) {
+  CdcPort port;
+  consoleWriteLine(port, _drop, line);
+}
+#else
+static void emitLog(const char* line) { Serial.println(line); }
+#endif
+
 // Mode check and write under one lock: a flip to Command mid-call
 // cannot let a log line splice into a command frame.
 void Console::log(const char* line) {
   if (_mutex) xSemaphoreTake(_mutex, portMAX_DELAY);
-  if (_mode == Mode::Normal) Serial.println(line);
+  if (_mode == Mode::Normal) emitLog(line);
   if (_mutex) xSemaphoreGive(_mutex);
 }
 void Console::reply(const char* line) { writeLocked(line); }

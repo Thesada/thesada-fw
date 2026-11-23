@@ -12,6 +12,7 @@
 #include <soc/soc_caps.h>
 #include "thesada_config.h"
 #include <Config.h>
+#include <EventBus.h>
 #include <Identity.h>
 #include <Enroll.h>
 #include <ModuleRegistry.h>
@@ -92,8 +93,9 @@ static bool _heartbeatEnabled = true;
 void setup() {
   Serial.begin(115200);
 #if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
-  // Drop console output when no host reads; a blocked write starves the task watchdog.
-  Serial.setTxTimeoutMs(0);
+  // Bounded wait when no host reads: 0 cut every line past the 256 B buffer,
+  // an unbounded write starves the task watchdog.
+  Serial.setTxTimeoutMs(50);
 #endif
   logBootCause();
   OTAUpdate::rollbackIfCrashLoop();
@@ -164,8 +166,8 @@ void setup() {
     OTAUpdate::begin();
     OTAUpdate::checkNow();  // immediate check while heap is clean
   }
-  // Registers the subscription set that Cellular::smsubAll mirrors onto the
-  // cellular MQTT session on failover. connect() is a no-op if WiFi is down.
+  // Registers the subscription set every session resubscribes. connect() is
+  // a no-op until a transport is up.
   if (_mqttEnabled) {
     // Roll back mqtt.* to last-good if a bad config rebooted us without ever
     // connecting; no-op otherwise. Must precede the first connect attempt.
@@ -179,6 +181,16 @@ void setup() {
 
   // All modules self-registered via MODULE_REGISTER. beginAll() sorts by priority.
   ModuleRegistry::beginAll();
+
+  // A config schema migration that could not run reaches the app as an alert.
+  // MQTT queues it until the first session.
+  if (const char* why = Config::schemaAlert()) {
+    JsonDocument alert;
+    alert["severity"] = "warn";
+    alert["code"]     = "config_schema";
+    alert["message"]  = why;
+    EventBus::publish("alert", alert.as<JsonObject>());
+  }
 
   SleepManager::begin();
 

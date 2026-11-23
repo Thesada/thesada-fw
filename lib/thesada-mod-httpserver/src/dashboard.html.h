@@ -17,6 +17,9 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawhtml(
   h1{font-size:1.2rem;margin:0 0 1rem;color:#7cf}
   .card{background:#1e1e1e;border-radius:8px;padding:1rem;margin-bottom:1rem}
   table{width:100%;border-collapse:collapse}
+  tr.grp td{color:#888;font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;padding-top:.8rem}
+  .ml{color:#888;font-size:.8rem;margin-right:.3rem}
+  @media (max-width:480px){th:nth-child(3),td.upd{display:none}}
   td,th{padding:.4rem .6rem;text-align:left;border-bottom:1px solid #333}
   th{color:#7cf;font-weight:600}
   .val{font-family:monospace;color:#afa}
@@ -159,7 +162,7 @@ let _authResolve = null;
   if (saved) {
     _authHeader = 'Bearer ' + saved;
     // Validate the token is still accepted by the server
-    fetch('/api/ws/token', { headers: { 'Authorization': _authHeader } })
+    fetch('/api/auth/check', { headers: { 'Authorization': _authHeader } })
       .then(r => { if (r.status === 401) clearAuth(); });
   }
 })();
@@ -198,6 +201,7 @@ function authSubmit() {
       return r.json();
     })
     .then(data => {
+      if (data && !data.token && data.error) { err.textContent = data.error; return; }
       if (!data || !data.token) return;
       _authHeader = 'Bearer ' + data.token;
       sessionStorage.setItem('thesada_token', data.token);
@@ -276,78 +280,67 @@ function refreshState() {
       }
       const now = new Date().toLocaleTimeString();
       let html = '';
+      // One row per sensor, its metrics stacked, a header row per module.
+      const row = (name, metrics, col) => {
+        const cells = metrics.length
+          ? metrics.map(m => `<div><span class="ml">${m.label}</span> <span${col ? ` style="color:${col}"` : ''}>${m.value}</span></div>`).join('')
+          : '-';
+        html += `<tr><td>${name}</td><td class="val">${cells}</td><td class="upd">${now}</td></tr>`;
+      };
+      const group = title => { html += `<tr class="grp"><td colspan="3">${esc(title)}</td></tr>`; };
       for (const [key, val] of Object.entries(data)) {
         if (key.startsWith('_')) continue;  // skip metadata keys
-        if (typeof val === 'object' && val !== null) {
-          if (Array.isArray(val.sensors)) {
-            val.sensors.forEach(s => {
-              const sensorName = esc(s.name || s.address || key);
-              const metrics = [];
-              const addMetric = (metricKey, label, unit) => {
-                const v = s[metricKey];
-                if (v === undefined || v === null) return;
-                metrics.push({ label: label, value: unit ? `${v} ${unit}` : String(v) });
-              };
-
-              if (s.temp !== undefined && s.temp !== null) {
-                const unit = (s.temp_c !== undefined && s.temp !== s.temp_c) ? '\u00B0F' : '\u00B0C';
-                addMetric('temp', 'temperature', unit);
-              } else {
-                addMetric('temp_c', 'temperature', '\u00B0C');
-              }
-              addMetric('humidity', 'humidity', '%');
-              addMetric('current_a', 'current', 'A');
-              addMetric('voltage_v', 'voltage', 'V');
-              addMetric('power_w', 'power', 'W');
-              addMetric('percent', 'percent', '%');
-
-              const known = new Set(['name', 'address', 'temp', 'temp_c', 'humidity', 'current_a', 'voltage_v', 'power_w', 'percent']);
-              Object.entries(s).forEach(([metricKey, raw]) => {
-                if (known.has(metricKey)) return;
-                if (raw === undefined || raw === null) return;
-                if (typeof raw === 'object') return;
-                metrics.push({ label: esc(metricKey.replace(/_/g, ' ')), value: esc(String(raw)) });
-              });
-
-              if (!metrics.length) {
-                html += `<tr><td>${sensorName}</td>
-                             <td class="val">-</td>
-                             <td>${now}</td></tr>`;
-                return;
-              }
-
-              metrics.forEach(m => {
-                html += `<tr><td>${sensorName} - ${m.label}</td>
-                             <td class="val">${m.value}</td>
-                             <td>${now}</td></tr>`;
-              });
+        if (typeof val !== 'object' || val === null) continue;
+        if (Array.isArray(val.sensors)) {
+          group(key);
+          val.sensors.forEach(s => {
+            const metrics = [];
+            const add = (k, label, unit) => {
+              const v = s[k];
+              if (v === undefined || v === null) return;
+              metrics.push({ label: label, value: esc(unit ? `${v} ${unit}` : String(v)) });
+            };
+            if (s.temp !== undefined && s.temp !== null) {
+              add('temp', 'temp', (s.temp_c !== undefined && s.temp !== s.temp_c) ? '\u00B0F' : '\u00B0C');
+            } else {
+              add('temp_c', 'temp', '\u00B0C');
+            }
+            add('humidity', 'humidity', '%');
+            add('current_a', 'current', 'A');
+            add('voltage_v', 'voltage', 'V');
+            add('power_w', 'power', 'W');
+            add('percent', 'percent', '%');
+            const known = new Set(['name', 'address', 'temp', 'temp_c', 'humidity', 'current_a', 'voltage_v', 'power_w', 'percent']);
+            Object.entries(s).forEach(([k, raw]) => {
+              if (known.has(k) || raw === undefined || raw === null || typeof raw === 'object') return;
+              metrics.push({ label: esc(k.replace(/_/g, ' ')), value: esc(String(raw)) });
             });
-          } else if (Array.isArray(val.channels)) {
-            val.channels.forEach(c => {
-              const a = c.current_a !== undefined ? c.current_a + ' A' : '-';
-              const w = c.power_w !== undefined ? c.power_w + ' W' : '-';
-              const v = c.voltage_v !== undefined ? c.voltage_v + ' V' : '-';
-              html += `<tr><td>${esc(c.name)}</td>
-                           <td class="val">${a} &nbsp; ${w} &nbsp; <span style="color:#888">${v}</span></td>
-                           <td>${now}</td></tr>`;
-            });
-          } else if (val.voltage_v !== undefined && val.percent !== undefined) {
-            const state = val.charging ? 'Charging' : 'Discharging';
-            const col = val.percent <= 20 ? '#c44' : val.charging ? '#4c4' : '#fff';
-            html += `<tr><td>Battery %</td>
-                         <td class="val" style="color:${col}">${val.percent}%</td>
-                         <td>${now}</td></tr>`;
-            html += `<tr><td>Battery V</td>
-                         <td class="val">${val.voltage_v} V</td>
-                         <td>${now}</td></tr>`;
-            html += `<tr><td>Battery Charge State</td>
-                         <td class="val" style="color:${col}">${state}</td>
-                         <td>${now}</td></tr>`;
+            row(esc(s.name || s.address || key), metrics);
+          });
+        } else if (Array.isArray(val.channels)) {
+          group(key);
+          val.channels.forEach(c => {
+            const metrics = [];
+            if (c.current_a !== undefined) metrics.push({ label: 'current', value: esc(c.current_a + ' A') });
+            if (c.power_w !== undefined) metrics.push({ label: 'power', value: esc(c.power_w + ' W') });
+            if (c.voltage_v !== undefined) metrics.push({ label: 'voltage', value: esc(c.voltage_v + ' V') });
+            row(esc(c.name), metrics);
+          });
+        } else if (val.voltage_v !== undefined && val.percent !== undefined) {
+          group(key);
+          if (val.present === false) {
+            row('Battery', [{ label: 'state', value: 'not present' }]);
           } else {
-            html += `<tr><td>${key}</td>
-                         <td class="val">${JSON.stringify(val)}</td>
-                         <td>${now}</td></tr>`;
+            const col = val.percent <= 20 ? '#c44' : val.charging ? '#4c4' : '';
+            row('Battery', [
+              { label: 'charge', value: esc(val.percent + '%') },
+              { label: 'voltage', value: esc(val.voltage_v + ' V') },
+              { label: 'state', value: val.charging ? 'charging' : 'discharging' },
+            ], col);
           }
+        } else {
+          group(key);
+          row(esc(key), [{ label: '', value: esc(JSON.stringify(val)) }]);
         }
       }
       tbody.innerHTML = html || '<tr><td colspan="3" style="color:#888">No data yet - waiting for first sensor read</td></tr>';
@@ -442,13 +435,16 @@ async function wsConnect() {
   if (_wsConnecting) return;
   if (!_authHeader) { termAppend('[not authenticated]'); return; }
   _wsConnecting = true;
+  let wsToken;
   try {
     const r = await fetch('/api/ws/token', { headers: { 'Authorization': _authHeader } });
     if (r.status === 401) { _wsConnecting = false; clearAuth(); termAppend('[session expired - log in again]'); return; }
     if (!r.ok) { _wsConnecting = false; setTimeout(wsConnect, 5000); return; }
+    wsToken = (await r.json()).token;
+    if (!wsToken) { _wsConnecting = false; setTimeout(wsConnect, 5000); return; }
   } catch(e) { _wsConnecting = false; setTimeout(wsConnect, 5000); return; }
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  _ws = new WebSocket(proto + '//' + location.host + '/ws/serial');
+  _ws = new WebSocket(proto + '//' + location.host + '/ws/serial?token=' + encodeURIComponent(wsToken));
   _ws.onopen    = () => { _wsConnecting = false; termAppend('[connected]'); };
   _ws.onmessage = e => {
     // Replay arrives as single message with newline-separated lines
@@ -517,6 +513,7 @@ async function refreshFiles() {
       files.filter(f => !f.dir).sort((a,b) => a.name.localeCompare(b.name)).forEach(f => {
         const opt = document.createElement('option');
         opt.value = f.name.startsWith('/') ? f.name : '/' + f.name;
+        opt.dataset.size = f.size;
         opt.textContent = (f.name.startsWith('/') ? f.name : '/' + f.name) +
                           '  (' + (f.size >= 1024 ? (f.size/1024).toFixed(1)+' KB' : f.size+' B') + ')';
         if (opt.value === cur) opt.selected = true;
@@ -525,20 +522,65 @@ async function refreshFiles() {
       document.getElementById('fileMsg').textContent = files.length + ' file(s)';
     });
 }
+// The editor and POST /api/file hold 64 KB. GET streams any size.
+const EDIT_MAX = 65536;
+function downloadFile(path, src, auth) {
+  fetch('/api/file?path=' + encodeURIComponent(path) + src, { headers: { 'Authorization': auth } })
+    .then(r => { if (r.status === 401) { clearAuth(); return null; } return r.ok ? r.blob() : null; })
+    .then(b => {
+      if (!b) return;
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(b);
+      a.download = path.split('/').pop();
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    });
+}
 async function loadFile() {
   const path = document.getElementById('fileList').value;
   if (!path) return;
   const auth = await authHeader();
   if (!auth) return;
-  fetch('/api/file?path=' + encodeURIComponent(path) + fileSourceParam(), { headers: { 'Authorization': auth } })
-    .then(r => { if (r.status === 401) { clearAuth(); return null; } return r.text(); })
-    .then(t => { if (t !== null) document.getElementById('fileContent').value = t; });
+  const box = document.getElementById('fileContent');
+  const msg = document.getElementById('fileMsg');
+  box.dataset.loaded = '';
+  // Source read once, so a switch mid-load cannot relabel what arrives.
+  const src = fileSourceParam();
+  const opt = document.getElementById('fileList').selectedOptions[0];
+  if (opt && Number(opt.dataset.size) > EDIT_MAX) {
+    box.value = '';
+    msg.textContent = 'Too large to edit here (max 64 KB), downloading it instead';
+    downloadFile(path, src, auth);
+    return;
+  }
+  fetch('/api/file?path=' + encodeURIComponent(path) + src, { headers: { 'Authorization': auth } })
+    .then(async r => {
+      if (r.status === 401) { clearAuth(); return; }
+      const t = await r.text();
+      if (!r.ok) {
+        box.value = '';
+        let e = t; try { e = JSON.parse(t).error || t; } catch (x) {}
+        msg.textContent = 'Error: ' + e;
+        return;
+      }
+      if (new Blob([t]).size > EDIT_MAX) {
+        box.value = '';
+        msg.textContent = 'Too large to edit here (max 64 KB)';
+        return;
+      }
+      box.value = t;
+      box.dataset.loaded = path + src;
+    });
 }
 async function saveFile() {
   const path = document.getElementById('fileList').value;
   const content = document.getElementById('fileContent').value;
   const msg = document.getElementById('fileMsg');
   if (!path) { msg.textContent = 'Select a file first'; return; }
+  // Only text that was loaded from this file goes back to it.
+  if (document.getElementById('fileContent').dataset.loaded !== path + fileSourceParam()) {
+    msg.textContent = 'Load the file first'; return;
+  }
   const auth = await authHeader();
   if (!auth) return;
   fetch('/api/file?path=' + encodeURIComponent(path) + fileSourceParam(), {
@@ -562,7 +604,7 @@ async function deleteFile() {
     .then(r => {
       if (!r) return;
       msg.textContent = r.ok ? 'Deleted' : ('Error: ' + r.error);
-      if (r.ok) { document.getElementById('fileContent').value = ''; refreshFiles(); }
+      if (r.ok) { const b = document.getElementById('fileContent'); b.value = ''; b.dataset.loaded = ''; refreshFiles(); }
     });
 }
 async function copyFileToOther() {
@@ -578,9 +620,13 @@ async function copyFileToOther() {
                         { headers: { 'Authorization': auth } });
   if (r.status === 401) { clearAuth(); return; }
   const content = await r.text();
+  if (!r.ok) {
+    let e = content; try { e = JSON.parse(content).error || content; } catch (x) {}
+    msg.textContent = 'Copy failed: ' + e; return;
+  }
   const w = await fetch('/api/file?path=' + encodeURIComponent(path) + '&source=' + dest,
                         { method: 'POST', body: content,
-                          headers: { 'Content-Type': 'text/plain', 'Authorization': auth } });
+                          headers: { 'Content-Type': 'application/octet-stream', 'Authorization': auth } });
   if (w.status === 401) { clearAuth(); return; }
   const j = await w.json();
   msg.textContent = j.ok ? ('Copied to ' + dest) : ('Copy failed: ' + j.error);
@@ -595,15 +641,20 @@ async function uploadFile() {
   if (!auth) return;
   msg.textContent = 'Uploading…';
   const text = await file.text();
-  fetch('/api/file?path=' + encodeURIComponent(path) + fileSourceParam(), {
+  const src = fileSourceParam();
+  fetch('/api/file?path=' + encodeURIComponent(path) + src, {
     method: 'POST', body: text,
-    headers: { 'Content-Type': 'text/plain', 'Authorization': auth }
+    headers: { 'Content-Type': 'application/octet-stream', 'Authorization': auth }
   })
     .then(r => { if (r.status === 401) { clearAuth(); return null; } return r.json(); })
     .then(r => {
       if (!r) return;
       msg.textContent = r.ok ? ('Uploaded: ' + path) : ('Error: ' + r.error);
-      if (r.ok) { input.value = ''; refreshFiles(); }
+      if (!r.ok) return;
+      // The editor now shows an older version of this file: drop it, so Save cannot undo the upload.
+      const b = document.getElementById('fileContent');
+      if (b.dataset.loaded === path + src) { b.value = ''; b.dataset.loaded = ''; }
+      input.value = ''; refreshFiles();
     });
 }
 

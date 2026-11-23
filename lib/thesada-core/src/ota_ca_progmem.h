@@ -14,12 +14,12 @@
 // chain to, so a fresh checkout of this firmware against a fresh deploy
 // (GitHub Releases, S3+CloudFront, Cloudflare-fronted origin, a plain
 // Let's Encrypt VPS, etc) validates out of the box:
-//   - ISRG Root X1 (Let's Encrypt RSA root, covers most LE chains)
+//   - ISRG Root X1 (Let's Encrypt RSA root, most LE chains and the GitHub release asset host)
 //   - ISRG Root X2 (Let's Encrypt ECDSA root, newer LE chains)
-//   - DigiCert Global Root CA (RSA, covers GitHub Releases chain)
+//   - DigiCert Global Root CA (RSA, older DigiCert chains)
 //   - DigiCert Global Root G2 (RSA, newer DigiCert chains)
 //   - DigiCert Global Root G3 (ECDSA, newer DigiCert chains)
-//   - USERTrust ECC Certification Authority (Sectigo ECC root)
+//   - USERTrust ECC Certification Authority (Sectigo ECC root, github.com)
 //
 // Regenerate this header if a backend the firmware targets switches
 // to a different issuer. Source PEMs come from the Mozilla CA bundle

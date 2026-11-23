@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
-#define FIRMWARE_VERSION "26.11.1"  // CalVer YY.0M.MICRO; bump on each release
+#define FIRMWARE_VERSION "26.11.6"  // CalVer YY.0M.MICRO; bump on each release
 
 // ── Memory tuning defaults ──────────────────────────────────────────────────
 #define LOG_RING_SIZE       50    // log replay lines for WS terminal
@@ -38,7 +38,7 @@
 
 // ── Optional core services ──────────────────────────────────────────────────
 #define ENABLE_WEBSERVER     // Web UI, REST API, dashboard, OTA upload
-#define ENABLE_SCRIPTENGINE  // Lua scripting (alerts.lua, rules.lua)
+#define ENABLE_SCRIPTENGINE  // Lua scripting (main.lua, rules.lua)
 
 // ── Example modules ─────────────────────────────────────────────────────────
 // Minimal modules that show the pattern, not deployment hardware. Off in every

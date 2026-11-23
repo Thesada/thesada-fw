@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #include "enroll_policy.h"
+#include <ArduinoJson.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -41,4 +42,19 @@ inline bool setupPassUsable(const char* pass) {
 // in: ssid, pass, url. out: true when all three can be stored.
 inline bool setupFormUsable(const char* ssid, const char* pass, const char* url) {
   return setupSsidUsable(ssid) && setupPassUsable(pass) && enrollUrlUsable(url);
+}
+
+// The setup form into a staged config: the network list becomes this one SSID,
+// enroll.url the base. A wifi, networks or enroll that is not the right type is
+// replaced. in: staged root, ssid, enroll base. out: false when a write did not land.
+inline bool setupFormToConfig(JsonObject cfg, const char* ssid, const char* enrollBase) {
+  if (cfg.isNull()) return false;
+  JsonObject wifi = cfg["wifi"].is<JsonObject>() ? cfg["wifi"].as<JsonObject>() : cfg["wifi"].to<JsonObject>();
+  if (wifi.isNull()) return false;
+  JsonArray nets = wifi["networks"].to<JsonArray>();
+  if (nets.isNull()) return false;
+  JsonObject net = nets.add<JsonObject>();
+  if (net.isNull() || !net["ssid"].set(ssid)) return false;
+  JsonObject enroll = cfg["enroll"].is<JsonObject>() ? cfg["enroll"].as<JsonObject>() : cfg["enroll"].to<JsonObject>();
+  return !enroll.isNull() && enroll["url"].set(enrollBase);
 }

@@ -6,8 +6,9 @@
 // work - mbedtls_x509_crt_parse, mbedtls_pk_parse_key, mbedtls_pk_check_pair -
 // stays in MQTTClient.cpp and is NOT covered by this unit. What lives here is
 // (1) a structural pre-flight that rejects obviously-malformed PEM before a
-// parser is handed attacker-influenced bytes, and (2) CN extraction, which is
-// display metadata for `cert info`, not a security decision.
+// parser is handed attacker-influenced bytes, (2) CN extraction, which is
+// display metadata for `cert info`, not a security decision, and (3) what
+// `cert.apply` and the `cert.clear` gate do with the pair check's answer.
 //
 // certKeyInputsUsable is a DELIBERATE BEHAVIOUR CHANGE, not a refactor: the
 // guard it fronts previously required only non-null and non-empty. It is
@@ -16,6 +17,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 
 #define PEM_CERT_BEGIN "-----BEGIN CERTIFICATE-----"
@@ -81,4 +83,50 @@ inline bool certExtractCn(const char* dn, char* out, size_t outLen) {
   while (*p && *p != ',' && i < outLen - 1) out[i++] = *p++;
   out[i] = '\0';
   return true;
+}
+
+// Stored cert metadata. The sizes travel with the type, so no caller can hand
+// getCertInfo a cap larger than a buffer. A serial past 47 bytes does not fit.
+struct CertInfo {
+  char cn[128];
+  char serial[96];
+  char notBefore[32];
+  char notAfter[32];
+};
+
+// Lowercase hex of a cert serial, whole or not at all: a clipped serial names
+// another cert. in: bytes, count, out, cap. out: false when it does not fit.
+inline bool certSerialHex(const uint8_t* p, size_t len, char* out, size_t outLen) {
+  if (!out || outLen == 0) return false;
+  out[0] = '\0';
+  if (!p || len == 0 || len > (outLen - 1) / 2) return false;
+  static const char kHex[] = "0123456789abcdef";
+  for (size_t i = 0; i < len; i++) {
+    out[2 * i]     = kHex[p[i] >> 4];
+    out[2 * i + 1] = kHex[p[i] & 0x0f];
+  }
+  out[2 * len] = '\0';
+  return true;
+}
+
+// What the stored-pair check found. NoHeap: a buffer would not allocate, so
+// the pair was never read and nothing is known about it.
+enum class PairCheck : uint8_t { Valid, Invalid, NoHeap };
+
+// cert.set stores each half unchecked, so cert.apply judges the pair: it reboots
+// only when both halves are stored and the key is the cert's private half.
+enum class CertApply : uint8_t { Missing, Mismatch, LowHeap, Reboot };
+
+// in: both halves in NVS, the stored-pair check. out: what cert.apply does.
+inline CertApply certApplyVerdict(bool bothStored, PairCheck pair) {
+  if (!bothStored) return CertApply::Missing;
+  if (pair == PairCheck::Valid) return CertApply::Reboot;
+  return pair == PairCheck::NoHeap ? CertApply::LowHeap : CertApply::Mismatch;
+}
+
+// Broken verdict after a check (it opens cert.clear to a password session).
+// NoHeap keeps wasBroken: heap pressure says nothing about the cert.
+inline bool storedCertBrokenAfter(PairCheck pair, bool wasBroken) {
+  if (pair == PairCheck::NoHeap) return wasBroken;
+  return pair == PairCheck::Invalid;
 }

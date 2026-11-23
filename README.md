@@ -25,7 +25,7 @@ Full documentation: [thesada.io/firmware](https://thesada.io/firmware/)
 - Cert upgrade is skipped below 40 KB free heap, because a TLS allocation on a constrained board takes the whole node down with it.
 
 **Sensors and power**
-- DS18B20 temperature over OneWire. Multi-sensor, auto-discovered. A probe that stops answering is published as `stale` with no value, never its last reading, and a jump past `max_delta_c` counts once the next reading confirms it.
+- DS18B20 temperature over OneWire. Multi-sensor, auto-discovered. A probe that stops answering is published as `stale` with no value, never its last reading (Home Assistant shows it unavailable after three missed intervals), and a jump past `max_delta_c` counts once the next reading confirms it.
 - SHT31 temperature and humidity, driven directly, no external library.
 - ADS1115 RMS current. 30 samples across two 60 Hz cycles, reported in amps and watts for the SCT-013-030 clamp. This is the pump-is-running signal.
 - Celsius or Fahrenheit, and the choice follows through to MQTT, the dashboard and Home Assistant.
@@ -205,8 +205,9 @@ Install the local git hooks once after clone:
 
 This symlinks `scripts/hooks/pre-commit`, `commit-msg`, and `pre-push`
 into `.git/hooks/`. The pre-commit hook refuses a commit that touches
-load-bearing source files (OTA, MQTT, Shell, Config, HttpServer,
-Cellular) without an update to [docs/invariants.md](docs/invariants.md).
+a file [docs/invariants.md](docs/invariants.md) cites on a `Source:` line
+(`scripts/check-invariant-ledger.sh --list`) without an update to the
+ledger.
 The same check runs server side in CI (`.github/workflows/ci.yml` job
 `invariant-ledger`).
 

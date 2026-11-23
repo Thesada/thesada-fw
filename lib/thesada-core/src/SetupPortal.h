@@ -6,6 +6,8 @@
 
 class SetupPortal {
  public:
+  static constexpr size_t LINK_CAP = 320;
+
   // Applies a queued form and refreshes whether the page is open.
   // Call from the main loop. in: none. out: none.
   static void loop();
@@ -23,9 +25,7 @@ class SetupPortal {
   // out: true after a queued form has been applied this boot.
   static bool hasResult();
 
-  // out: claim link, or "" when the apply failed or has not run.
-  static const char* claimLink();
-
-  // out: static reason when the apply failed, else "".
-  static const char* resultError();
+  // Copy the applied result under its lock, any task. in: link buffer, its cap.
+  // out: link ("" when none), *error set to a static reason or "".
+  static void result(char* link, size_t cap, const char** error);
 };

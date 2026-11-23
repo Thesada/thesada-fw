@@ -65,9 +65,9 @@ void test_deep_nesting_is_refused(void) {
   const char* head = "{\"mqtt\":{\"broker\":\"b\"},\"deep\":";
   memcpy(deep + n, head, strlen(head));
   n += strlen(head);
-  for (int i = 0; i < CMD_CONFIG_MAX_DEPTH; i++) deep[n++] = '{';
+  for (int i = 0; i < CONFIG_MAX_DEPTH; i++) deep[n++] = '{';
   deep[n++] = '}';
-  for (int i = 0; i < CMD_CONFIG_MAX_DEPTH; i++) deep[n++] = '}';
+  for (int i = 0; i < CONFIG_MAX_DEPTH; i++) deep[n++] = '}';
   deep[n++] = '}';
   deep[n] = '\0';
   TEST_ASSERT_EQUAL(CMD_CONFIG_REFUSE_SHAPE, cmdConfigVerdict(true, deep, n));

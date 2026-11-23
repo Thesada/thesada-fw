@@ -4,7 +4,7 @@ How to write firmware in this repo. Reference material for PR review.
 Sibling to [docs/invariants.md](docs/invariants.md) (the load-bearing
 rules).
 
-Dated 2026-05-13. Bump on every edit.
+Dated 2026-11-20. Bump on every edit.
 
 ---
 
@@ -172,11 +172,17 @@ mbedtls_platform_zeroize(keyBuf, maxLen);
 free(keyBuf);
 ```
 
-Persistent buffers held for the life of the TLS session (`_clientKey`
-in `MQTTClient`) are NOT freed during normal operation; they live in
-heap until reboot. That is intentional - `WiFiClientSecure` keeps the
-raw pointer. The zero-then-free rule is for transient copies (cert.set
-handler, modem upload buffers).
+The client cert and key buffers (`_clientCert`, `_clientKey` in
+`MQTTClient`) stay allocated while `TlsClient` holds the raw pointer,
+and `connect()` frees them when a load or an allocation fails. They
+come from `secretAlloc` and go back through `secretFree`, which wipes
+the whole block. On the MQTT CLI path a `JsonDocument` that may hold a
+key is built on `secretJsonAllocator()`, and a heap copy of the payload
+is a `SecretString` (`secret_heap.h`). The HTTP command path does not
+do this yet (see the zeroize rule in the ledger).
+
+Trim a `String` that holds a secret in place with `remove()`. An
+assignment from `substring()` frees the temporary's copy unwiped.
 
 ### Use `String::reserve` for known-size growth
 
@@ -286,6 +292,7 @@ Run them:
 ```bash
 make test-native                      # all native suites
 make test-native TEST=test_rollback   # one suite
+make test-native TEST=test_lua_stdlibs  # the Lua fork, built on the host (also test_lua_budget_hooks)
 ```
 
 Static analysis gates the same units. `scripts/static-check.sh` runs
@@ -345,7 +352,7 @@ Process:
 3. Grep the rest of the codebase for the same pattern.
 4. Fix all instances in one PR (or document why some are different).
 5. Update [docs/invariants.md](docs/invariants.md) in the SAME commit -
-   add the pattern if missing, and bump the `Dated` line. See "Ledger
+   add the pattern if missing, with the entry's own `Dated` line. See "Ledger
    discipline" below.
 
 ---
@@ -367,17 +374,21 @@ versus which ones got quietly removed.
 How enforced (layered):
 
 - Pre-commit hook (`scripts/hooks/pre-commit`) refuses commits that
-  touch load-bearing source paths (OTA, MQTT, Shell, Config, HTTP
-  server, Cellular) unless `docs/invariants.md` is also staged. Bypass
+  touch a file the ledger cites on a `Source:` line unless
+  `docs/invariants.md` is also staged. Bypass
   is explicit: `INVARIANT_OK=1 git commit ...` (audit-traceable).
   Install via `./scripts/hooks/install.sh` after clone.
 - CI workflow (`.github/workflows/ci.yml` job `invariant-ledger`) runs
   the same check against the push or PR commit range, so a contributor
   who has not installed the local hook still hits the guard. Bypass
   trailer: include `INVARIANT_OK: 1` in any commit message in the range.
-- Both call into `scripts/check-invariant-ledger.sh` so the matching
-  rule lives in one place. When a new file becomes load-bearing, add
-  its path to the `SENSITIVE_REGEX` in that shared script.
+- Both call into `scripts/check-invariant-ledger.sh`, which reads its
+  file list from the ledger's `Source:` lines (`--list` prints it). When
+  a new file becomes load-bearing, cite it on a `Source:` line. A cited
+  name that matches no file fails the gate's self-test in CI. Name a
+  file every release or dependency bump changes (`src/thesada_config.h`,
+  `platformio.ini`, `scripts/coverage-floors.txt`) in the prose instead,
+  or every bump trips the gate.
 
 What counts as "establishes a new invariant":
 
@@ -396,9 +407,11 @@ What does not need a ledger entry (use the `INVARIANT_OK=1` bypass):
 - Pure refactor that preserves all invariants in their existing files.
 - New feature behind a flag that has no security/correctness coupling.
 
-Date bump: every edit to `docs/invariants.md` updates the `Dated`
-line to today's date. That line is the heartbeat - a stale date is
-a signal the ledger has drifted.
+Dates: an entry you add or change carries its own `Dated YYYY-MM-DD`
+line, on its own line above its `Source:` line. The ledger has no
+file-wide date line, so two PRs that change different entries merge
+without a conflict. The gate fails a `Dated` line above the first `##`
+heading. The file's heartbeat is `git log -1 docs/invariants.md`.
 
 ---
 

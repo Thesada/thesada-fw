@@ -92,6 +92,30 @@ void test_telegram_post_inside_period(void) {
   TEST_ASSERT_FALSE(2 * TELEGRAM_IO_MS + 120000UL + TELEGRAM_HTTP_TIMEOUT_MS < TASK_WDT_TIMEOUT_MS);
 }
 
+// A wait for the AT bus that another task holds is fed every slice. #69: the
+// 30 s probe wait sat unfed in one take and the 30 s watchdog panicked.
+void test_slices_walk_the_budget_fed(void) {
+  const uint32_t budgets[] = {1, 999, 1000, 1001, 30000, 120000};
+  for (uint32_t budget : budgets) {
+    uint32_t now = 0xFFFFF000UL;  // across the 32-bit wrap
+    const uint32_t start = now;
+    uint32_t total = 0;
+    for (uint32_t s; (s = waitSliceMs(start, now, budget)) != 0; now += s) {
+      TEST_ASSERT_TRUE(s <= WAIT_STEP_MAX_MS);
+      total += s;
+    }
+    TEST_ASSERT_EQUAL_UINT32(budget, total);
+  }
+}
+
+void test_slice_is_zero_once_spent(void) {
+  TEST_ASSERT_EQUAL_UINT32(0, waitSliceMs(1000, 1000, 0));
+  TEST_ASSERT_EQUAL_UINT32(0, waitSliceMs(1000, 31000, 30000));
+  TEST_ASSERT_EQUAL_UINT32(0, waitSliceMs(1000, 90000, 30000));
+  TEST_ASSERT_EQUAL_UINT32(1, waitSliceMs(1000, 30999, 30000));
+  TEST_ASSERT_EQUAL_UINT32(WAIT_STEP_MAX_MS, waitSliceMs(1000, 1000, 30000));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_poll_steps_fit_watchdog);
@@ -103,5 +127,7 @@ int main(int, char**) {
   RUN_TEST(test_budget_spent_rollover_safe);
   RUN_TEST(test_lua_budget_inside_period);
   RUN_TEST(test_telegram_post_inside_period);
+  RUN_TEST(test_slices_walk_the_budget_fed);
+  RUN_TEST(test_slice_is_zero_once_spent);
   return UNITY_END();
 }

@@ -116,6 +116,98 @@ void test_gradual_climb_is_always_accepted(void) {
   }
 }
 
+// A stale probe publishes no per-sensor value; HA must drop the old one
+// after three missed intervals.
+void test_expire_after_is_three_intervals(void) {
+  TEST_ASSERT_EQUAL_UINT32(180u, tempExpireAfterS(60));
+  TEST_ASSERT_EQUAL_UINT32(3u, tempExpireAfterS(1));
+  TEST_ASSERT_EQUAL_UINT32(0u, tempExpireAfterS(0));
+}
+
+void test_interval_is_floored(void) {
+  TEST_ASSERT_EQUAL_UINT32(TEMP_INTERVAL_MIN_S, tempIntervalS(0));
+  TEST_ASSERT_EQUAL_UINT32(TEMP_INTERVAL_MIN_S, tempIntervalS(TEMP_INTERVAL_MIN_S - 1));
+  TEST_ASSERT_EQUAL_UINT32(60u, tempIntervalS(60));
+  TEST_ASSERT_EQUAL_UINT32(3 * TEMP_INTERVAL_MIN_S, tempExpireAfterS(tempIntervalS(0)));
+}
+
+void test_interval_is_bounded_before_unsigned(void) {
+  TEST_ASSERT_EQUAL_UINT32(5u, TEMP_INTERVAL_MIN_S);
+  TEST_ASSERT_EQUAL_UINT32(TEMP_INTERVAL_MIN_S, tempIntervalS(-1));
+  TEST_ASSERT_EQUAL_UINT32(TEMP_INTERVAL_MAX_S, tempIntervalS(4294968LL));
+  TEST_ASSERT_EQUAL_UINT32(TEMP_INTERVAL_MAX_S, tempIntervalS(TEMP_INTERVAL_MAX_S));
+  TEST_ASSERT_TRUE((unsigned long long)tempIntervalS(4294968LL) * 1000ULL <= UINT32_MAX);
+}
+
+void test_expire_after_saturates_instead_of_wrapping(void) {
+  TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, tempExpireAfterS(UINT32_MAX / 3));  // exact
+  TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, tempExpireAfterS(UINT32_MAX / 3 + 1));  // wraps to 2
+}
+
+// --- the DS18B20 power-on value ------------------------------------------
+
+// fw #2: a probe that reset reads 85.00 C before its first conversion, and
+// that value was published as a real temperature after boot.
+void test_power_on_value_first_is_held_back(void) {
+  TempGuard g;
+  TEST_ASSERT_TRUE(tempGuardJudge(g, 85.0f, DELTA) == TempVerdict::PowerOn);
+  TEST_ASSERT_EQUAL_FLOAT(TEMP_NO_READING, g.accepted);
+  TEST_ASSERT_TRUE(tempGuardJudge(g, 21.5f, DELTA) == TempVerdict::Accepted);
+  TEST_ASSERT_EQUAL_FLOAT(21.5f, g.accepted);
+}
+
+// A probe reset mid-run reads 85.00 too, guard off or not.
+void test_power_on_value_after_a_cold_reading_is_held_back(void) {
+  const float deltas[] = {DELTA, 0.0f};
+  for (float d : deltas) {
+    TempGuard g;
+    tempGuardJudge(g, 21.0f, d);
+    TEST_ASSERT_TRUE(tempGuardJudge(g, 85.0f, d) == TempVerdict::PowerOn);
+    TEST_ASSERT_EQUAL_FLOAT(21.0f, g.accepted);
+  }
+}
+
+// A boiler really at 85 C: near the last reading it passes. At boot it waits
+// for the first reading that is not exactly 85.00, then 85.00 is near it.
+void test_real_85_is_accepted(void) {
+  TempGuard g;
+  tempGuardJudge(g, 84.6f, DELTA);
+  TEST_ASSERT_TRUE(tempGuardJudge(g, 85.0f, DELTA) == TempVerdict::Accepted);
+  TempGuard b;
+  TEST_ASSERT_TRUE(tempGuardJudge(b, 85.0f, DELTA) == TempVerdict::PowerOn);
+  TEST_ASSERT_TRUE(tempGuardJudge(b, 85.0f, DELTA) == TempVerdict::PowerOn);
+  TEST_ASSERT_TRUE(tempGuardJudge(b, 85.0625f, DELTA) == TempVerdict::Accepted);
+  TEST_ASSERT_TRUE(tempGuardJudge(b, 85.0f, DELTA) == TempVerdict::Accepted);
+  TEST_ASSERT_EQUAL_FLOAT(85.0f, b.accepted);
+}
+
+// CR #126: a clone whose conversions keep failing reads 85.00 with a scratchpad
+// the library does not flag. The second 85.00 was accepted and published, so
+// stale and temperature alerts never fired. Repeats alone never confirm it.
+void test_repeated_85_is_never_confirmed(void) {
+  const float deltas[] = {DELTA, 0.0f};
+  for (float d : deltas) {
+    TempGuard boot;
+    TempGuard cold;
+    tempGuardJudge(cold, 21.0f, d);
+    for (int i = 0; i < 10; i++) {
+      TEST_ASSERT_TRUE(tempGuardJudge(boot, 85.0f, d) == TempVerdict::PowerOn);
+      TEST_ASSERT_TRUE(tempGuardJudge(cold, 85.0f, d) == TempVerdict::PowerOn);
+    }
+    TEST_ASSERT_EQUAL_FLOAT(TEMP_NO_READING, boot.accepted);
+    TEST_ASSERT_EQUAL_FLOAT(21.0f, cold.accepted);
+    TEST_ASSERT_TRUE(tempGuardJudge(cold, 21.5f, d) == TempVerdict::Accepted);
+  }
+  // Nor does 85.00 confirm a jump next to it: only two real readings do.
+  TempGuard g;
+  tempGuardJudge(g, 21.0f, DELTA);
+  TEST_ASSERT_TRUE(tempGuardJudge(g, 85.0f, DELTA) == TempVerdict::PowerOn);
+  TEST_ASSERT_TRUE(tempGuardJudge(g, 85.5f, DELTA) == TempVerdict::Implausible);
+  TEST_ASSERT_TRUE(tempGuardJudge(g, 85.0f, DELTA) == TempVerdict::PowerOn);
+  TEST_ASSERT_EQUAL_FLOAT(85.5f, g.held);
+  TEST_ASSERT_TRUE(tempGuardJudge(g, 85.4f, DELTA) == TempVerdict::Rebaselined);
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_first_reading_is_accepted_whatever_its_value);
@@ -127,5 +219,13 @@ int main(int, char**) {
   RUN_TEST(test_failed_reads_leave_state_untouched);
   RUN_TEST(test_zero_or_negative_max_delta_disables_guard);
   RUN_TEST(test_gradual_climb_is_always_accepted);
+  RUN_TEST(test_expire_after_is_three_intervals);
+  RUN_TEST(test_interval_is_floored);
+  RUN_TEST(test_interval_is_bounded_before_unsigned);
+  RUN_TEST(test_expire_after_saturates_instead_of_wrapping);
+  RUN_TEST(test_power_on_value_first_is_held_back);
+  RUN_TEST(test_power_on_value_after_a_cold_reading_is_held_back);
+  RUN_TEST(test_real_85_is_accepted);
+  RUN_TEST(test_repeated_85_is_never_confirmed);
   return UNITY_END();
 }

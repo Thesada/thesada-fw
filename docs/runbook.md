@@ -28,6 +28,7 @@ What the user sees: the device drops mTLS and the app has pushed it into **passw
 1. Symptom: device fails to apply config, or connects with wrong/empty settings.
 2. Critical `mqtt.*` keys self-heal: boot-time `rollbackIfUncommitted()` compares live config against the last-good NVS snapshot and restores it (`Log::warn "mqtt.config_rollback"`, `MQTTClient.cpp:523`). Let it reboot once and check for that log.
 3. Inspect on-device: `fs.cat /config.json` (or the mounted path); `fs.ls /` to see what is present.
+   An older file is migrated at boot (`config.schema_migrated` in the log). The file before that migration is `/config.json.bak`. `config.schema_migrate_failed`, `config.schema_newer` or `config.schema_invalid` means the device runs the file as it was and the app got a `config_schema` alert.
 4. If only non-critical keys are bad: fix with `config.set <key> <value>` and commit. *(Confirm the exact config command names on the running build.)*
 5. If the file is unrecoverable: reformat LittleFS (`fs.format --yes` - LittleFS) and re-provision from the app pairing flow. Secrets in NVS (via `secret.set`) survive an FS reformat; a full NVS erase does not.
 
@@ -40,11 +41,11 @@ What the user sees: the device drops mTLS and the app has pushed it into **passw
 
 ## Cellular: SIM blocked / quota exhausted
 
-1. Symptom: registration may pass but PDP/MQTT connect fails; fw logs generic `Bearer activation failed` / `MQTT connect failed` - **there is no quota/billing detection** (see [`failure-modes/cellular.md`](failure-modes/cellular.md)).
+1. Symptom: registration may pass but PDP/MQTT connect fails; fw logs generic `cellular.bearer_failed` / `tls.dial_failed` - **there is no quota/billing detection** (see [`failure-modes/cellular.md`](failure-modes/cellular.md)).
 2. Rule out signal vs SIM: `Registration DENIED` / `timeout` points to coverage/registration; a `SIM not ready` points to the SIM itself (note: blocked vs absent are not distinguished).
 3. Check the SIM with the carrier (quota, block, activation). OneSimCard SIMs need handset-first activation before they work in the modem.
-4. On the device, a wedged modem self-recovers: `SMSTATE no response - modem wedged` triggers a soft reset, and an activation timeout triggers a DC3 hard power-cycle (`Cellular.cpp:706`, `:1218`). Force one by rebooting the device if it is stuck.
-5. Failover: if WiFi is available the device uses it after 60s; cellular is the fallback path.
+4. On the device, a wedged modem self-recovers: an activation timeout triggers a DC3 hard power-cycle (`Cellular::hardReset`), and `cell.reset` forces one from the shell. Rebooting the device works too.
+5. Failover: the MQTT session moves back to WiFi as soon as WiFi is up. The 60 s is the cellular teardown after that. Cellular is the fallback path.
 
 ## Heap-reboot loop
 
