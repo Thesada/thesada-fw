@@ -34,6 +34,9 @@ ALLOWED=(
   "lib/thesada-mod-scriptengine/src/ScriptEngine.cpp:LittleFS.open(path, \"r\")"
   # lua.load: Shell::pathSafe(argv[1]) checked immediately above the open
   "lib/thesada-mod-scriptengine/src/ScriptEngine.cpp:LittleFS.open(argv[1], \"r\")"
+  # moveStagedConfig: cmd_mv checks Shell::pathSafe(argv[1]), and fsMoveRoute
+  # sends only the root /config.json.new here
+  "lib/thesada-core/src/Shell.cpp:LittleFS.open(src, \"r\")"
 )
 
 # First-party source only. base/.pio and build/ hold vendored deps and artifacts.

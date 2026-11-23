@@ -4,6 +4,8 @@
 #pragma once
 #include <ArduinoJson.h>
 #include <functional>
+#include <FS.h>
+#include "config_mask_policy.h"
 
 // Single-task invariant: every method reads or writes the one _doc with no
 // locking, and ArduinoJson is not thread-safe. Every caller must run on the
@@ -55,6 +57,12 @@ public:
   // in: hook. out: false when all 4 slots are taken.
   static bool onChange(void (*fn)());
   static JsonObject get();
+  // A marker under a secret key in staged takes the value /config.json holds,
+  // or is dropped. Main loop only. out: false when the live doc could not be copied.
+  static bool keepStoredSecrets(JsonDocument& staged);
+  // What a read of path on fs may serve (config_mask_policy.h). shownPath is
+  // the path as the caller typed it. out: verdict, out filled when MASKED.
+  static ConfigFileRead readFileMasked(fs::FS& fs, const char* path, const char* shownPath, String& out);
   // in: none. out: why the boot schema migration did not run, or nullptr.
   static const char* schemaAlert();
 private:

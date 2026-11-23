@@ -6,6 +6,7 @@
 #include "Identity.h"
 #include "Config.h"
 #include "Secret.h"
+#include "SecretJson.h"
 #include "Console.h"
 #include "Log.h"
 #include "WiFiManager.h"
@@ -23,6 +24,7 @@
 #include "glob_policy.h"
 #include "http_fetch_policy.h"
 #include "cert_policy.h"
+#include "secret_heap.h"
 #include <thesada_config.h>
 #include <mbedtls/platform_util.h>
 #include <esp_ota_ops.h>
@@ -568,6 +570,19 @@ static void cmd_cat(int argc, char** argv, ShellOutput out) {
   FS* fs = resolveFS(argv[1]);
   const char* fsPath = stripPrefix(argv[1]);
 
+  // The config file and any JSON object with secrets in it print masked.
+  String masked;
+  switch (Config::readFileMasked(*fs, fsPath, argv[1], masked)) {
+    case CFG_READ_REFUSE:
+      Shell::fail(out, "Refused: config file is not one JSON object or does not fit, not shown");
+      return;
+    case CFG_READ_MASKED:
+      out(masked.c_str());
+      return;
+    case CFG_READ_RAW:
+      break;
+  }
+
   File f = fs->open(fsPath, "r");
   if (!f) { out("File not found"); return; }
 
@@ -669,8 +684,42 @@ static void cmd_write(int argc, char** argv, ShellOutput out) {
   out(msg);
 }
 
+// The editor's staged save onto /config.json: its bytes go through
+// Config::writeRaw, which keeps stored secrets, then the staged copy goes.
+// in: staged path after stripPrefix, dst as shown. out: false with the reason sent.
+static bool moveStagedConfig(const char* src, const char* dst, ShellOutput out) {
+  File f = LittleFS.open(src, "r");
+  if (!f || f.isDirectory()) {
+    if (f) f.close();
+    Shell::fail(out, "Failed to rename");
+    return false;
+  }
+  const size_t size = f.size();
+  char* buf = size > 0 && size <= CONFIG_FILE_MAX ? (char*)secretAlloc(size) : nullptr;
+  if (!buf) {
+    f.close();
+    Shell::fail(out, "Refused: staged config is empty, too large or out of heap, /config.json unchanged");
+    return false;
+  }
+  const size_t got = f.read((uint8_t*)buf, size);
+  f.close();
+  size_t onDisk = 0;
+  const bool ok = got == size && Config::writeRaw(buf, size, &onDisk);
+  secretFree(buf);
+  if (!ok) {
+    Shell::fail(out, "Failed to rename: staged config not written, /config.json unchanged");
+    return false;
+  }
+  char msg[128];
+  snprintf(msg, sizeof(msg), "Renamed %s -> %s%s", src, dst,
+           LittleFS.remove(src) ? "" : " (staged copy left)");
+  out(msg);
+  return true;
+}
+
 // Rename or move a file. Both paths must resolve to one filesystem; rename
 // cannot cross mounts, and the stripped dst would land on the src mount.
+// /config.json takes only the staged save, through the secret-keeping write.
 static void cmd_mv(int argc, char** argv, ShellOutput out) {
   if (argc < 3) { out("Usage: mv <src> <dst>"); return; }
   if (!Shell::pathSafe(argv[1]) || !Shell::pathSafe(argv[2])) {
@@ -684,6 +733,16 @@ static void cmd_mv(int argc, char** argv, ShellOutput out) {
   const char* src = stripPrefix(argv[1]);
   const char* dst = stripPrefix(argv[2]);
 
+  switch (fsMoveRoute(fs == &LittleFS, src, dst)) {
+    case FS_MOVE_CONFIG_REFUSED:
+      Shell::fail(out, "Refused: /config.json takes only config.set, fs.write or the staged /config.json.new");
+      return;
+    case FS_MOVE_CONFIG_STAGED:
+      moveStagedConfig(src, dst, out);
+      return;
+    case FS_MOVE_PLAIN:
+      break;
+  }
   if (fs->rename(src, dst)) {
     char msg[128];
     snprintf(msg, sizeof(msg), "Renamed %s -> %s", src, dst);
@@ -836,11 +895,15 @@ static void cmd_config_get(int argc, char** argv, ShellOutput out) {
 
   if (current.isNull()) {
     out("null");
-  } else {
-    String val;
-    serializeJsonPretty(current, val);
-    out(val.c_str());
+    return;
   }
+  // Secret fields read as their marker (config_mask_policy.h).
+  String val;
+  if (!configMaskedNodeText(argv[1], current, val, true, secretJsonAllocator())) {
+    Shell::fail(out, "Config read out of memory");
+    return;
+  }
+  out(val.c_str());
 }
 
 // Set a dotted key (value) or delete it (null) through Config::edit, then reply.
@@ -874,6 +937,13 @@ static void cmd_config_set(int argc, char** argv, ShellOutput out) {
   if (value.length() >= 2 && value.charAt(0) == '"' && value.charAt(value.length() - 1) == '"') {
     value.remove(value.length() - 1);
     value.remove(0, 1);
+  }
+  // A read mask sent back is not a value: the stored secret stays.
+  if (configSetKeepsSecret(argv[1], value.c_str())) {
+    char msg[160];
+    snprintf(msg, sizeof(msg), "Kept %s (read mask, stored secret unchanged)", argv[1]);
+    out(msg);
+    return;
   }
   shellConfigApply(argv[1], value == "--delete" ? nullptr : value.c_str(), out);
 }
@@ -952,7 +1022,10 @@ static void cmd_config_reload(int argc, char** argv, ShellOutput out) {
 static void cmd_config_dump(int argc, char** argv, ShellOutput out) {
   JsonObject cfg = Config::get();
   String json;
-  serializeJsonPretty(cfg, json);
+  if (!configMaskedNodeText("", cfg, json, true, secretJsonAllocator())) {
+    Shell::fail(out, "Config read out of memory");
+    return;
+  }
   out(json.c_str());
 }
 
@@ -1234,12 +1307,14 @@ struct HttpFetchJob {
   char          host[128];
   const char*   path;       // into url, or the literal "/"
   uint16_t      port;
+  bool          pinned;     // holds an MQTT reconnect pin the task drops when it ends
   // out
   HttpPreview   body;
   int           status;
   bool          ok;
   const char*   err;        // static message, nullptr on success
   std::atomic<uint32_t> state;  // HTTP_JOB_*, the task's last write
+  int           tlsErr;     // WiFi mbedtls error of a failed GET, 0 if none
 };
 
 // The WiFi fetch. Every local, the CA PEM included, lives until return.
@@ -1277,6 +1352,10 @@ static void httpFetchRun(HttpFetchJob* job) {
   http.setTimeout(10000);
 
   job->status = http.GET();
+  if (job->status < 0 && job->https) {
+    char eb[64];
+    job->tlsErr = tls.lastError(eb, sizeof(eb));
+  }
   if (job->status > 0) {
     job->ok = true;
     int         len = http.getSize();  // -1 when chunked / unknown
@@ -1329,9 +1408,10 @@ static void httpFetchTask(void* arg) {
   } else {
     httpFetchRun(job);
   }
-  Log::kvf("Shell", "shell.http_done via=%s status=%d body=%u cut=%d stack_free=%u",
-           job->cellGet ? "cellular" : "wifi", job->status, (unsigned)job->body.total,
+  Log::kvf("Shell", "shell.http_done via=%s status=%d tls_err=%d body=%u cut=%d stack_free=%u",
+           job->cellGet ? "cellular" : "wifi", job->status, job->tlsErr, (unsigned)job->body.total,
            (int)job->body.cut, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+  if (job->pinned) MQTTClient::unpinTlsHold();
   if (httpJobFinish(job->state)) delete job;
   vTaskDelete(nullptr);
 }
@@ -1410,8 +1490,14 @@ static void cmd_http(int argc, char** argv, ShellOutput out) {
     job->port    = port;
   }
 
+  const bool yielded = MQTTClient::yieldTlsHeap("net.http", waitMs);
+  // The pin holds the reconnect until the task ends, past an abandoned wait too.
+  job->pinned = yielded;
+  if (yielded) MQTTClient::pinTlsHold();
   if (xTaskCreate(httpFetchTask, "net.http", 12288, job,
                   tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
+    if (yielded) MQTTClient::unpinTlsHold();
+    if (yielded) MQTTClient::releaseTlsHeap();
     out("net.http: failed to spawn fetch task");
     delete job;
     return;
@@ -1432,6 +1518,7 @@ static void cmd_http(int argc, char** argv, ShellOutput out) {
   }
   Log::kvf("Shell", "shell.http_wait via=%s waited_ms=%u mqtt_ticks=%u loop_stack_free=%u", via,
            (unsigned)(millis() - t0), ticks, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+  if (yielded) MQTTClient::releaseTlsHeap();
   if (job->state.load() != HTTP_JOB_DONE && !httpJobAbandon(job->state)) {
     // The task owns the job now and frees it when its own bounds end the GET.
     Log::kvfw("Shell", "shell.http_abandoned via=%s wait_ms=%u", via, (unsigned)waitMs);

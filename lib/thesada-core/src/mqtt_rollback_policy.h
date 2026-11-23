@@ -5,6 +5,7 @@
 #pragma once
 #include <ArduinoJson.h>
 #include <string.h>
+#include "mqtt_topic_policy.h"
 
 // Roll back to last-good iff a snapshot exists (lg / haveLg), the still-current
 // config equals the recorded failing candidate (rbCfg), and it differs from
@@ -80,4 +81,19 @@ inline MqttSessionLg mqttRollbackSessionDecide(bool persistFailed, const char* f
 inline bool mqttRollbackSessionLastGood(bool persistFailed, const char* failing, const char* cur,
                                         const char* lgText, JsonDocument& lg) {
   return mqttRollbackSessionDecide(persistFailed, failing, cur, lgText, lg) == MQTT_LG_DIAL;
+}
+
+// KEEP: the endpoint begin() set. SET: the host given. CLEAR: no broker, dial nothing.
+enum MqttEndpoint {
+  MQTT_EP_KEEP = 0,
+  MQTT_EP_SET,
+  MQTT_EP_CLEAR,
+};
+
+// A fallback that ends on a live config without a broker, or with one past the
+// host buffer, must not keep the old host, or live credentials dial it. in: DIAL, fallback was on, host.
+inline MqttEndpoint mqttSessionEndpoint(bool lastGood, bool wasFallback, const char* host) {
+  if (!lastGood && !wasFallback) return MQTT_EP_KEEP;
+  if (host && *host) return mqttHostFits(host, MQTT_BROKER_HOST_CAP) ? MQTT_EP_SET : MQTT_EP_CLEAR;
+  return lastGood ? MQTT_EP_KEEP : MQTT_EP_CLEAR;
 }

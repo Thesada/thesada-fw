@@ -5,6 +5,8 @@
 #include "config_load_policy.h"
 #include "config_write_policy.h"
 #include "config_schema_policy.h"
+#include "SecretJson.h"
+#include "secret_heap.h"
 #include <LittleFS.h>
 
 static const char* TAG = "Config";
@@ -123,10 +125,11 @@ static void migrateSchema(JsonDocument& live) {
 
 const char* Config::schemaAlert() { return _schemaAlert[0] ? _schemaAlert : nullptr; }
 
-// in: none. out: /config.json size in bytes, -1 when it is missing.
+// in: none. out: /config.json size in bytes, -1 when it is missing,
+// CONFIG_SIZE_UNREADABLE when it exists and does not open.
 static long configFileSize() {
   File f = LittleFS.open("/config.json", "r");
-  if (!f) return -1;
+  if (!f) return LittleFS.exists("/config.json") ? CONFIG_SIZE_UNREADABLE : -1;
   const long n = (long)f.size();
   f.close();
   return n;
@@ -169,6 +172,10 @@ static bool commitTmp(size_t written, size_t expected, size_t* bytes);
 // The one tmp + rename path for /config.json. lfs rename replaces the
 // destination atomically, so a failure leaves the last good file in place.
 bool Config::writeFile(JsonVariantConst src, bool pretty, size_t* bytes) {
+  if (!configDepthOk(src)) {
+    Log::kvfe(TAG, "config.save_failed reason=too_deep max=%d", CONFIG_MAX_DEPTH);
+    return false;
+  }
   size_t expected = pretty ? measureJsonPretty(src) : measureJson(src);
   if (expected > CONFIG_FILE_MAX) {
     Log::kvfe(TAG, "config.save_failed reason=too_large bytes=%u max=%u", (unsigned)expected, (unsigned)CONFIG_FILE_MAX);
@@ -185,9 +192,19 @@ bool Config::writeFile(JsonVariantConst src, bool pretty, size_t* bytes) {
 }
 
 bool Config::writeRaw(const char* data, size_t len, size_t* bytes) {
-  if (!configBytesAreObject(data, len)) {
-    Log::error(TAG, "config.save_failed reason=not_object");
-    return false;
+  // A read mask in the values is resolved first, so the file is rewritten whole.
+  {
+    JsonDocument doc(secretJsonAllocator());
+    switch (configRawWritePlan(doc, data, len)) {
+      case CFG_RAW_NOT_OBJECT:
+        Log::error(TAG, "config.save_failed reason=not_object");
+        return false;
+      case CFG_RAW_KEEP:
+        if (!keepStoredSecrets(doc)) return false;
+        return writeFile(doc.as<JsonVariantConst>(), false, bytes);
+      case CFG_RAW_AS_IS:
+        break;
+    }
   }
   File f = LittleFS.open("/config.json.tmp", "w");
   if (!f) {
@@ -238,6 +255,10 @@ struct LittleFsStageSource {
 
 // Write staged and move it into _doc. in: staged doc, log event. out: false if live stayed.
 bool Config::commit(JsonDocument& staged, const char* event, bool deferPrefix) {
+  if (!keepStoredSecrets(staged)) {
+    Log::kvfe(TAG, "%s reason=copy_failed action=keep_live", event);
+    return false;
+  }
   const bool wasHeld = _hold.held;
   auto write = [](JsonVariantConst src) { return Config::writeFile(src, false); };
   const ConfigCommit r = deferPrefix ? configCommitDeferPrefix(_doc, staged, write, _hold)
@@ -291,6 +312,7 @@ bool Config::rescueEdit(const std::function<bool(JsonObject)>& fn) {
   if (from != CONFIG_STAGE_FILE && from != CONFIG_STAGE_LIVE && from != CONFIG_STAGE_RESCUED) {
     const char* why = from == CONFIG_STAGE_NO_HEAP       ? "no_heap"
                       : from == CONFIG_STAGE_COPY_FAILED ? "copy_failed"
+                      : from == CONFIG_STAGE_READ_FAILED ? "file_unreadable"
                                                          : "no_source";
     Log::kvfe(TAG, "config.edit_failed reason=%s err=%s action=keep_live", why, err ? err.c_str() : "none");
     return false;
@@ -372,4 +394,59 @@ bool Config::copyDiskDoc(JsonDocument& dst) {
 
 JsonObject Config::get() {
   return _doc.as<JsonObject>();
+}
+
+bool Config::keepStoredSecrets(JsonDocument& staged) {
+  JsonDocument stored(secretJsonAllocator());
+  LittleFsStageSource src;
+  size_t n = 0;
+  const ConfigKeep r = configKeepStoredSecrets(src, staged, stored, &n);
+  if (r == CONFIG_KEEP_COPY_FAILED) {
+    Log::error(TAG, "config.save_failed reason=copy_failed");
+    return false;
+  }
+  if (r == CONFIG_KEEP_SET_FAILED) {
+    Log::error(TAG, "config.save_failed reason=no_heap step=mask_keep");
+    return false;
+  }
+  if (r == CONFIG_KEEP_OK) Log::kvf(TAG, "config.mask_kept fields=%u", (unsigned)n);
+  return true;
+}
+
+ConfigFileRead Config::readFileMasked(fs::FS& fs, const char* path, const char* shownPath, String& out) {
+  out = String();
+  File f = fs.open(path, "r");
+  if (f && f.isDirectory()) {
+    f.close();
+    return CFG_READ_RAW;
+  }
+  const bool opened = (bool)f;
+  const bool exists = opened || fs.exists(path);
+  const int first = opened ? configFirstNonSpace(f) : -1;
+  const size_t size = opened ? f.size() : 0;
+  switch (configFilePreRead(shownPath, opened, exists, first, size)) {
+    case CFG_PRE_RAW:
+      if (opened) f.close();
+      return CFG_READ_RAW;
+    case CFG_PRE_REFUSE:
+      if (opened) f.close();
+      return CFG_READ_REFUSE;
+    case CFG_PRE_BUFFER:
+      break;
+  }
+  if (!f.seek(0)) {
+    f.close();
+    return CFG_READ_REFUSE;
+  }
+  char* buf = (char*)secretAlloc(size + 1);
+  if (!buf) {
+    f.close();
+    return CFG_READ_REFUSE;
+  }
+  const size_t got = size ? f.read((uint8_t*)buf, size) : 0;
+  f.close();
+  ConfigFileRead r = CFG_READ_REFUSE;
+  if (got == size) r = configFileReadMasked(shownPath, buf, size, out, secretJsonAllocator());
+  secretFree(buf);
+  return r;
 }

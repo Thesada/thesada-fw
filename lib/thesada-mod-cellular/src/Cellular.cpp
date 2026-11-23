@@ -83,12 +83,12 @@ static bool atTake(SemaphoreHandle_t m, uint32_t timeoutMs) {
 }
 
 // Console pumps running inside a held exchange (pumpConsoleHeld).
-static unsigned s_heldPumps = 0;
+static std::atomic<unsigned> s_heldPumps{0};
 
 Cellular::ATGuard::ATGuard(uint32_t timeoutMs) : _held(false) {
   atMutexInit();
   if (_atMutex == nullptr) return;  // OOM at create time - degrade open
-  if (cellAtNestedRefused(s_heldPumps, xSemaphoreGetMutexHolder(_atMutex),
+  if (cellAtNestedRefused(s_heldPumps.load(), xSemaphoreGetMutexHolder(_atMutex),
                           xTaskGetCurrentTaskHandle())) {
     Log::kvfw(TAG, "cellular.at_refused reason=console_in_exchange");
     return;

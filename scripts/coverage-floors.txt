@@ -16,6 +16,7 @@ lib/thesada-core/src/cli_topics.h               95
 lib/thesada-core/src/clock_floor_policy.h       95
 lib/thesada-core/src/cmd_config_policy.h        95
 lib/thesada-core/src/device_identity_policy.h    95
+lib/thesada-core/src/enroll_commit_policy.h     95
 lib/thesada-core/src/enroll_policy.h            95
 lib/thesada-core/src/http_body_policy.h         95
 lib/thesada-core/src/http_fetch_policy.h        95
@@ -58,5 +59,6 @@ lib/thesada-core/src/config_schema_policy.h      95
 lib/thesada-core/src/config_scalar_policy.h      95
 lib/thesada-core/src/elapsed_policy.h            95
 lib/thesada-core/src/sleep_policy.h              95
+lib/thesada-core/src/config_mask_policy.h        95
 lib/thesada-core/src/console_drop_policy.h     95
 lib/thesada-core/src/module_begin_policy.h     95

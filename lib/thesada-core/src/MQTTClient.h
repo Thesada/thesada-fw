@@ -146,6 +146,17 @@ public:
   // after the normal retry interval. in: none. out: none.
   static void dropSession();
 
+  // Before a second TLS session: hold the reconnect up to holdMs, and drop
+  // this session first when heap is short. in: caller tag, hold. out: true if held.
+  static bool yieldTlsHeap(const char* why, uint32_t holdMs);
+
+  // End a yieldTlsHeap hold so loop() reconnects now. in: none. out: none.
+  static void releaseTlsHeap();
+
+  // Hold reconnects while a TLS session outlives its hold timer. Any task.
+  static void pinTlsHold();
+  static void unpinTlsHold();
+
   // Publish the retained-state set this device owns: availability "online",
   // HA discovery configs, /info, retained-topics manifest. connect() runs
   // it with force on every new session; the session flag stops a

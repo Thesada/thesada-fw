@@ -346,7 +346,7 @@ void test_secret_set_holds_the_field_to_the_provisioning_set(void) {
   TEST_ASSERT_TRUE(cliAuthzSecretFieldAllowed("telegram.bot_token t"));
   TEST_ASSERT_TRUE(cliAuthzSecretFieldAllowed("web.password w"));
   TEST_ASSERT_TRUE(cliAuthzSecretFieldAllowed("wifi.ap_password a"));
-  TEST_ASSERT_TRUE(cliAuthzSecretFieldAllowed("wifi.password:Barn x"));
+  TEST_ASSERT_TRUE(cliAuthzSecretFieldAllowed("wifi.password:Net2 x"));
   TEST_ASSERT_FALSE(cliAuthzSecretFieldAllowed("wifi.password x"));
   TEST_ASSERT_FALSE(cliAuthzSecretFieldAllowed("mqtt.username x"));
   TEST_ASSERT_FALSE(cliAuthzSecretFieldAllowed("ota.url x"));

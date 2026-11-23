@@ -188,6 +188,18 @@ void test_key_valid_table(void) {
   TEST_ASSERT_FALSE(configKeyValid(nullptr));
 }
 
+
+// A key past the lookup buffer is refused whole, so lookup and secret check see one key.
+void test_lookup_key_fits(void) {
+  std::string k(CONFIG_KEY_MAX - 1 - 9, 'a');
+  k += ".password";
+  TEST_ASSERT_EQUAL(CONFIG_KEY_MAX - 1, k.size());
+  TEST_ASSERT_TRUE(configLookupKeyFits(k.c_str()));
+  TEST_ASSERT_FALSE(configLookupKeyFits((k + "x").c_str()));
+  TEST_ASSERT_FALSE(configLookupKeyFits(nullptr));
+  TEST_ASSERT_TRUE(configLookupKeyFits("mqtt.port"));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_set_creates_missing_sections);
@@ -202,5 +214,6 @@ int main(int, char**) {
   RUN_TEST(test_array_index_refuses_overflow);
   RUN_TEST(test_empty_segments_are_refused);
   RUN_TEST(test_key_valid_table);
+  RUN_TEST(test_lookup_key_fits);
   return UNITY_END();
 }

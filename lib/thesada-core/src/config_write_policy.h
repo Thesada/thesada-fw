@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#include "config_mask_policy.h"
 
 // lfs_dir_find skips "." segments. in: path. out: path past its leading
 // slashes and "." segments, "" for the root.
@@ -46,6 +47,24 @@ inline bool fileWriteLanded(size_t written, size_t onDisk, size_t expected) {
 // As fileWriteLanded, and an empty config file never parses, so it never lands.
 inline bool configWriteLanded(size_t written, size_t onDisk, size_t expected) {
   return expected > 0 && fileWriteLanded(written, onDisk, expected);
+}
+
+// The config editor stages a save here, then moves it over /config.json.
+static const char CONFIG_STAGED_NAME[] = "config.json.new";
+
+enum FsMoveRoute {
+  FS_MOVE_PLAIN = 0,       // rename as asked
+  FS_MOVE_CONFIG_STAGED,   // the staged save: written through Config::writeRaw, then removed
+  FS_MOVE_CONFIG_REFUSED,  // any other move onto the config file
+};
+
+// How fs.mv reaches dst. Only the staged save may become /config.json, and it
+// goes through the write path that keeps stored secrets, never a rename.
+// in: both on LittleFS, src and dst after stripPrefix. out: route.
+inline FsMoveRoute fsMoveRoute(bool littleFs, const char* src, const char* dst) {
+  if (!littleFs || !configPathIsLive(dst)) return FS_MOVE_PLAIN;
+  return src && strcmp(fsSkipRootDots(src), CONFIG_STAGED_NAME) == 0 ? FS_MOVE_CONFIG_STAGED
+                                                                    : FS_MOVE_CONFIG_REFUSED;
 }
 
 static const char UPLOAD_TMP_NAME[] = ".upload.tmp";
@@ -122,8 +141,28 @@ inline bool configKeyIsPrefix(const char* key) {
 
 // The reply config.set / config.del give once the edit is on disk and live.
 // in: buf, key, value (null for a delete), file prefix not live yet. out: buf filled.
+// A secret value reads as its marker, a literal with secrets inside, or a
+// duplicate key, as its masked form cut to fit, a literal that does not parse not at all.
 inline void configSavedReply(char* buf, size_t cap, const char* key, const char* value, bool pending = false) {
   const bool restart = pending && configKeyIsPrefix(key);
+  char shown[160];
+  // configPathStore skips the same spaces, so a spaced literal is masked as stored.
+  const char* lv = value ? configSkipSpace(value) : nullptr;
+  if (value && configPathIsSecret(key)) {
+    value = *value ? CONFIG_MASK_SET : CONFIG_MASK_EMPTY;
+  } else if (lv && (*lv == '{' || *lv == '[')) {
+    JsonDocument lit;
+    if (deserializeJson(lit, lv, DeserializationOption::NestingLimit(CONFIG_MAX_DEPTH))) {
+      value = "(value not shown)";
+    } else {
+      const bool whole = configParseKeptMembers(lv, strlen(lv), lit.as<JsonVariantConst>());
+      if (configMaskTree(lit.as<JsonVariant>()) > 0 || !whole) {
+        const size_t n = serializeJson(lit, shown, sizeof(shown) - 1);
+        shown[n] = '\0';
+        value = shown;
+      }
+    }
+  }
   if (value && restart) {
     (void)snprintf(buf, cap, "Set %s = %s (saved, new prefix applies after restart)", key, value);
   } else if (value) {
