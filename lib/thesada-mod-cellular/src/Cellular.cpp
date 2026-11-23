@@ -1,5 +1,6 @@
 // thesada-fw - Cellular.cpp
-// SIM7080G Cat-M1 with modem-native MQTT over TLS (AT+SMCONF/SMCONN/SMPUB).
+// SIM7080G Cat-M1: power, registration, data bearer and plain TCP sockets.
+// TLS and MQTT run on the ESP32 (TlsClient, MQTTClient) over those sockets.
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include <thesada_config.h>
@@ -18,6 +19,16 @@
 #include <memory>
 #include <new>
 #include <mbedtls/platform_util.h>
+#include <TlsClient.h>
+#include <WiFiManager.h>
+#include <clock_floor_policy.h>
+#include <http_fetch_policy.h>
+#include <boot_wait_policy.h>
+#include <cell_recover_policy.h>
+#include <cell_at_policy.h>
+#include <elapsed_policy.h>
+#include <http_url_policy.h>
+#include <atomic>
 
 // ── TinyGSM ─────────────────────────────────────────────────────────────────
 // TINY_GSM_MODEM_SIM7080 and TINY_GSM_RX_BUFFER=1024 set via build_flags.
@@ -42,13 +53,8 @@ static const char* TAG = "Cellular";
 // ── Module state ─────────────────────────────────────────────────────────────
 bool              Cellular::_modemAlive    = false;
 bool              Cellular::_started        = false;
-bool              Cellular::_mqttConnected  = false;
-bool              Cellular::_publishGate    = false;
-bool              Cellular::_hasCACert      = false;
-bool              Cellular::_hasClientCertOnModem = false;
 int               Cellular::_signalQuality  = 99;
 uint32_t          Cellular::_lastSignalSample = 0;
-uint32_t          Cellular::_lastSmpubMs    = 0;
 SemaphoreHandle_t Cellular::_atMutex        = nullptr;
 
 // Lazy init of the recursive AT-bus mutex. Called from every ATGuard
@@ -60,13 +66,41 @@ void Cellular::atMutexInit() {
   }
 }
 
+// IDF logs every feed from a task the watchdog does not watch.
+static void feedIfWatched() {
+  if (esp_task_wdt_status(nullptr) == ESP_OK) esp_task_wdt_reset();
+}
+
+// Take the bus in fed slices of 1 s at most: the loop and net.http tasks
+// both wait on it, and either can hold it past the 30 s watchdog. 0 = one try.
+static bool atTake(SemaphoreHandle_t m, uint32_t timeoutMs) {
+  if (timeoutMs == 0) return xSemaphoreTakeRecursive(m, 0) == pdTRUE;
+  const uint32_t t0 = millis();
+  for (uint32_t step; (step = waitSliceMs(t0, millis(), timeoutMs)) != 0; feedIfWatched()) {
+    if (xSemaphoreTakeRecursive(m, pdMS_TO_TICKS(step)) == pdTRUE) return true;
+  }
+  return false;
+}
+
+// Console pumps running inside a held exchange (pumpConsoleHeld).
+static std::atomic<unsigned> s_heldPumps{0};
+
 Cellular::ATGuard::ATGuard(uint32_t timeoutMs) : _held(false) {
   atMutexInit();
   if (_atMutex == nullptr) return;  // OOM at create time - degrade open
-  TickType_t to = (timeoutMs == 0) ? 0 : pdMS_TO_TICKS(timeoutMs);
-  if (xSemaphoreTakeRecursive(_atMutex, to) == pdTRUE) {
-    _held = true;
+  if (cellAtNestedRefused(s_heldPumps.load(), xSemaphoreGetMutexHolder(_atMutex),
+                          xTaskGetCurrentTaskHandle())) {
+    Log::kvfw(TAG, "cellular.at_refused reason=console_in_exchange");
+    return;
   }
+  _held = atTake(_atMutex, timeoutMs);
+}
+
+// Pump from a wait that holds the bus. A typed line that needs it is refused.
+static void pumpConsoleHeld() {
+  ++s_heldPumps;
+  Shell::pumpConsole();
+  --s_heldPumps;
 }
 Cellular::ATGuard::~ATGuard() {
   if (_held) xSemaphoreGiveRecursive(_atMutex);
@@ -101,47 +135,227 @@ void Cellular::ATGuard::pause(uint32_t pauseMs) {
     // the pause and will not release, leave _held=false so the caller
     // sees ok()==false and bails the retry loop instead of issuing AT
     // commands without the bus.
-    TickType_t to = pdMS_TO_TICKS(60000UL);
-    if (xSemaphoreTakeRecursive(_atMutex, to) == pdTRUE) {
-      _held = true;
-    } else {
-      Log::warn("Cellular", "cellular.at_reacquire_timeout");
-    }
+    _held = atTake(_atMutex, 60000UL);
+    if (!_held) Log::warn("Cellular", "cellular.at_reacquire_timeout");
   }
 }
 
-// Serial port for TinyGSM
-static TinyGsm modem(Serial1);
+class ThesadaModem : public TinyGsm {
+ public:
+  explicit ThesadaModem(Stream& s) : TinyGsm(s) {}
+  bool openSocket(const char* host, uint16_t port, uint8_t mux, int timeoutS) {
+    return modemConnect(host, port, mux, false, timeoutS);
+  }
+};
+static ThesadaModem modem(Serial1);
+
+// Open-failure bookkeeping, defined after waitChunked below.
+static void socketOpenFailed(uint8_t slot);
+static void socketOpenOk(uint8_t slot);
+static void socketSendFailed(uint8_t slot);
+static void socketSendOk(uint8_t slot);
+
+// One plain modem TCP socket. Lives for the whole program, so TinyGSM's
+// sockets[] table never points at a freed client, and with slot 0 always
+// registered its maintain() availability refresh (which only starts from
+// sockets[0]) covers every slot. connect/stop are bounded so a slow
+// network cannot outlast the 30 s task watchdog.
+class ModemSocket : public TinyGsm::GsmClientSim7080 {
+ public:
+  ModemSocket(ThesadaModem& m, uint8_t mux) : GsmClientSim7080(m, mux) {}
+  // The modem can still hold this cid after a timed-out open or a close
+  // it reported only by URC, and then refuses every later CAOPEN on it,
+  // so the close is sent whatever our flag says, before and after.
+  bool open(const char* host, uint16_t port, int timeoutS) {
+    close(true);
+    sock_connected = static_cast<ThesadaModem*>(at)->openSocket(host, port, mux, timeoutS);
+    if (!sock_connected) close(true);
+    return sock_connected;
+  }
+  void close(bool always = false) {
+    if (sock_connected || always) {
+      at->sendAT(GF("+CACLOSE="), mux);
+      at->waitResponse(3000);
+    }
+    sock_connected = false;
+    sock_available = 0;
+    got_data       = false;
+    rx.clear();
+  }
+  bool   isOpen() const   { return sock_connected; }
+  size_t buffered()       { return rx.size() + sock_available; }
+  void   forget()         { sock_connected = false; sock_available = 0; rx.clear(); }
+  // Ask the next maintain() for a fresh modem-side byte count now instead
+  // of after TinyGSM's 500 ms idle throttle.
+  void   pollNow()        { got_data = true; prev_check = millis(); }
+  void   markClosed()     { sock_connected = false; }
+};
+
+// Per-socket counters for the httpsGet done line: where a slow transfer
+// spends its time.
+struct SocketStats { uint32_t reads, readBytes, readMs, polls, availCalls; };
+static SocketStats s_stats[Cellular::TCP_SLOTS] = {};
+
+// Set while one httpsGet owns socket slot 1.
+static std::atomic<uint32_t> s_httpsBusy{0};
+
+// Arduino Client over one ModemSocket. Every modem exchange takes the AT
+// bus guard for its own duration only, so a long transfer never locks
+// out the health probe or the other socket.
+class ModemClient : public Client {
+ public:
+  ModemClient(ThesadaModem& m, uint8_t mux) : _s(m, mux), _mux(mux) {}
+
+  // Resolves with the bounded +CDNSGIP first: a slow lookup inside
+  // CAOPEN holds the bus past the other socket's keepalive.
+  int connect(const char* host, uint16_t port) override {
+    char ip[48];
+    IPAddress parsed;
+    if (parsed.fromString(host)) {
+      strncpy(ip, host, sizeof(ip) - 1);
+      ip[sizeof(ip) - 1] = '\0';
+    } else if (!Cellular::resolveHost(host, ip, sizeof(ip))) {
+      Log::kvfw(TAG, "cellular.socket_dns_failed host=%s", host);
+      return 0;
+    }
+    Cellular::ATGuard g(25000UL);
+    if (!g.ok()) return 0;
+    esp_task_wdt_reset();
+    bool ok = _s.open(ip, port, 15);
+    esp_task_wdt_reset();
+    if (ok) socketOpenOk(_mux);
+    else    socketOpenFailed(_mux);
+    return ok ? 1 : 0;
+  }
+  int connect(IPAddress ip, uint16_t port) override {
+    char host[16];
+    snprintf(host, sizeof(host), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+    return connect(host, port);
+  }
+  size_t write(uint8_t b) override { return write(&b, 1); }
+  size_t write(const uint8_t* buf, size_t size) override {
+    Cellular::ATGuard g(10000UL);
+    if (!g.ok() || !_s.isOpen()) return 0;
+    size_t done = 0;
+    while (done < size) {
+      size_t chunk = size - done > 1024 ? 1024 : size - done;
+      size_t n = _s.write(buf + done, chunk);
+      if (n == 0) break;
+      done += n;
+      esp_task_wdt_reset();
+    }
+    if (done == size) socketSendOk(_mux);
+    else              socketSendFailed(_mux);
+    return done;
+  }
+  // While bytes are flowing, poll the modem every 30 ms: TinyGSM's own
+  // 500 ms idle throttle caps a download at a few KB/s. Idle sockets keep
+  // the slow cadence so a quiet MQTT session does not flood the AT bus.
+  int available() override {
+    Cellular::ATGuard g(0);
+    if (!g.ok()) return (int)_s.buffered();
+    uint32_t now = millis();
+    s_stats[_mux].availCalls++;
+    if (_s.buffered() == 0 && now - _lastData < 2000UL && now - _lastPoll >= 30UL) {
+      _s.pollNow();
+      _lastPoll = now;
+      s_stats[_mux].polls++;
+    }
+    int n = _s.available();
+    if (n > 0) _lastData = now;
+    return n;
+  }
+  int read() override {
+    uint8_t c;
+    return read(&c, 1) == 1 ? c : -1;
+  }
+  int read(uint8_t* buf, size_t size) override {
+    Cellular::ATGuard g(5000UL);
+    if (!g.ok()) return -1;
+    uint32_t t0 = millis();
+    int n = _s.read(buf, size);
+    s_stats[_mux].reads++;
+    s_stats[_mux].readMs += millis() - t0;
+    if (n > 0) s_stats[_mux].readBytes += n;
+    return n > 0 ? n : -1;
+  }
+  int peek() override {
+    Cellular::ATGuard g(5000UL);
+    if (!g.ok()) return -1;
+    return _s.peek();
+  }
+  void flush() override {}
+  void stop() override {
+    Cellular::ATGuard g(10000UL);
+    if (g.ok()) _s.close();
+    else        _s.forget();
+  }
+  uint8_t connected() override { return (_s.isOpen() || _s.buffered() > 0) ? 1 : 0; }
+  operator bool() override { return connected(); }
+  void forget() { _s.forget(); }
+  // A socket URC read outside TinyGSM. Caller holds the bus.
+  void urc(uint8_t kind) {
+    if (kind == CELL_URC_CLOSED) _s.markClosed();
+    else if (kind == CELL_URC_DATA) _s.pollNow();
+  }
+
+ private:
+  ModemSocket _s;
+  uint8_t     _mux;
+  uint32_t    _lastData = 0;
+  uint32_t    _lastPoll = 0;
+};
+
+// Constructed in place: a copy would leave sockets[mux] on the temporary.
+static ModemClient  s_sock0(modem, 0);
+static ModemClient  s_sock1(modem, 1);
+static ModemClient* const s_sockets[Cellular::TCP_SLOTS] = { &s_sock0, &s_sock1 };
+
+// Raw readers (cellAT, the +CDNSGIP and +CNTP waits) pass every line here.
+static void noteSocketUrc(const char* line) {
+  const CellUrc u = cellSocketUrc(line, Cellular::TCP_SLOTS);
+  if (u.kind != CELL_URC_NONE) s_sockets[u.mux]->urc(u.kind);
+}
+
+// Read lines until one holds prefix. Caller holds the bus.
+// out: true with that line in line.buf.
+template <size_t N>
+static bool waitUrcLine(const char* prefix, uint32_t timeoutMs, CellLine<N>& line, bool pump) {
+  const uint32_t t0 = millis();
+  while (msWithin(millis(), t0, timeoutMs)) {
+    while (Serial1.available()) {
+      if (!line.feed((char)Serial1.read())) continue;
+      if (strstr(line.buf, prefix)) return true;
+      noteSocketUrc(line.buf);
+    }
+    delay(20);
+    esp_task_wdt_reset();
+    if (pump) pumpConsoleHeld();
+  }
+  return false;
+}
 
 // Sample AT+CSQ at most every 30 s to keep AT bus clean.
 static constexpr uint32_t SIGNAL_SAMPLE_MS = 30UL * 1000UL;
 
-// Minimum spacing between Cellular::publish() calls. Defensive guard
-// against the burst-wedge pattern: ~10 SMPUBs in the first ~10 s of
-// a fresh cellular MQTT session can wedge SIM7080G URC routing even
-// with cellATWrite on every publish, so spread bursts to <= 1 Hz.
-static constexpr uint32_t SMPUB_MIN_SPACING_MS = 1000UL;
-
-// MQTT-active health probe cadence. Per-tick TinyGSM AT calls would
-// drain Serial1 of any +SMSUB: URC arriving between loop iterations,
-// so during MQTT-active phase we only run isRegistered + isGprsConnected
-// + mqttIsConnected once every HEALTH_PROBE_MS. The ATGuard mutex held
-// across the probe blocks pumpInbound for that one tick.
+// Registration + bearer health probe cadence while the link is up.
 static constexpr uint32_t HEALTH_PROBE_MS = 60UL * 1000UL;
 static uint32_t           s_lastHealthMs   = 0;
+// Registration + bearer verdict of the last probe; false during recovery.
+static bool               s_linkUp         = false;
 
 // TinyGSM waitResponse blocks the task for the full timeout without
-// feeding the 5 s task watchdog. This wrapper splits any long wait into
+// feeding the task watchdog. This wrapper splits any long wait into
 // 1.5 s chunks with esp_task_wdt_reset() between, so SIM7080 commands
-// that legitimately need 10-30 s (CFSWFILE, SMCONN, registration) do
+// that legitimately need 10-30 s (CNACT, CFUN, registration) do
 // not trip TWDT on slow cycles. Returns the same codes as waitResponse:
 // 1 on OK match, >1 on alternate matches, 0 on timeout.
 template <typename... Args>
 static int waitChunked(uint32_t totalMs, Args... args) {
-  uint32_t end = millis() + totalMs;
+  const uint32_t t0 = millis();
   int res = 0;
-  while (millis() < end) {
-    uint32_t left  = end - millis();
+  while (msWithin(millis(), t0, totalMs)) {
+    uint32_t left  = totalMs - (millis() - t0);
     uint32_t chunk = left > 1500 ? 1500 : left;
     res = modem.waitResponse(chunk, args...);
     if (res != 0) return res;
@@ -150,49 +364,53 @@ static int waitChunked(uint32_t totalMs, Args... args) {
   return 0;
 }
 
-// MQTT retry backoff state. Reset on a successful connect cycle, doubled
-// on each failure up to MQTT_RETRY_MAX_MS so the modem and broker are not
-// hammered when the cellular session is wedged.
-static constexpr uint32_t MQTT_RETRY_INIT_MS = 10UL * 1000UL;
-static constexpr uint32_t MQTT_RETRY_MAX_MS  = 5UL * 60UL * 1000UL;
-static uint32_t           s_mqttRetryMs      = MQTT_RETRY_INIT_MS;
+// Consecutive failed socket opens, and consecutive failed sends, per slot.
+// Either streak at 3 recycles the bearer, at 6 power-cycles the modem.
+static CellFailStreaks<Cellular::TCP_SLOTS> s_openFails;
+static CellFailStreaks<Cellular::TCP_SLOTS> s_sendFails;
 
-// Sleep current MQTT backoff window, then double it (capped at
-// MQTT_RETRY_MAX_MS), feeding the task watchdog every 500 ms so a
-// long backoff does not trip TWDT.
-//
-// If `guard` is non-null, it is paused for the backoff so the AT bus
-// is released and the shell console pumps for cell.at / cell.cert.*
-// debug commands. The Cellular::loop() recovery path passes its own
-// guard; callers without a guard get a plain delay loop (no console
-// pump). The incremental tickActivation() path does not use this -
-// it schedules a non-blocking retry timestamp instead.
-//
-// in:  guard  optional ATGuard to pause during the sleep, or nullptr
-// out: none (uses module-static s_mqttRetryMs)
-static void mqttBackoffWait(Cellular::ATGuard* guard = nullptr) {
-  uint32_t ms = s_mqttRetryMs;
-  Log::kvfw(TAG, "cellular.mqtt.retry_wait retry_s=%lu", (unsigned long)(ms / 1000UL));
-  if (guard) {
-    guard->pause(ms);
-  } else {
-    uint32_t remaining = ms;
-    while (remaining) {
-      uint32_t step = remaining > 500UL ? 500UL : remaining;
-      delay(step);
-      esp_task_wdt_reset();
-      remaining -= step;
-    }
+// The task that runs activation and the probe, and a step queued off it.
+static TaskHandle_t         s_driverTask = nullptr;
+static std::atomic<uint8_t> s_recoverQueued{CELL_RECOVER_NONE};
+
+// One recovery step. Caller holds the AT bus.
+static void socketRecoverRun(uint8_t step) {
+  if (step == CELL_RECOVER_RECYCLE) {
+    Log::kvfw(TAG, "cellular.socket_recover action=bearer_recycle");
+    for (ModemClient* sk : s_sockets) sk->forget();
+    modem.sendAT("+CNACT=0,0");
+    waitChunked(10000UL);
+    modem.sendAT("+CNACT=0,1");
+    waitChunked(30000UL);
+  } else if (step == CELL_RECOVER_RESET) {
+    Log::kvfe(TAG, "cellular.socket_recover action=hard_reset");
+    Cellular::hardReset();
   }
-  uint32_t next = ms * 2UL;
-  s_mqttRetryMs = (next > MQTT_RETRY_MAX_MS) ? MQTT_RETRY_MAX_MS : next;
 }
 
-// Reset MQTT retry backoff to the initial window after a successful
-// connect cycle, so the next failure starts at the short delay again.
-static inline void mqttBackoffReset() {
-  s_mqttRetryMs = MQTT_RETRY_INIT_MS;
+static void socketRecover(CellFailStreaks<Cellular::TCP_SLOTS>& streaks, uint8_t slot,
+                          const char* kind) {
+  const uint8_t step = streaks.fail(slot);
+  Log::kvfw(TAG, "cellular.socket_%s_failed slot=%u streak=%u", kind, (unsigned)slot,
+            (unsigned)(step == CELL_RECOVER_RESET ? CELL_RESET_STREAK : streaks.streak(slot)));
+  // A refused open or send often takes the data context down with it on
+  // this modem: probe on the next loop instead of up to a minute later.
+  s_lastHealthMs = 0;
+  if (step == CELL_RECOVER_NONE) return;
+  if (cellRecoverHere(xTaskGetCurrentTaskHandle(), s_driverTask)) {
+    socketRecoverRun(step);
+    return;
+  }
+  // A worker task (net.http) leaves the long steps to the loop's next probe.
+  s_recoverQueued.fetch_or(step);
+  Log::kvfw(TAG, "cellular.socket_recover_queued action=%s",
+            step == CELL_RECOVER_RESET ? "hard_reset" : "bearer_recycle");
 }
+
+static void socketOpenOk(uint8_t slot)     { s_openFails.ok(slot); }
+static void socketOpenFailed(uint8_t slot) { socketRecover(s_openFails, slot, "open"); }
+static void socketSendOk(uint8_t slot)     { s_sendFails.ok(slot); }
+static void socketSendFailed(uint8_t slot) { socketRecover(s_sendFails, slot, "send"); }
 
 // Hardware-reset the modem by dropping DC3 for 200 ms via the PMU,
 // then re-pulsing PWRKEY and waiting for AT. Replaces the previous
@@ -218,10 +436,11 @@ static bool modemSoftReset() {
   digitalWrite(PIN_MODEM_PWR, HIGH); delay(1000);
   digitalWrite(PIN_MODEM_PWR, LOW);
 
-  uint32_t deadline = millis() + REBOOT_BUDGET_MS;
-  while (millis() < deadline) {
+  const uint32_t t0 = millis();
+  while (msWithin(millis(), t0, REBOOT_BUDGET_MS)) {
     delay(1000);
     esp_task_wdt_reset();
+    pumpConsoleHeld();
     if (modem.testAT(1000UL)) {
       Log::info(TAG, "cellular.modem_reset_ok");
       modem.sendAT("+CMEE=2");
@@ -233,36 +452,9 @@ static bool modemSoftReset() {
   return false;
 }
 
-// Drop the modem-side cached client cert (next mqttConnect re-decides
-// based on current NVS state) AND tear down any live SMCONN so the
-// next reconnect cycle uses the new auth mode. Wired to MQTTClient's
-// cert-cleared hook from begin(); also safe to call directly. No-op
-// when cellular MQTT was never up. Held briefly on the AT bus.
-void Cellular::invalidateClientCert() {
-  _hasClientCertOnModem = false;
-  if (!_modemAlive) return;
-
-  ATGuard g(5000UL);
-  if (!g.ok()) {
-    // The bus is busy - the next health probe / reconnect will pick
-    // up _hasClientCertOnModem=false and re-decide; the live session
-    // continues until then. Acceptable for a runtime cert.clear.
-    Log::warn(TAG, "cellular.cert_invalidate_deferred reason=at_bus_busy");
-    return;
-  }
-  if (_mqttConnected) {
-    Log::info(TAG, "cellular.mqtt.session_drop reason=cert_clear");
-    modem.sendAT("+SMDISC");
-    modem.waitResponse(5000UL);
-    _mqttConnected = false;
-    MQTTClient::setFallbackTlsVerified(false);
-  }
-}
-
 // Public wrapper for the hardware reset. Drops state flags so the next
-// CellularModule::loop tick re-walks activation (networkConnect +
-// mqttConnect + smsubAll). Caller can be Shell, watchdog, or anything
-// that needs to recover a wedged modem.
+// CellularModule::loop tick re-walks activation. Caller can be Shell,
+// watchdog, or anything that needs to recover a wedged modem.
 bool Cellular::hardReset() {
   ATGuard g(120000UL);
   if (!g.ok()) {
@@ -270,36 +462,12 @@ bool Cellular::hardReset() {
     return false;
   }
   bool ok = modemSoftReset();
-  _modemAlive    = ok;
-  _started       = false;
-  _mqttConnected = false;
-  MQTTClient::setFallbackTlsVerified(false);
-  // Modem FS does not survive a DC3 power cycle - any prior cert
-  // upload is gone, force a re-upload on the next mqttConnect.
-  _hasClientCertOnModem = false;
+  _modemAlive = ok;
+  _started    = false;
+  s_recoverQueued.store(CELL_RECOVER_NONE);
+  // The power cycle closed every socket without a +CASTATE URC.
+  for (ModemClient* s : s_sockets) s->forget();
   return ok;
-}
-
-// Slurp pending bytes from the modem stream for a short window and
-// return them as a one-line String (CR/LF replaced with " | "). Used
-// to capture +CME ERROR / SMSTATE chatter after an AT failure when
-// waitChunked returns 0, so the log line is actionable instead of a
-// bare "MQTT connect failed".
-//
-// in:  windowMs  how long to keep slurping bytes
-// out: String    sanitized tail (may be empty)
-static String drainModemTail(uint32_t windowMs = 300UL) {
-  uint32_t t0 = millis();
-  String buf;
-  while (millis() - t0 < windowMs) {
-    while (modem.stream.available()) buf += (char)modem.stream.read();
-    delay(10);
-    esp_task_wdt_reset();
-  }
-  buf.replace("\r", " ");
-  buf.replace("\n", " | ");
-  buf.trim();
-  return buf;
 }
 
 // ---------------------------------------------------------------------------
@@ -356,200 +524,11 @@ bool Cellular::wakeModem() {
 
 // ---------------------------------------------------------------------------
 
-// Upload CA certificate from LittleFS to the modem for TLS verification
-bool Cellular::writeCACert() {
-  // Load CA cert from LittleFS /ca.crt. Required for TLS.
-  // If not present, skip cert write - modem TLS will connect without verification.
-  String certBuf;
-  if (LittleFS.exists("/ca.crt")) {
-    File cf = LittleFS.open("/ca.crt", "r");
-    if (cf) { certBuf = cf.readString(); cf.close(); Log::info(TAG, "cellular.ca_loaded path=/ca.crt"); }
-  }
-  if (certBuf.isEmpty()) {
-    Log::kvfw(TAG, "cellular.tls_insecure reason=no_ca");
-    _hasCACert = false;
-    return true;
-  }
-  const char* cert    = certBuf.c_str();
-  size_t      certLen = certBuf.length();
-
-  // Terminate any previous FS session, then open.
-  modem.sendAT("+CFSTERM");
-  modem.waitResponse();
-  modem.sendAT("+CFSINIT");
-  if (modem.waitResponse() != 1) {
-    Log::error(TAG, "cellular.ca_write_failed step=cfsinit");
-    return false;
-  }
-
-  // Bounded retries: a wedged FS session (CFSINIT dropped, modem reset,
-  // FS full) previously spun here forever holding the AT-bus mutex, and
-  // the activation deadline never fired. Fail hard so the caller re-walks
-  // the state machine.
-  size_t  total    = certLen;
-  size_t  written  = 0;
-  uint8_t failures = 0;
-  while (total > 0) {
-    size_t chunk = total > 10000 ? 10000 : total;
-    modem.sendAT("+CFSWFILE=", 3, ",\"server-ca.crt\",",
-                 (written > 0 ? 1 : 0), ",", chunk, ",10000");
-    if (waitChunked(30000UL, "DOWNLOAD") != 1) {
-      Log::error(TAG, "cellular.ca_write_failed step=download_prompt");
-      modem.sendAT("+CFSTERM");
-      modem.waitResponse();
-      return false;
-    }
-    modem.stream.write(cert + written, chunk);
-    if (waitChunked(30000UL) == 1) {
-      written  += chunk;
-      total    -= chunk;
-      failures  = 0;
-    } else if (++failures >= 3) {
-      Log::error(TAG, "cellular.ca_write_failed step=chunk_write attempts=3");
-      modem.sendAT("+CFSTERM");
-      modem.waitResponse();
-      return false;
-    } else {
-      Log::warn(TAG, "cellular.ca_chunk_retry");
-      delay(1000);
-    }
-  }
-
-  modem.sendAT("+CFSTERM");
-  modem.waitResponse();
-  _hasCACert = true;
-  Log::info(TAG, "cellular.ca_written");
-  return true;
-}
-
-// ---------------------------------------------------------------------------
-
-// Chunked CFSWFILE upload helper. Same flow as writeCACert: open a
-// session via CFSINIT, walk the buffer in <= 10 KB chunks via CFSWFILE
-// (truncate write on chunk 0, append on subsequent), close with CFSTERM.
-// Caller owns the AT bus mutex.
-//
-// in:  filename  modem-side file name (in OEM partition, index 3)
-//      data      pointer to PEM bytes
-//      length    byte count
-// out: bool      true on success
-static bool writeModemFile(TinyGsm& modem, const char* filename,
-                           const uint8_t* data, size_t length) {
-  modem.sendAT("+CFSTERM");
-  modem.waitResponse();
-  modem.sendAT("+CFSINIT");
-  if (modem.waitResponse() != 1) return false;
-
-  // Bounded retries - same abort policy as writeCACert.
-  size_t  remaining = length;
-  size_t  written   = 0;
-  uint8_t failures  = 0;
-  while (remaining > 0) {
-    size_t chunk = remaining > 10000 ? 10000 : remaining;
-    modem.sendAT("+CFSWFILE=", 3, ",\"", filename, "\",",
-                 (written > 0 ? 1 : 0), ",", chunk, ",10000");
-    if (waitChunked(30000UL, "DOWNLOAD") != 1) {
-      Log::kvfe(TAG, "cellular.file_write_failed step=download_prompt file=%s", filename);
-      modem.sendAT("+CFSTERM");
-      modem.waitResponse();
-      return false;
-    }
-    modem.stream.write(data + written, chunk);
-    if (waitChunked(30000UL) == 1) {
-      written   += chunk;
-      remaining -= chunk;
-      failures   = 0;
-    } else if (++failures >= 3) {
-      Log::kvfe(TAG, "cellular.file_write_failed step=chunk_write attempts=3 file=%s", filename);
-      modem.sendAT("+CFSTERM");
-      modem.waitResponse();
-      return false;
-    } else {
-      delay(1000);
-    }
-  }
-
-  modem.sendAT("+CFSTERM");
-  modem.waitResponse();
-  return true;
-}
-
-// Upload the NVS-stored client cert and private key as TWO separate
-// PEM files on the modem FS - `client.crt` for the certificate,
-// `client.key` for the private key. SIM7080G fw 1951B17 wants
-// CSSLCFG type 1 with the 4-arg form (cert filename + key filename
-// as separate args), so the two-file layout matches what mqttConnect's
-// CSSLCFG + SMSSL sequence references.
-//
-// Earlier impl concatenated cert+key into one PEM and used SMSSL=2,
-// which silently fails the TLS handshake on this fw rev (broker logs
-// `unexpected eof while reading`, modem closes mid-handshake). Pattern
-// here mirrors the LilyGo SIMCom AT samples (AWS IoT + ATT mosquitto)
-// that work on the same modem family.
-//
-// in:  none (NVS via MQTTClient::loadClientCert; AT bus via outer ATGuard)
-// out: bool  true on full upload + CFSTERM ack for both files; false if
-//             NVS empty, alloc fails, or any AT step errors out
-bool Cellular::writeClientCert() {
-  if (!MQTTClient::hasClientCert()) return false;
-
-  const size_t maxLen = MQTTClient::CERT_MAX_LEN;
-  char* certBuf = (char*)malloc(maxLen);
-  char* keyBuf  = (char*)malloc(maxLen);
-
-  // Zero + free helper - the private key half of the pair must never linger
-  // in heap past use. mbedtls_platform_zeroize cannot be optimised away by
-  // the compiler, unlike memset which is legal to skip on a buffer that is
-  // about to be free'd.
-  auto wipe_and_free = [maxLen](char*& cert, char*& key) {
-    if (cert) { mbedtls_platform_zeroize(cert, maxLen); free(cert); cert = nullptr; }
-    if (key)  { mbedtls_platform_zeroize(key,  maxLen); free(key);  key  = nullptr; }
-  };
-
-  if (!certBuf || !keyBuf) {
-    Log::error(TAG, "cellular.client_cert_write_failed reason=alloc");
-    wipe_and_free(certBuf, keyBuf);
-    return false;
-  }
-
-  if (!MQTTClient::loadClientCert(certBuf, keyBuf, maxLen)) {
-    Log::warn(TAG, "cellular.client_cert_write_failed reason=nvs_load");
-    wipe_and_free(certBuf, keyBuf);
-    return false;
-  }
-  size_t certLen = strlen(certBuf);
-  size_t keyLen  = strlen(keyBuf);
-  if (certLen == 0 || keyLen == 0) {
-    Log::warn(TAG, "cellular.client_cert_write_failed reason=empty_cert_or_key");
-    wipe_and_free(certBuf, keyBuf);
-    return false;
-  }
-
-  bool ok = writeModemFile(modem, "client.crt",
-                           (const uint8_t*)certBuf, certLen);
-  if (ok) {
-    ok = writeModemFile(modem, "client.key",
-                        (const uint8_t*)keyBuf, keyLen);
-  }
-
-  wipe_and_free(certBuf, keyBuf);
-  if (!ok) {
-    Log::error(TAG, "cellular.client_cert_write_failed reason=upload");
-    return false;
-  }
-
-  Log::kvf(TAG, "cellular.client_cert_written cert_b=%u key_b=%u",
-           (unsigned)certLen, (unsigned)keyLen);
-  return true;
-}
-
-// ---------------------------------------------------------------------------
-
 // Radio configuration block of the network bring-up: CFUN power-cycle,
 // network/preferred-mode select, APN (CGDCONT/CNCFG), CEREG/CGREG URC
 // enable, then a configurable RF-settle delay before registration is
-// polled. Caller owns the AT bus. Shared by the synchronous
-// networkConnect() and the incremental tickActivation() RADIO_CFG phase.
+// polled. Caller owns the AT bus. Called from the tickActivation()
+// RADIO_CFG phase.
 //
 // The CFUN waits + RF settle are chunked so the task watchdog stays fed;
 // the whole sequence is one ~40 s burst that otherwise blocks > TWDT.
@@ -586,6 +565,7 @@ void Cellular::radioConfigure() {
     uint32_t step = remaining > 500UL ? 500UL : remaining;
     delay(step);
     esp_task_wdt_reset();
+    pumpConsoleHeld();
     remaining -= step;
   }
 }
@@ -659,295 +639,27 @@ bool Cellular::activateBearer() {
 
 // ---------------------------------------------------------------------------
 
-// Configure radio, register on LTE-M network, and activate data bearer.
-// Synchronous (blocking registration poll) - used by the steady-state
-// recovery path in Cellular::loop() and the modem-wedge path in
-// mqttConnect(). The incremental CellularModule activation walks
-// radioConfigure() / pollRegistration() / activateBearer() through
-// tickActivation() instead, so it can yield between phases.
-bool Cellular::networkConnect() {
-  radioConfigure();
-
-  Log::info(TAG, "cellular.registration_wait");
-  JsonObject cfg        = Config::get();
-  uint32_t   regTimeout = cfg["cellular"]["reg_timeout_ms"] | 180000;
-  uint32_t   start      = millis();
-  for (;;) {
-    Shell::pumpConsole();
-    int r = pollRegistration();
-    if (r > 0) break;
-    if (r < 0) return false;  // REG_DENIED
-    delay(1000);
-    if (millis() - start > regTimeout) {
-      Log::error(TAG, "cellular.registration_timeout");
-      return false;
-    }
-  }
-
-  return activateBearer();
-}
 
 // ---------------------------------------------------------------------------
-
-// Configure and connect modem-native MQTT over TLS
-bool Cellular::mqttConnect() {
-  JsonObject  cfg      = Config::get();
-  const char* broker   = cfg["mqtt"]["broker"]   | "mqtt.example.com";
-  int         port     = cfg["mqtt"]["port"]      | 8883;
-  const char* user     = cfg["mqtt"]["user"]      | "";
-  const char* password = cfg["mqtt"]["password"]  | "";
-  const char* devName  = Identity::nodeName();
-
-  // Same rule as the WiFi path in main: the shared literal as clientId evicts
-  // a sibling off the broker. Refuse before the modem session is configured.
-  if (!Identity::brokerNameUsable()) {
-    Log::error(TAG, "cellular.mqtt.refused reason=node_name_not_unique");
-    return false;
-  }
-
-  Log::info(TAG, "cellular.mqtt.configure");
-
-  // The session about to be torn down below takes its auth verdict with it.
-  // Every exit from here that is not a live SMCONN must leave it at password.
-  MQTTClient::setFallbackSessionMTLS(false);
-  MQTTClient::setFallbackTlsVerified(false);
-
-  // Strong teardown: SMDISC alone is not enough after a warm SMCONN
-  // failure - the SIM7080 keeps the URL slot half-locked and the next
-  // SMCONF "URL" returns ERROR. Probe SMSTATE; if the modem still
-  // thinks a session is up, recycle data context 0 (CNACT=0,0 then
-  // CNACT=0,1) before reconfiguring.
-  modem.sendAT("+SMDISC");
-  modem.waitResponse(5000UL);
-
-  int smState = -1;
-  modem.sendAT("+SMSTATE?");
-  if (modem.waitResponse(2000UL, "+SMSTATE: ") == 1) {
-    smState = modem.stream.parseInt();
-    modem.waitResponse();
-  }
-  if (smState == -1) {
-    // Modem ignored SMSTATE? - AT bus wedged. Bench data shows bearer
-    // cycle here does nothing because CNACT also gets ignored; only
-    // a CFUN=1,1 soft reset clears it. After reboot we have to redo
-    // CA upload and network registration before retrying SMCONF.
-    Log::warn(TAG, "cellular.modem_wedged reason=smstate_no_response");
-    if (!modemSoftReset()) return false;
-    // Modem FS cleared by the power cycle; next CFSWFILE writes the
-    // CA + (if mTLS) the client cert+key from a clean slate.
-    _hasCACert = false;
-    _hasClientCertOnModem = false;
-    writeCACert();
-    if (!networkConnect()) return false;
-  } else if (smState != 0) {
-    Log::kvfw(TAG, "cellular.mqtt.session_stale smstate=%d action=bearer_recycle", smState);
-    modem.sendAT("+CNACT=0,0");
-    modem.waitResponse(5000UL);
-    delay(500);
-    modem.sendAT("+CNACT=0,1");
-    if (waitChunked(20000UL) != 1) {
-      Log::warn(TAG, "cellular.bearer_reactivate_slow action=continue");
-    }
-  }
-
-  modem.sendAT("+SMCONF=\"URL\",", broker, ",", port);
-  if (modem.waitResponse() != 1) {
-    String tail = drainModemTail();
-    Log::kvfe(TAG, "cellular.mqtt.config_failed step=url tail=\"%s\"", tail.c_str());
-    return false;
-  }
-
-  // KEEPTIME=15 forces MQTT PINGREQ every 15 s. Default 60 s on
-  // some IoT cellular carriers leaves a long drift window where
-  // inbound MQTT forwarding silently stops while outbound SMPUB
-  // still works - looks like asymmetric NAT timeout on the broker->
-  // modem direction. 15 s pings keep that path warm. Bench-observed
-  // on multiple roaming partners.
-  modem.sendAT("+SMCONF=\"KEEPTIME\",15");
-  modem.waitResponse();
-
-  modem.sendAT("+SMCONF=\"CLEANSS\",1");
-  modem.waitResponse();
-
-  modem.sendAT("+SMCONF=\"CLIENTID\",\"", devName, "\"");
-  if (modem.waitResponse() != 1) { Log::error(TAG, "cellular.mqtt.config_failed step=client_id"); return false; }
-
-  // mTLS detection: NVS holds a client cert AND we already wrote (or
-  // can now write) the matching cert+key onto the modem FS. Skip the
-  // upload if the cache flag says it is already there from a prior
-  // session - the modem FS persists across SMDISC, just not across
-  // a hardware power cycle (handled by hardReset / modemSoftReset).
-  // Same rule as the WiFi session: mTLS only on the mTLS listener, so a
-  // session dialled to any other port authenticates and is judged password.
-  bool wantMTLS = MQTTClient::hasClientCert() && _hasCACert &&
-                  port == MQTT_MTLS_PORT;
-  if (wantMTLS && !_hasClientCertOnModem) {
-    if (writeClientCert()) {
-      _hasClientCertOnModem = true;
-    } else {
-      Log::warn(TAG, "cellular.mqtt.mtls_cert_upload_failed fallback=password");
-      wantMTLS = false;
-    }
-  }
-
-  if (!wantMTLS) {
-    modem.sendAT("+SMCONF=\"USERNAME\",\"", user, "\"");
-    if (modem.waitResponse() != 1) { Log::error(TAG, "cellular.mqtt.config_failed step=username"); return false; }
-
-    modem.sendAT("+SMCONF=\"PASSWORD\",\"", password, "\"");
-    if (modem.waitResponse() != 1) { Log::error(TAG, "cellular.mqtt.config_failed step=password"); return false; }
-  } else {
-    // The modem retains SMCONF entries across SMDISC, so a previous
-    // user/pass cycle leaves USERNAME/PASSWORD set. Brokers using
-    // use_identity_as_username (mTLS-only ACLs) reject the connect
-    // when both cert AND user/pass arrive. Clear them explicitly.
-    modem.sendAT("+SMCONF=\"USERNAME\",\"\"");
-    modem.waitResponse();
-    modem.sendAT("+SMCONF=\"PASSWORD\",\"\"");
-    modem.waitResponse();
-    Log::info(TAG, "cellular.mqtt.mtls_active auth=client_cert");
-  }
-
-  // TLS 1.2
-  modem.sendAT("+CSSLCFG=\"SSLVERSION\",0,3");
-  modem.waitResponse();
-
-  if (wantMTLS) {
-    // CSSLCFG CONVERT slot semantics on SIM7080G (fw 1951B17 verified):
-    //   type 1 = client certificate, takes 4-arg form with separate
-    //            key filename: CONVERT,1,"<cert>","<key>"
-    //   type 2 = CA list (single PEM file)
-    // Sequence + filenames mirror the LilyGo SIMCom samples (AWS IoT +
-    // ATT mosquitto) - bench-validated wedge pattern; using SMSSL=2 +
-    // a concatenated cert/key file aborted the TLS handshake mid-way
-    // even though CONVERT 2 returned OK. The 4-arg CONVERT 1 flow with
-    // separate cert/key files is what the modem actually wires through
-    // to mbedtls for client auth.
-    modem.sendAT("+CSSLCFG=\"CONVERT\",2,\"server-ca.crt\"");
-    if (modem.waitResponse() != 1) { Log::error(TAG, "cellular.mqtt.tls_config_failed step=ca_convert"); return false; }
-
-    modem.sendAT("+CSSLCFG=\"CONVERT\",1,\"client.crt\",\"client.key\"");
-    if (modem.waitResponse() != 1) { Log::error(TAG, "cellular.mqtt.tls_config_failed step=client_convert"); return false; }
-
-    // Optional SNI: AWS IoT + Cloudflare-fronted brokers need it to
-    // route to the right backend. Mosquitto direct (no SNI required)
-    // ignores it harmlessly. CSSLCFG SNI is per-CTX (index 0 = default
-    // SSL context, the one SMSSL drives).
-    char sniCmd[160];
-    snprintf(sniCmd, sizeof(sniCmd), "+CSSLCFG=\"sni\",0,\"%s\"", broker);
-    modem.sendAT(sniCmd);
-    modem.waitResponse();
-
-    // SMSSL mode 1 with both CA + client cert filenames = mutual TLS.
-    // Mode 1 is the catch-all "verify server + present client cert if
-    // configured" knob on this fw rev; mode 2 has different semantics
-    // and bench-failed the handshake. The client-cert side is wired
-    // by the prior CSSLCFG CONVERT 1 call referencing client.crt + key.
-    modem.sendAT("+SMSSL=1,\"server-ca.crt\",\"client.crt\"");
-    if (modem.waitResponse() != 1) { Log::error(TAG, "cellular.mqtt.tls_config_failed step=mtls_attach"); return false; }
-  } else if (_hasCACert) {
-    modem.sendAT("+CSSLCFG=\"CONVERT\",2,\"server-ca.crt\"");
-    if (modem.waitResponse() != 1) { Log::error(TAG, "cellular.mqtt.tls_config_failed step=ca_convert"); return false; }
-
-    modem.sendAT("+SMSSL=1,\"server-ca.crt\",\"\"");
-    if (modem.waitResponse() != 1) { Log::error(TAG, "cellular.mqtt.tls_config_failed step=ssl_attach"); return false; }
-  } else {
-    modem.sendAT("+SMSSL=0,\"\",\"\"");
-    modem.waitResponse();
-    Log::warn(TAG, "cellular.mqtt.tls_unverified reason=no_ca");
-  }
-  bool serverVerified = wantMTLS || _hasCACert;
-
-  Log::info(TAG, "cellular.mqtt.connect_start");
-  modem.sendAT("+SMCONN");
-  if (waitChunked(30000UL) != 1) {
-    // SIM7080G emits the actual cause (CME/SSL error) hundreds of ms
-    // to a few seconds after the bare ERROR; 5 s window catches the
-    // full chatter so the log line carries the real reason.
-    String tail = drainModemTail(5000UL);
-    Log::kvfe(TAG, "cellular.mqtt.connect_failed tail=\"%s\"", tail.c_str());
-    return false;
-  }
-
-  Log::info(TAG, "cellular.mqtt.connected");
-
-  // This session's own credential decides what its CLI commands may run.
-  MQTTClient::setFallbackSessionMTLS(wantMTLS);
-  MQTTClient::setFallbackTlsVerified(serverVerified);
-
-  // Re-issue every WiFi-side subscription on the cellular MQTT session
-  //. Reconnect path benefits too - the modem drops subscriptions
-  // on SMDISC so we have to repaint them on every fresh SMCONN.
-  if (!smsubAll()) {
-    Log::warn(TAG, "cellular.mqtt.smsub_partial inbound=degraded");
-  }
-  return true;
-}
-
-// ---------------------------------------------------------------------------
-
-// Parse a single +SMSUB: URC line and dispatch to MQTTClient. Shared
-// by pumpInbound and cellAT so both code paths deliver URCs identically.
-//
-// in:  line   NUL-terminated +SMSUB: URC line (no trailing CRLF)
-// out: none   - dispatched via MQTTClient::dispatchInbound on success
-void Cellular::routeSmsubLine(char* line) {
-  // Format: +SMSUB: "<topic>","<payload>"
-  char* p = line + 8;
-  if (*p != '"') return;
-  p++;
-  char* topicStart = p;
-  char* topicEnd   = strchr(p, '"');
-  if (!topicEnd) return;
-  *topicEnd = '\0';
-  p = topicEnd + 1;
-  if (*p != ',' || *(p + 1) != '"') return;
-  p += 2;
-  char* payloadStart = p;
-  char* payloadEnd   = strrchr(p, '"');
-  if (!payloadEnd || payloadEnd == p - 1) return;
-  *payloadEnd = '\0';
-
-  Log::kvf(TAG, "cellular.mqtt.rx topic=%s bytes=%u", topicStart,
-           (unsigned)(payloadEnd - payloadStart));
-
-  MQTTClient::dispatchInbound(topicStart, payloadStart,
-                              (size_t)(payloadEnd - payloadStart));
-}
 
 // URC-safe AT command. See header for contract.
 int Cellular::cellAT(const char* cmd, const char* expect, uint32_t timeoutMs,
                      std::function<void(const char*)> lineCallback) {
-  // Drain any bytes already in the modem stream so we do not mix
-  // straggler URCs into our response window. Any +SMSUB: lines we
-  // find here are dispatched immediately.
-  {
-    char    line[512];
-    size_t  lineLen = 0;
-    while (Serial1.available()) {
-      char c = (char)Serial1.read();
-      if (c == '\r') continue;
-      if (c == '\n') {
-        line[lineLen] = '\0';
-        if (strncmp(line, "+SMSUB: ", 8) == 0) routeSmsubLine(line);
-        lineLen = 0;
-        continue;
-      }
-      if (lineLen < sizeof(line) - 1) line[lineLen++] = c;
-    }
-  }
+  // Hand straggler URCs (+CADATAIND, +CASTATE) to TinyGSM so socket
+  // state stays right, then the response window starts clean.
+  while (Serial1.available()) modem.waitResponse(15, nullptr, nullptr);
 
   // Send command.
   Serial1.print("AT");
   Serial1.print(cmd);
   Serial1.print("\r\n");
 
-  uint32_t end = millis() + timeoutMs;
+  const uint32_t t0 = millis();
   uint32_t lastWdt = millis();
   char     line[512];
   size_t   lineLen = 0;
 
-  while (millis() < end) {
+  while (msWithin(millis(), t0, timeoutMs)) {
     // Watchdog feed every 500 ms so callers can pass long timeouts
     // without tripping the 5 s task watchdog.
     if (millis() - lastWdt > 500) {
@@ -961,13 +673,7 @@ int Cellular::cellAT(const char* cmd, const char* expect, uint32_t timeoutMs,
         line[lineLen] = '\0';
         // Empty line: skip (the modem prefixes responses with a CRLF).
         if (lineLen == 0) continue;
-
-        // URC -> dispatch and continue waiting for our response.
-        if (strncmp(line, "+SMSUB: ", 8) == 0) {
-          routeSmsubLine(line);
-          lineLen = 0;
-          continue;
-        }
+        noteSocketUrc(line);
 
         // Terminator?
         if (strcmp(line, expect) == 0) return 1;
@@ -995,131 +701,7 @@ int Cellular::cellAT(const char* cmd, const char* expect, uint32_t timeoutMs,
   return 0;  // timeout
 }
 
-// URC-safe SMPUB-style AT command. See header for contract.
-//
-// Why this exists: TinyGSM's waitResponse (used by Cellular::publish's
-// previous AT+SMPUB path) does not recognize +SMSUB: URCs and silently
-// consumes them out of the modem stream. Bench evidence (diag fork,
-// 1 s burst pubs against a wildcard sub): only 2/5 URCs delivered when
-// the firmware self-publishes a cli/response between bursts. With
-// 5 s spacing 5/5 deliver. cellATWrite reads bytes itself and routes
-// any +SMSUB: line through routeSmsubLine the same way pumpInbound and
-// cellAT do.
-int Cellular::cellATWrite(const char* cmd, const uint8_t* payload,
-                          size_t payloadLen, uint32_t promptTimeoutMs,
-                          uint32_t okTimeoutMs) {
-  // Phase 0: drain any straggler bytes already in the stream and route
-  // URCs (same as cellAT). Anything left over from a prior call must
-  // not pollute our prompt/response window.
-  {
-    char    line[512];
-    size_t  lineLen = 0;
-    while (Serial1.available()) {
-      char c = (char)Serial1.read();
-      if (c == '\r') continue;
-      if (c == '\n') {
-        line[lineLen] = '\0';
-        if (strncmp(line, "+SMSUB: ", 8) == 0) routeSmsubLine(line);
-        lineLen = 0;
-        continue;
-      }
-      if (lineLen < sizeof(line) - 1) line[lineLen++] = c;
-    }
-  }
-
-  // Phase 1: send command, wait for '>' prompt. Assemble lines in
-  // parallel so any +SMSUB: line arriving before the prompt is still
-  // routed (the modem can interleave URCs and the prompt). The prompt
-  // is a single '>' byte with no LF, so we scan byte-by-byte.
-  Serial1.print("AT");
-  Serial1.print(cmd);
-  Serial1.print("\r\n");
-
-  uint32_t end     = millis() + promptTimeoutMs;
-  uint32_t lastWdt = millis();
-  char     line[512];
-  size_t   lineLen = 0;
-  bool     gotPrompt = false;
-
-  while (!gotPrompt && millis() < end) {
-    if (millis() - lastWdt > 500) {
-      esp_task_wdt_reset();
-      lastWdt = millis();
-    }
-    while (Serial1.available()) {
-      char c = (char)Serial1.read();
-      if (c == '>') { gotPrompt = true; break; }
-      if (c == '\r') continue;
-      if (c == '\n') {
-        line[lineLen] = '\0';
-        if (lineLen > 0) {
-          if (strncmp(line, "+SMSUB: ", 8) == 0) routeSmsubLine(line);
-          else if (strcmp(line, "ERROR") == 0)  return -1;
-          else if (strncmp(line, "+CME ERROR", 10) == 0 ||
-                   strncmp(line, "+CMS ERROR", 10) == 0) return -1;
-        }
-        lineLen = 0;
-        continue;
-      }
-      if (lineLen < sizeof(line) - 1) {
-        line[lineLen++] = c;
-      } else {
-        Log::warn(TAG, "cellular.at_line_overflow src=cellatwrite action=drop");
-        lineLen = 0;
-      }
-    }
-    if (!gotPrompt) delay(2);
-  }
-  if (!gotPrompt) return 0;
-
-  // Phase 2: write payload bytes.
-  Serial1.write(payload, payloadLen);
-
-  // Phase 3: wait for OK terminator. Same line loop as cellAT, with
-  // URC routing.
-  end     = millis() + okTimeoutMs;
-  lastWdt = millis();
-  lineLen = 0;
-
-  while (millis() < end) {
-    if (millis() - lastWdt > 500) {
-      esp_task_wdt_reset();
-      lastWdt = millis();
-    }
-    while (Serial1.available()) {
-      char c = (char)Serial1.read();
-      if (c == '\r') continue;
-      if (c == '\n') {
-        line[lineLen] = '\0';
-        if (lineLen == 0) continue;
-        if (strncmp(line, "+SMSUB: ", 8) == 0) {
-          routeSmsubLine(line);
-          lineLen = 0;
-          continue;
-        }
-        if (strcmp(line, "OK") == 0)    return 1;
-        if (strcmp(line, "ERROR") == 0) return -1;
-        if (strncmp(line, "+CME ERROR", 10) == 0 ||
-            strncmp(line, "+CMS ERROR", 10) == 0) return -1;
-        lineLen = 0;
-        continue;
-      }
-      if (lineLen < sizeof(line) - 1) {
-        line[lineLen++] = c;
-      } else {
-        Log::warn(TAG, "cellular.at_line_overflow src=cellatwrite action=drop");
-        lineLen = 0;
-      }
-    }
-    delay(2);
-  }
-  return 0;  // timeout
-}
-
-// Check if the modem is registered on the cellular network. URC-safe:
-// goes through cellAT instead of TinyGSM's getRegistrationStatus so a
-// +SMSUB: URC arriving during the response window is not eaten by the
-// modem.waitResponse(OK) parser.
+// Check if the modem is registered on the cellular network.
 bool Cellular::isRegistered() {
   // Try +CEREG? first (LTE-M / NB-IoT). Fall back to +CGREG? if the
   // modem reports only GPRS-style registration. Format:
@@ -1164,20 +746,6 @@ bool Cellular::isGprsConnectedRaw() {
   return active;
 }
 
-// URC-safe MQTT session check. Parses +SMSTATE: <state>; state == 1
-// means an MQTT session is up.
-bool Cellular::mqttIsConnected() {
-  bool up = false;
-  cellAT("+SMSTATE?", "OK", 2000UL, [&](const char* line) {
-    const char* p = strstr(line, "+SMSTATE:");
-    if (!p) return;
-    p += 9;
-    while (*p == ' ') p++;
-    if (atoi(p) == 1) up = true;
-  });
-  return up;
-}
-
 // ---------------------------------------------------------------------------
 
 // Power up the modem only. PMU rails on, PWRKEY pulsed, AT verified.
@@ -1215,19 +783,17 @@ enum class ActPhase : uint8_t {
   RADIO_CFG,  // CFUN cycle, band/APN config, RF settle
   REGISTER,   // poll network registration, one read per tick
   BEARER,     // activate the PDP data context
-  MQTT,       // modem-native MQTT connect (non-blocking backoff on fail)
 };
 static ActPhase s_actPhase     = ActPhase::INIT;
 static uint32_t s_actDeadline  = 0;  // millis() hard stop for the cycle
 static uint32_t s_regPollStart = 0;  // millis() the REGISTER phase began
 static uint32_t s_lastRegPoll  = 0;  // millis() of the last registration read
-static uint32_t s_nextRetryMs  = 0;  // millis() before which a failed MQTT
-                                     // connect will not be retried
 
 // Advance the cellular bring-up by one phase. See Cellular.h for the
 // caller contract. Each phase takes its own short-lived ATGuard so the
 // AT bus is free between phases and other module loops keep ticking.
 Cellular::ActStatus Cellular::tickActivation() {
+  s_driverTask = xTaskGetCurrentTaskHandle();
   // Already fully up (re-entry after a WiFi-recovery yield): nothing to do.
   if (_started) { s_actPhase = ActPhase::INIT; return ActStatus::DONE; }
 
@@ -1248,17 +814,9 @@ Cellular::ActStatus Cellular::tickActivation() {
   switch (s_actPhase) {
     case ActPhase::INIT: {
       Log::info(TAG, "cellular.activation_start");
-      // Wire the MQTTClient cert-cleared hook so cert.clear from any path
-      // (Shell, MQTT CLI, WS) drops the modem-side cache + active session
-      // and triggers a reconnect under the new auth mode. Idempotent.
-      MQTTClient::setOnClientCertCleared([]() {
-        Cellular::invalidateClientCert();
-      });
       JsonObject cfg     = Config::get();
       uint32_t   timeout = cfg["cellular"]["activation_timeout_ms"] | 1800000UL;
       s_actDeadline = now + timeout;
-      s_nextRetryMs = 0;
-      mqttBackoffReset();  // fresh cycle starts at the short backoff window
       s_actPhase    = ActPhase::POWER_ON;
       return ActStatus::PENDING;
     }
@@ -1293,12 +851,22 @@ Cellular::ActStatus Cellular::tickActivation() {
         Log::info(TAG, "cellular.sim_unlocked");
       }
       if (modem.getSimStatus() != SIM_READY) {
+        // CFUN=0 (minimum functionality) takes the SIM down with the radio.
+        Log::warn(TAG, "cellular.sim_wait action=cfun1");
+        modem.sendAT("+CFUN=1");
+        modem.waitResponse(10000UL);
+        for (int i = 0; i < 20 && modem.getSimStatus() != SIM_READY; i++) {
+          delay(500);
+          esp_task_wdt_reset();
+          pumpConsoleHeld();
+        }
+      }
+      if (modem.getSimStatus() != SIM_READY) {
         Log::error(TAG, "cellular.sim_not_ready");
         s_actPhase = ActPhase::INIT;
         return ActStatus::FAILED;
       }
       Log::info(TAG, "cellular.sim_ready");
-      writeCACert();
       s_actPhase = ActPhase::RADIO_CFG;
       return ActStatus::PENDING;
     }
@@ -1351,38 +919,14 @@ Cellular::ActStatus Cellular::tickActivation() {
         s_actPhase = ActPhase::RADIO_CFG;
         return ActStatus::PENDING;
       }
-      s_actPhase = ActPhase::MQTT;
-      return ActStatus::PENDING;
-    }
-
-    case ActPhase::MQTT: {
-      // Non-blocking backoff: after a failed connect, just wait out
-      // s_nextRetryMs without holding the bus so other modules tick.
-      if (s_nextRetryMs != 0 && (int32_t)(now - s_nextRetryMs) < 0) {
-        return ActStatus::PENDING;
-      }
-      ATGuard g(120000UL);
-      if (!g.ok()) return ActStatus::PENDING;
-
-      if (mqttConnect()) {
-        mqttBackoffReset();
-        _started          = true;
-        _mqttConnected    = true;
-        _publishGate      = true;
-        _lastSignalSample = 0;
-        Log::kvf(TAG, "cellular.mqtt.state_change from=disconnected to=connected");
-        sampleSignalQuality();
-        s_actPhase = ActPhase::INIT;
-        return ActStatus::DONE;
-      }
-
-      // Failed - schedule the next attempt and grow the backoff window.
-      s_nextRetryMs = millis() + s_mqttRetryMs;
-      uint32_t next = s_mqttRetryMs * 2UL;
-      s_mqttRetryMs = (next > MQTT_RETRY_MAX_MS) ? MQTT_RETRY_MAX_MS : next;
-      Log::kvfw(TAG, "cellular.mqtt.connect_failed retry_s=%lu",
-                (unsigned long)((s_nextRetryMs - millis()) / 1000UL));
-      return ActStatus::PENDING;
+      _started          = true;
+      s_linkUp          = true;
+      _lastSignalSample = 0;
+      s_recoverQueued.store(CELL_RECOVER_NONE);  // a fresh bearer needs none
+      sampleSignalQuality();
+      Log::kvf(TAG, "cellular.link.state_change from=down to=up");
+      s_actPhase = ActPhase::INIT;
+      return ActStatus::DONE;
     }
   }
   return ActStatus::PENDING;  // unreachable - keeps the compiler happy
@@ -1390,93 +934,39 @@ Cellular::ActStatus Cellular::tickActivation() {
 
 // ---------------------------------------------------------------------------
 
-// Cellular-only recovery: re-register on network loss, reconnect MQTT on drop.
-// WiFi-vs-cellular policy is handled by CellularModule, not here.
-//
-// Steady-state ordering:
-//   1. pumpInbound() drains +SMSUB: URCs. Self-guarded with a 0-tick
-//      try-acquire so it steps aside instantly when any AT caller (this
-//      task or another) holds the bus.
-//   2. Once per HEALTH_PROBE_MS, take an ATGuard, run the TinyGSM checks
-//      (isRegistered / isGprsConnected / mqttIsConnected / sampleSignalQuality),
-//      release on scope exit.
-//   3. If a probe finds the link broken, run the existing recovery
-//      (networkConnect + mqttConnect) inside the same guard scope so URCs
-//      do not interleave with AT chatter.
+// Steady-state health probe. Once per HEALTH_PROBE_MS one guarded probe
+// checks registration + bearer and samples CSQ. On loss it clears
+// _started and CellularModule re-runs activation.
 void Cellular::loop() {
+  s_driverTask = xTaskGetCurrentTaskHandle();
   if (!_started) return;
 
-  pumpInbound();
-
   uint32_t now = millis();
-  if (s_lastHealthMs != 0 && (now - s_lastHealthMs) < HEALTH_PROBE_MS) {
-    return;  // pumpInbound owns Serial1 the rest of the time
-  }
+  if (s_lastHealthMs != 0 && (now - s_lastHealthMs) < HEALTH_PROBE_MS) return;
   s_lastHealthMs = now;
 
   ATGuard g;
   if (!g.ok()) {
-    // Another task holds the bus past the 30 s budget - skip this tick
-    // and try next loop. Health probe is best-effort; a stuck guard will
-    // recover when the holder releases.
     Log::warn(TAG, "cellular.health_probe_skipped reason=at_bus_busy");
     return;
   }
   esp_task_wdt_reset();
 
-  // Recovery: network dropped.
-  if (!isRegistered() || !isGprsConnectedRaw()) {
-    esp_task_wdt_reset();
-    if (_mqttConnected) {
-      Log::kvfw(TAG, "cellular.mqtt.state_change from=connected to=disconnected reason=network_lost");
-    }
-    _mqttConnected = false;
-    MQTTClient::setFallbackTlsVerified(false);
-    while (!networkConnect()) {
-      Log::warn(TAG, "cellular.network_retry wait_s=10");
-      // Release the AT bus + pump shell during the sleep so restart /
-      // cell.* / config.* commands stay reachable while we hammer
-      // re-registration. Without this the main loop is frozen until
-      // the modem recovers, and a stuck modem can require a physical
-      // power cycle to escape.
-      g.pause(10000UL);
-    }
-    while (!mqttConnect()) {
-      // A refusal on the name rule never clears by retrying: recovery is a
-      // serial identity.reset or a device.name, both of which reboot us.
-      if (!Identity::brokerNameUsable()) return;
-      mqttBackoffWait(&g);
-    }
-    mqttBackoffReset();
-    _mqttConnected = true;
-    Log::kvf(TAG, "cellular.mqtt.state_change from=disconnected to=connected reason=network_recovered");
-    return;
+  // A recycle or reset that a socket failure on another task queued.
+  const uint8_t step = cellRecoverPick(s_recoverQueued.exchange(CELL_RECOVER_NONE));
+  if (step != CELL_RECOVER_NONE) {
+    socketRecoverRun(step);
+    if (!_started) return;
   }
 
-  esp_task_wdt_reset();
-
-  // Recovery: MQTT dropped, network still up.
-  if (!mqttIsConnected()) {
-    esp_task_wdt_reset();
-    if (_mqttConnected) {
-      Log::kvfw(TAG, "cellular.mqtt.state_change from=connected to=disconnected reason=mqtt_dropped");
-    }
-    _mqttConnected = false;
-    MQTTClient::setFallbackTlsVerified(false);
-    if (mqttConnect()) {
-      _mqttConnected = true;
-      mqttBackoffReset();
-      Log::kvf(TAG, "cellular.mqtt.state_change from=disconnected to=connected reason=reconnected");
-    } else {
-      mqttBackoffWait(&g);
-    }
-  } else if (!_mqttConnected) {
-    // Modem session is up but our flag drifted false (e.g. a slow SMPUB
-    // OK timed out at 5 s and we marked _mqttConnected=false; the OK
-    // eventually arrived and the broker thinks we're still subscribed).
-    // Re-sync the flag so Cellular::publish stops silently dropping.
-    Log::kvf(TAG, "cellular.mqtt.state_change from=disconnected to=connected reason=flag_resync");
-    _mqttConnected = true;
+  if (!isRegistered() || !isGprsConnectedRaw()) {
+    // Hand recovery to CellularModule: ACTIVATING re-walks bring-up one
+    // phase per loop under its deadline, so nothing here blocks.
+    Log::kvfw(TAG, "cellular.link.state_change from=up to=down reason=network_lost");
+    s_linkUp = false;
+    for (ModemClient* sk : s_sockets) sk->forget();
+    _started = false;
+    return;
   }
 
   esp_task_wdt_reset();
@@ -1486,19 +976,18 @@ void Cellular::loop() {
 
 // ---------------------------------------------------------------------------
 
-// True when modem is up AND the publish gate is open. Subscribers gate on
-// this so a brief WiFi recovery does not require tearing the modem down.
+// True when activation finished and the last probe saw registration and
+// an active bearer: the modem sockets can be expected to carry data.
 bool Cellular::connected() {
-  return _started && _mqttConnected && _publishGate;
+  return _started && s_linkUp;
 }
 
 // ---------------------------------------------------------------------------
 
-// Toggle the publish gate. Closing it stops cellular publishes immediately
-// while leaving the MQTT session warm for fast re-takeover. CellularModule
-// uses this on yield (WiFi recovered) and resume (WiFi dropped again).
-void Cellular::setPublishGate(bool open) {
-  _publishGate = open;
+// Plain TCP socket on the modem for TLS to ride on. Slot 0 carries the
+// MQTT session, slot 1 HTTPS (OTA, net.http).
+Client* Cellular::tcpClient(uint8_t slot) {
+  return slot < TCP_SLOTS ? s_sockets[slot] : nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -1522,15 +1011,15 @@ bool Cellular::isModemAlive() {
 // Atomic GNSS fix-acquisition cycle for SIM7080G. Per long-running
 // community testing (undocumented in vendor PDFs): the modem time-shares
 // its radio between LTE and GNSS. While CGNSPWR=1 the LTE data path is
-// suspended; TCP/TLS connections (incl. modem-native +SMCONN MQTT) stay
+// suspended; TCP sockets (and the TLS sessions on them) stay
 // registered but cannot push bytes. Issuing CFUN=0 to switch tears the
 // TCP session down - the right pattern is just CGNSPWR=1, then on the
 // way back CGNSPWR=0 followed by CFUN=1 to wake the LTE data path. The
 // broker delivers anything sent during the GNSS window the moment
 // CFUN=1 returns.
 //
-// ATGuard is held across the entire window so pumpInbound, publish()
-// and the health probe cannot race the AT bus. The window is bounded
+// ATGuard is held across the entire window so the socket clients and
+// the health probe cannot race the AT bus. The window is bounded
 // by timeoutMs and the watchdog is fed every second so a 60 s cold fix
 // does not trip TWDT. Guard timeout = timeoutMs + 10 s slack so the
 // outer caller never wins the race against itself on a long cold fix.
@@ -1548,10 +1037,10 @@ bool Cellular::gpsAcquireFix(uint32_t timeoutMs,
 
   bool fix = false;
   if (modem.enableGPS()) {
-    uint32_t end = millis() + timeoutMs;
+    const uint32_t t0 = millis();
     float fLat = 0, fLon = 0, fAlt = 0, fSpeed = 0, fAcc = 0;
     int   vSat = 0, uSat = 0;
-    while (millis() < end) {
+    while (msWithin(millis(), t0, timeoutMs)) {
       if (modem.getGPS(&fLat, &fLon, &fSpeed, &fAlt, &vSat, &uSat, &fAcc)) {
         fix = true;
         if (lat)        *lat        = fLat;
@@ -1567,30 +1056,23 @@ bool Cellular::gpsAcquireFix(uint32_t timeoutMs,
       // 60 s stay TWDT-safe.
       delay(1000);
       esp_task_wdt_reset();
+      pumpConsoleHeld();
     }
     modem.disableGPS();
   }
 
   // Wake the LTE data path. Without this, even with CGNSPWR=0, the modem
-  // keeps LTE data suspended and the next SMPUB silently fails. CFUN=1
-  // returns OK fast but the data path needs a short settle before the
-  // modem-native MQTT session is publish-ready - poll SMSTATE? until it
-  // reports 1 (connected) or until a short timeout, so the next
-  // Cellular::publish does not catch the half-asleep state.
+  // keeps LTE data suspended and the next socket write silently stalls.
+  // CFUN=1 returns OK fast but the bearer needs a short settle, so poll
+  // CNACT? until the data context reports active or a short timeout.
   modem.sendAT("+CFUN=1");
   modem.waitResponse(5000UL);
 
-  uint32_t settleEnd = millis() + 5000UL;
-  while (millis() < settleEnd) {
-    modem.sendAT("+SMSTATE?");
-    int state = -1;
-    if (modem.waitResponse(2000UL, "+SMSTATE: ") == 1) {
-      state = modem.stream.parseInt();
-      modem.waitResponse();
-    }
-    if (state == 1) break;
+  const uint32_t settleT0 = millis();
+  while (msWithin(millis(), settleT0, 5000UL) && !isGprsConnectedRaw()) {
     delay(250);
     esp_task_wdt_reset();
+    pumpConsoleHeld();
   }
 
   return fix;
@@ -1643,10 +1125,7 @@ void Cellular::atPassthrough(const char* cmd, uint32_t timeoutMs,
 // ---------------------------------------------------------------------------
 
 // Refresh _signalQuality from AT+CSQ at most every SIGNAL_SAMPLE_MS to avoid
-// monopolising the AT bus. Called from begin() and loop() while started.
-// Goes through cellAT so any +SMSUB: URC arriving during the response
-// window is delivered, not eaten by a TinyGSM-style waitResponse parser.
-//
+// monopolising the AT bus. Called from loop() while started.
 void Cellular::sampleSignalQuality() {
   uint32_t now = millis();
   if (_lastSignalSample != 0 && (now - _lastSignalSample) < SIGNAL_SAMPLE_MS) return;
@@ -1666,194 +1145,10 @@ void Cellular::sampleSignalQuality() {
 
 // ---------------------------------------------------------------------------
 
-// Publish a message via modem-native MQTT (AT+SMPUB).
-// retain=true sets the AT+SMPUB retain flag so messages whose semantics
-// require broker-side retention (HA discovery, retained-topics manifest,
-// LWT availability) carry the same flag over the cellular leg.
-//
-// Enforces a 1 Hz minimum spacing between successive publishes
-// (defensive guard against the burst-wedge pattern: ~10 SMPUBs landing
-// in the first ~10 s of a fresh cellular MQTT session can wedge URC
-// routing on the SIM7080G even with cellATWrite routing URCs through
-// the prompt/OK windows). Bounded delay (<= 1000 ms) leaves TWDT
-// margin; ATGuard is acquired after the delay so other callers do
-// not stall behind a sleeping one.
-bool Cellular::publish(const char* topic, const char* payload, bool retain) {
-  if (!connected()) {
-    const char* reason = !_started       ? "modem_not_started"
-                       : !_mqttConnected ? "session_down"
-                       : !_publishGate   ? "gate_closed"
-                                         : "unknown";
-    Log::kvfw(TAG, "cellular.publish_skipped reason=%s topic=%s", reason, topic);
-    return false;
-  }
-
-  // A clipped command loses its closing quote; refuse it before the wait and bus.
-  size_t len = strlen(payload);
-  char cmd[MQTT_TOPIC_CAP + 32];
-  int n = snprintf(cmd, sizeof(cmd), "+SMPUB=\"%s\",%d,1,%d",
-                   topic, (int)len, retain ? 1 : 0);
-  if (n < 0 || (size_t)n >= sizeof(cmd)) {
-    Log::kvfw(TAG, "cellular.publish_skipped reason=topic_too_long topic_len=%u topic=%.64s",
-              (unsigned)strlen(topic), topic);
-    return false;
-  }
-
-  // Rate-limit before AT-bus acquire so concurrent callers wait for the
-  // mutex, not for a sleeping publisher. Each successful publish updates
-  // _lastSmpubMs; the next caller pays the remaining quantum.
-  uint32_t now = millis();
-  if (_lastSmpubMs != 0 && (now - _lastSmpubMs) < SMPUB_MIN_SPACING_MS) {
-    uint32_t wait = SMPUB_MIN_SPACING_MS - (now - _lastSmpubMs);
-    while (wait > 0) {
-      uint32_t step = wait > 200 ? 200 : wait;
-      delay(step);
-      esp_task_wdt_reset();
-      wait -= step;
-    }
-  }
-
-  ATGuard g;
-  if (!g.ok()) {
-    Log::warn(TAG, "cellular.publish_skipped reason=at_bus_busy");
-    return false;
-  }
-  _lastSmpubMs = millis();
-
-  // Use cellATWrite (raw Serial1 + URC routing) instead of TinyGSM's
-  // sendAT/waitResponse pair. waitResponse does not recognize +SMSUB:
-  // URCs, so any URC arriving inside the SMPUB '>' prompt or OK
-  // terminator window is silently consumed. cellATWrite routes those
-  // lines through routeSmsubLine -> dispatchInbound the same way
-  // pumpInbound and cellAT do.
-  int rc = cellATWrite(cmd, (const uint8_t*)payload, len, 5000UL, 8000UL);
-  if (rc == 1) return true;
-
-  Log::warn(TAG, rc == 0 ? "cellular.smpub_failed reason=timeout"
-                         : "cellular.smpub_failed reason=error");
-  _mqttConnected = false;
-  MQTTClient::setFallbackTlsVerified(false);
-  return false;
-}
-
-// ---------------------------------------------------------------------------
-
-// Subscribe to a single MQTT topic on the cellular MQTT session via
-// AT+SMSUB. QoS 1 to match the WiFi-side default. Returns true on OK
-// response.
-//
-// No connected() guard here on purpose: smsubAll is called from inside
-// mqttConnect right after SMCONN succeeds, but _started/_mqttConnected
-// are not flipped until mqttConnect returns. The AT command itself
-// fails fast if the session is not actually up.
-bool Cellular::smsub(const char* topic) {
-  ATGuard g;
-  if (!g.ok()) {
-    Log::warn(TAG, "cellular.smsub_skipped reason=at_bus_busy");
-    return false;
-  }
-  esp_task_wdt_reset();
-  modem.sendAT("+SMSUB=\"", topic, "\",1");
-  int res = modem.waitResponse(3000UL);
-  esp_task_wdt_reset();
-  if (res != 1) {
-    Log::kvfw(TAG, "cellular.smsub_failed topic=%s", topic);
-    return false;
-  }
-  return true;
-}
-
-// Issue AT+SMSUB for every active subscription registered with MQTTClient.
-//
-// Bench observation on this SIM7080G modem firmware revision: with the
-// DC3 power-cycle fix in place,
-//   - Literal topics                          : reliable
-//   - Single-level `+` (e.g. cli/+)           : reliable
-//   - Multi-level  `#` (e.g. cli/#, <prefix>/#): drops URCs under burst
-// So we mirror exactly what MQTTClient::_subs holds (cli/+ and literal
-// cmd/* topics) and never widen to `#`.
-//
-// MAX_SUBS=4 stays under the SIM7080 session cap.
-bool Cellular::smsubAll() {
-  bool allOk = true;
-  static constexpr int MAX_SUBS = 4;
-  int  count = 0;
-  MQTTClient::forEachSubscription([&](const char* topic) {
-    if (count >= MAX_SUBS) {
-      Log::kvfw(TAG, "cellular.smsub_cap_reached max=%d", MAX_SUBS);
-      return;
-    }
-    if (!smsub(topic)) allOk = false;
-    count++;
-  });
-  Log::kvf(TAG, "cellular.smsub_done topics=%d", count);
-  return allOk;
-}
-
-// Drain Serial1 for any pending +SMSUB: URCs and dispatch matching
-// payloads via MQTTClient::dispatchInbound (same callback path WiFi
-// uses). Non-blocking: reads at most until the next \n or until the
-// stream is empty.
-//
-// SIM7080 +SMSUB URC format:
-//   +SMSUB: "<topic>","<payload>"\r\n
-//
-// Topics and payloads are double-quoted ASCII. Embedded quotes / binary
-// in payloads is out of scope for v1 (filed).
-//
-// Stream ownership: this takes the AT bus mutex with a 0-tick try-acquire;
-// if any caller (this task or another) currently holds the bus we step
-// aside and wait for the next loop iteration. The mutex makes the check
-// race-free where the previous cooperative s_atBusy flag was not.
-void Cellular::pumpInbound() {
-  if (!_started) return;
-  ATGuard g(0);
-  if (!g.ok()) return;
-
-  static char    line[512];
-  static size_t  lineLen = 0;
-
-  while (Serial1.available()) {
-    char c = (char)Serial1.read();
-    if (c == '\r') continue;
-    if (c == '\n') {
-      line[lineLen] = '\0';
-#ifdef THESADA_CELL_DEBUG
-      // Diag: log every line so we can see exactly what reaches pumpInbound.
-      if (lineLen > 0) {
-        char dmsg[160];
-        // Raw serial trace - kept free-text on purpose (kv would obscure it).
-        snprintf(dmsg, sizeof(dmsg), "rx: %s", line);
-        Log::info(TAG, dmsg);
-      }
-#endif
-      // Look for the +SMSUB: prefix; ignore everything else (other URCs,
-      // stray AT responses that escaped TinyGSM's parser).
-      if (strncmp(line, "+SMSUB: ", 8) == 0) routeSmsubLine(line);
-      lineLen = 0;
-      continue;
-    }
-    if (lineLen < sizeof(line) - 1) {
-      line[lineLen++] = c;
-    } else {
-      // Line overflow - reset, drop the rest. Logged once.
-      Log::warn(TAG, "cellular.at_line_overflow src=pump_inbound action=drop");
-      lineLen = 0;
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-
-// HTTPS GET via TinyGsmClientSecure. See header for contract.
-//
-// Coexistence with modem-native MQTT: TinyGsmClientSecure on SIM7080G
-// drives AT+CAOPEN / AT+CASEND / AT+CARECV which use the modem's
-// general-purpose TCP socket slots, while AT+SMCONN holds the dedicated
-// MQTT session on its own internal slot. They do not collide in
-// practice. We still take the AT-bus mutex for the whole call so other
-// AT traffic on this firmware (CSQ probes, cell.at calls, the MQTT
-// pumpInbound URC drain) serialises behind the request.
+// HTTPS GET over TlsClient on modem socket slot 1. See header for contract.
+// TLS runs on the ESP32, so chain and host name are checked the same way
+// as on WiFi. The socket takes the AT bus per exchange, never for the
+// whole download, so the MQTT session on slot 0 keeps its share.
 //
 // Status-line + header parsing is line-oriented: collect bytes until
 // CRLF, dispatch on the line, switch to body-streaming after the empty
@@ -1861,49 +1156,48 @@ void Cellular::pumpInbound() {
 // the caller can stream to Update.write() / mbedtls_sha256_update()
 // without ever buffering the full payload.
 bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
+                        const char* caPem,
                         std::function<bool(const uint8_t*, size_t)> writeCallback,
                         int* httpStatus,
-                        size_t rangeStart, size_t rangeEndInclusive) {
+                        size_t rangeStart, size_t rangeEndInclusive,
+                        uint32_t budgetMs, bool* budgetCut) {
   if (httpStatus) *httpStatus = 0;
-  if (!_modemAlive) {
-    Log::warn(TAG, "cellular.https_get_skipped reason=modem_not_alive");
+  if (budgetCut) *budgetCut = false;
+  if (!connected()) {
+    Log::warn(TAG, "cellular.https_get_skipped reason=link_down");
+    return false;
+  }
+  // OTA on the loop and net.http on its own task both use slot 1.
+  HttpSlotClaim slot(s_httpsBusy);
+  if (!slot.held()) {
+    Log::warn(TAG, "cellular.https_get_skipped reason=busy");
     return false;
   }
 
-  // Generous overall budget: TLS handshake against a CDN can take 8 s,
-  // and a multi-MB firmware download is the eventual caller (typical
-  // 1.5 MB binary @ ~8 KB/s LTE-M = ~3 min). Cap at 15 min so a slow or
-  // stalled cellular link gives up gracefully instead of holding the AT
-  // bus forever.
-  ATGuard g(15UL * 60UL * 1000UL);
-  if (!g.ok()) {
-    Log::warn(TAG, "cellular.https_get_skipped reason=at_bus_busy");
-    return false;
-  }
-
-  // TinyGsmClientSecure holds its rx_buffer (TINY_GSM_RX_BUFFER, 4 KB on
-  // cellular envs) as a member array. Stack-allocating it would consume
-  // half of the 8 KB Arduino loop task stack and risk overflow under a
-  // deep call chain. Heap allocation routes through PSRAM on ESP32-S3
-  // when internal SRAM is tight (CONFIG_SPIRAM_USE_MALLOC + the
-  // arduino-esp32 default policy), leaving the loop stack free.
-  auto* clientPtr = new (std::nothrow) TinyGsmClientSecure(modem, 0);
-  if (!clientPtr) {
+  // The mbedTLS contexts are a few KB, so they live on the heap.
+  std::unique_ptr<TlsClient> owner(new (std::nothrow) TlsClient());
+  if (!owner) {
     Log::error(TAG, "cellular.https_get_failed reason=alloc");
     return false;
   }
-  std::unique_ptr<TinyGsmClientSecure> clientOwner(clientPtr);
-  TinyGsmClientSecure& client = *clientPtr;
-  client.setTimeout(30000);
+  TlsClient& client = *owner;
+  client.setTransport(tcpClient(TCP_SLOT_HTTPS));
+  if (caPem && *caPem) {
+    client.setCACert(caPem);
+  } else {
+    Log::kvfw(TAG, "cellular.https_insecure host=%s", host);
+    client.setInsecure();
+  }
 
   Log::kvf(TAG, "cellular.https_get_connect host=%s port=%u", host, port);
-  if (!client.connect(host, port, 30)) {
+  s_stats[TCP_SLOT_HTTPS] = {};
+  const uint32_t tStart = millis();
+  if (!client.connect(host, port)) {
     Log::error(TAG, "cellular.https_get_failed reason=connect");
     return false;
   }
 
-  // Build + send GET. Keep request small (well under MTU) so a single
-  // CASEND covers it. Optional Range header for chunked downloads.
+  // Build + send GET. Optional Range header for chunked downloads.
   char rangeHdr[64];
   rangeHdr[0] = '\0';
   if (rangeEndInclusive > 0) {
@@ -1913,14 +1207,14 @@ bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
   }
   char req[500];
   int reqLen = snprintf(req, sizeof(req),
-    "GET %s HTTP/1.1\r\n"
+    "GET %s%s HTTP/1.1\r\n"
     "Host: %s\r\n"
     "Connection: close\r\n"
     "User-Agent: thesada-fw\r\n"
     "Accept: */*\r\n"
     "%s"
     "\r\n",
-    path, host, rangeHdr);
+    httpTargetLead(path), path, host, rangeHdr);
   if (reqLen <= 0 || reqLen >= (int)sizeof(req)) {
     Log::error(TAG, "cellular.https_get_failed reason=request_overflow");
     client.stop();
@@ -1944,11 +1238,18 @@ bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
   // waiting for CARECV to drain. Empirically a multi-second idle is the
   // signal we've actually run out of data, not the connected flag.
   static constexpr uint32_t kBodyIdleTimeoutMs = 15000UL;
-  uint32_t deadline = millis() + 5UL * 60UL * 1000UL;  // 5 min global cap
+  const uint32_t capT0 = millis();  // 5 min global cap
   uint32_t lastWdt  = millis();
   uint32_t lastByte = millis();
 
-  while (millis() < deadline) {
+  while (msWithin(millis(), capT0, 5UL * 60UL * 1000UL)) {
+    if (httpReadBudgetSpent(millis() - tStart, budgetMs)) {
+      Log::kvfw(TAG, "cellular.https_get_cut reason=budget budget_ms=%u status=%d body_bytes=%u",
+                (unsigned)budgetMs, status, (unsigned)bodyBytes);
+      client.stop();
+      if (budgetCut) *budgetCut = true;
+      return false;
+    }
     // Belt + braces: feed task watchdog every 200 ms even if the body
     // loop never sleeps. Yield each iteration so the Arduino loop's
     // other cooperative tasks (USB CDC, Shell pump, etc) get cycles
@@ -2001,7 +1302,9 @@ bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
     // Body phase. Trust Content-Length over TinyGSM's connected flag:
     // exit when we have the full payload, or after kBodyIdleTimeoutMs of
     // no data when the server hasn't told us how big the body is.
-    if (contentLen > 0 && bodyBytes >= (size_t)contentLen) break;
+    // An empty body (Content-Length: 0, 204, 304) is complete at once, not after the idle wait.
+    if (contentLen >= 0 && bodyBytes >= (size_t)contentLen) break;
+    if (status == 204 || status == 304) break;
 
     // 1024 B per read keeps each CARECV cycle aligned with a full TCP
     // segment from the modem's socket buffer, reducing the number of
@@ -2039,13 +1342,20 @@ bool Cellular::httpsGet(const char* host, const char* path, uint16_t port,
     Log::error(TAG, "cellular.https_get_failed reason=no_status_line");
     return false;
   }
-  Log::kvf(TAG, "cellular.https_get_done status=%d body_bytes=%u content_length=%d",
-           status, (unsigned)bodyBytes, contentLen);
+  const SocketStats& st = s_stats[TCP_SLOT_HTTPS];
+  Log::kvf(TAG, "cellular.https_get_done status=%d body_bytes=%u content_length=%d ms=%lu reads=%lu read_ms=%lu sock_bytes=%lu polls=%lu avail=%lu",
+           status, (unsigned)bodyBytes, contentLen, (unsigned long)(millis() - tStart),
+           (unsigned long)st.reads, (unsigned long)st.readMs, (unsigned long)st.readBytes,
+           (unsigned long)st.polls, (unsigned long)st.availCalls);
   // Treat short body (got fewer bytes than Content-Length declared) as a
   // transport failure so the OTA caller does not run SHA on a truncated
   // stream and report a hash mismatch. Status code stays correct.
   if (contentLen > 0 && bodyBytes < (size_t)contentLen) return false;
   return true;
+}
+
+bool Cellular::httpsBusy() {
+  return s_httpsBusy.load() != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -2068,11 +1378,10 @@ bool Cellular::dataLinkUp() {
 
 // ---------------------------------------------------------------------------
 
-// Close the data context and modem MQTT session, leaving the modem
-// powered and registered. Clears _started so a future re-takeover
-// re-walks begin() - powerOn() is then a no-op (modem still alive),
-// writeCACert() is gated by _hasCACert, networkConnect() re-opens CNACT
-// and mqttConnect() re-establishes the session.
+// Close the sockets and the data context, leaving the modem powered and
+// registered. Clears _started so a future re-takeover re-walks
+// activation - powerOn() is then a no-op (modem still alive) and the
+// BEARER phase re-opens CNACT.
 //
 // In:  none (AT bus via internal ATGuard)
 // Out: CNACT slot 0 closed; modem stays CFUN=1 registered.
@@ -2083,14 +1392,11 @@ void Cellular::dataLinkDown() {
     Log::warn(TAG, "cellular.data_link_down_skipped reason=at_bus_stuck");
     return;
   }
-  modem.sendAT("+SMDISC");
-  modem.waitResponse(5000UL);
+  for (ModemClient* sk : s_sockets) sk->stop();
   modem.sendAT("+CNACT=0,0");
   modem.waitResponse(5000UL);
-  _started       = false;
-  _mqttConnected = false;
-  MQTTClient::setFallbackTlsVerified(false);
-  _publishGate   = false;
+  _started = false;
+  s_linkUp = false;
   Log::info(TAG, "cellular.data_link_down modem=registered");
 }
 
@@ -2203,43 +1509,10 @@ bool Cellular::resolveHost(const char* host, char* out, size_t outLen) {
 
   if (cellAT(cmd, "OK", 8000UL, nullptr) != 1) return false;
 
-  // Drain Serial1 for the +CDNSGIP: URC (arrives after the OK).
-  char     foundIp[48] = {0};
-  bool     resolved    = false;
-  uint32_t t0          = millis();
-  String   buf;
-  buf.reserve(256);
-  while (millis() - t0 < 10000UL) {
-    while (Serial1.available()) buf += (char)Serial1.read();
-    int idx = buf.indexOf("+CDNSGIP:");
-    if (idx >= 0) {
-      int nl = buf.indexOf('\n', idx);
-      if (nl < 0) { delay(20); esp_task_wdt_reset(); continue; }
-      String l = buf.substring(idx, nl);
-      // +CDNSGIP: 1,"host","ip"...  -> status field is 1
-      int firstComma = l.indexOf(',');
-      if (firstComma > 0 && l.substring(9, firstComma).indexOf('1') >= 0) {
-        int q1 = l.indexOf('"', firstComma);          // open host
-        int q2 = l.indexOf('"', q1 + 1);              // close host
-        int q3 = l.indexOf('"', q2 + 1);              // open ip
-        int q4 = l.indexOf('"', q3 + 1);              // close ip
-        if (q3 > 0 && q4 > q3) {
-          String ipStr = l.substring(q3 + 1, q4);
-          strncpy(foundIp, ipStr.c_str(), sizeof(foundIp) - 1);
-          resolved = true;
-        }
-      }
-      break;
-    }
-    delay(20);
-    esp_task_wdt_reset();
-  }
-
-  if (resolved) {
-    strncpy(out, foundIp, outLen - 1);
-    out[outLen - 1] = '\0';
-  }
-  return resolved;
+  // The +CDNSGIP: URC arrives after the OK. Sized for the longest host.
+  CellLine<sizeof(cmd) + 128> line;
+  if (!waitUrcLine("+CDNSGIP:", 10000UL, line, false)) return false;
+  return cellDnsgipIp(line.buf, out, outLen);
 }
 
 // Sync the ESP32 system clock off the modem. Runs AT+CNTP against
@@ -2271,29 +1544,26 @@ bool Cellular::ntpSync(const char* server, uint32_t timeoutMs) {
   // does not work on this part).
   cellAT("+CNTPCID=0", "OK", 5000UL, nullptr);
 
-  if (cellAT(cmd, "OK", 5000UL, nullptr) != 1) return false;
+  if (cellAT(cmd, "OK", 5000UL, nullptr) != 1) {
+    Log::kvfw(TAG, "cellular.ntp_failed step=config");
+    return false;
+  }
 
   // Execute the sync. Result is a +CNTP: <code> URC after the OK; the
   // SIM7080 reports code 1 on success.
-  if (cellAT("+CNTP", "OK", 5000UL, nullptr) != 1) return false;
-
-  int      code = 0;
-  uint32_t t0   = millis();
-  String   buf;
-  buf.reserve(128);
-  while (millis() - t0 < timeoutMs) {
-    while (Serial1.available()) buf += (char)Serial1.read();
-    int idx = buf.indexOf("+CNTP:");
-    if (idx >= 0) {
-      int nl = buf.indexOf('\n', idx);
-      if (nl < 0) { delay(20); esp_task_wdt_reset(); continue; }
-      code = atoi(buf.c_str() + idx + 6);
-      break;
-    }
-    delay(50);
-    esp_task_wdt_reset();
+  if (cellAT("+CNTP", "OK", 5000UL, nullptr) != 1) {
+    Log::kvfw(TAG, "cellular.ntp_failed step=start");
+    return false;
   }
-  if (code != 1) return false;
+
+  const uint32_t t0 = millis();
+  CellLine<64>   line;
+  const int code = waitUrcLine("+CNTP:", timeoutMs, line, true) ? cellNtpCode(line.buf) : 0;
+  if (code != 1) {
+    Log::kvfw(TAG, "cellular.ntp_failed step=result code=%d ms=%lu", code,
+              (unsigned long)(millis() - t0));
+    return false;
+  }
 
   // Modem RTC is now UTC. Read it and push to the ESP32 clock.
   //   +CCLK: "yy/MM/dd,hh:mm:ss+zz"
@@ -2317,16 +1587,21 @@ bool Cellular::ntpSync(const char* server, uint32_t timeoutMs) {
       gotClock = true;
     }
   });
-  if (!gotClock) return false;
+  if (!gotClock) {
+    Log::kvfw(TAG, "cellular.ntp_failed step=cclk");
+    return false;
+  }
 
-  // mktime() interprets tmv in the process TZ. This path only runs when
-  // WiFi never associated, so WiFiManager's configTime() never set a
-  // non-UTC zone - the default newlib TZ is UTC, making mktime == UTC
-  // here. Matches the mktime use in Shell.cpp's `net.ntp set`.
-  time_t epoch = mktime(&tmv);
-  if (epoch < 1700000000L) return false;
+  // UTC by calendar math, not mktime(): WiFi may have set a TZ via configTime.
+  time_t epoch = (time_t)(clockFloorDaysFromCivil(tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday) * 86400 +
+                          tmv.tm_hour * 3600 + tmv.tm_min * 60 + tmv.tm_sec);
+  if (epoch < 1700000000L) {
+    Log::kvfw(TAG, "cellular.ntp_failed step=epoch epoch=%ld", (long)epoch);
+    return false;
+  }
   struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
   settimeofday(&tv, nullptr);
+  WiFiManager::noteNtpSync();
   return true;
 }
 

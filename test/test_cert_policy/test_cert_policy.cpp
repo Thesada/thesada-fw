@@ -1,5 +1,6 @@
-// Host-native unit tests for cert_policy.h - PEM structural pre-flight and CN
-// extraction. Does not cover the mbedtls pair check, which stays on-target.
+// Host-native unit tests for cert_policy.h - PEM structural pre-flight, CN
+// extraction and the cert.apply verdict. Does not cover the mbedtls pair
+// check, which stays on-target.
 // SPDX-License-Identifier: GPL-3.0-only
 #include <unity.h>
 #include "cert_policy.h"
@@ -140,8 +141,93 @@ void test_cn_with_comma_truncates(void) {
   TEST_ASSERT_EQUAL_STRING("node\\", cn);
 }
 
+// ---- cert.apply ----------------------------------------------------------
+
+// cert.set stores halves unchecked: a mismatched pair must not be applied (#58).
+void test_cert_apply_refuses_a_mismatched_pair(void) {
+  TEST_ASSERT_TRUE(certApplyVerdict(true, PairCheck::Invalid) == CertApply::Mismatch);
+}
+
+void test_cert_apply_reboots_onto_a_valid_pair(void) {
+  TEST_ASSERT_TRUE(certApplyVerdict(true, PairCheck::Valid) == CertApply::Reboot);
+}
+
+// A check the heap could not run is neither a pass nor a mismatch.
+void test_cert_apply_low_heap_is_not_a_mismatch(void) {
+  TEST_ASSERT_TRUE(certApplyVerdict(true, PairCheck::NoHeap) == CertApply::LowHeap);
+}
+
+// A missing half wins over any pair verdict.
+void test_cert_apply_needs_both_halves(void) {
+  TEST_ASSERT_TRUE(certApplyVerdict(false, PairCheck::Invalid) == CertApply::Missing);
+  TEST_ASSERT_TRUE(certApplyVerdict(false, PairCheck::Valid) == CertApply::Missing);
+  TEST_ASSERT_TRUE(certApplyVerdict(false, PairCheck::NoHeap) == CertApply::Missing);
+}
+
+// A refused cert.apply must open cert.clear on the same password session.
+void test_invalid_pair_marks_the_stored_cert_broken(void) {
+  TEST_ASSERT_TRUE(storedCertBrokenAfter(PairCheck::Invalid, false));
+  TEST_ASSERT_TRUE(storedCertBrokenAfter(PairCheck::Invalid, true));
+}
+
+void test_valid_pair_clears_the_broken_verdict(void) {
+  TEST_ASSERT_FALSE(storedCertBrokenAfter(PairCheck::Valid, true));
+  TEST_ASSERT_FALSE(storedCertBrokenAfter(PairCheck::Valid, false));
+}
+
+// A full heap must not open cert.clear while a good cert sits in NVS.
+void test_low_heap_keeps_the_last_verdict(void) {
+  TEST_ASSERT_FALSE(storedCertBrokenAfter(PairCheck::NoHeap, false));
+  TEST_ASSERT_TRUE(storedCertBrokenAfter(PairCheck::NoHeap, true));
+}
+
+// --- serial hex: whole or refused, never past the buffer --------------------
+
+void test_serial_hex_is_lowercase_and_whole(void) {
+  const uint8_t s[] = {0x00, 0xAB, 0x0f, 0x10};
+  char out[16];
+  TEST_ASSERT_TRUE(certSerialHex(s, sizeof(s), out, sizeof(out)));
+  TEST_ASSERT_EQUAL_STRING("00ab0f10", out);
+}
+
+// The CertInfo serial buffer holds 47 bytes of hex. A 48-byte serial (an
+// ASN.1 INTEGER has no length cap) is refused and nothing past the cap moves.
+void test_serial_hex_refuses_a_serial_past_the_cert_info_buffer(void) {
+  uint8_t s[64];
+  for (size_t i = 0; i < sizeof(s); i++) s[i] = (uint8_t)(0xA0 + (i & 0x0f));
+  struct {
+    char    buf[sizeof(CertInfo::serial)];
+    uint8_t canary[64];
+  } frame;
+  memset(frame.canary, 0x5A, sizeof(frame.canary));
+  const size_t cap = (sizeof(frame.buf) - 1) / 2;
+  TEST_ASSERT_EQUAL_UINT(47, cap);
+  TEST_ASSERT_TRUE(certSerialHex(s, cap, frame.buf, sizeof(frame.buf)));
+  TEST_ASSERT_EQUAL_UINT(2 * cap, strlen(frame.buf));
+  TEST_ASSERT_FALSE(certSerialHex(s, cap + 1, frame.buf, sizeof(frame.buf)));
+  TEST_ASSERT_EQUAL_STRING("", frame.buf);
+  TEST_ASSERT_FALSE(certSerialHex(s, sizeof(s), frame.buf, sizeof(frame.buf)));
+  for (size_t i = 0; i < sizeof(frame.canary); i++) TEST_ASSERT_EQUAL_HEX8(0x5A, frame.canary[i]);
+}
+
+void test_serial_hex_refuses_empty_and_null(void) {
+  const uint8_t s[] = {0x01};
+  char out[8] = "x";
+  TEST_ASSERT_FALSE(certSerialHex(s, 0, out, sizeof(out)));
+  TEST_ASSERT_EQUAL_STRING("", out);
+  TEST_ASSERT_FALSE(certSerialHex(nullptr, 1, out, sizeof(out)));
+  TEST_ASSERT_FALSE(certSerialHex(s, 1, out, 0));
+  TEST_ASSERT_FALSE(certSerialHex(s, 1, nullptr, 8));
+  TEST_ASSERT_FALSE(certSerialHex(s, 1, out, 2));
+  TEST_ASSERT_TRUE(certSerialHex(s, 1, out, 3));
+  TEST_ASSERT_EQUAL_STRING("01", out);
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
+  RUN_TEST(test_serial_hex_is_lowercase_and_whole);
+  RUN_TEST(test_serial_hex_refuses_a_serial_past_the_cert_info_buffer);
+  RUN_TEST(test_serial_hex_refuses_empty_and_null);
   RUN_TEST(test_well_formed_cert_recognised);
   RUN_TEST(test_truncated_cert_rejected);
   RUN_TEST(test_reversed_markers_rejected);
@@ -160,5 +246,12 @@ int main(int, char**) {
   RUN_TEST(test_null_dn_and_zero_len_handled);
   RUN_TEST(test_cn_substring_in_earlier_field_wins);
   RUN_TEST(test_cn_with_comma_truncates);
+  RUN_TEST(test_cert_apply_refuses_a_mismatched_pair);
+  RUN_TEST(test_cert_apply_reboots_onto_a_valid_pair);
+  RUN_TEST(test_cert_apply_low_heap_is_not_a_mismatch);
+  RUN_TEST(test_cert_apply_needs_both_halves);
+  RUN_TEST(test_invalid_pair_marks_the_stored_cert_broken);
+  RUN_TEST(test_valid_pair_clears_the_broken_verdict);
+  RUN_TEST(test_low_heap_keeps_the_last_verdict);
   return UNITY_END();
 }

@@ -21,9 +21,12 @@ cd "$(cd "$(dirname "$0")/.." && pwd)"
 
 # Reviewed dynamic call sites. Each line: the guard that makes it safe.
 ALLOWED=(
-  # path checked by _pathSafe -> Shell::pathSafe at HttpServer.cpp:676/698/731
+  # GET /api/file: path checked by _pathSafe -> Shell::pathSafe in the handler
   "lib/thesada-mod-httpserver/src/HttpServer.cpp:LittleFS.open(path.c_str(), FILE_READ)"
-  "lib/thesada-mod-httpserver/src/HttpServer.cpp:LittleFS.open(path.c_str(), FILE_WRITE)"
+  # _fileWriteAtomic: tmp is uploadTmpPath of a POST /api/file path that passed
+  # _pathSafe, so it only swaps the file name for .upload.tmp in the same dir
+  "lib/thesada-mod-httpserver/src/HttpServer.cpp:LittleFS.open(tmp, FILE_WRITE)"
+  "lib/thesada-mod-httpserver/src/HttpServer.cpp:LittleFS.open(tmp, FILE_READ)"
   # sha256File: internal callers only, fixed paths from the config schema
   "lib/thesada-core/src/MQTTClient.cpp:LittleFS.open(path, \"r\")"
   # executeFile: called with literal /scripts/*.lua, and via lua.load which
@@ -31,6 +34,9 @@ ALLOWED=(
   "lib/thesada-mod-scriptengine/src/ScriptEngine.cpp:LittleFS.open(path, \"r\")"
   # lua.load: Shell::pathSafe(argv[1]) checked immediately above the open
   "lib/thesada-mod-scriptengine/src/ScriptEngine.cpp:LittleFS.open(argv[1], \"r\")"
+  # moveStagedConfig: cmd_mv checks Shell::pathSafe(argv[1]), and fsMoveRoute
+  # sends only the root /config.json.new here
+  "lib/thesada-core/src/Shell.cpp:LittleFS.open(src, \"r\")"
 )
 
 # First-party source only. base/.pio and build/ hold vendored deps and artifacts.

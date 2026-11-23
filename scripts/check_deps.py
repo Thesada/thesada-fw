@@ -39,13 +39,14 @@ PIO_LIBS = [
     ("vshymanskyy/TinyGSM",          "0.12.0"),
     ("adafruit/Adafruit ADS1X15",    "2.6.2"),
     ("jgromes/RadioLib",             "7.0.0"),
+    ("esp32async/ESPAsyncWebServer", "3.12.1"),
+    ("esp32async/AsyncTCP",          "3.5.0"),
 ]
 
 # GitHub-only libs (no pinned version - always tracks HEAD/latest release).
 # We report the latest tag so the developer can decide whether to act.
 GITHUB_LIBS = [
     "lewisxhe/XPowersLib",
-    "ESP32Async/ESPAsyncWebServer",
     "sfranzyshen/ESP-Arduino-Lua",
 ]
 

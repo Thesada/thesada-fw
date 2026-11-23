@@ -16,8 +16,15 @@ env. Suites live in `test/test_<name>/`.
 ```bash
 pio test -e native                    # all suites
 pio test -e native -f test_rollback   # one suite
+pio test -e native-lua                # the Lua fork suites, built on the host
 scripts/static-check.sh               # cppcheck over the pure units (CI gate)
 ```
+
+`test_lua_stdlibs` and `test_lua_budget_hooks` are the suites that are not
+pure headers. They build the Lua fork the boards link under
+`[env:native-lua]`, and `make test-native` runs them after the `native`
+suites. `test_lua_budget_hooks` runs a runaway loop through
+`luaBudgetedCall` on a fake clock, in a coroutine and under `pcall`.
 
 Current suites:
 

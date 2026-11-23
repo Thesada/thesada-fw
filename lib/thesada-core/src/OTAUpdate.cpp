@@ -2,13 +2,13 @@
 //
 // Manifest format (JSON at a known URL):
 //   {
-//     "version": "1.x",
+//     "version": "1.2.3",   (strict N.N.N, see otaParseVersion)
 //     "url": "https://example.com/firmware.bin",
 //     "sha256": "e3b0c44298fc1c149afbf4c8996fb924..."
 //   }
 //
-// TLS: uses /ca.crt from LittleFS (same file as MQTTClient and Cellular).
-// If /ca.crt is not present, falls back to setInsecure().
+// TLS: /ca.crt from LittleFS (same file as MQTTClient and Cellular), else the
+// PROGMEM bundle. Unverified TLS or an http:// URL needs ota.allow_insecure.
 //
 // SPDX-License-Identifier: GPL-3.0-only
 
@@ -35,6 +35,7 @@
 #include "ota_verify_policy.h"
 #include "http_url_policy.h"
 #include "ota_health_policy.h"
+#include "elapsed_policy.h"
 #include <esp_ota_ops.h>
 #include <esp_image_format.h>
 #include <esp_timer.h>
@@ -199,18 +200,26 @@ static void putFledUnsaved(uint32_t s) {
   _otaFledUnsaved[1] = ~s;
 }
 
+// A fresh day for one version. Age first: a lost version write then leaves the
+// old release a fresh day. in: version. out: true when both writes landed.
+static bool putFledRecord(const char* version) {
+  Preferences prefs;
+  bool wrote = prefs.begin("boot", false) &&
+               prefs.putULong64("fled_age", otaFledPack({0, 0, 0})) != 0 &&
+               prefs.putString("fled_ver", version) != 0;
+  prefs.end();
+  putFledUnsaved(0);
+  return wrote;
+}
+
 // Written after the boot slot is set, so a failed switch leaves no skip. A
 // lost write costs one more download of this release. in: none. out: none.
 static void recordFledRelease() {
-  Preferences prefs;
-  // Age first: a lost version write then leaves the old release a fresh day.
-  bool wrote = prefs.begin("boot", false) &&
-               prefs.putULong64("fled_age", otaFledPack({0, 0, 0})) != 0 &&
-               prefs.putString("fled_ver", FIRMWARE_VERSION) != 0;
-  prefs.end();
-  putFledUnsaved(0);
-  if (wrote) Log::kvfw(TAG, "ota.fled_release_recorded version=%s", FIRMWARE_VERSION);
-  else Log::kvfe(TAG, "ota.fled_release_unrecorded reason=nvs_write");
+  if (putFledRecord(FIRMWARE_VERSION)) {
+    Log::kvfw(TAG, "ota.fled_release_recorded version=%s", FIRMWARE_VERSION);
+  } else {
+    Log::kvfe(TAG, "ota.fled_release_unrecorded reason=nvs_write");
+  }
 }
 
 // An unread record skips nothing: it must not hold back every update. The
@@ -258,6 +267,27 @@ static bool saveFled(uint32_t ageS, uint8_t tries) {
   _fled.markMs = millis();
   putFledUnsaved(0);
   return wrote;
+}
+
+// Written once the update has set the boot slot. The build stays recorded until
+// it confirms, so an abort or rollback is not pulled again. in: manifest version.
+static void recordInstalledBuild(const char* version) {
+  loadFled();
+  if (!otaFledRecordsInstall(_fled.ver, version)) return;
+  if (putFledRecord(version)) Log::kvf(TAG, "ota.install_recorded version=%s", version);
+  else Log::kvfe(TAG, "ota.install_unrecorded reason=nvs_write");
+}
+
+// A record naming the running build is the install record. Once this image is
+// confirmed it would only refuse this build after another one runs. out: none.
+static void dropOwnFledRecord() {
+  if (!otaSameVersion(_fled.ver, FIRMWARE_VERSION)) return;
+  Preferences prefs;
+  bool removed = prefs.begin("boot", false) && prefs.remove("fled_ver");
+  prefs.end();
+  _fled.ver[0] = '\0';
+  if (removed) Log::kvf(TAG, "ota.install_record_cleared version=%s", FIRMWARE_VERSION);
+  else Log::kvfe(TAG, "ota.install_record_kept reason=nvs_write");
 }
 
 // RTC memory holds the unsaved seconds each turn and NVS gets them every 10
@@ -361,6 +391,7 @@ uint32_t OTAUpdate::recordBootStreak(int resetReason, uint32_t* brownoutsOut) {
   OtaPlanned planned = otaHealthTakePlanned(&_otaPlannedRestart);
   // Only a confirmed image may hold a planned restart; unknown counts.
   bool confirmed = planned != OTA_PLANNED_NONE && runningImageConfirmed();
+  bool pending = planned != OTA_PLANNED_NONE && runningImageIs(ESP_OTA_IMG_PENDING_VERIFY);
   uint8_t id[OTA_IMAGE_ID_LEN];
   bool haveId = runningImageId(id);
   Preferences prefs;
@@ -390,8 +421,9 @@ uint32_t OTAUpdate::recordBootStreak(int resetReason, uint32_t* brownoutsOut) {
       prefs.isKey("proven_id") ? prefs.getBytes("proven_id", stored, sizeof(stored)) : 0;
   bool proven = haveId && otaHealthImageProven(stored, storedLen, id);
   _otaProvenDone = proven;
-  OtaResetClass kind = otaHealthBootClass(resetReason, planned, confirmed, proven);
-  uint32_t crashes = otaHealthNextCrashStreak(prefs.getUInt("crash_n", 0), kind);
+  OtaResetClass kind = otaHealthBootClass(resetReason, planned, confirmed, proven, pending);
+  uint32_t previous = prefs.getUInt("crash_n", 0);
+  uint32_t crashes = otaHealthNextCrashStreak(previous, kind);
   // A failed write must not look stored. Confirm would keep a bad image.
   if (prefs.putUInt("crash_n", crashes) == 0) {
     prefs.end();
@@ -412,6 +444,9 @@ uint32_t OTAUpdate::recordBootStreak(int resetReason, uint32_t* brownoutsOut) {
   } else if (resetReason == OTA_RST_SW && confirmed && planned == OTA_PLANNED_BROKER) {
     Log::kvfw(TAG, "ota.crash_streak_counted reason=broker_restart_unproven streak=%lu",
               (unsigned long)crashes);
+  } else if (kind == OTA_RESET_FRESH) {
+    Log::kvf(TAG, "ota.crash_streak_restarted reason=install previous=%lu streak=%lu",
+             (unsigned long)previous, (unsigned long)crashes);
   }
   return crashes;
 }
@@ -532,6 +567,7 @@ void OTAUpdate::confirmIfHealthy() {
     _otaPending = state == ESP_OTA_IMG_PENDING_VERIFY;
     _otaRunState = (uint32_t)state;
     _otaStateKnown = true;
+    if (!_otaPending) dropOwnFledRecord();
   }
   if (!_otaPending) {
     const bool usb = _otaRunState == ESP_OTA_IMG_UNDEFINED;
@@ -566,6 +602,12 @@ void OTAUpdate::confirmIfHealthy() {
   }
   _otaImageSettled = true;
   Log::info(TAG, "ota.state_change from=pending to=valid reason=healthy");
+  dropOwnFledRecord();
+}
+
+bool OTAUpdate::awaitingConfirm() {
+  if (_otaImageSettled) return false;
+  return _otaStateKnown ? _otaPending : _otaBootPending;
 }
 
 uint32_t OTAUpdate::_lastCheck       = 0;
@@ -604,17 +646,16 @@ static void loadCaCert() {
 }
 
 // Without this, every silent bailout looks identical to "device offline"
-// from the broker side. publish() queues on the WiFi ring (or routes to
-// the cellular forwarder) when the broker is down, so a refusal raised
-// while disconnected still reaches the operator on reconnect - do not
-// pre-empt that with a connected() guard here.
+// from the broker side. publish() queues on the ring when the broker is
+// down, so a refusal raised while disconnected still reaches the operator
+// on reconnect - do not pre-empt that with a connected() guard here.
 // in:  reason (short kebab-case identifier, e.g. "no-ca", "heap-low").
 // out: none.
 static void publishOtaRefusal(const char* reason) {
   JsonObject  cfg    = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
   char topic[MQTT_TOPIC_CAP];
-  snprintf(topic, sizeof(topic), "%s/status/ota", prefix);
+  if (!MQTTClient::formatTopic(topic, sizeof(topic), "%s/status/ota", prefix)) return;
   char payload[160];
   snprintf(payload, sizeof(payload),
            "{\"state\":\"refused\",\"reason\":\"%s\",\"version\":\"%s\"}",
@@ -624,11 +665,11 @@ static void publishOtaRefusal(const char* reason) {
 
 // Short socket + handshake timeouts so a flaky upstream cannot block
 // readBytes() long enough to trip the task watchdog. WiFiClientSecure
-// defaults to ~60s read timeout, far past the ~5s TWDT window.
+// defaults to ~60s read timeout, past the 30 s TWDT window (TASK_WDT_TIMEOUT_MS).
 //
-// When /ca.crt is missing OTAUpdate::begin() refuses to enable OTA unless
-// ota.allow_insecure is set in config.json, so by the time we get here we
-// already know either the CA cert is loaded or the operator has opted in.
+// Without /ca.crt the baked PROGMEM bundle loads. Only with no CA at all does
+// begin() refuse OTA unless ota.allow_insecure is set, so here either a CA is
+// loaded or the operator has opted in.
 static void configureSecureClient(WiFiClientSecure& client) {
   loadCaCert();
   if (_otaCaCert.isEmpty()) {
@@ -643,10 +684,9 @@ static void configureSecureClient(WiFiClientSecure& client) {
 // ---------------------------------------------------------------------------
 // Transport-agnostic HTTP GET
 //
-// OTA fallback over cellular when WiFi is down. The two
-// underlying paths are very different (Arduino HTTPClient/WiFiClientSecure
-// over WiFi vs SIM7080G modem-native SSL socket via TinyGsmClientSecure),
-// so we wrap both behind a single byte-stream callback API. Same /ca.crt
+// OTA fallback over cellular when WiFi is down. WiFi runs Arduino
+// HTTPClient/WiFiClientSecure, cellular runs Cellular::httpsGet (TlsClient
+// on a modem socket); both sit behind one byte-stream callback API. Same /ca.crt
 // validates the manifest origin on either path (public TLS roots covering
 // the common backends - GitHub Releases, Let's Encrypt fronted origins,
 // Sectigo, etc - are baked into the firmware via ota_ca_progmem.h).
@@ -703,8 +743,8 @@ static bool otaHttpGetWiFiHop(const char* url,
   int contentLength  = http.getSize();
   size_t total = 0;
   uint8_t buf[1024];
-  uint32_t deadline = millis() + 5UL * 60UL * 1000UL;  // 5 min cap
-  while (millis() < deadline) {
+  const uint32_t t0 = millis();
+  while (msWithin(millis(), t0, 5UL * 60UL * 1000UL)) {  // 5 min cap
     yield(); Watchdog::feed();
     Shell::pumpConsole();
     if (!stream->connected() && !stream->available()) break;
@@ -746,6 +786,13 @@ static bool otaHttpGetWiFi(const char* url,
 }
 
 #ifdef ENABLE_CELLULAR
+// The CA the WiFi path verifies with. nullptr only when it is empty, which
+// begin() and check() allow under ota.allow_insecure alone.
+static const char* otaCellularCa() {
+  loadCaCert();
+  return _otaCaCert.isEmpty() ? nullptr : _otaCaCert.c_str();
+}
+
 // in:  url, writeCallback. out: outStatus, outLen.
 static bool otaHttpGetCellular(const char* url,
                                std::function<bool(const uint8_t*, size_t)> writeCallback,
@@ -770,7 +817,7 @@ static bool otaHttpGetCellular(const char* url,
     total += len;
     return writeCallback ? writeCallback(buf, len) : true;
   };
-  bool ok = Cellular::httpsGet(host, path, port, wrap, outStatus);
+  bool ok = Cellular::httpsGet(host, path, port, otaCellularCa(), wrap, outStatus);
   if (outLen) *outLen = total;
   return ok;
 }
@@ -801,70 +848,80 @@ static bool downloadBinaryChunkedCellular(
     return false;
   }
 
-  // MQTT (SMCONN) runs inside the modem fw and competes with our HTTPS
-  // chunks for the modem's TCP socket slots and the PDP context's
-  // bandwidth, even though our ATGuard blocks our own SMPUB traffic.
-  // Drop the modem-native MQTT session before the download so the chunks
-  // get the full bandwidth budget. Cellular::loop() detects the dropped
-  // session on its next tick after ATGuard releases and re-establishes
-  // MQTT automatically (existing recovery path), so no explicit SMCONN
-  // is needed here. On OTA success the device reboots and MQTT comes up
-  // fresh on the new fw anyway.
-  Cellular::atPassthrough("+SMDISC", 5000UL, [](const char*){});
+  // Drop the MQTT session before the download: it would share the link
+  // with the chunks and hold a second TLS session's heap. MQTTClient::loop
+  // reconnects afterwards; on success the device reboots anyway.
+  MQTTClient::dropSession();
 
-  // 64 KB chunk size. At ~8.4 KB/s LTE-M that is ~8 s per chunk, well
-  // under the empirically observed session-degradation threshold. For
-  // a 1.48 MB binary this is ~23 round trips.
-  static constexpr size_t   CHUNK             = 64UL * 1024UL;
-  // Inter-chunk pacing: lets the modem's internal TCP slots clear
-  // TIME_WAIT and the carrier's per-source-port rate-counter decay
-  // before the next handshake. Bench-tuned on LTE-M; trimmable if a
-  // future carrier handles back-to-back sockets cleanly.
-  static constexpr uint32_t CHUNK_GAP_MS      = 5000UL;
-  // Reset the PDP context every Nth chunk as a heavier escape hatch
-  // for the same problem class (modem-internal state accumulation).
-  // 8 chunks * 64 KB = 512 KB which is where the empirical stall
-  // showed up most consistently.
-  static constexpr int      CHUNK_BOUNCE_EVERY = 8;
+  // 256 KB per request: about 2 min at the ~2 KB/s an LTE-M link gives,
+  // inside httpsGet's 5 min cap, and each TLS handshake costs ~5 s.
+  static constexpr size_t   CHUNK             = 256UL * 1024UL;
+  // Short pause between requests so the modem closes the old socket first.
+  static constexpr uint32_t CHUNK_GAP_MS      = 1000UL;
+
+  // A chunk that fails part-way resumes from the last byte the writer took,
+  // once the link probe has the data context back: the modem drops it now
+  // and then on its own.
+  static constexpr int      CHUNK_TRIES       = 3;
+  static constexpr uint32_t LINK_WAIT_MS      = 90000UL;
 
   size_t offset    = 0;
-  int    chunkIdx  = 0;
   while (offset < expectedSize) {
-    size_t end = std::min(offset + CHUNK - 1, expectedSize - 1);
-    int status = 0;
-    bool ok = Cellular::httpsGet(host, path, port, writeCallback, &status,
-                                 offset, end);
-    if (!ok || (status != 206 && status != 200)) {
-      Log::kvfe(TAG, "ota.chunk_failed offset=%u status=%d ok=%d",
-                (unsigned)offset, status, (int)ok);
+    size_t end   = std::min(offset + CHUNK - 1, expectedSize - 1);
+    bool   done  = false;
+    for (int attempt = 1; attempt <= CHUNK_TRIES && !done; ++attempt) {
+      // A console net.http can hold slot 1 past its shell wait. Its refusal
+      // would spend this try, so wait it out first.
+      for (uint32_t w = millis(); Cellular::httpsBusy() && millis() - w < LINK_WAIT_MS;) {
+        Shell::pumpConsole();
+        esp_task_wdt_reset();
+        delay(200);
+      }
+      size_t got    = 0;
+      int    status = 0;
+      // Only the requested range reaches flash: a 206, or a 200 that is the
+      // whole image from byte 0. Anything past `end` is dropped.
+      const bool whole = (offset == 0 && end == expectedSize - 1);
+      auto counting = [&](const uint8_t* d, size_t n) {
+        if (status != 206 && !(status == 200 && whole)) return false;
+        size_t room = end + 1 - (offset + got);
+        bool   over = n > room;
+        if (over) n = room;
+        if (n && !writeCallback(d, n)) return false;
+        got += n;
+        return !over;
+      };
+      Cellular::httpsGet(host, path, port, otaCellularCa(), counting, &status, offset, end);
+      offset += got;
+      if (offset > end) { done = true; break; }
+      // A 5xx is the host, not the image: spend a try on it.
+      if (status != 0 && status < 500 && status != 206 && !(status == 200 && whole)) {
+        Log::kvfe(TAG, "ota.chunk_failed offset=%u status=%d", (unsigned)offset, status);
+        return false;
+      }
+      Log::kvfw(TAG, "ota.chunk_retry offset=%u attempt=%d got=%u", (unsigned)offset, attempt,
+                (unsigned)got);
+      // Probe the link, and re-run activation once the probe has dropped it.
+      const uint32_t waitT0 = millis();
+      do {
+        if (Cellular::activated()) Cellular::loop();
+        else Cellular::tickActivation();
+        Shell::pumpConsole();
+        esp_task_wdt_reset();
+        delay(200);
+      } while (!Cellular::connected() && msWithin(millis(), waitT0, LINK_WAIT_MS));
+    }
+    if (!done) {
+      Log::kvfe(TAG, "ota.chunk_failed offset=%u tries=%d", (unsigned)offset, CHUNK_TRIES);
       return false;
     }
     offset = end + 1;
-    chunkIdx++;
     if (totalOut) *totalOut = offset;
 
     if (offset >= expectedSize) break;
 
-    // Periodic CNACT bounce. Deactivate + reactivate the PDP context
-    // so the modem releases every TCP slot still in TIME_WAIT and the
-    // operator-side flow counters reset. Cheap (~1-2 s) compared to
-    // the recovery cost when a chunk eventually stalls without it.
-    if (chunkIdx % CHUNK_BOUNCE_EVERY == 0) {
-      Log::info(TAG, "ota.pdp_bounce method=cnact_cycle");
-      Cellular::atPassthrough("+CNACT=0,0", 5000UL, [](const char*){});
-      delay(500);
-      Cellular::atPassthrough("+CNACT=0,1", 10000UL, [](const char*){});
-      // CNACT activation completes asynchronously via +APP PDP URC;
-      // a short settle window before the next handshake is reliable.
-      for (int i = 0; i < 20; ++i) {
-        Shell::pumpConsole();
-        delay(100);
-        esp_task_wdt_reset();
-      }
-    }
-
-    uint32_t paceUntil = millis() + CHUNK_GAP_MS;
-    while (millis() < paceUntil) {
+    const uint32_t paceT0 = millis();
+    while (msWithin(millis(), paceT0, CHUNK_GAP_MS)) {
       Shell::pumpConsole();
       esp_task_wdt_reset();
       delay(200);
@@ -972,18 +1029,13 @@ void OTAUpdate::registerCommandTopic() {
   const char* customTopic = cfg["ota"]["cmd_topic"] | "";
   if (strlen(customTopic) == 0) return;
 
-  char topic[MQTT_TOPIC_CAP];
-  strncpy(topic, customTopic, sizeof(topic) - 1);
-  topic[sizeof(topic) - 1] = '\0';
-
-  MQTTClient::subscribe(topic, [](const char* topic, const char* payload) {
+  // The payload is ignored: any session that can publish here could otherwise
+  // pick the manifest. A URL override stays on the authz-gated `ota.check <url>`.
+  // subscribe() copies the topic, and refuses one past MQTT_TOPIC_CAP.
+  MQTTClient::subscribe(customTopic, [](const char* topic, const char* payload) {
     Log::info(TAG, "ota.trigger source=mqtt");
+    _pendingManifestUrl = "";
     _checkRequested = true;
-    if (payload && strlen(payload) > 8) {
-      _pendingManifestUrl = payload;
-    } else {
-      _pendingManifestUrl = "";
-    }
   });
 }
 
@@ -1010,14 +1062,8 @@ void OTAUpdate::triggerCheck(const char* manifestOverride, bool force) {
 void OTAUpdate::loop() {
   confirmIfHealthy();
   // Deferred MQTT-triggered check: runs outside MQTT callback context.
-  if (_checkRequested) {
-    _checkRequested = false;
-    bool force = _forceRequested;
-    _forceRequested = false;
-    const char* override = _pendingManifestUrl.length() > 0
-                             ? _pendingManifestUrl.c_str() : nullptr;
-    check(override, force);
-    _pendingManifestUrl = "";
+  if (otaRunRequested(_checkRequested, _forceRequested, _pendingManifestUrl,
+                      [](const char* url, bool force) { check(url, force); })) {
     return;
   }
 
@@ -1055,9 +1101,10 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
   }
 
   JsonObject cfg = Config::get();
-  const char* url = manifestOverride
-                      ? manifestOverride
-                      : (cfg["ota"]["manifest_url"] | "");
+  // A copy: the fetch pumps the console, and a config.set there rebuilds the doc.
+  const String urlCopy = manifestOverride ? manifestOverride
+                                          : (const char*)(cfg["ota"]["manifest_url"] | "");
+  const char* url = urlCopy.c_str();
 
   if (strlen(url) == 0) {
     Log::error(TAG, "ota.check_refused reason=no_manifest_url");
@@ -1082,6 +1129,12 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
     publishOtaRefusal("no-ca");
     return;
   }
+  // Redirects keep the scheme, so this and the binary check cover every hop.
+  if (!otaUrlAllowed(url, allowInsecure)) {
+    Log::kvfe(TAG, "ota.check_refused reason=insecure_url url=%.80s", url);
+    publishOtaRefusal("insecure-url");
+    return;
+  }
 
   Log::kvf(TAG, "ota.phase_change from=idle to=check force=%d", (int)force);
 
@@ -1093,19 +1146,19 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
   // MQTT to free TLS buffers, letting the manifest fetch succeed on a
   // clean heap. MQTT reconnect happens post-reboot if update applies, or
   // in loop() if we bail out.
-  // Only applies to the WiFi transport: cellular MQTT TLS runs inside
-  // the modem so it does not fragment ESP heap, and the manifest fetch
-  // goes through the modem's separate SSL socket layer regardless.
-  if (WiFiManager::connected() &&
-      MQTTClient::connected() && ESP.getMaxAllocHeap() < 40000) {
-    if (!force) {
+  // Applies to both transports: TLS runs on the ESP32 for either. On
+  // cellular a periodic check drops the session too instead of refusing:
+  // with the WiFi stack still loaded the heap sits under the gate for the
+  // whole failover, and the reconnect is a few seconds.
+  const bool onCellular = strcmp(MQTTClient::transportName(), "cellular") == 0;
+  if (MQTTClient::connected() && ESP.getMaxAllocHeap() < 40000) {
+    if (!force && !onCellular) {
       Log::kvfw(TAG, "ota.check_skipped reason=heap_low");
       publishOtaRefusal("heap-low");
       return;
     }
     Log::kvf(TAG, "ota.heap_low action=mqtt_disconnect");
-    MQTTClient::_client.disconnect();
-    MQTTClient::_wifiClient.stop();
+    MQTTClient::dropSession();
     delay(200);  // let TCP teardown + free mbedtls context
   }
 
@@ -1117,6 +1170,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
     publishOtaRefusal("manifest-fetch-failed");
     return;
   }
+  cfg = Config::get();  // the doc may have been rebuilt during the fetch
 
   Log::kvf(TAG, "ota.version_check remote=%s local=%s",
            remoteVersion.c_str(), FIRMWARE_VERSION);
@@ -1128,12 +1182,19 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
     // "device offline" or "silent refusal" from the broker side.
     const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
     char topic[MQTT_TOPIC_CAP];
-    snprintf(topic, sizeof(topic), "%s/status/ota", prefix);
+    if (!MQTTClient::formatTopic(topic, sizeof(topic), "%s/status/ota", prefix)) return;
     char payload[160];
     snprintf(payload, sizeof(payload),
              "{\"state\":\"up-to-date\",\"version\":\"%s\",\"remote\":\"%s\"}",
              FIRMWARE_VERSION, remoteVersion.c_str());
     MQTTClient::publish(topic, payload);
+    return;
+  }
+  // Before the fled gate, so no try is spent on a binary that is never fetched.
+  if (!otaUrlAllowed(binUrl.c_str(), allowInsecure)) {
+    Log::kvfe(TAG, "ota.phase_change from=fetch_manifest to=idle reason=insecure_url url=%.80s",
+              binUrl.c_str());
+    publishOtaRefusal("insecure-url");
     return;
   }
   // Without this the image a switch booted pulls the fled build straight back.
@@ -1175,16 +1236,19 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
            remoteVersion.c_str(), binUrl.c_str());
 
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
+  // A status topic that does not fit skips the status publishes, not the update.
   char statusTopic[MQTT_TOPIC_CAP];
-  snprintf(statusTopic, sizeof(statusTopic), "%s/status/ota", prefix);
+  bool haveStatus =
+      MQTTClient::formatTopic(statusTopic, sizeof(statusTopic), "%s/status/ota", prefix);
   char statusPayload[128];
   snprintf(statusPayload, sizeof(statusPayload),
            "{\"state\":\"updating\",\"from\":\"%s\",\"to\":\"%s\"}",
            FIRMWARE_VERSION, remoteVersion.c_str());
-  MQTTClient::publish(statusTopic, statusPayload);
+  if (haveStatus) MQTTClient::publish(statusTopic, statusPayload);
   delay(100);
 
   if (applyUpdate(binUrl, sha256, binSize)) {
+    recordInstalledBuild(remoteVersion.c_str());
     Log::kvf(TAG, "ota.phase_change from=apply to=reboot version=%s", remoteVersion.c_str());
     delay(500);
     plannedRestart();
@@ -1192,7 +1256,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
     Log::error(TAG, "ota.update_failed");
     snprintf(statusPayload, sizeof(statusPayload),
              "{\"state\":\"failed\",\"version\":\"%s\"}", FIRMWARE_VERSION);
-    MQTTClient::publish(statusTopic, statusPayload);
+    if (haveStatus) MQTTClient::publish(statusTopic, statusPayload);
   }
 }
 
@@ -1202,7 +1266,7 @@ void OTAUpdate::check(const char* manifestOverride, bool force) {
 // so a stall here (TLS handshake, hung socket read on a flaky upstream)
 // cannot block this task long enough to trip TWDT. Goes through the
 // unified otaHttpGet helper so the same call site works over WiFi or
-// the SIM7080G modem-native SSL socket.
+// a modem socket.
 bool OTAUpdate::fetchManifest(const char* url,
                                String& version, String& binUrl, String& sha256,
                                size_t& size) {

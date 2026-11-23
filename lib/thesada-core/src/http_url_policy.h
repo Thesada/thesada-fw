@@ -8,6 +8,7 @@
 #include <string.h>
 
 // Split an http(s) URL. in: url, host cap. out: host, path, port, https.
+// A root query ("https://h?k=v") yields path "?k=v"; write it after httpTargetLead.
 inline bool httpUrlSplit(const char* url, char* host, size_t hostCap,
                          const char** pathOut, uint16_t* portOut, bool* httpsOut = nullptr) {
   if (!url || !host || hostCap == 0) return false;
@@ -18,7 +19,9 @@ inline bool httpUrlSplit(const char* url, char* host, size_t hostCap,
   else if (strncmp(p, "http://",  7) == 0) { p += 7; port = 80; https = false; }
   else return false;
   const char* slash   = strchr(p, '/');
-  const char* hostEnd = slash ? slash : p + strlen(p);
+  const char* query   = strchr(p, '?');
+  if (slash && query && query < slash) slash = nullptr;
+  const char* hostEnd = slash ? slash : query ? query : p + strlen(p);
   size_t hostLen      = hostEnd - p;
   if (hostLen == 0 || hostLen >= hostCap) return false;
   memcpy(host, p, hostLen);
@@ -32,11 +35,14 @@ inline bool httpUrlSplit(const char* url, char* host, size_t hostCap,
     port = (uint16_t)v;
   }
   if (host[0] == '\0') return false;
-  *pathOut = slash ? slash : "/";
+  *pathOut = slash ? slash : query ? query : "/";
   *portOut = port;
   if (httpsOut) *httpsOut = https;
   return true;
 }
+
+// in: a path from httpUrlSplit. out: "/" when it is a bare root query ("?k=v"), else "".
+inline const char* httpTargetLead(const char* path) { return (path && path[0] == '?') ? "/" : ""; }
 
 // in: an HTTP status line ("HTTP/1.1 200 OK"). out: the code, or -1 if malformed.
 inline int httpStatusCode(const char* line) {

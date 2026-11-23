@@ -7,6 +7,7 @@
 // "wifi.wifi_check_interval_s" seconds (default 900 = 15 min).
 // SPDX-License-Identifier: GPL-3.0-only
 
+#include <lwip/opt.h>
 #include "WiFiManager.h"
 #include "Identity.h"
 #include "ap_policy.h"
@@ -45,6 +46,23 @@ static volatile bool s_ntpSynced = false;
 // SNTP completion hook. in: new time (unused). out: none.
 static void onNtpSync(struct timeval*) { s_ntpSynced = true; }
 
+// lwIP SNTP stores the server name pointers and re-resolves them every poll.
+// Two slots: configTime moves SNTP onto the fresh one before the old is reused.
+static constexpr size_t NTP_HOST_CAP = DNS_MAX_NAME_LENGTH;  // lwIP refuses longer names itself
+static char    s_ntpHost[2][2][NTP_HOST_CAP];
+static uint8_t s_ntpSlot = 0;
+
+// Copy an NTP host into dst, the default when it does not fit (never clipped).
+// in: dst (NTP_HOST_CAP), configured host, default, config key for the log.
+static void copyNtpHost(char* dst, const char* host, const char* def, const char* key) {
+  if (strlen(host) >= NTP_HOST_CAP) {
+    Log::kvfw(TAG, "wifi.ntp_server_refused key=%s reason=too_long fallback=%s", key, def);
+    host = def;
+  }
+  strncpy(dst, host, NTP_HOST_CAP - 1);
+  dst[NTP_HOST_CAP - 1] = '\0';
+}
+
 // ---------------------------------------------------------------------------
 
 // Initialize WiFi in station mode and start connection
@@ -78,9 +96,9 @@ void WiFiManager::scanAndConnect() {
   Log::kvf(TAG, "wifi.scan_done visible=%d", found);
 
   // Match configured networks against scan results; record best RSSI per SSID.
-  // Stack-allocated; supports up to 8 configured networks. password is a buffer
-  // (not a pointer) so a per-network NVS secret resolves into stable storage.
-  struct Candidate { const char* ssid; char password[Secret::MAX_LEN]; int32_t rssi; };
+  // Up to 8 networks. ssid and password are copies: tryConnect pumps the
+  // console, and a config.set there rebuilds the doc they came from.
+  struct Candidate { char ssid[33]; char password[Secret::MAX_LEN]; int32_t rssi; };
   Candidate candidates[8];
   uint8_t   count = 0;
 
@@ -103,8 +121,10 @@ void WiFiManager::scanAndConnect() {
     }
 
     // Resolve the per-network password: NVS (app-provisioned) -> config.json.
+    // A match equals a scanned SSID, at most 32 bytes, so the copy is whole.
     Candidate& c = candidates[count];
-    c.ssid = ssid;
+    strncpy(c.ssid, ssid, sizeof(c.ssid) - 1);
+    c.ssid[sizeof(c.ssid) - 1] = '\0';
     c.rssi = bestRssi;
     char nvsKey[16];
     Secret::wifiKey(ssid, nvsKey, sizeof(nvsKey));
@@ -149,8 +169,11 @@ void WiFiManager::scanAndConnect() {
         // Start NTP sync and wait up to NTP_WAIT_MS.
         {
           JsonObject  cfg     = Config::get();
-          const char* ntpSrv  = cfg["ntp"]["server"]      | "pool.ntp.org";
-          const char* ntpFb   = cfg["ntp"]["server2"]     | "time.cloudflare.com";
+          s_ntpSlot ^= 1;
+          char*       ntpSrv  = s_ntpHost[s_ntpSlot][0];
+          char*       ntpFb   = s_ntpHost[s_ntpSlot][1];
+          copyNtpHost(ntpSrv, cfg["ntp"]["server"]  | "pool.ntp.org", "pool.ntp.org", "server");
+          copyNtpHost(ntpFb,  cfg["ntp"]["server2"] | "time.cloudflare.com", "time.cloudflare.com", "server2");
           int32_t     tzOff   = cfg["ntp"]["tz_offset_s"] | 0;
           sntp_set_time_sync_notification_cb(onNtpSync);
           configTime(tzOff, 0, ntpSrv, ntpFb);
@@ -299,6 +322,7 @@ void WiFiManager::loop() {
 
 // Return whether WiFi is connected and in CONNECTED state
 bool WiFiManager::ntpSynced() { return s_ntpSynced; }
+void WiFiManager::noteNtpSync() { s_ntpSynced = true; }
 
 bool WiFiManager::connected() {
   return _status == WiFiStatus::CONNECTED && WiFi.status() == WL_CONNECTED;

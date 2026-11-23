@@ -413,6 +413,17 @@ void test_hex_len_counts_only_lowercase_hex(void) {
   TEST_ASSERT_EQUAL_INT32(-1, (int32_t)enrollHexLen(nullptr));
 }
 
+// The task's own deadline, plus one IO timeout, ends it inside the hold.
+void test_task_budget_inside_the_hold(void) {
+  TEST_ASSERT_FALSE(enrollTaskBudgetSpent(1000, 1000));
+  TEST_ASSERT_FALSE(enrollTaskBudgetSpent(1000 + ENROLL_TASK_BUDGET_MS - 1, 1000));
+  TEST_ASSERT_TRUE(enrollTaskBudgetSpent(1000 + ENROLL_TASK_BUDGET_MS, 1000));
+  TEST_ASSERT_FALSE(enrollTaskBudgetSpent(0xFFFFFF00u + 100u, 0xFFFFFF00u));
+  TEST_ASSERT_TRUE(enrollTaskBudgetSpent(0xFFFFFF00u + ENROLL_TASK_BUDGET_MS, 0xFFFFFF00u));
+  TEST_ASSERT_TRUE(ENROLL_TASK_BUDGET_MS + ENROLL_IO_TIMEOUT_MS < ENROLL_JOB_CEILING_MS);
+  TEST_ASSERT_TRUE(2 * ENROLL_IO_TIMEOUT_MS < ENROLL_TASK_BUDGET_MS);
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_serial_canonical_matches_the_app_form);
@@ -421,6 +432,7 @@ int main(int, char**) {
   RUN_TEST(test_status_message_is_the_signed_statement);
   RUN_TEST(test_status_message_refuses_unset_clock_and_bad_fields);
   RUN_TEST(test_status_body_carries_every_field);
+  RUN_TEST(test_task_budget_inside_the_hold);
   RUN_TEST(test_status_body_refuses_off_shape_values);
   RUN_TEST(test_status_wipes_only_on_revoked_for_this_serial);
   RUN_TEST(test_status_cadence_is_six_hours_plus_an_eighth);

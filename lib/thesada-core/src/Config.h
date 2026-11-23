@@ -3,36 +3,70 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #include <ArduinoJson.h>
+#include <functional>
+#include <FS.h>
+#include "config_mask_policy.h"
 
 // Single-task invariant: every method reads or writes the one _doc with no
 // locking, and ArduinoJson is not thread-safe. Every caller must run on the
 // main loop task: module begin()/loop(), Shell handlers, MQTT callbacks all
-// do today. Do NOT call from an ISR or a secondary FreeRTOS task. If a second
-// task ever needs config, add a recursive mutex here first, as EventBus.h
-// says for the bus.
+// do today. Do NOT call from an ISR or a secondary FreeRTOS task. A second
+// task reads a copy the main loop refreshes from onChange(), as HttpServer's
+// web snapshot does for the async_tcp handlers.
 class Config {
 public:
-  static void load();
-  static bool save();   // false if the on-disk write failed (open or short write)
-  // false on parse or persist failure. Either failure reloads the on-disk file
-  // and puts a held boot prefix back.
+  // Read /config.json into the live doc. A mount failure, a missing file or a
+  // file that is not one JSON object logs and keeps the doc it had.
+  // out: false when the doc was kept.
+  static bool load();
+  // tmp + rename into /config.json, live doc untouched. Main loop only: every
+  // writer shares /config.json.tmp. out: false if the old file stayed, bytes on disk.
+  static bool writeFile(JsonVariantConst src, bool pretty, size_t* bytes = nullptr);
+  // As writeFile for a file handed over as bytes, kept byte for byte. Refuses
+  // anything but one JSON object. out: false if the old file stayed, bytes on disk.
+  static bool writeRaw(const char* data, size_t len, size_t* bytes);
+  // false on a parse failure, trailing content, a non-object, or a persist
+  // failure. Each leaves the live doc and the held boot prefix as they were.
   static bool replace(const char* json);
+  // Run fn on a copy staged from /config.json (the live doc if the file is
+  // missing), write it, then make it live. fn returns false to write nothing.
+  // deferPrefix: a moved topic prefix is written and the old one held until restart.
+  static bool edit(const std::function<bool(JsonObject)>& fn, bool deferPrefix = false);
+  // As edit, but a corrupt, oversized or non-object file is replaced by a
+  // fresh doc plus fn. Setup portal only: every other writer fails closed.
+  static bool rescueEdit(const std::function<bool(JsonObject)>& fn);
   // Largest topic prefix the hold can keep without truncating it.
   static constexpr size_t TOPIC_PREFIX_CAP = 128;
-  // Put the boot prefix back in the live doc after a replace. Later saves
+  // Put the boot prefix back in the live doc after a replace. Later edits
   // still write the prefix that is already on disk.
   // in: boot prefix, full string. out: false if prefix is null, the disk
   // value is not a string, or either string does not fit. Unchanged on failure.
   static bool holdTopicPrefix(const char* prefix);
   // in: none. out: true while a boot prefix is overlaid on the live doc.
   static bool topicPrefixHeld();
-  // in: buffer. out: false if no prefix is held or it does not fit.
-  static bool copyBootTopicPrefix(char* out, size_t cap);
-  // Copy the doc a save should write. A held boot prefix stays out of the copy.
+  // in: none. out: true while the prefix in the file is not the live one.
+  static bool topicPrefixPending();
+  // Copy the live doc as it is on disk, a held boot prefix left out.
   // in: destination document. out: false if the copy did not land.
   static bool copyDiskDoc(JsonDocument& dst);
-  static bool set(const char* path, const char* value);
+  // out: true when a live doc (an object) is loaded.
+  static bool hasLiveDoc();
+  // Changes after every load, replace or set that rebuilt or edited the doc.
+  static uint32_t revision();
+  // Run fn on the main loop after each such change, before the caller resumes.
+  // in: hook. out: false when all 4 slots are taken.
+  static bool onChange(void (*fn)());
   static JsonObject get();
+  // A marker under a secret key in staged takes the value /config.json holds,
+  // or is dropped. Main loop only. out: false when the live doc could not be copied.
+  static bool keepStoredSecrets(JsonDocument& staged);
+  // What a read of path on fs may serve (config_mask_policy.h). shownPath is
+  // the path as the caller typed it. out: verdict, out filled when MASKED.
+  static ConfigFileRead readFileMasked(fs::FS& fs, const char* path, const char* shownPath, String& out);
+  // in: none. out: why the boot schema migration did not run, or nullptr.
+  static const char* schemaAlert();
 private:
+  // Write staged and move it in. in: staged doc, log event. out: false if live stayed.
+  static bool commit(JsonDocument& staged, const char* event, bool deferPrefix = false);
   static JsonDocument _doc;
 };

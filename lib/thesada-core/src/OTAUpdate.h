@@ -46,10 +46,16 @@ public:
   // or leave it pending. Call every main-loop turn, even when loop() is skipped.
   static void confirmIfHealthy();
 
+  // in: none. out: true while the running image is pending and not yet
+  // confirmed, so the next bootloader run would roll it back.
+  static bool awaitingConfirm();
+
   // Fetch manifest, compare version, download, verify SHA256, flash, reboot.
-  // A manifest version a guard switch fled is refused as fled-release for
-  // 24 h, then installed again. force=true bypasses isNewer() and that
-  // refusal - re-flashes even when remote == local.
+  // A manifest version a guard switch fled, or one installed that never
+  // confirmed, is refused as fled-release for 24 h, then installed again.
+  // An http:// manifest or binary URL is refused as insecure-url unless
+  // ota.allow_insecure is set. force=true bypasses isNewer() and the
+  // fled-release refusal - re-flashes even when remote == local.
   // Useful for dev iteration without bumping FIRMWARE_VERSION each cycle.
   //
   // WARNING: synchronous - blocks on fetch + download + flash + ESP.restart().

@@ -4,6 +4,7 @@
 #include "HeartbeatLED.h"
 #include "Config.h"
 #include "Log.h"
+#include "elapsed_policy.h"
 #include <thesada_config.h>
 
 #ifdef ENABLE_PMU
@@ -17,7 +18,8 @@ int      HeartbeatLED::_pin        = -1;
 bool     HeartbeatLED::_activeLow  = false;
 int32_t  HeartbeatLED::_intervalMs = -1;
 uint32_t HeartbeatLED::_lastBeat   = 0;
-uint32_t HeartbeatLED::_offAt      = 0;
+uint32_t HeartbeatLED::_pulseAt    = 0;
+bool     HeartbeatLED::_pulseOn    = false;
 bool     HeartbeatLED::_usePmu     = false;
 
 // Initialize heartbeat LED from config (PMU or GPIO)
@@ -65,7 +67,7 @@ void HeartbeatLED::loop() {
   uint32_t now = millis();
 
   // Turn off after pulse.
-  if (_offAt && now >= _offAt) {
+  if (_pulseOn && !msWithin(now, _pulseAt, PULSE_MS)) {
 #ifdef ENABLE_PMU
     if (_usePmu) {
       PowerManager::ledOff();
@@ -74,13 +76,14 @@ void HeartbeatLED::loop() {
     {
       digitalWrite(_pin, _activeLow ? HIGH : LOW);
     }
-    _offAt = 0;
+    _pulseOn = false;
   }
 
   // Pulse on interval.
   if (now - _lastBeat >= (uint32_t)_intervalMs) {
     _lastBeat = now;
-    _offAt    = now + PULSE_MS;
+    _pulseAt  = now;
+    _pulseOn  = true;
 #ifdef ENABLE_PMU
     if (_usePmu) {
       PowerManager::ledOn();

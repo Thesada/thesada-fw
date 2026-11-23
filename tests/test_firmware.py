@@ -22,6 +22,8 @@ import argparse
 import glob
 import json
 import base64
+import os
+import ssl
 import urllib.request
 import urllib.error
 
@@ -765,7 +767,7 @@ def test_filesystem(r):
     # df
     lines = sh.cmd("fs.df")
     lfs_line = next((l for l in lines if "LittleFS:" in l), None)
-    sd_line  = next((l for l in lines if "SD card:" in l), None)
+    sd_line  = next((l for l in lines if l.lstrip().startswith("/sd:") or "SD card:" in l), None)
 
     if lfs_line:
         r.ok("fs.df (LittleFS)", lfs_line.strip())
@@ -1046,8 +1048,9 @@ def test_shell(r):
 
     # module.list
     lines = sh.cmd("module.list")
-    if lines and "Compiled modules:" in lines[0]:
-        enabled = [l.split("[x]")[1].strip() for l in lines if "[x]" in l]
+    rows = [l for l in lines[1:] if "[x]" in l or "[ ]" in l] if lines else []
+    if lines and "Registered modules" in lines[0] and rows:
+        enabled = [l.split("[x]")[1].strip() for l in rows if "[x]" in l]
         r.ok("module.list", f"enabled: {', '.join(enabled)}" if enabled else "none enabled")
     else:
         r.fail("module.list", f"output: {lines[:2]}")
@@ -1159,9 +1162,9 @@ def test_api_cmd(r, ip, web_user, web_pass):
     else:
         r.fail("api/cmd heap", f"status={status} data={data}")
 
-    # unknown command returns output with "Unknown command"
+    # unknown command replies ok:false with "Unknown command" (ledger 2026-11-01)
     status, data = post("xyzzy_not_a_command")
-    if status == 200 and data.get("ok") and data.get("output") and "Unknown" in data["output"][0]:
+    if status == 200 and data.get("ok") is False and data.get("output") and "Unknown" in data["output"][0]:
         r.ok("api/cmd unknown command error")
     else:
         r.fail("api/cmd unknown command error", f"status={status} data={data}")
@@ -1240,6 +1243,13 @@ def test_lua(r):
         r.ok("lua.exec error handling")
     else:
         r.fail("lua.exec error handling", f"expected Error:, got: {lines}")
+
+    # string, table and math are the library tables, not their names
+    lines = sh.cmd("lua.exec return type(math)..type(table)..type(string)..table.concat({math.floor(2.7)})")
+    if lines and lines[0] == "tabletabletable2":
+        r.ok("lua stdlib globals", "math, table, string are tables")
+    else:
+        r.fail("lua stdlib globals", f"expected tabletabletable2, got: {lines}")
 
     # reload
     lines = sh.cmd("lua.reload", wait=4.0)
@@ -1321,6 +1331,22 @@ def test_manual_mqtt_publish(r):
         r.fail("mqtt publish (Lua)", "message not received at broker")
 
 
+def test_manual_live_alert(r):
+    # Sends a real Telegram message and app alert, so it runs only with --live-alert.
+    r.group("9b · Live alert (manual, opt-in)")
+    if r.is_skipped("live_alert"):
+        r.skip("live alert test (needs --live-alert)")
+        return
+    lines = r.sh.cmd('lua.exec if not Telegram.broadcast("thesada-fw bench test, please ignore", "bench_test") then error("broadcast refused") end')
+    if not lines or "OK" not in " ".join(lines):
+        r.fail("live alert (Lua)", f"broadcast refused: {lines}")
+        return
+    if r.ask("Did Telegram and the app alert history (code bench_test) both get it?"):
+        r.man("live alert (Lua)", "code bench_test")
+    else:
+        r.fail("live alert (Lua)", "not received")
+
+
 def test_manual_ota(r):
     key = "ota"
     r.group("10 · OTA")
@@ -1340,7 +1366,14 @@ def test_manual_ota(r):
         try:
             req = urllib.request.Request(manifest_url,
                                          headers={"User-Agent": "thesada-fw-test/1.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            # Python builds without a CA bundle (macOS PlatformIO) also get the system file.
+            ctx = ssl.create_default_context()
+            if os.path.exists("/etc/ssl/cert.pem"):
+                try:
+                    ctx.load_verify_locations(cafile="/etc/ssl/cert.pem")
+                except (ssl.SSLError, OSError):
+                    ctx = ssl.create_default_context()
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
                 body = resp.read()
                 if resp.status == 200:
                     try:
@@ -1428,7 +1461,7 @@ def test_manual_sd_log(r):
 
     sh = r.sh
 
-    lines     = sh.cmd("fs.ls /sd/", wait=2.0)
+    lines     = sh.cmd("fs.ls /sd/", wait=10.0)  # a card with hundreds of logs lists slowly
     log_files = [l for l in lines if ".csv" in l.lower()]
 
     if not log_files:
@@ -1437,9 +1470,27 @@ def test_manual_sd_log(r):
 
     r.ok("sd log files present", f"{len(log_files)} log file(s)")
 
-    # Inspect the last log file
-    last_name = log_files[-1].strip().split()[-1]
-    lines     = sh.cmd(f"fs.cat /sd/{last_name}", wait=3.0)
+    # Inspect the newest log small enough to read: serial fs.cat sends the whole file.
+    sized = []
+    for l in log_files:
+        parts = l.strip().split()
+        if parts and parts[0].isdigit():
+            sized.append((int(parts[0]), parts[-1]))
+    if not sized:
+        r.skip(f"sd log content ({log_files[-1].strip().split()[-1]}: no size in the listing)")
+        return
+    readable = [(size, name) for size, name in sized if size <= 64 * 1024]
+    if not readable:
+        r.skip("sd log content (every log is over 64 KiB, too big to read over serial)")
+        return
+    last_size, last_name = readable[-1]
+    last_path = last_name if last_name.startswith("/") else f"/sd/{last_name}"
+    # 115200 baud moves about 11.5 KB/s, so wait for the whole file with margin.
+    lines     = sh.cmd(f"fs.cat {last_path}", wait=max(3.0, last_size / 11520 * 1.5 + 1.0))
+    received  = sum(len(l) + 1 for l in lines)
+    if lines and received < last_size * 0.9:
+        r.warn("sd log content", f"{last_name}: read {received} of {last_size} bytes, output incomplete")
+        return
 
     if lines and len(lines) >= 2:
         print(f"\n  {DIM}Last 3 lines of {last_name}:{RESET}")
@@ -1527,25 +1578,20 @@ def test_manual_config_mqtt(r):
         r.skip("MQTT config set/push (skipped)")
         return
 
-    # Test config/set
-    lines = sh.cmd("config.get telegram.cooldown_s")
-    original = lines[0].strip('"') if lines else "300"
-    print(f"  {DIM}Current telegram.cooldown_s: {original}{RESET}")
-
-    if r.ask(f"Publish cli/config.set to change cooldown_s to 999?"):
+    # Test config/set on a scratch section, deleted afterwards
+    if r.ask("Publish cli/config.set to set test.mqtt_set to 999?"):
         r.man("config/set", f"Publish to {prefix}/cli/config.set with payload: "
-              'telegram.cooldown_s 999')
+              'test.mqtt_set 999')
         r.pause("Publish the message, then press Enter")
-        lines = sh.cmd("config.get telegram.cooldown_s")
+        lines = sh.cmd("config.get test.mqtt_set")
         val = lines[0].strip('"') if lines else ""
         if val == "999":
-            r.ok("config/set verify", f"cooldown_s changed to {val}")
+            r.ok("config/set verify", f"test.mqtt_set set to {val}")
         else:
             r.fail("config/set verify", f"expected 999, got {val}")
 
-        # Restore
-        sh.cmd(f'lua.exec Config.set("telegram.cooldown_s","{original}")')
-        r.ok("config/set restore", f"cooldown_s restored to {original}")
+        sh.cmd("config.del test")
+        r.ok("config/set cleanup", "test section deleted")
 
 
 def test_manual_fallback_ap(r):
@@ -1595,6 +1641,7 @@ Skippable groups (--skip a,b,c):
   sensors      Manual sensor reading confirmation
   ads1115      Load test (requires physical load + 70 s wait)
   mqtt         MQTT publish test (requires broker access to verify)
+  live_alert   Real Telegram + app alert, off unless --live-alert
   ota          OTA trigger (requires broker + manifest_url in config)
   websocket    Web terminal test (requires browser)
   sd           SD card log file check
@@ -1623,6 +1670,8 @@ Examples:
     parser.add_argument("--http",      metavar="HOST",
                         help="Use HTTP shell instead of serial (e.g. 192.0.2.10). "
                              "Requires --web-pass.")
+    parser.add_argument("--live-alert", action="store_true",
+                        help="Send one real Telegram + app alert (off by default, never in CI)")
     parser.add_argument("--skip",      default="",
                         help="Comma-separated manual test groups to skip")
     parser.add_argument("--web-user",  default="admin",
@@ -1644,6 +1693,8 @@ Examples:
                         help="Disable TLS for MQTT connection")
     args  = parser.parse_args()
     skips = [s.strip() for s in args.skip.split(",") if s.strip()]
+    if not args.live_alert:
+        skips.append("live_alert")
 
     # ── Shell ──
     if args.http:
@@ -1682,6 +1733,8 @@ Examples:
         device_ip = None  # resolved later via ifconfig
 
     r = Runner(sh, skips)
+    mqtt_failed = 0
+    interrupted = False
 
     try:
         if args.board:
@@ -1701,6 +1754,7 @@ Examples:
         test_manual_sensors(r)
         test_manual_ads1115(r)
         test_manual_mqtt_publish(r)
+        test_manual_live_alert(r)
         test_manual_ota(r)
         test_manual_websocket(r)
         test_manual_sd_log(r)
@@ -1721,16 +1775,17 @@ Examples:
             mqtt_r = Runner(mqtt_sh, skips)
             test_mqtt_cli(mqtt_r)
             mqtt_sh.close()
-            mqtt_r.summary()
+            mqtt_failed = mqtt_r.summary()
 
     except KeyboardInterrupt:
         print(f"\n{YELLOW}Interrupted.{RESET}")
+        interrupted = True
 
     finally:
         sh.close()
 
     failed = r.summary()
-    sys.exit(0 if failed == 0 else 1)
+    sys.exit(0 if failed == 0 and mqtt_failed == 0 and not interrupted else 1)
 
 
 if __name__ == "__main__":

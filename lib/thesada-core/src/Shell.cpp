@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "Shell.h"
+#include "config_scalar_policy.h"
 #include "Identity.h"
 #include "Config.h"
 #include "Secret.h"
+#include "SecretJson.h"
 #include "Console.h"
 #include "Log.h"
 #include "WiFiManager.h"
@@ -14,8 +16,15 @@
 #include "SensorRegistry.h"
 #include "Net.h"
 #include "path_safety_policy.h"
+#include "config_load_policy.h"
+#include "config_write_policy.h"
+#include "config_path_policy.h"
+#include "cell_ntp_policy.h"
 #include "ap_policy.h"
 #include "glob_policy.h"
+#include "http_fetch_policy.h"
+#include "cert_policy.h"
+#include "secret_heap.h"
 #include <thesada_config.h>
 #include <mbedtls/platform_util.h>
 #include <esp_ota_ops.h>
@@ -34,10 +43,14 @@
 #include <ArduinoJson.h>
 #include <sys/time.h>
 #include <algorithm>
+#include <atomic>
+#include <new>
 
 ShellEntry Shell::_commands[MAX_COMMANDS];
 int Shell::_commandCount = 0;
-char Shell::_parseBuf[SHELL_LINE_MAX];
+char Shell::_parseBuf[SHELL_NEST_MAX][SHELL_LINE_MAX];
+bool Shell::_failed[SHELL_NEST_MAX] = {};
+int  Shell::_depth = 0;
 
 Shell::FSMount Shell::_fsMounts[Shell::FS_MOUNTS_MAX] = {};
 int            Shell::_fsMountCount = 0;
@@ -56,18 +69,38 @@ static portMUX_TYPE _shellRingMux = portMUX_INITIALIZER_UNLOCKED;
 // Command registry
 // ---------------------------------------------------------------------------
 
-void Shell::registerCommand(const char* name, const char* help, ShellCommand handler) {
+void Shell::registerCommand(const char* name, const char* help, ShellCommand handler,
+                            int restFrom) {
   if (_commandCount >= MAX_COMMANDS) return;
-  _commands[_commandCount] = {name, help, handler};
+  _commands[_commandCount] = {name, help, handler, restFrom};
   _commandCount++;
 }
 
-void Shell::execute(const char* line, ShellOutput out) {
-  if (!line || strlen(line) == 0) return;
+void Shell::fail(ShellOutput out, const char* msg) {
+  if (_depth > 0) _failed[_depth - 1] = true;
+  out(msg);
+}
 
+ShellResult Shell::execute(const char* line, ShellOutput out) {
+  if (!line || strlen(line) == 0) return ShellResult::Ok;
+
+  int slot = shellParseSlot(_depth);
+  if (slot < 0) {
+    out("Shell busy (nested command) - not run");
+    return ShellResult::Failed;
+  }
+  char* buf = _parseBuf[slot];
   char* argv[SHELL_ARGS_MAX];
   int argc = 0;
-  ShellLine split = shellSplitLine(line, _parseBuf, sizeof(_parseBuf), argv, SHELL_ARGS_MAX, &argc);
+  // Name first, then split again the way that command takes its arguments.
+  ShellLine split = shellSplitLine(line, buf, SHELL_LINE_MAX, argv, SHELL_ARGS_MAX, &argc, 1);
+  const ShellEntry* cmd = nullptr;
+  for (int i = 0; split == ShellLine::Ok && argc > 0 && i < _commandCount; i++) {
+    if (strcasecmp(argv[0], _commands[i].name) == 0) { cmd = &_commands[i]; break; }
+  }
+  if (cmd) split = shellSplitLine(line, buf, SHELL_LINE_MAX, argv, SHELL_ARGS_MAX, &argc, cmd->restFrom);
+
+  bool handlerFailed = false;
   if (split != ShellLine::Ok) {
     char msg[80];
     if (split == ShellLine::TooLong) {
@@ -76,27 +109,22 @@ void Shell::execute(const char* line, ShellOutput out) {
       snprintf(msg, sizeof(msg), "Too many arguments (max %d words) - not run", SHELL_ARGS_MAX);
     }
     out(msg);
-    return;
+  } else if (cmd) {
+    _failed[slot] = false;
+    _depth++;
+    cmd->handler(argc, argv, out);
+    _depth--;
+    handlerFailed = _failed[slot];
+  } else if (argc > 0) {
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Unknown command: %s  (type 'help')", argv[0]);
+    out(msg);
   }
-  if (argc == 0) return;
-
-  for (int i = 0; i < _commandCount; i++) {
-    if (strcasecmp(argv[0], _commands[i].name) == 0) {
-      _commands[i].handler(argc, argv, out);
-      return;
-    }
-  }
-
-  char msg[128];
-  snprintf(msg, sizeof(msg), "Unknown command: %s  (type 'help')", argv[0]);
-  out(msg);
+  return shellDispatchResult(split, argc, cmd != nullptr, handlerFailed);
 }
 
-// Stage a command for main-loop execution via the deferred dispatcher.
-// Capture by-value of the sink intentional - the caller's lambda may
-// reference task-local state that goes out of scope before loop()
-// fires; std::function's small-buffer optimization keeps trivial
-// captures inline.
+// Stage a command for main-loop execution. sink arrives by value (the copy happens on
+// the caller's stack) and is moved into the slot, so nothing allocates under the lock.
 bool Shell::enqueue(const char* line, ShellOutput sink) {
   if (!line || strlen(line) == 0) return false;
   if (!shellFits(line, DEFERRED_LINE_LEN)) return false;
@@ -108,7 +136,7 @@ bool Shell::enqueue(const char* line, ShellOutput sink) {
     slot.mode = SlotMode::Shell;
     strncpy(slot.line, line, sizeof(slot.line) - 1);
     slot.line[sizeof(slot.line) - 1] = '\0';
-    slot.sink = sink;
+    slot.sink = std::move(sink);
     slot.fn = nullptr;
     slot.active = true;
     _ringTail = next;
@@ -187,9 +215,13 @@ void Shell::loop() {
   }
 }
 
+// Console owner, set by begin(). A worker task (net.http) skips the pump.
+static TaskHandle_t s_consoleTask = nullptr;
+
 // Single console - safe to share static buffer state because there is only
-// one host typing at the other end.
+// one host typing at the other end, and one task reading it.
 void Shell::pumpConsole() {
+  if (!shellPumpAllowed(xTaskGetCurrentTaskHandle(), s_consoleTask)) return;
   static char  buf[Shell::DEFERRED_LINE_LEN];
   static int   pos = 0;
   static bool  overflow = false;
@@ -205,17 +237,20 @@ void Shell::pumpConsole() {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
       buf[pos] = '\0';
-      if (overflow) {
+      bool wasOverflow = overflow;
+      bool hasLine = pos > 0;
+      // Reset before running: a line typed while it blocks starts at buf[0].
+      pos = 0;
+      overflow = false;
+      if (wasOverflow) {
         char msg[64];
         snprintf(msg, sizeof(msg), "Line too long (max %d bytes) - not run", (int)sizeof(buf) - 1);
         Console::reply(msg);
         Console::endReply();
-      } else if (pos > 0) {
+      } else if (hasLine) {
         Shell::execute(buf, [](const char* line) { Console::reply(line); });
         Console::endReply();
       }
-      pos = 0;
-      overflow = false;
     } else if (pos < (int)sizeof(buf) - 1) {
       buf[pos++] = c;
     } else {
@@ -351,6 +386,50 @@ fs::FS* Shell::resolveFS(const char* path) {
     }
   }
   return &LittleFS;
+}
+
+FsWrite Shell::writeChecked(fs::FS* fs, const char* path, bool append,
+                            const uint8_t* data, size_t len, size_t* onDisk) {
+  *onDisk = 0;
+  size_t before = 0;
+  if (append) {
+    File p = fs->open(path, FILE_READ);
+    if (p) { before = p.size(); p.close(); }
+  }
+  File f = fs->open(path, append ? FILE_APPEND : FILE_WRITE);
+  if (!f) return FS_WRITE_OPEN_FAILED;
+  size_t written = len ? f.write(data, len) : 0;
+  f.close();
+  size_t after = 0;
+  File chk = fs->open(path, FILE_READ);
+  if (chk) { after = chk.size(); chk.close(); }
+  *onDisk = after >= before ? after - before : 0;
+  return fileWriteLanded(written, *onDisk, len) ? FS_WRITE_OK : FS_WRITE_SHORT;
+}
+
+FsWrite Shell::writeRouted(fs::FS* fs, const char* path, bool append,
+                           const uint8_t* data, size_t len, size_t* onDisk) {
+  *onDisk = 0;
+  switch (fsWriteRoute(fs == &LittleFS, path, append)) {
+    case FS_ROUTE_PLAIN:
+      return writeChecked(fs, path, append, data, len, onDisk);
+    case FS_ROUTE_CONFIG_APPEND:
+      return FS_WRITE_CONFIG_APPEND;
+    case FS_ROUTE_CONFIG:
+      break;
+  }
+  if (!configBytesAreObject((const char*)data, len)) return FS_WRITE_CONFIG_NOT_OBJECT;
+  return Config::writeRaw((const char*)data, len, onDisk) ? FS_WRITE_OK : FS_WRITE_SHORT;
+}
+
+const char* Shell::fsWriteRefusal(FsWrite w) {
+  if (w == FS_WRITE_CONFIG_APPEND) {
+    return "Refused: /config.json takes no append, fs.write the whole file or use config.set";
+  }
+  if (w == FS_WRITE_CONFIG_NOT_OBJECT) {
+    return "Refused: /config.json must be one JSON object, nothing written";
+  }
+  return nullptr;
 }
 
 const char* Shell::stripPrefix(const char* path) {
@@ -491,6 +570,19 @@ static void cmd_cat(int argc, char** argv, ShellOutput out) {
   FS* fs = resolveFS(argv[1]);
   const char* fsPath = stripPrefix(argv[1]);
 
+  // The config file and any JSON object with secrets in it print masked.
+  String masked;
+  switch (Config::readFileMasked(*fs, fsPath, argv[1], masked)) {
+    case CFG_READ_REFUSE:
+      Shell::fail(out, "Refused: config file is not one JSON object or does not fit, not shown");
+      return;
+    case CFG_READ_MASKED:
+      out(masked.c_str());
+      return;
+    case CFG_READ_RAW:
+      break;
+  }
+
   File f = fs->open(fsPath, "r");
   if (!f) { out("File not found"); return; }
 
@@ -572,25 +664,62 @@ static void cmd_write(int argc, char** argv, ShellOutput out) {
 
   bool append = (strcasecmp(argv[0], "fs.append") == 0);
 
-  String content;
-  for (int i = 2; i < argc; i++) {
-    if (i > 2) content += " ";
-    content += argv[i];
+  String content(argv[2]);  // restFrom 2: the rest of the line as typed
+
+  size_t onDisk = 0;
+  const FsWrite w = Shell::writeRouted(fs, fsPath, append, (const uint8_t*)content.c_str(),
+                                       content.length(), &onDisk);
+  if (w == FS_WRITE_OPEN_FAILED) { Shell::fail(out, "Failed to open for writing"); return; }
+  if (const char* why = Shell::fsWriteRefusal(w)) { Shell::fail(out, why); return; }
+
+  char msg[160];
+  if (w == FS_WRITE_SHORT) {
+    snprintf(msg, sizeof(msg), "Write failed: %u of %u bytes landed in %s (filesystem full?)",
+             (unsigned)onDisk, (unsigned)content.length(), fsPath);
+    Shell::fail(out, msg);
+    return;
   }
-
-  File f = fs->open(fsPath, append ? "a" : "w");
-  if (!f) { out("Failed to open for writing"); return; }
-  f.print(content);
-  f.close();
-
-  char msg[64];
-  snprintf(msg, sizeof(msg), "%s %d bytes to %s",
-           append ? "Appended" : "Wrote", content.length(), fsPath);
+  snprintf(msg, sizeof(msg), "%s %u bytes to %s",
+           append ? "Appended" : "Wrote", (unsigned)onDisk, fsPath);
   out(msg);
+}
+
+// The editor's staged save onto /config.json: its bytes go through
+// Config::writeRaw, which keeps stored secrets, then the staged copy goes.
+// in: staged path after stripPrefix, dst as shown. out: false with the reason sent.
+static bool moveStagedConfig(const char* src, const char* dst, ShellOutput out) {
+  File f = LittleFS.open(src, "r");
+  if (!f || f.isDirectory()) {
+    if (f) f.close();
+    Shell::fail(out, "Failed to rename");
+    return false;
+  }
+  const size_t size = f.size();
+  char* buf = size > 0 && size <= CONFIG_FILE_MAX ? (char*)secretAlloc(size) : nullptr;
+  if (!buf) {
+    f.close();
+    Shell::fail(out, "Refused: staged config is empty, too large or out of heap, /config.json unchanged");
+    return false;
+  }
+  const size_t got = f.read((uint8_t*)buf, size);
+  f.close();
+  size_t onDisk = 0;
+  const bool ok = got == size && Config::writeRaw(buf, size, &onDisk);
+  secretFree(buf);
+  if (!ok) {
+    Shell::fail(out, "Failed to rename: staged config not written, /config.json unchanged");
+    return false;
+  }
+  char msg[128];
+  snprintf(msg, sizeof(msg), "Renamed %s -> %s%s", src, dst,
+           LittleFS.remove(src) ? "" : " (staged copy left)");
+  out(msg);
+  return true;
 }
 
 // Rename or move a file. Both paths must resolve to one filesystem; rename
 // cannot cross mounts, and the stripped dst would land on the src mount.
+// /config.json takes only the staged save, through the secret-keeping write.
 static void cmd_mv(int argc, char** argv, ShellOutput out) {
   if (argc < 3) { out("Usage: mv <src> <dst>"); return; }
   if (!Shell::pathSafe(argv[1]) || !Shell::pathSafe(argv[2])) {
@@ -604,6 +733,16 @@ static void cmd_mv(int argc, char** argv, ShellOutput out) {
   const char* src = stripPrefix(argv[1]);
   const char* dst = stripPrefix(argv[2]);
 
+  switch (fsMoveRoute(fs == &LittleFS, src, dst)) {
+    case FS_MOVE_CONFIG_REFUSED:
+      Shell::fail(out, "Refused: /config.json takes only config.set, fs.write or the staged /config.json.new");
+      return;
+    case FS_MOVE_CONFIG_STAGED:
+      moveStagedConfig(src, dst, out);
+      return;
+    case FS_MOVE_PLAIN:
+      break;
+  }
   if (fs->rename(src, dst)) {
     char msg[128];
     snprintf(msg, sizeof(msg), "Renamed %s -> %s", src, dst);
@@ -723,20 +862,6 @@ static void cmd_format(int argc, char** argv, ShellOutput out) {
 // Config commands
 // ---------------------------------------------------------------------------
 
-// Parse `tok` as an unsigned integer for use as a JsonArray index.
-// in:  tok    candidate token string
-// out: bool   true if every char is a digit (and at least one digit), idx filled
-static bool parseArrayIndex(const char* tok, size_t& idx) {
-  if (!tok || !*tok) return false;
-  size_t v = 0;
-  for (const char* p = tok; *p; ++p) {
-    if (*p < '0' || *p > '9') return false;
-    v = v * 10 + (size_t)(*p - '0');
-  }
-  idx = v;
-  return true;
-}
-
 // Read a config value by dot-notation key. Supports array indices
 // (e.g. wifi.networks.0.ssid - "0" descends into the JsonArray returned
 // by wifi.networks).
@@ -748,13 +873,14 @@ static void cmd_config_get(int argc, char** argv, ShellOutput out) {
 
   char key[128];
   if (!shellFits(argv[1], sizeof(key))) { out("Key too long (max 127 bytes)"); return; }
+  if (!configKeyValid(argv[1])) { out("Invalid key (empty segment)"); return; }
   strncpy(key, argv[1], sizeof(key) - 1);
   key[sizeof(key) - 1] = '\0';
 
   char* token = strtok(key, ".");
   while (token) {
     size_t idx;
-    if (current.is<JsonArray>() && parseArrayIndex(token, idx)) {
+    if (current.is<JsonArray>() && configArrayIndex(token, idx)) {
       JsonArray arr = current.as<JsonArray>();
       if (idx >= arr.size()) { out("Array index out of range"); return; }
       current = arr[idx];
@@ -769,306 +895,75 @@ static void cmd_config_get(int argc, char** argv, ShellOutput out) {
 
   if (current.isNull()) {
     out("null");
-  } else {
-    String val;
-    serializeJsonPretty(current, val);
-    out(val.c_str());
+    return;
   }
+  // Secret fields read as their marker (config_mask_policy.h).
+  String val;
+  if (!configMaskedNodeText(argv[1], current, val, true, secretJsonAllocator())) {
+    Shell::fail(out, "Config read out of memory");
+    return;
+  }
+  out(val.c_str());
 }
 
-// Persist a document to /config.json via tmp + rename - same policy as
-// Config::save(), so a short write (fs full) never destroys the last
-// good config. Reports failure to the shell caller.
-static bool shellConfigWrite(JsonVariantConst src, ShellOutput out, size_t* bytes = nullptr) {
-  File wf = LittleFS.open("/config.json.tmp", "w");
-  if (!wf) { out("Failed to write config.json"); return false; }
-  size_t written  = serializeJsonPretty(src, wf);
-  size_t expected = measureJsonPretty(src);
-  wf.close();
-  if (written < expected ||
-      !LittleFS.rename("/config.json.tmp", "/config.json")) {
-    LittleFS.remove("/config.json.tmp");
-    out("Failed to write config.json (fs full?)");
-    return false;
+// Set a dotted key (value) or delete it (null) through Config::edit, then reply.
+// A refused path writes nothing. A new prefix waits for a restart.
+static void shellConfigApply(const char* key, const char* value, ShellOutput out) {
+  if (!configKeyValid(key)) { Shell::fail(out, "Invalid key (empty segment)"); return; }
+  char msg[200];
+  bool refused = false;
+  const bool saved = Config::edit([&](JsonObject root) {
+    refused = !configPathApply(root, key, value, msg, sizeof(msg));
+    return !refused;
+  }, configKeyIsPrefix(key));
+  if (refused) {
+    Shell::fail(out, msg);
+    return;
   }
-  if (bytes) *bytes = written;
-  return true;
-}
-
-struct BootPrefixKeep {
-  char prefix[Config::TOPIC_PREFIX_CAP];
-  bool keep;
-};
-
-// Remember a boot prefix held over the live doc. A shell write reloads the
-// file, and that reload would otherwise publish the pushed prefix immediately.
-// in: none. out: false when a held prefix does not fit and the command must stop.
-static bool captureBootPrefix(BootPrefixKeep* kept, ShellOutput out) {
-  kept->keep = false;
-  kept->prefix[0] = '\0';
-  if (!Config::topicPrefixHeld()) return true;
-  if (!Config::copyBootTopicPrefix(kept->prefix, sizeof(kept->prefix))) {
-    out("Refused: boot topic prefix does not fit");
-    return false;
+  if (!saved) {
+    Shell::fail(out, "Failed to write config.json (fs full or file unreadable?)");
+    return;
   }
-  kept->keep = true;
-  return true;
-}
-
-// in: captured prefix, the key this command wrote. out: none.
-static void restoreBootPrefix(const BootPrefixKeep* kept, const char* key) {
-  if (!kept->keep) return;
-  if (key && (strcmp(key, "mqtt") == 0 || strcmp(key, "mqtt.topic_prefix") == 0)) return;
-  if (!Config::holdTopicPrefix(kept->prefix)) {
-    Log::error("Shell", "config.boot_prefix_restore_failed");
-  }
+  configSavedReply(msg, sizeof(msg), key, value, Config::topicPrefixPending());
+  out(msg);
 }
 
 static void cmd_config_set(int argc, char** argv, ShellOutput out) {
-  if (argc < 3) { out("Usage: config.set <key> <value>  (then config.save to persist)"); return; }
-  char key[128];
-  if (!shellFits(argv[1], sizeof(key))) { out("Key too long (max 127 bytes)"); return; }
-  BootPrefixKeep kept;
-  if (!captureBootPrefix(&kept, out)) return;
-
-  String value;
-  for (int i = 2; i < argc; i++) {
-    if (i > 2) value += " ";
-    value += argv[i];
-  }
+  if (argc < 3) { Shell::fail(out, "Usage: config.set <key> <value>"); return; }
+  if (!shellFits(argv[1], CONFIG_KEY_MAX)) { Shell::fail(out, "Key too long (max 127 bytes)"); return; }
+  // Registered with restFrom 2: argv[2] is the value as typed.
+  String value(argv[2]);
   // Strip surrounding double quotes (MQTT CLI payloads often arrive quoted)
   if (value.length() >= 2 && value.charAt(0) == '"' && value.charAt(value.length() - 1) == '"') {
-    value = value.substring(1, value.length() - 1);
+    value.remove(value.length() - 1);
+    value.remove(0, 1);
   }
-
-  if (!LittleFS.exists("/config.json")) { out("config.json not found"); return; }
-  File f = LittleFS.open("/config.json", "r");
-  if (!f) { out("Failed to read config.json"); return; }
-  String json = f.readString();
-  f.close();
-
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, json);
-  if (err) { out("JSON parse error in config.json"); return; }
-
-  strncpy(key, argv[1], sizeof(key) - 1);
-  key[sizeof(key) - 1] = '\0';
-
-  char* lastDot = strrchr(key, '.');
-  if (lastDot) {
-    *lastDot = '\0';
-    const char* finalKey = lastDot + 1;
-    String parentPath(key);  // parent path with dots intact, for error messages
-
-    JsonVariant parent = doc.as<JsonVariant>();
-    String walked;           // dotted path resolved so far
-    char* saveptr = nullptr;
-    char* token = strtok_r(key, ".", &saveptr);
-    while (token) {
-      // Peek the next segment so an auto-created intermediate knows
-      // whether the user actually wants an array at this level.
-      char* nextToken = strtok_r(nullptr, ".", &saveptr);
-
-      size_t idx;
-      if (parent.is<JsonArray>() && parseArrayIndex(token, idx)) {
-        JsonArray arr = parent.as<JsonArray>();
-        if (idx >= arr.size()) { out("Parent array index out of range"); return; }
-        parent = arr[idx];
-      } else if (parent.is<JsonObject>()) {
-        // Auto-create missing intermediate objects so config.set can land
-        // a value into a section that does not exist yet (e.g. enabling a
-        // brand-new optional module like gnss). Never auto-creates arrays:
-        // if the next segment is a numeric index the user wants an array
-        // here, so refuse with a clear instruction rather than silently
-        // creating an object the index cannot address.
-        if (parent[token].isNull()) {
-          size_t dummy;
-          if (nextToken && parseArrayIndex(nextToken, dummy)) {
-            String path = walked.length() ? walked + "." + token : String(token);
-            char msg[160];
-            snprintf(msg, sizeof(msg),
-                     "Parent path '%s' doesn't exist. Run config.set %s [] first.",
-                     path.c_str(), path.c_str());
-            out(msg);
-            return;
-          }
-          parent[token].to<JsonObject>();
-        }
-        parent = parent[token];
-      } else {
-        out("Parent key not found");
-        return;
-      }
-      walked = walked.length() ? walked + "." + token : String(token);
-      token = nextToken;
-    }
-
-    // Resolve a writable target for the final key. JsonObject member
-    // assignment + JsonArray index assignment use different ArduinoJson
-    // APIs; capture the destination as a JsonVariant once so the value
-    // detection below is target-agnostic.
-    //
-    // Append semantics on arrays: if the terminal index equals
-    // arr.size() the slot is appended via arr.add<JsonVariant>() so
-    // numeric-suffix config.set paths naturally extend an array. Strict
-    // idx > size rejection still prevents a sparse array from ever
-    // forming.
-    // A numeric final segment only addresses an array. If the parent
-    // resolved to an object the array does not exist yet - refuse rather
-    // than creating a string-keyed member that merely looks like an index.
-    JsonVariant target;
-    size_t finalIdx;
-    if (parseArrayIndex(finalKey, finalIdx) && !parent.is<JsonArray>()) {
-      char msg[160];
-      snprintf(msg, sizeof(msg),
-               "Parent path '%s' is not an array. Run config.set %s [] first.",
-               parentPath.c_str(), parentPath.c_str());
-      out(msg);
-      return;
-    }
-    if (parent.is<JsonArray>() && parseArrayIndex(finalKey, finalIdx)) {
-      JsonArray arr = parent.as<JsonArray>();
-      if (finalIdx > arr.size()) {
-        out("Array index out of range (would leave hole)");
-        return;
-      }
-      if (finalIdx == arr.size()) {
-        target = arr.add<JsonVariant>();
-      } else {
-        target = arr[finalIdx];
-      }
-    } else if (parent.is<JsonObject>()) {
-      // ArduinoJson's operator[] yields an *unbound* variant for a key
-      // that does not exist yet; capturing that into `target` and
-      // calling target.set() later writes into nothing. That is why
-      // config.set could update an existing key but silently failed to
-      // create a new one. Materialise the member first (mirrors the
-      // intermediate-object auto-create above) so the captured handle
-      // binds to a real document slot. The placeholder object is
-      // overwritten by the value assignment below.
-      if (parent[finalKey].isNull()) {
-        parent[finalKey].to<JsonObject>();
-      }
-      target = parent[finalKey];
-    } else {
-      out("Parent is not an object or array");
-      return;
-    }
-
-    if (value == "--delete") {
-      if (parent.is<JsonObject>()) {
-        parent[finalKey].clear();
-        parent.as<JsonObject>().remove(finalKey);
-      } else {
-        // For arrays we set the slot to null; remove() would shift
-        // indices and silently break sibling references.
-        target.clear();
-      }
-      goto save;
-    }
-
-    // Assign as a Variant so config.set wifi.networks [{"ssid":"..."}] stores
-    // a real JsonArray, not a stringified blob (prior fallthrough behaviour).
-    {
-      String trimmed = value;
-      trimmed.trim();
-      if (trimmed.length() > 0 &&
-          (trimmed.charAt(0) == '{' || trimmed.charAt(0) == '[')) {
-        JsonDocument lit;
-        DeserializationError lerr = deserializeJson(lit, trimmed);
-        if (!lerr) {
-          target.set(lit.as<JsonVariant>());
-          goto save;
-        }
-        // Parse failed - fall through to scalar detection. The user
-        // probably typed a string that just happens to start with `{`.
-      }
-    }
-
-    if (value == "true") target.set(true);
-    else if (value == "false") target.set(false);
-    else {
-      char* end;
-      long lv = strtol(value.c_str(), &end, 10);
-      if (*end == '\0' && value.length() > 0) {
-        target.set(lv);
-      } else {
-        float fv = strtof(value.c_str(), &end);
-        if (*end == '\0' && value.length() > 0) {
-          target.set(fv);
-        } else {
-          target.set(value);
-        }
-      }
-    }
-  } else {
-    // Top-level key.
-    out("Cannot set top-level keys directly (use section.key format)");
-    return;
-  }
-
-  save:
-  if (!shellConfigWrite(doc.as<JsonVariantConst>(), out)) return;
-
-  // Does NOT trigger MQTT reconnect - that requires config.reload.
-  Config::load();
-  restoreBootPrefix(&kept, argv[1]);
-
-  char msg[128];
-  if (value == "--delete") {
-    snprintf(msg, sizeof(msg), "Deleted %s (saved)", argv[1]);
-  } else {
-    snprintf(msg, sizeof(msg), "Set %s = %s (saved - run config.reload to apply network changes)", argv[1], value.c_str());
-  }
-  out(msg);
-}
-
-// For programmatic changes to Config::get() that bypass config.set.
-static void cmd_config_save(int argc, char** argv, ShellOutput out) {
-  JsonDocument dst;
-  if (!Config::copyDiskDoc(dst)) {
-    out("Failed to snapshot config");
-    return;
-  }
-  size_t bytes = 0;
-  if (!shellConfigWrite(dst.as<JsonVariantConst>(), out, &bytes)) return;
-  char msg[64];
-  snprintf(msg, sizeof(msg), "Config saved to /config.json (%d bytes)", (int)bytes);
-  out(msg);
-}
-
-// Delete a config key. Dotted keys go through the config.set --delete
-// path (object member removed; array slot nulled so sibling indices stay
-// stable). A bare top-level key removes the whole section - the cleanup
-// for a key whose type changed between releases (e.g. bool -> object):
-// delete the stale node, then config.set recreates it with the new shape.
-static void cmd_config_del(int argc, char** argv, ShellOutput out) {
-  if (argc < 2) { out("Usage: config.del <key>  (dot notation; bare section name deletes the section)"); return; }
-  BootPrefixKeep kept;
-  if (!captureBootPrefix(&kept, out)) return;
-
-  if (!strchr(argv[1], '.')) {
-    if (!LittleFS.exists("/config.json")) { out("config.json not found"); return; }
-    File f = LittleFS.open("/config.json", "r");
-    if (!f) { out("Failed to read config.json"); return; }
-    String json = f.readString();
-    f.close();
-    JsonDocument doc;
-    if (deserializeJson(doc, json)) { out("JSON parse error in config.json"); return; }
-    JsonObject root = doc.as<JsonObject>();
-    if (root[argv[1]].isNull()) { out("Key not found"); return; }
-    root.remove(argv[1]);
-    if (!shellConfigWrite(doc.as<JsonVariantConst>(), out)) return;
-    Config::load();
-    restoreBootPrefix(&kept, argv[1]);
-    char msg[128];
-    snprintf(msg, sizeof(msg), "Deleted %s (saved)", argv[1]);
+  // A read mask sent back is not a value: the stored secret stays.
+  if (configSetKeepsSecret(argv[1], value.c_str())) {
+    char msg[160];
+    snprintf(msg, sizeof(msg), "Kept %s (read mask, stored secret unchanged)", argv[1]);
     out(msg);
     return;
   }
+  shellConfigApply(argv[1], value == "--delete" ? nullptr : value.c_str(), out);
+}
 
-  char* delArgv[3] = { argv[0], argv[1], (char*)"--delete" };
-  cmd_config_set(3, delArgv, out);
+// Write /config.json back through Config::edit and make it live.
+static void cmd_config_save(int argc, char** argv, ShellOutput out) {
+  if (!Config::edit([](JsonObject) { return true; })) {
+    Shell::fail(out, "Failed to write config.json (fs full or file unreadable?)");
+    return;
+  }
+  out("Config saved to /config.json");
+}
+
+// Delete a config key. A dotted key removes the member, or nulls an array
+// slot so sibling indices stay. A bare top-level key removes the whole
+// section, the cleanup for a key whose type changed between releases.
+static void cmd_config_del(int argc, char** argv, ShellOutput out) {
+  if (argc < 2) { Shell::fail(out, "Usage: config.del <key>  (dot notation; bare section name deletes the section)"); return; }
+  if (!shellFits(argv[1], CONFIG_KEY_MAX)) { Shell::fail(out, "Key too long (max 127 bytes)"); return; }
+  shellConfigApply(argv[1], nullptr, out);
 }
 
 // Reload config from flash. If network-affecting keys changed, reinit MQTT
@@ -1090,7 +985,10 @@ static void cmd_config_reload(int argc, char** argv, ShellOutput out) {
   oldOtaTopic[sizeof(oldOtaTopic) - 1] = '\0';
   oldPort = oldCfg["mqtt"]["port"] | 8883;
 
-  Config::load();
+  if (!Config::load()) {
+    Shell::fail(out, "Reload failed: /config.json unreadable, missing or not one JSON object. Previous config kept");
+    return;
+  }
   JsonObject cfg = Config::get();
   const char* name = cfg["device"]["name"] | "?";
 
@@ -1124,7 +1022,10 @@ static void cmd_config_reload(int argc, char** argv, ShellOutput out) {
 static void cmd_config_dump(int argc, char** argv, ShellOutput out) {
   JsonObject cfg = Config::get();
   String json;
-  serializeJsonPretty(cfg, json);
+  if (!configMaskedNodeText("", cfg, json, true, secretJsonAllocator())) {
+    Shell::fail(out, "Config read out of memory");
+    return;
+  }
   out(json.c_str());
 }
 
@@ -1269,7 +1170,9 @@ static void cmd_ntp(int argc, char** argv, ShellOutput out) {
     if (epoch > 1700000000UL) {
       struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
       settimeofday(&tv, nullptr);
-      struct tm* t = gmtime(&epoch);
+      struct tm tmv;
+      gmtime_r(&epoch, &tmv);
+      struct tm* t = &tmv;
       char ts[32];
       strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", t);
       snprintf(line, sizeof(line), "Time set to %s (epoch %ld)", ts, (long)epoch);
@@ -1281,30 +1184,38 @@ static void cmd_ntp(int argc, char** argv, ShellOutput out) {
   }
 
   // ntp sync - force a sync now. Over WiFi the SNTP client runs in the
-  // background already; over cellular nothing syncs the clock unless the
-  // modem is asked (AT+CNTP), so this is the recovery path for the
-  // "WiFi never associated, clock stuck at 1970" case.
+  // background already. Over cellular CellularModule syncs on a backoff
+  // schedule, and this asks the modem (AT+CNTP) right away.
   if (argc >= 2 && strcmp(argv[1], "sync") == 0) {
-    JsonObject  scfg   = Config::get();
-    const char* server = scfg["ntp"]["server"] | "pool.ntp.org";
+    JsonObject scfg = Config::get();
     if (WiFiManager::connected()) {
       out("WiFi up - SNTP client already syncing in background");
       return;
     }
     const Net::CellularProvider* cell = Net::cellular();
     if (cell && cell->linkUp && cell->linkUp() && cell->ntpSync) {
-      uint32_t timeoutMs = (scfg["ntp"]["cell_timeout_s"] | 60) * 1000UL;
+      uint32_t    timeoutMs = (scfg["ntp"]["cell_timeout_s"] | 60) * 1000UL;
+      const char* cand[CELL_NTP_PER_TRY];
+      uint8_t     n = cellNtpCandidates(scfg["ntp"]["server"] | "pool.ntp.org",
+                                        scfg["ntp"]["server2"] | "time.cloudflare.com", cand);
+      // Copies: ntpSync pumps the console, and a config.set there reloads the doc.
+      char host[CELL_NTP_PER_TRY][CELL_NTP_HOST_MAX + 1];
+      for (uint8_t i = 0; i < n; i++) snprintf(host[i], sizeof(host[i]), "%s", cand[i]);
       out("Syncing clock via cellular NTP...");
-      if (cell->ntpSync(server, timeoutMs)) {
+      for (uint8_t i = 0; i < n; i++) {
+        if (!cell->ntpSync(host[i], timeoutMs)) continue;
         time_t now = time(nullptr);
-        struct tm* t = gmtime(&now);
+        struct tm tmv;
+        gmtime_r(&now, &tmv);
+        struct tm* t = &tmv;
         char ts[32];
         strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", t);
         snprintf(line, sizeof(line), "Synced via cellular - UTC: %s", ts);
         out(line);
-      } else {
-        out("Cellular NTP sync failed");
+        out(host[i]);
+        return;
       }
+      out("Cellular NTP sync failed");
       return;
     }
     out("No transport up - cannot sync");
@@ -1312,7 +1223,9 @@ static void cmd_ntp(int argc, char** argv, ShellOutput out) {
   }
 
   time_t now = time(nullptr);
-  struct tm* t = gmtime(&now);
+  struct tm tmv;
+  gmtime_r(&now, &tmv);
+  struct tm* t = &tmv;
 
   if (now < 1700000000) {
     out("NTP: not synced (time is before 2023)");
@@ -1345,12 +1258,9 @@ static void cmd_mqtt(int argc, char** argv, ShellOutput out) {
   snprintf(line, sizeof(line), "  broker: %s:%d  prefix: %s", broker, port, prefix);
   out(line);
 
-  // Surface which transport carries the session - cellular takes over
-  // when WiFi is down (see CellularModule's STANDBY/ACTIVE policy), so a
-  // debug session sees the carrier without grepping serial logs.
-  const Net::CellularProvider* cell = Net::cellular();
-  bool viaCellular = cell && cell->linkUp && cell->linkUp() && !WiFiManager::connected();
-  snprintf(line, sizeof(line), "  transport: %s", viaCellular ? "cellular" : "WiFi");
+  // Which transport carries the session - cellular takes over when WiFi
+  // is down (see CellularModule's STANDBY/ACTIVE policy).
+  snprintf(line, sizeof(line), "  transport: %s", MQTTClient::transportName());
   out(line);
 
   snprintf(line, sizeof(line), "  subs: %u/%u",
@@ -1381,30 +1291,34 @@ static void cmd_mqtt(int argc, char** argv, ShellOutput out) {
   }
 }
 
-// net.http body-preview cap: the first N bytes of the response body are
-// echoed back to the shell; the rest is counted but discarded.
-static const size_t HTTP_PREVIEW_CAP = 1024;
-static const size_t HTTP_URL_MAX     = 256;
+// net.http URL cap. Preview size and the read and wait bounds are in
+// http_fetch_policy.h.
+static const size_t HTTP_URL_MAX = 256;
 
-// One net.http WiFi fetch. Heap-allocated by cmd_http and handed to
-// httpFetchTask; cmd_http owns it and frees it once `done` is observed.
+// One net.http fetch, heap-allocated by cmd_http and run by httpFetchTask.
+// cmd_http frees it, unless httpJobAbandon handed it to the task.
 struct HttpFetchJob {
   // in
   char          url[HTTP_URL_MAX];
   bool          https;
   bool          insecure;
+  // in, cellular only: provider GET and the split URL
+  decltype(Net::CellularProvider::httpsGet) cellGet;
+  char          host[128];
+  const char*   path;       // into url, or the literal "/"
+  uint16_t      port;
+  bool          pinned;     // holds an MQTT reconnect pin the task drops when it ends
   // out
-  char          preview[HTTP_PREVIEW_CAP];
-  size_t        previewLen;
-  size_t        totalLen;
+  HttpPreview   body;
   int           status;
   bool          ok;
   const char*   err;        // static message, nullptr on success
-  volatile bool done;       // task sets this last; cmd_http polls it
+  std::atomic<uint32_t> state;  // HTTP_JOB_*, the task's last write
+  int           tlsErr;     // WiFi mbedtls error of a failed GET, 0 if none
 };
 
-// The fetch itself. Every local, the CA PEM included, lives until return.
-// in:  job. out: job fields filled except done.
+// The WiFi fetch. Every local, the CA PEM included, lives until return.
+// in:  job. out: job fields filled except state.
 static void httpFetchRun(HttpFetchJob* job) {
   String           pem;  // setCACert keeps the pointer, not a copy
   WiFiClientSecure tls;
@@ -1438,56 +1352,77 @@ static void httpFetchRun(HttpFetchJob* job) {
   http.setTimeout(10000);
 
   job->status = http.GET();
+  if (job->status < 0 && job->https) {
+    char eb[64];
+    job->tlsErr = tls.lastError(eb, sizeof(eb));
+  }
   if (job->status > 0) {
     job->ok = true;
-    int         len      = http.getSize();  // -1 when chunked / unknown
-    WiFiClient* s        = http.getStreamPtr();
+    int         len = http.getSize();  // -1 when chunked / unknown
+    WiFiClient* s   = http.getStreamPtr();
     uint8_t     chunk[512];
-    uint32_t    deadline = millis() + 20000UL;
-    while (millis() < deadline) {
+    uint32_t    t0  = millis();
+    while (millis() - t0 < HTTP_WIFI_READ_MS) {
       if (!s->connected() && !s->available()) break;
       int avail = s->available();
       if (avail <= 0) { delay(10); continue; }
       int n = s->readBytes(chunk, std::min((size_t)avail, sizeof(chunk)));
       if (n <= 0) break;
-      job->totalLen += n;
-      if (job->previewLen < HTTP_PREVIEW_CAP) {
-        size_t copy = std::min((size_t)n, HTTP_PREVIEW_CAP - job->previewLen);
-        memcpy(job->preview + job->previewLen, chunk, copy);
-        job->previewLen += copy;
-      }
-      if (len > 0 && (int)job->totalLen >= len) break;
+      httpPreviewKeep(job->body, chunk, n);
+      if (len > 0 && (int)job->body.total >= len) break;
     }
   }
   http.end();
 }
 
-// Run the WiFi HTTPS fetch on a dedicated deep-stack task.
-//
-// Why a task: the mbedtls TLS handshake needs ~6 KB of stack, and
-// net.http executes deep in the deferred-CLI call chain on the main-loop
-// task (loop -> Shell::loop -> deferred drain -> execute -> cmd_http).
-// Doing the handshake there overflows the 8 KB loop-task stack - the
-// board resets silently (panic out the other UART, USB-CDC dead). This
-// task gets its own 12 KB stack; cmd_http blocks on job->done.
-//
-// The task is not subscribed to the task watchdog, so it does not feed
-// it - the main-loop task keeps feeding its own wdt from cmd_http's wait
-// loop. Every exit path sets job->done and self-deletes.
-// in:  arg - HttpFetchJob* (owned by cmd_http). out: job fields filled.
+// The cellular fetch: TlsClient on modem socket slot 1, same CA rule as WiFi.
+// in:  job. out: job fields filled except state.
+static void httpFetchRunCellular(HttpFetchJob* job) {
+  String pem;  // TlsClient keeps the pointer for the whole GET
+  File ca = LittleFS.open("/ca.crt", "r");
+  if (ca) { pem = ca.readString(); ca.close(); }
+  if (pem.isEmpty() && !job->insecure) {
+    job->err = "no /ca.crt on flash - pass --insecure to skip verification";
+    return;
+  }
+  auto sink = [job](const uint8_t* buf, size_t len) -> bool {
+    httpPreviewKeep(job->body, buf, len);
+    return true;
+  };
+  bool got = job->cellGet(job->host, job->path, job->port, pem.isEmpty() ? nullptr : pem.c_str(),
+                          sink, &job->status, HTTP_CELL_READ_MS, &job->body.cut);
+  job->ok = got || (job->body.cut && job->status > 0);
+}
+
+// One net.http fetch on its own 12 KB stack: a TLS handshake deep in the CLI
+// chain overflows the 8 KB loop task, and the board resets silently.
+// in:  arg - HttpFetchJob*. out: job filled, freed here once abandoned.
 static void httpFetchTask(void* arg) {
   HttpFetchJob* job = static_cast<HttpFetchJob*>(arg);
-  httpFetchRun(job);
-  job->done = true;
+  if (job->cellGet) {
+    // The modem socket and TlsClient feed the watchdog, and IDF logs every
+    // feed from a task it does not watch.
+    const bool watched = esp_task_wdt_add(nullptr) == ESP_OK;
+    httpFetchRunCellular(job);
+    if (watched) esp_task_wdt_delete(nullptr);
+  } else {
+    httpFetchRun(job);
+  }
+  Log::kvf("Shell", "shell.http_done via=%s status=%d tls_err=%d body=%u cut=%d stack_free=%u",
+           job->cellGet ? "cellular" : "wifi", job->status, job->tlsErr, (unsigned)job->body.total,
+           (int)job->body.cut, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+  if (job->pinned) MQTTClient::unpinTlsHold();
+  if (httpJobFinish(job->state)) delete job;
   vTaskDelete(nullptr);
 }
 
 // HTTPS GET via whichever transport is up - the single HTTPS-GET shell
-// command, auto-routed. WiFi -> a deep-stack task running HTTPClient +
-// WiFiClientSecure (CA loaded from /ca.crt). WiFi down + cellular up ->
-// the modem SSL socket via the Net cellular provider (no ESP-side
-// mbedtls, so it runs inline). Output: status code, body length, first
-// <=1 KB preview. HTTPS-only by default; plain HTTP needs --insecure.
+// command, auto-routed. Both fetches run on the net.http task: WiFi as
+// HTTPClient + WiFiClientSecure (CA from /ca.crt), cellular as the Net
+// provider's httpsGet. The wait feeds the loop watchdog, pumps the console,
+// ticks MQTT, and gives the loop back at the transport's ceiling.
+// Output: status code, body length, first <=1 KB preview. HTTPS-only by
+// default, plain HTTP needs --insecure.
 //
 // in:  argv - optional "--insecure", then the URL
 // out: status / length / preview lines via the shell sink
@@ -1531,98 +1466,107 @@ static void cmd_http(int argc, char** argv, ShellOutput out) {
            https ? "https" : "http", host, port, path);
   out(msg);
 
-  HttpFetchJob* job = static_cast<HttpFetchJob*>(calloc(1, sizeof(HttpFetchJob)));
+  HttpFetchJob* job = new (std::nothrow) HttpFetchJob();
   if (!job) { out("net.http: out of memory"); return; }
   strncpy(job->url, url, sizeof(job->url) - 1);
   job->https    = https;
   job->insecure = insecure;
 
-  const char* via = "?";
-
-  if (WiFiManager::connected()) {
-    via = "WiFi";
-    // The WiFi HTTPS path runs on a dedicated deep-stack task (see
-    // httpFetchTask); cmd_http blocks here feeding the main-task
-    // watchdog and pumping the console while it waits.
-    if (xTaskCreate(httpFetchTask, "net.http", 12288, job,
-                    tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
-      out("net.http: failed to spawn fetch task");
-      free(job);
-      return;
-    }
-    // The task's own bounds are ~8 s connect + 8 s handshake + 20 s read;
-    // 60 s is a comfortable ceiling. job is freed only after done is
-    // observed, so the task cannot write into freed memory on this path.
-    uint32_t deadline = millis() + 60000UL;
-    while (!job->done && millis() < deadline) {
-      esp_task_wdt_reset();
-      Shell::pumpConsole();
-      delay(20);
-    }
-    if (!job->done) {
-      // Unreachable given the task's internal bounds. Leak the job rather
-      // than free it - the task may still hold the pointer.
-      out("net.http: fetch task overran - leaking job buffer");
-      return;
-    }
-  } else {
+  const char* via    = "WiFi";
+  uint32_t    waitMs = HTTP_WIFI_WAIT_MS;
+  if (!WiFiManager::connected()) {
     const Net::CellularProvider* cell = Net::cellular();
-    if (cell && cell->linkUp && cell->linkUp() && cell->httpsGet) {
-      if (!https) { out("cellular path is HTTPS only"); free(job); return; }
-      via = "cellular";
-      // No ESP-side mbedtls on the cellular path (the modem does TLS), so
-      // this runs inline on the main-loop task without the stack hit.
-      auto sink = [&](const uint8_t* buf, size_t len) -> bool {
-        job->totalLen += len;
-        if (job->previewLen < HTTP_PREVIEW_CAP) {
-          size_t copy = std::min(len, HTTP_PREVIEW_CAP - job->previewLen);
-          memcpy(job->preview + job->previewLen, buf, copy);
-          job->previewLen += copy;
-        }
-        return true;
-      };
-      job->ok = cell->httpsGet(host, path, port, sink, &job->status);
-    } else {
+    if (!cell || !cell->linkUp || !cell->linkUp() || !cell->httpsGet) {
       out("no transport up");
-      free(job);
+      delete job;
       return;
     }
+    if (!https) { out("cellular path is HTTPS only"); delete job; return; }
+    via          = "cellular";
+    waitMs       = HTTP_CELL_WAIT_MS;
+    job->cellGet = cell->httpsGet;
+    strncpy(job->host, host, sizeof(job->host) - 1);
+    job->path    = slash ? job->url + (slash - url) : "/";
+    job->port    = port;
+  }
+
+  const bool yielded = MQTTClient::yieldTlsHeap("net.http", waitMs);
+  // The pin holds the reconnect until the task ends, past an abandoned wait too.
+  job->pinned = yielded;
+  if (yielded) MQTTClient::pinTlsHold();
+  if (xTaskCreate(httpFetchTask, "net.http", 12288, job,
+                  tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
+    if (yielded) MQTTClient::unpinTlsHold();
+    if (yielded) MQTTClient::releaseTlsHeap();
+    out("net.http: failed to spawn fetch task");
+    delete job;
+    return;
+  }
+  // MQTT is ticked once a second, so its keepalive pings go out on time.
+  const uint32_t t0       = millis();
+  uint32_t       lastTick = t0;
+  unsigned       ticks    = 0;
+  while (job->state.load() != HTTP_JOB_DONE && millis() - t0 < waitMs) {
+    esp_task_wdt_reset();
+    Shell::pumpConsole();
+    if (httpWaitTickDue(lastTick, millis())) {
+      MQTTClient::tick();
+      lastTick = millis();
+      ++ticks;
+    }
+    delay(20);
+  }
+  Log::kvf("Shell", "shell.http_wait via=%s waited_ms=%u mqtt_ticks=%u loop_stack_free=%u", via,
+           (unsigned)(millis() - t0), ticks, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+  if (yielded) MQTTClient::releaseTlsHeap();
+  if (job->state.load() != HTTP_JOB_DONE && !httpJobAbandon(job->state)) {
+    // The task owns the job now and frees it when its own bounds end the GET.
+    Log::kvfw("Shell", "shell.http_abandoned via=%s wait_ms=%u", via, (unsigned)waitMs);
+    snprintf(msg, sizeof(msg), "net.http: no result after %u s, the fetch ends on its task (see log)",
+             (unsigned)(waitMs / 1000));
+    out(msg);
+    return;
   }
 
   if (job->err) {
     out(job->err);
-    free(job);
+    delete job;
     return;
   }
 
   snprintf(msg, sizeof(msg),
            "status=%d ok=%d body=%u bytes (preview <=%u, via %s)",
-           job->status, (int)job->ok, (unsigned)job->totalLen,
-           (unsigned)job->previewLen, via);
+           job->status, (int)job->ok, (unsigned)job->body.total,
+           (unsigned)job->body.len, via);
   out(msg);
+  if (job->body.cut) {
+    snprintf(msg, sizeof(msg), "read stopped at the %u s budget", (unsigned)(HTTP_CELL_READ_MS / 1000));
+    out(msg);
+  }
 
-  size_t start = 0;
-  for (size_t i = 0; i < job->previewLen; ++i) {
-    if (job->preview[i] == '\n' || job->preview[i] == '\r') {
+  const char* preview = job->body.data;
+  size_t      start   = 0;
+  for (size_t i = 0; i < job->body.len; ++i) {
+    if (preview[i] == '\n' || preview[i] == '\r') {
       if (i > start) {
         char l[256];
         size_t n = std::min(i - start, sizeof(l) - 1);
-        memcpy(l, job->preview + start, n);
+        memcpy(l, preview + start, n);
         l[n] = '\0';
         out(l);
       }
       start = i + 1;
     }
   }
-  if (start < job->previewLen) {
+  if (start < job->body.len) {
     char l[256];
-    size_t n = std::min(job->previewLen - start, sizeof(l) - 1);
-    memcpy(l, job->preview + start, n);
+    size_t n = std::min(job->body.len - start, sizeof(l) - 1);
+    memcpy(l, preview + start, n);
     l[n] = '\0';
     out(l);
   }
   out("--- done ---");
-  free(job);
+  delete job;
 }
 
 // ---------------------------------------------------------------------------
@@ -1680,17 +1624,17 @@ static void cmd_cert_info(int argc, char** argv, ShellOutput out) {
     return;
   }
 
-  char cn[128], serial[96], notBefore[32], notAfter[32];
-  bool parsed = hasCertBlob && MQTTClient::getCertInfo(cn, serial, notBefore, notAfter, sizeof(cn));
+  CertInfo info;
+  bool parsed = hasCertBlob && MQTTClient::getCertInfo(info);
 
   if (parsed) {
     char line[192];
-    snprintf(line, sizeof(line), "CN:         %s", cn);         out(line);
-    snprintf(line, sizeof(line), "Serial:     %s", serial);     out(line);
-    snprintf(line, sizeof(line), "Not before: %s", notBefore);  out(line);
-    snprintf(line, sizeof(line), "Not after:  %s", notAfter);   out(line);
+    snprintf(line, sizeof(line), "CN:         %s", info.cn);         out(line);
+    snprintf(line, sizeof(line), "Serial:     %s", info.serial);     out(line);
+    snprintf(line, sizeof(line), "Not before: %s", info.notBefore);  out(line);
+    snprintf(line, sizeof(line), "Not after:  %s", info.notAfter);   out(line);
   } else if (hasCertBlob) {
-    out("Cert stored but unparseable (corrupt or not valid PEM)");
+    out("Cert stored but unparseable (corrupt, not valid PEM, or serial over 47 bytes)");
   }
 
   if (hasCertBlob && hasKeyBlob) {
@@ -1702,13 +1646,26 @@ static void cmd_cert_info(int argc, char** argv, ShellOutput out) {
   }
 }
 
-// Apply a newly-pushed client cert by disconnecting MQTT. The loop() path
-// then reconnects and (if both cert + key are now in NVS) sets up mTLS.
+// Apply a newly-pushed client cert by rebooting onto it, once both halves are
+// stored and the key is the private half of the cert (certApplyVerdict).
 // in: argc, argv, out. out: status line
 static void cmd_cert_apply(int argc, char** argv, ShellOutput out) {
-  if (!MQTTClient::hasClientCert()) {
-    out("No cert + key in NVS - push both via cli/cert.set before apply");
-    return;
+  const bool stored = MQTTClient::hasClientCert();
+  const PairCheck pair = stored ? MQTTClient::checkStoredClientCert() : PairCheck::Invalid;
+  switch (certApplyVerdict(stored, pair)) {
+    case CertApply::Missing:
+      Shell::fail(out, "No cert + key in NVS - push both via cli/cert.set before apply");
+      return;
+    case CertApply::Mismatch:
+      Log::warn("Shell", "shell.cert_apply_refused reason=pair_invalid");
+      Shell::fail(out, "Stored cert + key do not validate as a pair - not applied");
+      return;
+    case CertApply::LowHeap:
+      Log::warn("Shell", "shell.cert_apply_refused reason=low_heap");
+      Shell::fail(out, "Low heap - stored pair not checked, retry cert.apply");
+      return;
+    case CertApply::Reboot:
+      break;
   }
   // Disconnect alone is not enough on classic-platform boards: WiFiClientSecure
   // holds sticky mbedtls state across the cert swap and the next handshake
@@ -1740,16 +1697,18 @@ static void cmd_cert_clear(int argc, char** argv, ShellOutput out) {
 // telegram.bot_token, web.password, wifi.ap_password, wifi.password:<ssid>.
 static void cmd_secret_set(int argc, char** argv, ShellOutput out) {
   if (argc < 3) { out("Usage: secret.set <field> <value>"); return; }
-  String value;
-  for (int i = 2; i < argc; i++) { if (i > 2) value += " "; value += argv[i]; }
+  String value(argv[2]);  // restFrom 2: the rest of the line as typed
   if (value.length() >= 2 && value.charAt(0) == '"' &&
       value.charAt(value.length() - 1) == '"') {
-    value = value.substring(1, value.length() - 1);
+    // In place: a substring() temporary would free a copy of the secret unwiped.
+    value.remove(value.length() - 1);
+    value.remove(0, 1);
   }
   bool ok = Secret::set(argv[1], value.c_str());
   // Wipe the plaintext secret from the String's heap buffer before it frees.
   mbedtls_platform_zeroize((void*)value.c_str(), value.length());
-  out(ok ? "secret stored in NVS" : "unknown field or NVS write failed");
+  if (ok) out("secret stored in NVS");
+  else Shell::fail(out, "unknown field or NVS write failed");
 }
 
 // Erase a secret from NVS; the read site falls back to config.json/empty.
@@ -2281,17 +2240,17 @@ void Shell::registerBuiltins() {
   registerCommand("fs.ls",         "List directory (fs.ls [path], glob ok)", cmd_ls);
   registerCommand("fs.cat",        "Print file contents",           cmd_cat);
   registerCommand("fs.rm",         "Remove a file (glob needs --yes)", cmd_rm);
-  registerCommand("fs.write",      "Write content to file",         cmd_write);
-  registerCommand("fs.append",     "Append content to file",        cmd_write);
+  registerCommand("fs.write",      "Write content to file",         cmd_write, 2);
+  registerCommand("fs.append",     "Append content to file",        cmd_write, 2);
   registerCommand("fs.mv",         "Rename/move a file",            cmd_mv);
   registerCommand("fs.df",         "Disk usage (LittleFS + SD)",    cmd_df);
   registerCommand("fs.format",     "Reformat LittleFS (fs.format --yes)", cmd_format);
 
   // Config
   registerCommand("config.get",    "Read config key (dot notation)",   cmd_config_get);
-  registerCommand("config.set",    "Set config key (saves + reloads)", cmd_config_set);
+  registerCommand("config.set",    "Set config key (saves, live at once, prefix at restart)", cmd_config_set, 2);
   registerCommand("config.del",    "Delete config key or section",     cmd_config_del);
-  registerCommand("config.save",   "Save current config to flash",     cmd_config_save);
+  registerCommand("config.save",   "Rewrite /config.json, make it live (MQTT on restart)", cmd_config_save);
   registerCommand("config.reload", "Reload config from flash",         cmd_config_reload);
   registerCommand("config.dump",   "Print full config JSON",           cmd_config_dump);
 
@@ -2309,7 +2268,7 @@ void Shell::registerBuiltins() {
   registerCommand("cert.info",     "Show stored client cert metadata",  cmd_cert_info);
   registerCommand("cert.apply",    "Reconnect MQTT with stored cert",   cmd_cert_apply);
   registerCommand("cert.clear",    "Erase client cert from NVS",        cmd_cert_clear);
-  registerCommand("secret.set",    "Provision a secret into NVS",       cmd_secret_set);
+  registerCommand("secret.set",    "Provision a secret into NVS",       cmd_secret_set, 2);
   registerCommand("secret.info",   "Show which secrets are NVS-backed", cmd_secret_info);
   registerCommand("secret.clear",  "Erase a secret from NVS",           cmd_secret_clear);
   registerCommand("boot.info",     "Last reset reason + uptime",    cmd_boot_info);
@@ -2324,28 +2283,40 @@ void Shell::registerBuiltins() {
   registerCommand("module.status", "Module status overview",        cmd_module_status);
 }
 
+// An explicit "mode": null is present: isNull() alone reads it as absent.
+static bool shellModeKeyPresent() {
+  JsonObjectConst shell = Config::get()["shell"].as<JsonObjectConst>();
+  if (shell.isNull()) return false;
+  for (JsonPairConst kv : shell) {
+    if (strcmp(kv.key().c_str(), "mode") == 0) return true;
+  }
+  return false;
+}
+
 ShellMode Shell::mode() {
   static const ShellMode m = []() {
     JsonVariantConst v = Config::get()["shell"]["mode"];
-    return shellModeResolve(!v.isNull(), v.is<const char*>() ? v.as<const char*>() : nullptr);
+    return shellModeResolve(shellModeKeyPresent(),
+                            v.is<const char*>() ? v.as<const char*>() : nullptr);
   }();
   return m;
 }
 
 void Shell::begin() {
+  s_consoleTask = xTaskGetCurrentTaskHandle();
   registerBuiltins();
 
   JsonVariantConst modeVal = Config::get()["shell"]["mode"];
   const char* raw = modeVal.is<const char*>() ? modeVal.as<const char*>() : nullptr;
-  if (!modeVal.isNull() && !raw) {
+  if (shellModeKeyPresent() && !raw) {
     Log::kvfw("Shell", "shell.mode_not_a_string applied=off "
                        "hint=\"full|serial-only|mqtt-only|off\"");
   } else if (shellModeUnrecognised(raw)) {
-    Log::kvfw("Shell", "shell.mode_unrecognised value=%s applied=off "
+    Log::kvfw("Shell", "shell.mode_unrecognised value=\"%s\" applied=off "
                        "hint=\"full|serial-only|mqtt-only|off\"", raw);
   }
   Log::kvf("Shell", "shell.ready commands=%d mode=%s serial=%d mqtt=%d",
-           _commandCount, raw ? raw : "full",
+           _commandCount, shellModeName(mode()),
            shellModeSerialAllowed(mode()) ? 1 : 0,
            shellModeMqttAllowed(mode()) ? 1 : 0);
 }

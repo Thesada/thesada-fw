@@ -35,6 +35,7 @@ M._mqtt_subs  = {}    -- topic       -> list of callbacks
 M._timers     = {}    -- list of { fire_at = ms, cb = fn }
 
 local MAX_TIMERS = 8  -- matches MAX_TIMERS in ScriptEngine.cpp
+local MAX_DELAY_MS = 30 * 24 * 3600 * 1000  -- LUA_TIMER_MAX_DELAY_MS in lua_timer_policy.h
 
 -- ── Internal helpers ────────────────────────────────────────────────────────
 
@@ -268,10 +269,16 @@ function M.install()
     ip         = function() record("Node.ip");      return "0.0.0.0" end,
     setTimeout = function(ms, callback)
       record("Node.setTimeout", ms)
+      -- luaL_checknumber: numeric strings convert, anything else raises
+      local n = tonumber(ms)
+      if n == nil then error("bad argument #1 to 'setTimeout' (number expected)", 2) end
+      ms = n
       if ms ~= ms then return false end  -- NaN refused, matches firmware
       if #M._timers >= MAX_TIMERS then
         return false  -- queue full, matches firmware
       end
+      if ms < 0 then ms = 0 end  -- clamped like luaTimerFireAt
+      if ms > MAX_DELAY_MS then ms = MAX_DELAY_MS end
       table.insert(M._timers, { fire_at = M.now_ms + ms, cb = callback })
       return true
     end,
@@ -289,6 +296,7 @@ function M.install()
       record("EventBus.subscribe", event)
       M._event_subs[event] = M._event_subs[event] or {}
       table.insert(M._event_subs[event], callback)
+      return true
     end,
   }
 
@@ -312,8 +320,8 @@ function M.install()
       record("Telegram.send", chat_id, msg)
       return true
     end,
-    broadcast = function(msg)
-      record("Telegram.broadcast", msg)
+    broadcast = function(msg, code)
+      record("Telegram.broadcast", msg, code)
       return true
     end,
   }

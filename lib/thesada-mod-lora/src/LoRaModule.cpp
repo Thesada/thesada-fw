@@ -75,10 +75,8 @@ void LoRaModule::begin() {
     "Transmit a text packet (lora.send <text>)",
     [this](int argc, char** argv, ShellOutput out) {
       if (argc < 2) { out("usage: lora.send <text>"); return; }
-      String msg;
-      for (int i = 1; i < argc; i++) { if (i > 1) msg += " "; msg += argv[i]; }
-      out(transmit(msg.c_str()) ? "TX_DONE" : "TX failed/timeout");
-    });
+      out(transmit(argv[1]) ? "TX_DONE" : "TX failed/timeout");
+    }, 1);
 
   Shell::registerCommand("lora.status",
     "Radio config + last RX stats",
@@ -256,12 +254,12 @@ void LoRaModule::publishRx(const LoRaRx& rx) {
   JsonObject cfg = Config::get();
   const char* prefix = cfg["mqtt"]["topic_prefix"] | "thesada/node";
   char topic[MQTT_TOPIC_CAP];
-  snprintf(topic, sizeof(topic), "%s/lora/rx", prefix);
-
-  String payload;
-  payload.reserve(measureJson(doc) + 1);
-  serializeJson(doc, payload);
-  MQTTClient::publish(topic, payload.c_str());
+  if (MQTTClient::formatTopic(topic, sizeof(topic), "%s/lora/rx", prefix)) {
+    String payload;
+    payload.reserve(measureJson(doc) + 1);
+    serializeJson(doc, payload);
+    MQTTClient::publish(topic, payload.c_str());
+  }
   EventBus::publish("lora", doc.as<JsonObject>());
 
   Log::kvf(TAG, "lora.rx len=%d rssi=%.1f snr=%.1f",

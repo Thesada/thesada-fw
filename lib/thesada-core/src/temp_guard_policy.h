@@ -2,10 +2,11 @@
 // DS18B20 plausibility guard. A reading more than max_delta_c from the last
 // accepted one is held back; the next reading within max_delta_c of the held
 // one is accepted, so a real step costs one interval instead of a reboot.
-// Pure, no Arduino deps, host-unit-testable.
+// Also the HA expiry that hides a stale probe. Pure, host-unit-testable.
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #include <cmath>
+#include <stdint.h>
 
 // DallasTemperature's DEVICE_DISCONNECTED_C; getTempC maps every fault to it.
 constexpr float TEMP_NO_READING = -127.0f;
@@ -17,11 +18,19 @@ struct TempGuard {
   float held     = TEMP_NO_READING;
 };
 
+// A DS18B20 reads exactly 85.0 C after power-on or a reset, before its first
+// conversion. Clones that fail every conversion read it with a scratchpad the
+// library does not flag, and nothing the module reads tells the two apart, so
+// 85.0 is taken only near the last accepted reading, never on repeats alone.
+constexpr float TEMP_POWER_ON_C      = 85.0f;
+constexpr float TEMP_POWER_ON_NEAR_C = 2.0f;
+
 enum class TempVerdict : unsigned char {
   Accepted,     // near the last accepted reading, first reading, or guard off
   Rebaselined,  // far from the last accepted, near the held one: accepted
   NoReading,    // read failed or NaN; state untouched, a held reading survives
   Implausible,  // far from both; it becomes the held reading
+  PowerOn,      // 85.0 C, the probe's power-on value, not near the last accepted
 };
 
 // Judge one reading and update the guard.
@@ -29,6 +38,11 @@ enum class TempVerdict : unsigned char {
 // out: verdict. Only Accepted and Rebaselined carry a value to publish.
 inline TempVerdict tempGuardJudge(TempGuard& g, float c, float maxDelta) {
   if (std::isnan(c) || c <= TEMP_NO_READING) return TempVerdict::NoReading;
+
+  if (std::fabs(c - TEMP_POWER_ON_C) < 1e-3f &&
+      !(g.accepted > TEMP_NO_READING && std::fabs(c - g.accepted) <= TEMP_POWER_ON_NEAR_C)) {
+    return TempVerdict::PowerOn;  // never a held reading another one confirms
+  }
 
   bool guardOn = maxDelta > 0.0f && g.accepted > TEMP_NO_READING;
   TempVerdict v = TempVerdict::Accepted;
@@ -42,4 +56,27 @@ inline TempVerdict tempGuardJudge(TempGuard& g, float c, float maxDelta) {
   g.accepted = c;
   g.held     = TEMP_NO_READING;
   return v;
+}
+
+// Bounds for temperature.interval_s: 0 would sample every loop pass, and the
+// cap keeps the interval in ms inside uint32_t.
+constexpr uint32_t TEMP_INTERVAL_MIN_S = 5;
+constexpr uint32_t TEMP_INTERVAL_MAX_S = 86400;
+
+// in: configured temperature.interval_s, signed. out: seconds within the bounds.
+inline uint32_t tempIntervalS(long long raw) {
+  if (raw < TEMP_INTERVAL_MIN_S) return TEMP_INTERVAL_MIN_S;
+  if (raw > TEMP_INTERVAL_MAX_S) return TEMP_INTERVAL_MAX_S;
+  return (uint32_t)raw;
+}
+
+// Missed intervals before HA marks a per-sensor entity unavailable. A stale
+// probe skips its per-sensor topic, so without expiry HA shows the old value.
+constexpr uint32_t TEMP_EXPIRE_INTERVALS = 3;
+
+// HA discovery expire_after for a DS18B20 entity.
+// in: temperature.interval_s. out: seconds, 0 = omit (no interval to scale).
+inline uint32_t tempExpireAfterS(uint32_t intervalS) {
+  if (intervalS > UINT32_MAX / TEMP_EXPIRE_INTERVALS) return UINT32_MAX;
+  return intervalS * TEMP_EXPIRE_INTERVALS;
 }

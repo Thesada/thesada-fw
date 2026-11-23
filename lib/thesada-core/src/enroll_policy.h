@@ -22,6 +22,17 @@
 #define ENROLL_BACKOFF_MIN_MS   150000u
 #define ENROLL_BACKOFF_MAX_MS   1800000u
 
+// The job's TLS hold, each connect, handshake and read timeout, and the task's
+// own deadline: the deadline plus one read timeout ends the task inside the hold.
+#define ENROLL_JOB_CEILING_MS   60000u
+#define ENROLL_IO_TIMEOUT_MS    10000u
+#define ENROLL_TASK_BUDGET_MS   40000u
+
+// Rollover-safe. in: now, task start. out: true once the task's deadline passed.
+inline bool enrollTaskBudgetSpent(uint32_t nowMs, uint32_t startMs) {
+  return (uint32_t)(nowMs - startMs) >= ENROLL_TASK_BUDGET_MS;
+}
+
 enum class EnrollStep : uint8_t { Announce, Verify, Poll, AwaitMtls, Ack, Done };
 
 struct EnrollAction {

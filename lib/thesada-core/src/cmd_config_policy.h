@@ -6,14 +6,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #include <stddef.h>
+#include "config_bounds.h"
 
 // One byte under a 4 KB MQTT buffer, leaving room for a terminating NUL
 // when the payload is copied out of the client callback.
 #define CMD_CONFIG_MAX 4096
-
-// Nesting past this is refused. A hostile document must not blow the stack
-// inside the MQTT callback that runs this scan.
-#define CMD_CONFIG_MAX_DEPTH 8
 
 enum CmdConfigVerdict {
   CMD_CONFIG_OK = 0,
@@ -103,10 +100,10 @@ static inline bool cmdConfigNumber(CmdConfigScan& p) {
 
 static inline bool cmdConfigValue(CmdConfigScan& p);
 
-// Depth is capped by CMD_CONFIG_MAX_DEPTH. The cycle is the JSON walk.
+// Depth is capped by CONFIG_MAX_DEPTH. The cycle is the JSON walk.
 // NOLINTNEXTLINE(misc-no-recursion)
 static inline bool cmdConfigContainer(CmdConfigScan& p, char open, char close) {
-  if (++p.depth > CMD_CONFIG_MAX_DEPTH) return false;
+  if (++p.depth > CONFIG_MAX_DEPTH) return false;
   p.i++;
   if (!cmdConfigSkipWs(p)) return false;
   if (p.s[p.i] == close) {
@@ -137,7 +134,7 @@ static inline bool cmdConfigContainer(CmdConfigScan& p, char open, char close) {
   }
 }
 
-// Same cycle as cmdConfigContainer. Depth is capped by CMD_CONFIG_MAX_DEPTH.
+// Same cycle as cmdConfigContainer. Depth is capped by CONFIG_MAX_DEPTH.
 // NOLINTNEXTLINE(misc-no-recursion)
 static inline bool cmdConfigValue(CmdConfigScan& p) {
   if (!cmdConfigSkipWs(p)) return false;
@@ -153,7 +150,7 @@ static inline bool cmdConfigValue(CmdConfigScan& p) {
 
 // in: p.i at '{'. out: 1 nonempty broker string, 0 absent or empty, -1 bad.
 static inline int cmdConfigMqttObject(CmdConfigScan& p) {
-  if (++p.depth > CMD_CONFIG_MAX_DEPTH) return -1;
+  if (++p.depth > CONFIG_MAX_DEPTH) return -1;
   p.i++;
   if (!cmdConfigSkipWs(p)) return -1;
   if (p.s[p.i] == '}') {

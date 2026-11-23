@@ -40,8 +40,10 @@ public:
   #define LOG_LINE_LEN 220
 #endif
   static constexpr uint8_t RING_SIZE = LOG_RING_SIZE;
-  static const char* ringLine(uint8_t index);  // 0 = oldest
-  static uint8_t     ringCount();
+  static constexpr size_t  RING_SNAPSHOT_CAP = (size_t)RING_SIZE * LOG_LINE_LEN;
+  // Copy the ring, oldest first, lines joined by '\n', under the ring lock. Any task.
+  // out: bytes written to out (no NUL counted), cut at cap - 1.
+  static size_t ringSnapshot(char* out, size_t cap);
 
 private:
   static void write(LogLevel level, const char* tag, const char* msg);
